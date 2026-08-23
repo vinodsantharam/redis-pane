@@ -1,0 +1,14 @@
+# Build output
+/target/
+/dist/
+*.log
+
+# Editors / OS
+.DS_Store
+.idea/
+*.swp
+
+# Local config & secrets
+.env
+.env.*
+/.local/

@@ -1,6 +1,6 @@
 # redis-pane — UX & UI Design
 
-**Status:** Draft v0.1 · **Companion to:** [PRD.md](PRD.md) · **Last updated:** 2026-08-23
+**Status:** Draft v0.2 · **Companion to:** [PRD.md](PRD.md) · **Last updated:** 2026-08-24
 
 ## 1. Design principles
 
@@ -23,24 +23,33 @@
 Three columns, one status bar, one hint bar. Splits are resizable and collapsible.
 
 ```
-┌ redis-pane ── ● staging · redis://cache-01:6379 · db 0 ────────── READ-ONLY ─┐
-│ CONNECTIONS   │ KEYS  scan 41,203 / ~180k        │ VALUE                     │
+┌ redis-pane ── ● staging · redis://cache-01:6379 · db 0 · from profile ── READ-ONLY ─┐
+│ PROFILES      │ KEYS  scan 41,203 / ~180k        │ VALUE                     │
 │               │ ┌ filter: user:*:session ──────┐ │ user:8812:session         │
 │ ● local       │ │                              │ │ hash · 14 fields · 2.1KB  │
 │ ● staging   ▸ │ │ ▾ user:                      │ │ ttl 00:42:17              │
 │ ○ prod        │ │   ▾ 8812:                    │ │                           │
 │               │ │     ● session   hash  42m    │ │  FIELD        VALUE       │
-│ DATABASES     │ │     ● profile   json   ∞     │ │  id           8812        │
-│  db0  128,441 │ │   ▸ 8813:            (3)     │ │  device       ios/17.2    │
-│  db1      —   │ │ ▾ cart:                      │ │  cart_total   4          │
+│ CONNECTED     │ │     ● profile   json   ∞     │ │  id           8812        │
+│ ▸ staging     │ │   ▸ 8813:            (3)     │ │  device       ios/17.2    │
+│   ⚡ cache-07  │ │ ▾ cart:                      │ │  cart_total   4          │
 │               │ │   ● 91af…       zset  12m    │ │  …                        │
-│ VIEWS         │ │                              │ │                           │
-│  Dashboard    │ │                              │ │                           │
-│  Monitor      │ └──────────────────────────────┘ │                           │
-│  Pub/Sub      │  ↑↓ move  → open  / filter  ⌫ del│  e edit  y copy  t ttl    │
+│ DATABASES     │ │                              │ │                           │
+│  db0  128,441 │ │                              │ │                           │
+│  db1      —   │ └──────────────────────────────┘ │                           │
+│               │  ↑↓ move  → open  / filter  ⌫ del│  e edit  y copy  t ttl    │
 └───────────────┴──────────────────────────────────┴───────────────────────────┘
- :cmd  ⌘K palette   ? help   ⇥ next pane            SCAN 23%  ▓▓▓░░░░  cancel ⎋
+ :cmd  ⌃K palette   ? help   ⇥ next pane            SCAN 23%  ▓▓▓░░░░  cancel ⎋
 ```
+
+The sidebar separates **PROFILES** (saved, from the config file) from **CONNECTED** (live
+Connections). An Ad-hoc Connection — one with no Profile behind it — appears only under
+CONNECTED, marked `⚡`, and inherits the `unknown` Environment unless it resolved to loopback.
+
+The title bar carries four things and always all four: Environment dot, target, database, and
+**Source** (`from profile` / `from --url` / `from REDIS_URL` / `default`). Per
+[ADR-0001](adr/0001-connection-resolution-order.md) the app resolves silently, and this readout
+is the entire mitigation for doing so — it is not optional chrome.
 
 **Responsive behavior**
 
@@ -48,7 +57,7 @@ Three columns, one status bar, one hint bar. Splits are resizable and collapsibl
 |---|---|
 | ≥ 140 cols | Three columns as above, value pane widest |
 | 100–139 | Sidebar collapses to icons + labels on focus |
-| 80–99 | Two columns: keys + value; sidebar becomes an overlay (`g c`) |
+| 80–99 | Two columns: keys + value; sidebar becomes an overlay (`g c`). Title bar keeps Environment and Source, truncating the target from the left |
 | < 80 | Single pane, stack-navigated; breadcrumb replaces columns |
 | Height < 24 | Hint bar collapses into the status bar |
 
@@ -100,12 +109,14 @@ itself. Bindings are user-overridable in config; the hint bar renders the *effec
 | `text` / `text-muted` | Primary content vs. metadata (TTL, sizes, counts) |
 | `accent` | Selection, cursor row, active tab |
 | `type.*` | One hue per Redis type — consistent everywhere a type appears |
-| `env.local` / `env.staging` / `env.prod` | Title bar and connection chrome |
+| `env.local` / `env.staging` / `env.prod` / `env.unknown` | Title bar band, sidebar dot, and confirmation dialogs |
 | `danger` / `warn` / `ok` | Destructive actions, expiring TTLs, success toasts |
 
-**Environment signaling.** `local` is neutral, `staging` is amber, `prod` is red — applied to
-the title bar band, the connection dot, and the confirmation dialogs. A prod connection is
-recognizable from across a desk.
+**Environment signaling.** `local` is neutral, `staging` is amber, `prod` is red, and `unknown`
+is a distinct fourth treatment — deliberately not a shade of the others, because it means "nobody
+told us," not "somewhere between staging and prod." Applied to the title bar band, the sidebar
+dot, and confirmation dialogs. A prod Connection is recognizable from across a desk. `prod` and
+`unknown` both start in Read-only Mode ([ADR-0004](adr/0004-untagged-connections-are-read-only.md)).
 
 **Typography and density.** Bold for headers and focused titles, dim for metadata, no
 underlining except links. One blank line between logical groups; padding of one column inside
@@ -122,10 +133,20 @@ Themes are data (a token → color map in config), so users can add their own.
 
 ## 6. Key screens
 
-### 6.1 Connection picker (first run)
-No empty-terminal cliff. First launch shows detected local instances (default ports, common
-socket paths, `REDIS_URL` if set), a "connect to URL" field, and a hint about the config file.
-The user is browsing a keyspace within two keystrokes.
+### 6.1 Launch, and the first-run picker
+The normal path has no screen at all. The target resolves deterministically
+([ADR-0001](adr/0001-connection-resolution-order.md)) and the app opens straight into the
+keyspace browser with the target and Source in the title bar. Bare launch with nothing
+configured connects to local Redis; there is no setup step to get to a keyspace.
+
+The picker appears in exactly one case: nothing is configured *and* nothing was detected. It
+offers detected local instances (default ports, common socket paths), a "connect to URL" field,
+and — because the app never writes the config file
+([ADR-0003](adr/0003-app-never-writes-config.md)) — the config path with a ready-to-paste
+example Profile. That example is the only teaching moment we get, so it earns real space.
+
+Config parse failures render here too, naming the file with line and column and showing the
+offending fragment. A broken config never degrades into a silent fallback to localhost.
 
 ### 6.2 Keyspace browser
 The centerpiece. Streams `SCAN` results into a virtualized list that stays interactive while
@@ -168,8 +189,9 @@ explaining its cost. Buffers are bounded with a visible cap.
   already knows, then fills the body when the fetch lands. No blank frame.
 - **Cancellation everywhere.** `Esc` aborts an in-flight scan, fetch, or command and says so.
 - **Toasts, not dialogs, for outcomes.** Errors include the failing command and a copy action.
-- **Persistent session state.** Last profile, pane sizes, filter, and scroll position restore on
-  relaunch. Reopening the app feels like never having left.
+- **Persistent session state.** Last Connection, pane sizes, filter, and scroll position restore
+  on relaunch. Reopening the app feels like never having left. This lives in a state file under
+  `$XDG_STATE_HOME/redis-pane/`, never in the user's config file.
 - **Copy that fits the terminal.** `y` offers key / value / `redis-cli` command / permalink-style
   reference — because the next step is usually pasting into a ticket or a shell.
 
@@ -187,3 +209,5 @@ explaining its cost. Buffers are bounded with a visible cap.
 - Does the console deserve a persistent bottom split (tmux-style) or stay an overlay?
 - How much of the dashboard belongs in v1 before it starts pretending to be a monitoring tool?
 - Should multi-connection be tabs across the top, or purely sidebar-driven?
+- Is the PROFILES / CONNECTED split in the sidebar earning its vertical space at 24 rows, or
+  should CONNECTED only appear once a second Connection exists?

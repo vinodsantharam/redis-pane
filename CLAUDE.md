@@ -9,6 +9,10 @@ product and design intent live in:
 
 - [docs/PRD.md](docs/PRD.md) — problem, users, requirements (R1.x–R7.x), milestones M0–M4
 - [docs/DESIGN.md](docs/DESIGN.md) — layout, navigation model, keymap, visual language, screens
+- [CONTEXT.md](CONTEXT.md) — the glossary. Read it before naming anything; several of these terms
+  are deliberately distinguished and the distinctions are load-bearing
+- [docs/adr/](docs/adr/) — decisions with their rejected alternatives. Check for a relevant ADR
+  before changing connection, config, or safety behaviour
 
 Requirements are numbered so code and commits can cite them (e.g. "implements R2.1"). When a
 feature diverges from these docs, update the doc in the same change — the docs are the spec, not
@@ -63,10 +67,26 @@ they are expensive to retrofit:
 - **Keybindings are data.** The keymap, the palette, and the on-screen hint bar all read from one
   source, so hints always show the *effective* binding after user overrides.
 
+## Decisions already made (see ADRs before revisiting)
+
+- **Connection resolution** is flags → default Profile → environment → `127.0.0.1:6379`, with
+  `REDIS_URL` used wholesale and never merged with the discrete `REDIS_HOST`/`PORT`/`USER`/
+  `PASSWORD` variables. It never prompts. The title bar shows target *and* Source at all times,
+  and that readout is the mitigation for resolving silently — do not treat it as optional chrome.
+- **Config is `~/.config/redis-pane/config.json`, and the app only ever reads it.** There is no
+  in-app "save profile". Anything the app persists (last Connection, pane sizes, filter, scroll)
+  goes to a separate state file under `$XDG_STATE_HOME/redis-pane/`.
+- **Secrets are references** (`passwordEnv`, `passwordCommand`). Literal passwords work but the
+  file is refused when group- or world-readable.
+- **There are four Environments, not three** — `unknown` is a real one. Ad-hoc Connections to
+  anything that isn't loopback or a unix socket get it, and start in Read-only Mode.
+
 ## Conventions
 
-- Environment tagging (`local` / `staging` / `prod`) is a safety feature, not decoration — any
-  code path touching mutations must be aware of it (PRD R4.5, R4.6).
+- Use the glossary's words in code, comments, and UI strings. A Profile is not a Connection;
+  code that blurs them will blur them in the interface too.
+- Environment (`local` / `staging` / `prod` / `unknown`) is a safety feature, not decoration —
+  any code path touching mutations must be aware of it (PRD R4.5, R4.6, R1.9).
 - Prefer adding to the command palette over adding a keybinding; every action must be reachable
   from the palette (R5.1), and only frequent actions earn a key.
 - Errors surface as non-blocking notifications carrying the failing command (R7.4) — never

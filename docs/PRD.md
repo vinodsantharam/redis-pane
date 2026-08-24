@@ -1,6 +1,6 @@
 # redis-pane — Product Requirements
 
-**Status:** Draft v0.1 · **Owner:** Vinod Santharam · **Last updated:** 2026-08-23
+**Status:** Draft v0.2 · **Owner:** Vinod Santharam · **Last updated:** 2026-08-24
 
 ## 1. Problem
 
@@ -59,16 +59,41 @@ excuse.
 
 ## 6. Requirements
 
-### 6.1 Connections
+### 6.1 Connections and Profiles
+
+Vocabulary is defined in [CONTEXT.md](../CONTEXT.md): a **Profile** is a saved description in the
+config file; a **Connection** is a live session, which may be **ad-hoc** (no Profile behind it).
+
 - **R1.1** Connect via URL (`redis://`, `rediss://`), host/port, or Unix socket.
-- **R1.2** Named connection profiles in a config file; no GUI-form requirement to get started.
-- **R1.3** Credentials resolved from env vars, config, or an external command (so secrets are
-  never stored in plaintext by us).
-- **R1.4** TLS, ACL usernames, and per-profile default database.
-- **R1.5** Profile carries an **environment tag** (`local` / `staging` / `prod`) that drives
-  chrome color and safety defaults.
-- **R1.6** Cluster and Sentinel topology discovery; `MOVED`/`ASK` handled transparently.
-- **R1.7** Multiple simultaneous connections, switchable without losing view state.
+- **R1.2** A Connection's target resolves in strict precedence: flags (`--url`, `--host`,
+  `--profile`) → the config file's default Profile → the environment → `127.0.0.1:6379`. In the
+  environment, `REDIS_URL` is used wholesale if set, otherwise the target is assembled from
+  `REDIS_HOST` / `REDIS_PORT` / `REDIS_USER` / `REDIS_PASSWORD`. The two forms are never merged.
+  See [ADR-0001](adr/0001-connection-resolution-order.md).
+- **R1.3** Resolution never prompts. The title bar permanently shows the resolved target **and**
+  its Source (flag / Profile / environment). Zero configuration is a supported way to run: with
+  nothing set up at all, the app connects to a local Redis and starts browsing.
+- **R1.4** Profiles live in a JSON file at `$XDG_CONFIG_HOME/redis-pane/config.json` (falling
+  back to `~/.config/redis-pane/config.json`), carrying address, credential reference,
+  Environment, and an optional `note` rendered in the UI.
+  See [ADR-0002](adr/0002-json-config-file.md).
+- **R1.5** Credentials are referenced, not embedded: `passwordEnv` or `passwordCommand`. A
+  literal `password` is honoured, but the file is refused if group- or world-readable, and such
+  Profiles are badged.
+- **R1.6** The app never writes the config file — Profiles are hand-authored. Session state is
+  persisted separately under `$XDG_STATE_HOME/redis-pane/`.
+  See [ADR-0003](adr/0003-app-never-writes-config.md).
+- **R1.7** The config file must be discoverable without the app ever writing it: first run prints
+  its path with a ready-to-paste example, `--config-path` reports it, and parse errors name the
+  file with line and column.
+- **R1.8** Every Profile and Connection carries an **Environment** — `local`, `staging`, `prod`,
+  or `unknown` — driving chrome colour and safety defaults.
+- **R1.9** Ad-hoc Connections infer their Environment: loopback, `::1`, or a unix socket →
+  `local`; anything else → `unknown`, which starts in Read-only Mode and is lifted with one
+  keypress. See [ADR-0004](adr/0004-untagged-connections-are-read-only.md).
+- **R1.10** TLS, ACL usernames, and per-Profile default database.
+- **R1.11** Cluster and Sentinel topology discovery; `MOVED`/`ASK` handled transparently.
+- **R1.12** Multiple simultaneous Connections, switchable without losing view state.
 
 ### 6.2 Keyspace browsing
 - **R2.1** Incremental `SCAN` with live streaming results; never `KEYS`.
@@ -93,7 +118,8 @@ excuse.
 - **R4.2** TTL editing (set/persist/extend) as a first-class action.
 - **R4.3** Rename, copy, move-across-db, delete — single and bulk.
 - **R4.4** Every mutation shows the exact command it will run before it runs.
-- **R4.5** **Read-only mode**, default-on for `prod`-tagged profiles, toggled explicitly.
+- **R4.5** **Read-only Mode**, default-on for `prod` and `unknown` Environments, toggled
+  explicitly (`Ctrl-R`).
 - **R4.6** Confirmation friction scales with blast radius: single delete = one keypress;
   bulk delete on prod = typed confirmation.
 
@@ -134,7 +160,8 @@ excuse.
 
 | Risk | Mitigation |
 |---|---|
-| Destructive action against prod | Env tagging, read-only default, scaled confirmation, command preview |
+| Destructive action against prod | Environment tagging, read-only default, scaled confirmation, command preview |
+| Silently resolving to an unexpected server | Deterministic precedence, target + Source always visible, `unknown` Environment read-only by default |
 | Large-value rendering hangs the UI | Hard fetch caps with explicit "load more"; render off the input thread |
 | Cluster semantics leak into UX | Topology-aware routing behind the scenes; surface node only where it matters |
 | Feature sprawl reproduces RedisInsight's bloat | Non-goals are enforced; every feature must survive the "would an on-call use this?" test |
@@ -142,7 +169,8 @@ excuse.
 
 ## 9. Milestones
 
-- **M0 — Skeleton.** App shell, event loop, theming, connection to a single instance, help overlay.
+- **M0 — Skeleton.** App shell, event loop, theming, help overlay, and the full connection
+  resolution chain (flags → Profile → env → localhost) with target and Source in the title bar.
 - **M1 — Browse.** Scan-based keyspace browser, tree/flat views, all core type viewers. *This is
   the milestone that already beats `redis-cli` for daily use.*
 - **M2 — Mutate.** Editing, TTL management, delete/rename/copy, read-only mode, safety rails.
@@ -153,5 +181,7 @@ excuse.
 ## 10. Open questions
 
 - Do we ship an export/import path (JSON, RDB-ish dump) in v1, or defer it?
+- Should `--profile` also be accepted positionally (`redis-pane staging`)?
 - Is a session-scoped undo buffer for mutations feasible, or is command preview enough?
-- Should profiles be shareable across a team (checked-in config), and what does that mean for secrets?
+- Should Profiles be shareable across a team (checked-in config)? ADR-0002's reference-only
+  credential path makes this plausible — is it worth designing for in v1?

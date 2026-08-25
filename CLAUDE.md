@@ -29,8 +29,11 @@ terminal application.
 ## Stack (confirmed 2026-08-24)
 
 Rust + [`ratatui`](https://ratatui.rs) + `crossterm`, with `tokio` for async I/O and
-[`fred`](https://docs.rs/fred) or `redis-rs` for the Redis protocol — that last choice is still
-open. Rationale: a single static binary with no runtime (PRD R7.6), the strongest TUI widget
+[`fred`](https://docs.rs/fred) for the Redis protocol. `fred` is settled rather than preferred:
+liveness (ADR-0006) needs RESP3 `CLIENT TRACKING` invalidation as a raw event stream, which
+`fred`'s `TrackingInterface` provides across centralized, clustered and sentinel deployments.
+`redis-rs` supports client-side caching too, but its `caching` module maintains a cache, which is
+the one thing ADR-0006 forbids. Rationale for the rest: a single static binary with no runtime (PRD R7.6), the strongest TUI widget
 ecosystem, and the headroom to hold a million-key keyspace in bounded memory.
 
 A TypeScript TUI (Ink, or a hand-written `react-reconciler` host) was considered and rejected on
@@ -64,6 +67,10 @@ they are expensive to retrofit:
 - **Type-awareness is a first-class abstraction**, not a `match` scattered through the UI.
   Every Redis type gets a viewer behind one shared trait/interface so the frame (header, body,
   footer) and navigation are identical across types.
+- **The Viewer never caches a value.** Reads always hit the server; liveness is push-driven via
+  `CLIENT TRACKING ON OPTIN` armed for the open key alone. Any memo keyed by key-name reintroduces
+  the exact RedisInsight bug this project was started over — see ADR-0006 before adding one, and
+  note that "just for the first frame" is how it starts.
 - **Mutations flow through one path** that produces a command preview before executing. Read-only
   mode and confirmation-scaling are enforced at that chokepoint, not at each call site.
 - **Colors are semantic tokens, never literals.** Themes remap tokens; widgets ask for
@@ -88,6 +95,9 @@ they are expensive to retrofit:
   goes to a separate state file under `$XDG_STATE_HOME/redis-pane/`.
 - **Secrets are references** (`passwordEnv`, `passwordCommand`). Literal passwords work but the
   file is refused when group- or world-readable.
+- **There is no refresh button.** The open key is live by default and the Viewer holds no value
+  cache; `r` is a scoped Refetch, not a global refresh. Degradation to manual is always visible
+  in the header, never silent (ADR-0006).
 - **There are four Environments, not three** — `unknown` is a real one. Ad-hoc Connections to
   anything that isn't loopback or a unix socket get it, and start in Read-only Mode.
 - **One Connection per process, one database, fixed at launch.** No switcher, no `SELECT`, no

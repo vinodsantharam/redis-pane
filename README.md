@@ -47,8 +47,11 @@ specification is the deliverable — it is kept current, not archived. The stack
 Requirements are numbered so commits can cite them (`implements R2.1`). When a change diverges
 from these documents, the documents change in the same commit.
 
-## The shape of it, in five decisions
+## The shape of it, in six decisions
 
+- **There is no refresh button.** The open key is live: the server pushes an invalidation when
+  it changes and the Viewer refetches. Nothing is ever memoized, so a value cannot go stale
+  behind a control claiming to update it. ([ADR-0006](docs/adr/0006-liveness-without-a-refresh-button.md))
 - **One Connection per process, one database, fixed at launch.** No switcher, no `SELECT`, no
   tabs, no sidebar — a second target is a second terminal. Everything else stays small because
   of this. ([ADR-0005](docs/adr/0005-one-connection-per-process.md))

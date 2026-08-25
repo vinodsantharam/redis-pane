@@ -1,6 +1,6 @@
 # redis-pane — Product Requirements
 
-**Status:** Draft v0.3 · **Owner:** Vinod Santharam · **Last updated:** 2026-08-25
+**Status:** Draft v0.3 · **Owner:** Vinod Santharam · **Last updated:** 2026-08-26
 
 ## 1. Problem
 
@@ -116,6 +116,8 @@ config file; a **Connection** is a live session, which may be **ad-hoc** (no Pro
   a temporary column, which is how it stays reachable without being resident (R2.4).
   Multi-select for bulk operations.
 - **R2.6** Handle 1M+ key keyspaces without UI stall (virtualized rendering, bounded memory).
+- **R2.7** `r` acts on the focused pane and nothing else: a rescan in the keys pane, a Refetch
+  in the Viewer. There is no global refresh, because there is no global staleness.
 
 ### 6.3 Value inspection
 - **R3.1** Dedicated viewer per type: string, hash, list, set, sorted set, stream, bitmap,
@@ -125,6 +127,20 @@ config file; a **Connection** is a live session, which may be **ad-hoc** (no Pro
 - **R3.3** Collections render as paginated, sortable, searchable tables — not as a wall of text.
 - **R3.4** Streams get an entry timeline with consumer-group state.
 - **R3.5** Search within a value; copy key, value, or a ready-to-paste `redis-cli` command.
+- **R3.6** **There is no value cache.** Every read of the open key issues real commands; the
+  Viewer never serves a value from memory. A stale value is therefore not a state the
+  application can reach. See [ADR-0006](adr/0006-liveness-without-a-refresh-button.md).
+- **R3.7** The open key is **live by default**: `CLIENT TRACKING ON OPTIN` is armed for exactly
+  that one key, and a Refetch is triggered by the server's invalidation push. No polling, no
+  idle traffic, one tracked key per session.
+- **R3.8** An arriving update applies immediately when the Viewer is at rest, and is announced
+  (`changed 2s ago · r to load`) when the user has scrolled. An open editor is never touched.
+- **R3.9** TTL renders as a countdown computed locally. It never costs a round trip.
+- **R3.10** A key deleted, expired, or evicted while open retains its last read value, badged
+  with the deletion and the read time, with mutating actions disabled.
+- **R3.11** Liveness state is always visible in the Viewer header. Where the server cannot
+  support it — Redis < 6, or no RESP3 — the app degrades to Read age plus explicit Refetch and
+  **says so**. It never silently behaves differently from what the user would assume.
 
 ### 6.4 Mutation
 - **R4.1** In-place edit for scalar values and collection members, with a diff-style confirm.
@@ -170,6 +186,7 @@ config file; a **Connection** is a live session, which may be **ad-hoc** (no Pro
 | Keystroke → visible response | < 16ms (one frame) for local interactions |
 | Memory at 1M keys browsed | < 250MB RSS |
 | Time to find a known key (new user, no docs) | < 30s |
+| Server change → visible in the Viewer | < 100ms after the invalidation push |
 | Binary size | < 20MB |
 
 ## 8. Risks
@@ -180,6 +197,7 @@ config file; a **Connection** is a live session, which may be **ad-hoc** (no Pro
 | Silently resolving to an unexpected server | Deterministic precedence, target + Source always visible, `unknown` Environment read-only by default |
 | Large-value rendering hangs the UI | Hard fetch caps with explicit "load more"; render off the input thread |
 | Cluster semantics leak into UX | Topology-aware routing behind the scenes; surface node only where it matters |
+| Showing a value the server no longer holds | No value cache (R3.6); liveness is push-driven and its state is always on screen |
 | Feature sprawl reproduces RedisInsight's bloat | Non-goals are enforced; every feature must survive the "would an on-call use this?" test |
 | Terminal capability fragmentation | Capability detection with graceful degradation; test matrix across common terminals |
 
@@ -187,8 +205,9 @@ config file; a **Connection** is a live session, which may be **ad-hoc** (no Pro
 
 - **M0 — Skeleton.** App shell, event loop, theming, help overlay, and the full connection
   resolution chain (flags → Profile → env → localhost) with target and Source in the title bar.
-- **M1 — Browse.** Scan-based keyspace browser, tree/flat views, all core type viewers. *This is
-  the milestone that already beats `redis-cli` for daily use.*
+- **M1 — Browse.** Scan-based keyspace browser, tree/flat views, all core type viewers, and
+  liveness on the open key (R3.6–R3.11). *This is the milestone that already beats `redis-cli`
+  for daily use.*
 - **M2 — Mutate.** Editing, TTL management, delete/rename/copy, read-only mode, safety rails.
 - **M3 — Power.** Command palette + console, monitor, pub/sub, server dashboard, slowlog.
 - **M4 — Scale & polish.** Cluster/Sentinel, million-key performance work, themes, packaging

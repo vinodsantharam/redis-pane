@@ -50,6 +50,22 @@ The input surface for raw commands sent to *the Redis server*. Deliberately sepa
 Palette: the Palette drives the app, the Console drives the server.
 _Avoid_: REPL, terminal, prompt, command bar
 
+**Refetch**:
+A single re-read of the open key from the server — type, memory usage, TTL, and the value
+itself. It always issues real commands; there is no value cache to serve from.
+_Avoid_: Refresh, reload, re-query
+
+**Liveness**:
+The property that the open key updates itself when it actually changes, driven by server
+invalidation rather than by a timer or a button. When the server cannot provide it, the app says
+so rather than falling back quietly.
+_Avoid_: Auto-refresh, polling, watch, live mode
+
+**Read age**:
+How long ago the value on screen was read. It is displayed whenever Liveness is unavailable,
+because a value with no stated age is a value the user has to guess about.
+_Avoid_: Staleness, last updated, timestamp
+
 **Viewer**:
 The type-specific rendering of a value — one per Redis type, all sharing a common frame so
 navigation transfers between them.

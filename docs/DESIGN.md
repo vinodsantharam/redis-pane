@@ -1,6 +1,6 @@
 # redis-pane — UX & UI Design
 
-**Status:** Draft v0.3 · **Companion to:** [PRD.md](PRD.md) · **Last updated:** 2026-08-25
+**Status:** Draft v0.3 · **Companion to:** [PRD.md](PRD.md) · **Last updated:** 2026-08-26
 
 ## 1. Design principles
 
@@ -189,7 +189,50 @@ footer: actions) so navigation muscle memory transfers:
 - **JSON module** — collapsible tree with JSONPath breadcrumb.
 - **Binary/unknown** — hex + ASCII dump with offset gutter.
 
-### 6.4 Editing and confirmation
+### 6.4 Liveness
+
+**There is no refresh button, because there is nothing to refresh.** The Viewer holds what the
+server last said, never a memo keyed by the key's name, so a value cannot go stale behind a
+control that claims to update it. The open key is tracked by the server, and when it changes the
+server says so and the Viewer refetches once.
+
+What arrives depends on where the user is. At rest, the new value simply lands, with changed
+fields briefly highlighted so the change is legible rather than merely present. Scrolled into a
+large hash or stream, nothing moves — the header announces it and waits, because pulling a row
+out from under a reader's cursor is its own kind of broken. Mid-edit, the update is held
+entirely; an unsaved buffer is never touched.
+
+The header carries the state at all times. Ambiguity is the actual defect being designed
+against: the failure users learn to distrust is not a wrong value, it is being unable to tell
+"the update did nothing" from "nothing changed."
+
+```
+┌─ value pane header · liveness readout ───────────────────┐
+│                                                          │
+│ live and current                                  ● live │
+│ an update just landed               ● live · updated now │
+│ changed, you are scrolled    ● live · changed 2s ago   r │
+│ mid-edit, held back              ● live · changed · held │
+│ key deleted on the server               ✕ deleted 3s ago │
+│ tracking unavailable         ○ manual · read 14s ago   r │
+│ refetch found no change             ○ manual · unchanged │
+│                                                          │
+└──────────────────────────────────────────────────────────┘
+```
+
+TTL is a special case worth stating: it counts down locally from the value read at fetch time,
+so the most time-sensitive figure on screen is live at no network cost.
+
+A key deleted, expired, or evicted while open keeps its last read value, badged
+`✕ deleted 3s ago`, with mutating actions disabled. During an incident the question is almost
+always *what was in it*, and that is precisely the moment the answer becomes unrecoverable.
+
+Where the server cannot support tracking — Redis before 6, or no RESP3 — the readout says
+`○ manual`, Read age replaces it, and `r` does the work. This is the same rule as the Source
+readout in the title bar: the app may choose for you, but it never lets you assume wrongly.
+Silent degradation here would recreate the exact frustration this screen exists to remove.
+
+### 6.5 Editing and confirmation
 Editing opens an inline editor in the value pane, not a modal. Committing shows a **command
 preview**: the literal command(s) that will be sent, plus a red/green diff for value changes.
 Confirmation friction scales with blast radius — a single-key `y` for one non-prod delete, a
@@ -197,19 +240,20 @@ typed key-count for a bulk prod delete. Read-only Mode refuses at the preview, n
 command and its blast radius first, and only then says you cannot run it. You learn what you
 were about to do before you learn that you are not allowed to.
 
-### 6.5 Dashboard
+### 6.6 Dashboard
 Triage-first: memory used vs. peak vs. maxmemory as a bar, hit ratio, ops/sec sparkline,
 connected/blocked clients, replication role and lag, and eviction/expiry counters. Anything
 alarming is colored, and every tile can be expanded into the raw `INFO` section behind it.
 
-### 6.6 Monitor / Pub-Sub
+### 6.7 Monitor / Pub-Sub
 Live tail with a filter box, pause/resume, and a persistent warning banner on `MONITOR`
 explaining its cost. Buffers are bounded with a visible cap.
 
 ## 7. Interaction details that carry the product
 
 - **Optimistic focus.** Opening a key renders header and metadata instantly from what the list
-  already knows, then fills the body when the fetch lands. No blank frame.
+  already knows, then fills the body when the fetch lands. No blank frame. What the list "knows"
+  is a hint for the first frame only — it is never the value (§6.4).
 - **Cancellation everywhere.** `Esc` aborts an in-flight scan, fetch, or command and says so.
 - **Toasts, not dialogs, for outcomes.** Errors include the failing command and a copy action.
 - **Persistent session state.** Pane split, filter, and scroll position restore on relaunch,
@@ -230,6 +274,9 @@ explaining its cost. Buffers are bounded with a visible cap.
 
 ## 9. Open design questions
 
+- Should the keys pane get liveness too, or does the open key remain the only tracked thing?
+  Tracking the visible rows would show deletions as they happen, at the cost of tracking-table
+  churn on every scroll.
 - Tree vs. flat as the *default* key view. Tree shows fewer rows but adds a concept and a
   keypress to reach a leaf; flat is one less idea and honest about scale.
 - Does the dashboard belong in v1 at all, or is the slowlog plus a memory figure in the status

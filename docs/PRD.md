@@ -1,6 +1,6 @@
 # redis-pane — Product Requirements
 
-**Status:** Draft v0.2 · **Owner:** Vinod Santharam · **Last updated:** 2026-08-24
+**Status:** Draft v0.3 · **Owner:** Vinod Santharam · **Last updated:** 2026-08-25
 
 ## 1. Problem
 
@@ -48,6 +48,8 @@ excuse.
 - **G5 — Safe by construction.** Destructive operations require intent, and production
   connections are visually unmistakable.
 - **G6 — Discoverable.** A new user finds the feature without reading documentation.
+- **G7 — Nothing on screen you will not act on.** Chrome earns its columns or it is removed.
+  Anything that is not the keyspace or the current value is reached on demand, never resident.
 
 ## 5. Non-goals (v1)
 
@@ -55,6 +57,11 @@ excuse.
 - Not a replacement for `redis-cli` scripting/piping in shell pipelines.
 - Not a monitoring/alerting product — observability views are for triage, not retention.
 - No plugin system, no embedded scripting language, no team/collaboration features.
+- **Not a multi-target workspace.** One Connection per process, one database per Connection.
+  A second target means a second terminal. See
+  [ADR-0005](adr/0005-one-connection-per-process.md).
+- No export/import in v1. `y` yields a paste-ready `redis-cli` command, which is what actually
+  gets pasted into a ticket or a shell.
 - No Windows-native terminal work beyond whatever the TUI toolkit gives us for free.
 
 ## 6. Requirements
@@ -66,7 +73,8 @@ config file; a **Connection** is a live session, which may be **ad-hoc** (no Pro
 
 - **R1.1** Connect via URL (`redis://`, `rediss://`), host/port, or Unix socket.
 - **R1.2** A Connection's target resolves in strict precedence: flags (`--url`, `--host`,
-  `--profile`) → the config file's default Profile → the environment → `127.0.0.1:6379`. In the
+  `--profile`, or a bare Profile name — `redis-pane staging`) → the config file's default
+  Profile → the environment → `127.0.0.1:6379`. In the
   environment, `REDIS_URL` is used wholesale if set, otherwise the target is assembled from
   `REDIS_HOST` / `REDIS_PORT` / `REDIS_USER` / `REDIS_PASSWORD`. The two forms are never merged.
   See [ADR-0001](adr/0001-connection-resolution-order.md).
@@ -93,15 +101,20 @@ config file; a **Connection** is a live session, which may be **ad-hoc** (no Pro
   keypress. See [ADR-0004](adr/0004-untagged-connections-are-read-only.md).
 - **R1.10** TLS, ACL usernames, and per-Profile default database.
 - **R1.11** Cluster and Sentinel topology discovery; `MOVED`/`ASK` handled transparently.
-- **R1.12** Multiple simultaneous Connections, switchable without losing view state.
+- **R1.12** Exactly one Connection per process, against exactly one database, fixed at launch.
+  There is no in-app connection switcher and no `SELECT`.
 
 ### 6.2 Keyspace browsing
 - **R2.1** Incremental `SCAN` with live streaming results; never `KEYS`.
 - **R2.2** Glob filter plus fuzzy filter over already-loaded keys.
 - **R2.3** Optional hierarchical grouping by separator (`:` default) — `user:1:session` folds
   into a tree — toggleable with flat view.
-- **R2.4** Per-key metadata inline: type, TTL, size/length, memory usage (lazily fetched).
-- **R2.5** Sort by name, TTL, or size. Multi-select for bulk operations.
+- **R2.4** Per-key metadata inline, lazily fetched: type, memory usage, and TTL. Element count
+  is deliberately **not** a column — it is noise for strings, it costs a fourth round trip per
+  key, and the Viewer header states it the moment a key is opened.
+- **R2.5** Sort by name, TTL, size, or element count. Sorting by element count surfaces it as
+  a temporary column, which is how it stays reachable without being resident (R2.4).
+  Multi-select for bulk operations.
 - **R2.6** Handle 1M+ key keyspaces without UI stall (virtualized rendering, bounded memory).
 
 ### 6.3 Value inspection
@@ -144,6 +157,9 @@ config file; a **Connection** is a live session, which may be **ad-hoc** (no Pro
 - **R7.4** Errors surface as non-blocking, dismissible notifications with the failing command.
 - **R7.5** Full-app help overlay and per-pane contextual key hints always visible.
 - **R7.6** Single self-contained binary, no runtime dependency.
+- **R7.7** The default layout is two panes — keyspace and current value. Anything else reaches
+  the screen through the Palette or a dismissible overlay, and nothing else holds columns
+  permanently. New surfaces must displace something or justify their width against G7.
 
 ## 7. Success metrics
 
@@ -175,13 +191,21 @@ config file; a **Connection** is a live session, which may be **ad-hoc** (no Pro
   the milestone that already beats `redis-cli` for daily use.*
 - **M2 — Mutate.** Editing, TTL management, delete/rename/copy, read-only mode, safety rails.
 - **M3 — Power.** Command palette + console, monitor, pub/sub, server dashboard, slowlog.
-- **M4 — Scale & polish.** Cluster/Sentinel, multi-connection, million-key performance work,
-  themes, packaging and distribution.
+- **M4 — Scale & polish.** Cluster/Sentinel, million-key performance work, themes, packaging
+  and distribution.
 
 ## 10. Open questions
 
-- Do we ship an export/import path (JSON, RDB-ish dump) in v1, or defer it?
-- Should `--profile` also be accepted positionally (`redis-pane staging`)?
-- Is a session-scoped undo buffer for mutations feasible, or is command preview enough?
 - Should Profiles be shareable across a team (checked-in config)? ADR-0002's reference-only
   credential path makes this plausible — is it worth designing for in v1?
+- With one Connection per process, is there any in-app Profile surface left to build, or do
+  `--profile`, a bare positional name, and shell completion cover it entirely?
+- Cluster (R1.11) is the one place the one-target rule strains: a cluster *is* many nodes. Does
+  it stay a single Connection with routing hidden, or is cluster support simply post-v1?
+- Is the Console worth building in v1, given that the terminal it is running in already has
+  `redis-cli` one keystroke away?
+
+**Resolved since v0.2** — undo buffers (no; the command preview is the mechanism, and an
+inverse-operation model per type is a large hidden surface that cannot be correct for every
+type), export/import (no; now a stated non-goal), positional Profile names (yes; with one target
+per terminal, launching *is* the interaction).

@@ -7,6 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **Greenfield — no code yet.** The repository currently contains only planning documents. The
 product and design intent live in:
 
+- [README.md](README.md) — what this is, and the five decisions that shape it
 - [docs/PRD.md](docs/PRD.md) — problem, users, requirements (R1.x–R7.x), milestones M0–M4
 - [docs/DESIGN.md](docs/DESIGN.md) — layout, navigation model, keymap, visual language, screens
 - [CONTEXT.md](CONTEXT.md) — the glossary. Read it before naming anything; several of these terms
@@ -25,16 +26,21 @@ keyspace and RedisInsight is too heavy and too mouse-bound to use where engineer
 (SSH sessions, bastion hosts). The bar is a TUI good enough that the user forgets it is a
 terminal application.
 
-## Stack (proposed, not yet locked)
+## Stack (confirmed 2026-08-24)
 
 Rust + [`ratatui`](https://ratatui.rs) + `crossterm`, with `tokio` for async I/O and
-[`fred`](https://docs.rs/fred) or `redis-rs` for the Redis protocol. Rationale: single static
-binary with no runtime (PRD R7.6), the strongest TUI widget ecosystem, and the headroom to hold
-a million-key keyspace in bounded memory. The credible alternative is Go + Bubble Tea — faster
-to write, weaker on large-list rendering performance.
+[`fred`](https://docs.rs/fred) or `redis-rs` for the Redis protocol — that last choice is still
+open. Rationale: a single static binary with no runtime (PRD R7.6), the strongest TUI widget
+ecosystem, and the headroom to hold a million-key keyspace in bounded memory.
 
-**Confirm the stack with the user before scaffolding.** Once `Cargo.toml` exists, replace this
-section with the real toolchain and fill in the commands below.
+A TypeScript TUI (Ink, or a hand-written `react-reconciler` host) was considered and rejected on
+two of the success metrics, not on ergonomics: the binary lands at 55–100MB against a <20MB
+target, and a million JS objects of key metadata will not fit in 250MB RSS. Those two metrics
+are the reason the project exists — they are exactly where RedisInsight fails. Everything else
+favoured TypeScript, and ratatui's immediate-mode model is a real ergonomic cost to pay for
+them: there are no components and no hooks, so widget state is hand-managed. Budget for that.
+
+Once `Cargo.toml` exists, fill in the commands below.
 
 ## Commands
 
@@ -53,7 +59,8 @@ they are expensive to retrofit:
 - **`SCAN` only, never `KEYS`.** Keyspace traversal is cursor-based, streaming, and resumable.
   Results render as they arrive.
 - **Lists are virtualized.** Render cost is a function of viewport size, not keyspace size.
-  Metadata (size, memory, TTL) is fetched lazily and fills in without shifting layout.
+  Metadata (type, memory, TTL — four columns, no element count; PRD R2.4) is fetched lazily
+  and fills in without shifting layout.
 - **Type-awareness is a first-class abstraction**, not a `match` scattered through the UI.
   Every Redis type gets a viewer behind one shared trait/interface so the frame (header, body,
   footer) and navigation are identical across types.
@@ -66,6 +73,9 @@ they are expensive to retrofit:
   ≥140 cols → 80 cols → single-pane. Layout breakpoints are in DESIGN.md §2.
 - **Keybindings are data.** The keymap, the palette, and the on-screen hint bar all read from one
   source, so hints always show the *effective* binding after user overrides.
+- **Screen space is a budget, not a canvas.** The layout is two panes (PRD R7.7, G7). A new
+  surface either displaces something or lives in the Palette or a dismissible overlay. "It's only
+  a few columns" is how the sidebar happened; it was removed for exactly that reason.
 
 ## Decisions already made (see ADRs before revisiting)
 
@@ -80,6 +90,10 @@ they are expensive to retrofit:
   file is refused when group- or world-readable.
 - **There are four Environments, not three** — `unknown` is a real one. Ad-hoc Connections to
   anything that isn't loopback or a unix socket get it, and start in Read-only Mode.
+- **One Connection per process, one database, fixed at launch.** No switcher, no `SELECT`, no
+  tabs, no sidebar. A second target is a second terminal. This is the constraint the rest of the
+  design leans on to stay small — check ADR-0005 before adding anything that implies a second
+  target, including "just" a database dropdown.
 
 ## Conventions
 

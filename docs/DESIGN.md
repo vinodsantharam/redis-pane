@@ -1,6 +1,6 @@
 # redis-pane — UX & UI Design
 
-**Status:** Draft v0.2 · **Companion to:** [PRD.md](PRD.md) · **Last updated:** 2026-08-24
+**Status:** Draft v0.3 · **Companion to:** [PRD.md](PRD.md) · **Last updated:** 2026-08-25
 
 ## 1. Design principles
 
@@ -20,34 +20,39 @@
 
 ## 2. Layout
 
-Three columns, one status bar, one hint bar. Splits are resizable and collapsible.
+Two columns, one status bar, one hint bar. The split is resizable; nothing else is permanent.
 
 ```
-┌ redis-pane ── ● staging · redis://cache-01:6379 · db 0 · from profile ── READ-ONLY ─┐
-│ PROFILES      │ KEYS  scan 41,203 / ~180k        │ VALUE                     │
-│               │ ┌ filter: user:*:session ──────┐ │ user:8812:session         │
-│ ● local       │ │                              │ │ hash · 14 fields · 2.1KB  │
-│ ● staging   ▸ │ │ ▾ user:                      │ │ ttl 00:42:17              │
-│ ○ prod        │ │   ▾ 8812:                    │ │                           │
-│               │ │     ● session   hash  42m    │ │  FIELD        VALUE       │
-│ CONNECTED     │ │     ● profile   json   ∞     │ │  id           8812        │
-│ ▸ staging     │ │   ▸ 8813:            (3)     │ │  device       ios/17.2    │
-│   ⚡ cache-07  │ │ ▾ cart:                      │ │  cart_total   4          │
-│               │ │   ● 91af…       zset  12m    │ │  …                        │
-│ DATABASES     │ │                              │ │                           │
-│  db0  128,441 │ │                              │ │                           │
-│  db1      —   │ └──────────────────────────────┘ │                           │
-│               │  ↑↓ move  → open  / filter  ⌫ del│  e edit  y copy  t ttl    │
-└───────────────┴──────────────────────────────────┴───────────────────────────┘
- :cmd  ⌃K palette   ? help   ⇥ next pane            SCAN 23%  ▓▓▓░░░░  cancel ⎋
+┌─ redis-pane ─ ● staging · cache-01:6379/0 · from profile ──────────────────┐
+│ KEYS   scanning 41,203 of ~180,000      │ user:8812:session                │
+│ / user:*:session            3,410 match │ hash · 14 fields · 2.1 KB        │
+│ KEY                 TYPE      SIZE  TTL │ ttl 00:42:17                     │
+│ ▾ user:                          41,203 │                                  │
+│   ▾ 8812:                             6 │ FIELD          VALUE             │
+│     ● session       hash    2.1 KB  42m │ id             8812              │
+│     ● profile       json     880 B    ∞ │ device         ios/17.2          │
+│     ● cart          zset     412 B  12m │ region         eu-west-1         │
+│   ▸ 8813:                             6 │ cart_total     4                 │
+│ ▾ cart:                           8,120 │ plan           pro               │
+│   ● 91af3c9d…       zset    1.1 KB  12m │ locale         fr-FR             │
+│   ● 91af41e0…       zset     380 B  58m │ exp_bucket     B                 │
+│ ▸ feed:                           2,088 │ cart_rev       18                │
+├─────────────────────────────────────────┼──────────────────────────────────┤
+│ ↑↓ move  → open  / filter  d d delete   │ e edit  y copy  t ttl            │
+└─────────────────────────────────────────┴──────────────────────────────────┘
+                                                                              
+ Esc back   ⌃K palette   : console   ? help     SCAN 23% ▓▓▓░░░░░  Esc cancel 
 ```
 
-The sidebar separates **PROFILES** (saved, from the config file) from **CONNECTED** (live
-Connections). An Ad-hoc Connection — one with no Profile behind it — appears only under
-CONNECTED, marked `⚡`, and inherits the `unknown` Environment unless it resolved to loopback.
+**There is no sidebar.** An earlier draft gave one to Profiles, live Connections and databases.
+All three turned out to be launch-time concerns: the target is chosen by flag or Profile before
+the process starts, and a second target means a second terminal
+([ADR-0005](adr/0005-one-connection-per-process.md)). Sixteen permanent columns were showing
+information the title bar already carried and offering switches nobody makes mid-session. They
+now belong to the keyspace.
 
-The title bar carries four things and always all four: Environment dot, target, database, and
-**Source** (`from profile` / `from --url` / `from REDIS_URL` / `default`). Per
+The title bar still carries all four things it must always carry: Environment dot, target,
+database, and **Source** (`from profile` / `from --url` / `from REDIS_URL` / `default`). Per
 [ADR-0001](adr/0001-connection-resolution-order.md) the app resolves silently, and this readout
 is the entire mitigation for doing so — it is not optional chrome.
 
@@ -55,19 +60,22 @@ is the entire mitigation for doing so — it is not optional chrome.
 
 | Width | Layout |
 |---|---|
-| ≥ 140 cols | Three columns as above, value pane widest |
-| 100–139 | Sidebar collapses to icons + labels on focus |
-| 80–99 | Two columns: keys + value; sidebar becomes an overlay (`g c`). Title bar keeps Environment and Source, truncating the target from the left |
-| < 80 | Single pane, stack-navigated; breadcrumb replaces columns |
+| ≥ 120 cols | Two columns as above; the value pane takes the larger share |
+| 90–119 | Two columns; the keys pane sheds `SIZE`, keeping `TYPE` and `TTL` |
+| 70–89 | Two columns, tight; the title bar truncates the target from the left, never the Environment or Source |
+| < 70 | Single pane, stack-navigated; breadcrumb replaces columns |
 | Height < 24 | Hint bar collapses into the status bar |
+
+`TTL` is the last metadata column to go because it is the field people are hunting when the
+terminal is small and the situation is urgent.
 
 ## 3. Navigation model
 
-- **Panes** are traversed with `Tab` / `Shift-Tab`; focus is shown by border color *and* a
+- **`Tab` toggles the two panes**; focus is shown by border color *and* a
   brightened title — never by border alone (colorblind and monochrome safety).
 - **Within a pane**, `↑↓` / `j k` move, `→` / `Enter` descends, `←` / `Esc` ascends.
-- **Global jumps** use a `g`-prefixed chord: `g c` connections, `g k` keys, `g d` dashboard,
-  `g m` monitor, `g p` pub/sub, `g s` slowlog.
+- **Global jumps** use a `g`-prefixed chord: `g k` keys, `g d` dashboard, `g m` monitor,
+  `g p` pub/sub, `g s` slowlog. There is no `g c` — there is only ever one Connection.
 - **The command palette** (`Ctrl-K`, or `Cmd-K` where the terminal forwards it) is the escape
   hatch for everything: actions, keys, profiles, commands, help topics — one fuzzy list.
 - **The console** (`:`) is for raw Redis commands. Palette and console are deliberately separate:
@@ -109,13 +117,13 @@ itself. Bindings are user-overridable in config; the hint bar renders the *effec
 | `text` / `text-muted` | Primary content vs. metadata (TTL, sizes, counts) |
 | `accent` | Selection, cursor row, active tab |
 | `type.*` | One hue per Redis type — consistent everywhere a type appears |
-| `env.local` / `env.staging` / `env.prod` / `env.unknown` | Title bar band, sidebar dot, and confirmation dialogs |
+| `env.local` / `env.staging` / `env.prod` / `env.unknown` | Title bar band and confirmation dialogs |
 | `danger` / `warn` / `ok` | Destructive actions, expiring TTLs, success toasts |
 
 **Environment signaling.** `local` is neutral, `staging` is amber, `prod` is red, and `unknown`
 is a distinct fourth treatment — deliberately not a shade of the others, because it means "nobody
-told us," not "somewhere between staging and prod." Applied to the title bar band, the sidebar
-dot, and confirmation dialogs. A prod Connection is recognizable from across a desk. `prod` and
+told us," not "somewhere between staging and prod." Applied to the title bar band and to
+confirmation dialogs. A prod Connection is recognizable from across a desk. `prod` and
 `unknown` both start in Read-only Mode ([ADR-0004](adr/0004-untagged-connections-are-read-only.md)).
 
 **Typography and density.** Bold for headers and focused titles, dim for metadata, no
@@ -123,7 +131,13 @@ underlining except links. One blank line between logical groups; padding of one 
 every pane border. Tables get a header row that stays pinned while the body scrolls.
 
 **Iconography.** Nerd Font glyphs when detected, ASCII fallbacks otherwise, chosen so the
-layout width does not change between the two.
+layout width does not change between the two. Codepoints with emoji presentation are banned
+outright — they render double-width in most terminals and shear the column grid rather than
+degrading quietly. An Ad-hoc Connection is therefore marked `~`, not `⚡`.
+
+**Key names in hint bars are words, not glyphs.** `Esc`, `Enter` and `Tab` are spelled out; the
+single-glyph forms are the least reliably present characters in a monospace font, and a missing
+glyph breaks alignment instead of falling back. Chords keep their compact form (`⌃K`, `d d`).
 
 **Motion.** Used sparingly and only to explain state: progress bar during scan, a 120ms fade on
 toasts, a subtle pulse on a value that just changed under a live view. No decorative animation.
@@ -155,6 +169,14 @@ configured separator and shows child counts on collapsed nodes; flat mode is one
 Metadata columns fill in asynchronously — the key appears immediately, its size arrives when it
 arrives, and a pending cell shows a placeholder rather than shifting the layout.
 
+The columns are `KEY`, `TYPE`, `SIZE`, `TTL`. **Element count is not among them** (R2.4). For
+strings it prints the same number twice; for collections it is genuinely diagnostic — three
+members occupying 1.1 MB means somebody stored blobs as members — but that is capacity forensics,
+not the find-a-key-and-read-it loop this pane exists for. It also costs a fourth pipelined
+command per key (`HLEN`/`LLEN`/`SCARD`/`ZCARD`/`XLEN`), which competes with `SCAN` for the
+connection while the list is still streaming. It stays reachable two ways: the Viewer header
+states it on open, and sorting by count surfaces it as a temporary column.
+
 ### 6.3 Value viewers
 One viewer per type, each with the same frame (header: key, type, size, TTL; body: type-specific;
 footer: actions) so navigation muscle memory transfers:
@@ -171,8 +193,9 @@ footer: actions) so navigation muscle memory transfers:
 Editing opens an inline editor in the value pane, not a modal. Committing shows a **command
 preview**: the literal command(s) that will be sent, plus a red/green diff for value changes.
 Confirmation friction scales with blast radius — a single-key `y` for one non-prod delete, a
-typed key-count for a bulk prod delete. Read-only mode intercepts before the editor opens and
-explains how to disable it.
+typed key-count for a bulk prod delete. Read-only Mode refuses at the preview, not at the keypress: the dialog composes the real
+command and its blast radius first, and only then says you cannot run it. You learn what you
+were about to do before you learn that you are not allowed to.
 
 ### 6.5 Dashboard
 Triage-first: memory used vs. peak vs. maxmemory as a bar, hit ratio, ops/sec sparkline,
@@ -189,8 +212,9 @@ explaining its cost. Buffers are bounded with a visible cap.
   already knows, then fills the body when the fetch lands. No blank frame.
 - **Cancellation everywhere.** `Esc` aborts an in-flight scan, fetch, or command and says so.
 - **Toasts, not dialogs, for outcomes.** Errors include the failing command and a copy action.
-- **Persistent session state.** Last Connection, pane sizes, filter, and scroll position restore
-  on relaunch. Reopening the app feels like never having left. This lives in a state file under
+- **Persistent session state.** Pane split, filter, and scroll position restore on relaunch,
+  keyed by target — reopening `redis-pane staging` feels like never having left, and it does not
+  drag staging's filter into a prod session. This lives in a state file under
   `$XDG_STATE_HOME/redis-pane/`, never in the user's config file.
 - **Copy that fits the terminal.** `y` offers key / value / `redis-cli` command / permalink-style
   reference — because the next step is usually pasting into a ticket or a shell.
@@ -199,15 +223,24 @@ explaining its cost. Buffers are bounded with a visible cap.
 
 - Never encode meaning in color alone — pair every color signal with a glyph, label, or weight.
 - WCAG AA contrast for both shipped themes; a high-contrast theme as a third option.
-- Full monochrome fallback that remains navigable.
+- Full monochrome fallback that remains navigable. The type name stays in the key list when
+  color is gone, so a hash is still distinguishable from a sorted set.
 - Screen-reader-friendly mode: linearized rendering, no box-drawing, announced focus changes.
 - No timing-dependent interactions; every chord has a non-chord equivalent in the palette.
 
 ## 9. Open design questions
 
-- Tree vs. flat as the *default* key view — tree is more legible, flat is more honest about scale.
-- Does the console deserve a persistent bottom split (tmux-style) or stay an overlay?
-- How much of the dashboard belongs in v1 before it starts pretending to be a monitoring tool?
-- Should multi-connection be tabs across the top, or purely sidebar-driven?
-- Is the PROFILES / CONNECTED split in the sidebar earning its vertical space at 24 rows, or
-  should CONNECTED only appear once a second Connection exists?
+- Tree vs. flat as the *default* key view. Tree shows fewer rows but adds a concept and a
+  keypress to reach a leaf; flat is one less idea and honest about scale.
+- Does the dashboard belong in v1 at all, or is the slowlog plus a memory figure in the status
+  bar the whole of what triage actually needs? This is now the largest remaining scope risk.
+- With two panes, is the split fixed at a ratio, or does it default to whichever pane has focus?
+- Does the keys pane need a permanent column header row, or can the columns be implied by the
+  data and explained once in help?
+- Below 70 columns, is single-pane stack navigation worth building, or should the app simply
+  say the terminal is too small?
+
+**Resolved since v0.2** — the sidebar (removed; [ADR-0005](adr/0005-one-connection-per-process.md)),
+tabs vs. sidebar for multiple Connections (dissolved with it), the Console's shape (an overlay;
+a persistent split is exactly the resident chrome G7 forbids), and the element-count column
+(dropped; see §6.2).

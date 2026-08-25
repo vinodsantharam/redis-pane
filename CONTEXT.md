@@ -14,7 +14,7 @@ _Avoid_: Saved connection, bookmark, target, server entry
 
 **Connection**:
 A live session against a Redis server. A Connection may originate from a Profile or be Ad-hoc.
-Several may be open at once.
+Exactly one exists per running process, against one database, fixed at launch.
 _Avoid_: Session, link, client
 
 **Ad-hoc Connection**:

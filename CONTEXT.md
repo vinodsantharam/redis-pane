@@ -37,8 +37,16 @@ _Avoid_: Origin, provenance
 
 **Read-only Mode**:
 An app state in which every mutating operation is refused before it can be composed. It is a
-property of the running app, not of the Redis user's ACL.
+property of the running app, not of the Redis user's ACL. It always carries a **reason** —
+`environment`, `replica`, or `user` — and the reason is displayed, because only some of them can
+be lifted.
 _Avoid_: Safe mode, locked, protected
+
+**Loaded set**:
+The keys the current session has scanned and is holding. Sorting, filtering and bulk selection
+all operate on the Loaded set, never on the whole keyspace — so the UI must be able to say how
+large it is and whether scanning is still adding to it.
+_Avoid_: Result set, cache, buffer, page
 
 **Palette**:
 The fuzzy launcher for actions belonging to *the application* — navigation, settings, view

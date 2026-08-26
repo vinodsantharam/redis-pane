@@ -1,6 +1,6 @@
 # redis-pane — Product Requirements
 
-**Status:** Draft v0.3 · **Owner:** Vinod Santharam · **Last updated:** 2026-08-26
+**Status:** Draft v0.4 · **Owner:** Vinod Santharam · **Last updated:** 2026-08-26
 
 ## 1. Problem
 
@@ -60,6 +60,11 @@ excuse.
 - **Not a multi-target workspace.** One Connection per process, one database per Connection.
   A second target means a second terminal. See
   [ADR-0005](adr/0005-one-connection-per-process.md).
+- **No Cluster support in v1.** Sentinel ships; Cluster is deferred to M4 because per-node
+  `SCAN`, `INFO` and tracking reintroduce a node selector into a UI built on having nothing to
+  select. See [ADR-0008](adr/0008-sentinel-in-v1-cluster-deferred.md).
+- **Nothing older than Redis 6.0**, and RESP2 is not spoken at all
+  ([ADR-0007](adr/0007-server-compatibility-floor.md)).
 - No export/import in v1. `y` yields a paste-ready `redis-cli` command, which is what actually
   gets pasted into a ticket or a shell.
 - No Windows-native terminal work beyond whatever the TUI toolkit gives us for free.
@@ -100,9 +105,24 @@ config file; a **Connection** is a live session, which may be **ad-hoc** (no Pro
   `local`; anything else → `unknown`, which starts in Read-only Mode and is lifted with one
   keypress. See [ADR-0004](adr/0004-untagged-connections-are-read-only.md).
 - **R1.10** TLS, ACL usernames, and per-Profile default database.
-- **R1.11** Cluster and Sentinel topology discovery; `MOVED`/`ASK` handled transparently.
+- **R1.11** Sentinel topology discovery, with failover surfacing as a reconnect to the new
+  address. Cluster is **not** in v1 — see [ADR-0008](adr/0008-sentinel-in-v1-cluster-deferred.md)
+  and §5.
 - **R1.12** Exactly one Connection per process, against exactly one database, fixed at launch.
   There is no in-app connection switcher and no `SELECT`.
+- **R1.13** The server floor is **RESP3 and Redis 6.0**, or an API-compatible fork. Older servers
+  are refused at launch, naming the version found. Liveness is gated by *capability* — the app
+  attempts `CLIENT TRACKING` and degrades on error — never by version number, because managed
+  platforms restrict it independently of the version they report.
+  See [ADR-0007](adr/0007-server-compatibility-floor.md).
+- **R1.14** A target that cannot be reached at launch prints a diagnostic naming the target, its
+  Source, and the failure, and exits non-zero. A Connection lost mid-session does **not** exit:
+  reconnection runs in the background with visible backoff, the UI stays interactive, and the
+  Viewer retains its last read value badged as disconnected. Every successful reconnect re-arms
+  tracking and refetches the open key. See [ADR-0009](adr/0009-connection-lifecycle.md).
+- **R1.15** Server conditions that will reject writes are detected, not merely reported:
+  `role:slave` turns on Read-only Mode with reason `replica`; `-OOM` and `-MISCONF` raise a
+  banner explaining why writes fail; `-LOADING` renders as a connection state with progress.
 
 ### 6.2 Keyspace browsing
 - **R2.1** Incremental `SCAN` with live streaming results; never `KEYS`.
@@ -112,10 +132,15 @@ config file; a **Connection** is a live session, which may be **ad-hoc** (no Pro
 - **R2.4** Per-key metadata inline, lazily fetched: type, memory usage, and TTL. Element count
   is deliberately **not** a column — it is noise for strings, it costs a fourth round trip per
   key, and the Viewer header states it the moment a key is opened.
-- **R2.5** Sort by name, TTL, size, or element count. Sorting by element count surfaces it as
-  a temporary column, which is how it stays reachable without being resident (R2.4).
+- **R2.5** Sort by name, TTL, size, or element count, across the whole **Loaded set**. Sorting
+  by a lazily-fetched column orders the values that have arrived, parks the rest at the end, and
+  states the count — it never triggers a mass metadata fetch. Sorting by element count surfaces
+  it as a temporary column, which is how it stays reachable without being resident (R2.4).
   Multi-select for bulk operations.
-- **R2.6** Handle 1M+ key keyspaces without UI stall (virtualized rendering, bounded memory).
+- **R2.6** Handle 1M+ key keyspaces without UI stall: virtualized rendering, and every scanned
+  key retained in a columnar arena so sort and filter span the Loaded set. Memory is bounded by
+  a documented **cap**; on reaching it, scanning stops and says so rather than growing until the
+  process is killed. See [ADR-0010](adr/0010-keyspace-memory-model.md).
 - **R2.7** `r` acts on the focused pane and nothing else: a rescan in the keys pane, a Refetch
   in the Viewer. There is no global refresh, because there is no global staleness.
 
@@ -148,7 +173,9 @@ config file; a **Connection** is a live session, which may be **ad-hoc** (no Pro
 - **R4.3** Rename, copy, move-across-db, delete — single and bulk.
 - **R4.4** Every mutation shows the exact command it will run before it runs.
 - **R4.5** **Read-only Mode**, default-on for `prod` and `unknown` Environments, toggled
-  explicitly (`Ctrl-R`).
+  explicitly (`Ctrl-R`). It carries a **reason** — `environment`, `replica`, or `user` — which is
+  displayed. The `replica` reason cannot be lifted, because the server will refuse regardless
+  (R1.15).
 - **R4.6** Confirmation friction scales with blast radius: single delete = one keypress;
   bulk delete on prod = typed confirmation.
 
@@ -196,21 +223,24 @@ config file; a **Connection** is a live session, which may be **ad-hoc** (no Pro
 | Destructive action against prod | Environment tagging, read-only default, scaled confirmation, command preview |
 | Silently resolving to an unexpected server | Deterministic precedence, target + Source always visible, `unknown` Environment read-only by default |
 | Large-value rendering hangs the UI | Hard fetch caps with explicit "load more"; render off the input thread |
-| Cluster semantics leak into UX | Topology-aware routing behind the scenes; surface node only where it matters |
+| Cluster semantics leak into UX | Deferred from v1; the keyspace source abstracts over *a stream of keys*, so N cursors can replace one without a rewrite |
+| Reconnect silently drops liveness | Re-arming tracking is an invariant of reconnect, asserted by test (ADR-0009, ADR-0011) |
 | Showing a value the server no longer holds | No value cache (R3.6); liveness is push-driven and its state is always on screen |
 | Feature sprawl reproduces RedisInsight's bloat | Non-goals are enforced; every feature must survive the "would an on-call use this?" test |
 | Terminal capability fragmentation | Capability detection with graceful degradation; test matrix across common terminals |
 
 ## 9. Milestones
 
-- **M0 — Skeleton.** App shell, event loop, theming, help overlay, and the full connection
-  resolution chain (flags → Profile → env → localhost) with target and Source in the title bar.
+- **M0 — Skeleton.** App shell, event loop, theming, help overlay, the full connection
+  resolution chain (flags → Profile → env → localhost) with target and Source in the title bar,
+  and the connection lifecycle: capability probe, startup diagnostics, background reconnect with
+  re-arming (R1.13–R1.15).
 - **M1 — Browse.** Scan-based keyspace browser, tree/flat views, all core type viewers, and
   liveness on the open key (R3.6–R3.11). *This is the milestone that already beats `redis-cli`
   for daily use.*
 - **M2 — Mutate.** Editing, TTL management, delete/rename/copy, read-only mode, safety rails.
 - **M3 — Power.** Command palette + console, monitor, pub/sub, server dashboard, slowlog.
-- **M4 — Scale & polish.** Cluster/Sentinel, million-key performance work, themes, packaging
+- **M4 — Scale & polish.** Cluster support, million-key performance work, themes, packaging
   and distribution.
 
 ## 10. Open questions
@@ -219,10 +249,13 @@ config file; a **Connection** is a live session, which may be **ad-hoc** (no Pro
   credential path makes this plausible — is it worth designing for in v1?
 - With one Connection per process, is there any in-app Profile surface left to build, or do
   `--profile`, a bare positional name, and shell completion cover it entirely?
-- Cluster (R1.11) is the one place the one-target rule strains: a cluster *is* many nodes. Does
-  it stay a single Connection with routing hidden, or is cluster support simply post-v1?
 - Is the Console worth building in v1, given that the terminal it is running in already has
   `redis-cli` one keystroke away?
+
+**Resolved since v0.3** — the server floor (RESP3, Redis 6.0+; ADR-0007), Cluster vs. Sentinel
+(Sentinel in v1, Cluster deferred; ADR-0008), connection lifecycle and startup failure
+(ADR-0009), the keyspace memory model and the R2.5/R2.6 contradiction (ADR-0010), and the test
+architecture (ADR-0011).
 
 **Resolved since v0.2** — undo buffers (no; the command preview is the mechanism, and an
 inverse-operation model per type is a large hidden surface that cannot be correct for every

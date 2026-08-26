@@ -1,6 +1,6 @@
 # redis-pane — UX & UI Design
 
-**Status:** Draft v0.3 · **Companion to:** [PRD.md](PRD.md) · **Last updated:** 2026-08-26
+**Status:** Draft v0.4 · **Companion to:** [PRD.md](PRD.md) · **Last updated:** 2026-08-26
 
 ## 1. Design principles
 
@@ -249,6 +249,49 @@ alarming is colored, and every tile can be expanded into the raw `INFO` section 
 Live tail with a filter box, pause/resume, and a persistent warning banner on `MONITOR`
 explaining its cost. Buffers are bounded with a visible cap.
 
+### 6.8 Connection states and degradation
+
+The title bar already answers *what am I connected to, and why*. It also has to answer *is that
+still true*, and *can I write*. Both are chrome the user reads without looking for it, so both
+live in the same place.
+
+```
+┌─ title bar · connection and safety readout ──────────────────┐
+│                                                              │
+│ healthy, writes allowed             ● staging · from profile │
+│ read-only by Environment          READ-ONLY environment   ⌃R │
+│ read-only: target is a replica    READ-ONLY replica   locked │
+│ read-only by choice                      READ-ONLY user   ⌃R │
+│ maxmemory reached                    ✕ OOM · writes rejected │
+│ RDB save failing                 ✕ MISCONF · writes rejected │
+│ server restarting                              ⟳ loading 43% │
+│ connection lost                ✕ disconnected · retry 4s   r │
+│ reconnected                              ● tracking re-armed │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**Losing the Connection is not an error screen.** Reconnection runs in the background with a
+visible backoff countdown, the app stays interactive, and the Viewer keeps its last read value
+badged rather than clearing — the same promise as a deleted key (§6.4). `r` retries immediately
+instead of waiting out the timer, because a silent wait is a freeze wearing a different name.
+
+**A reconnect re-arms tracking before it claims to be live.** Tracking is per-connection state,
+so a transparent reconnect leaves the server no longer watching the open key. The header must
+not read `● live` until it does. This is the one invariant in the design that, if it rots, puts
+the product back where RedisInsight was.
+
+**Read-only Mode shows its reason.** It can be on because the Environment is `prod` or
+`unknown`, because the server reported `role:slave`, or because the user asked. Only the first
+and third are liftable; a replica will refuse writes whatever the app believes. Offering `⌃R`
+where it cannot work would be a toggle that lies, so the hint reads `locked` instead.
+
+**Failing at launch is not this screen.** A target that cannot be reached exits to the shell with
+a diagnostic naming the target, its Source, and the failure
+([ADR-0009](adr/0009-connection-lifecycle.md)). Mid-session there is data worth keeping on
+screen; at startup there is nothing to show, and an app that opens to an empty error box wastes
+the reader's time.
+
 ## 7. Interaction details that carry the product
 
 - **Optimistic focus.** Opening a key renders header and metadata instantly from what the list
@@ -274,6 +317,8 @@ explaining its cost. Buffers are bounded with a visible cap.
 
 ## 9. Open design questions
 
+- Where does the scan cap surface once it is hit — a status-bar state, or something more
+  insistent? It is a rare condition that matters a great deal when it happens.
 - Should the keys pane get liveness too, or does the open key remain the only tracked thing?
   Tracking the visible rows would show deletions as they happen, at the cost of tracking-table
   churn on every scroll.

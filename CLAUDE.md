@@ -33,7 +33,9 @@ Rust + [`ratatui`](https://ratatui.rs) + `crossterm`, with `tokio` for async I/O
 liveness (ADR-0006) needs RESP3 `CLIENT TRACKING` invalidation as a raw event stream, which
 `fred`'s `TrackingInterface` provides across centralized, clustered and sentinel deployments.
 `redis-rs` supports client-side caching too, but its `caching` module maintains a cache, which is
-the one thing ADR-0006 forbids. Rationale for the rest: a single static binary with no runtime (PRD R7.6), the strongest TUI widget
+the one thing ADR-0006 forbids. **The server floor is RESP3 and Redis 6.0** (ADR-0007) — RESP2 is
+not spoken, so there is one reply shape per command and one code path per Viewer. Rationale for
+the rest: a single static binary with no runtime (PRD R7.6), the strongest TUI widget
 ecosystem, and the headroom to hold a million-key keyspace in bounded memory.
 
 A TypeScript TUI (Ink, or a hand-written `react-reconciler` host) was considered and rejected on
@@ -51,16 +53,36 @@ Not yet applicable — no build system exists. When scaffolding lands, this sect
 build, run against a local Redis, test (including how to run a *single* test), lint, and format.
 Do not leave it as prose.
 
+Two suites are planned (ADR-0011) and the distinction belongs here when they exist: the default
+`cargo test` run is the functional core plus golden-frame snapshots and needs no Docker; the
+integration suite uses `testcontainers` against real Redis and covers `SCAN` streaming, tracking
+invalidation across a reconnect, capability probing where `CLIENT TRACKING` is refused, and error
+mapping for `-LOADING`, `-OOM`, `-MISCONF` and `-READONLY`.
+
 ## Architecture guidance
 
 The following constraints come out of the PRD and should shape the code from the first commit —
 they are expensive to retrofit:
 
+- **Functional core, imperative shells.** The core takes a message and returns new state plus
+  commands; the terminal and the Redis connection are shells around it and are unreachable from
+  the core. **The clock is injected**, along with randomness, terminal size, and capability
+  detection — TTL countdowns and read ages make a frame a function of *when* it was rendered, and
+  golden-frame tests need it to be a function of state alone (ADR-0011). Trivial on day one,
+  invasive later.
 - **The render loop never does I/O.** All Redis work happens on async tasks that send messages
   into the UI; the UI reads state and draws. A keystroke must be answerable in one frame (16ms)
   regardless of what the network is doing. Every in-flight operation must be cancellable (`Esc`).
 - **`SCAN` only, never `KEYS`.** Keyspace traversal is cursor-based, streaming, and resumable.
   Results render as they arrive.
+- **The key list is columnar and capped.** Key names go in one byte arena addressed by
+  `(offset, len)`; metadata lives in parallel arrays, never a `Vec` of per-key structs. Sorting
+  permutes an index vector. Every scanned key is retained up to a documented cap, because `SCAN`
+  has no random access and no stable order, which makes a sliding window harder *and* worse
+  (ADR-0010). This shapes every access to the key list — it belongs in the first commit that
+  stores a key.
+- **The keyspace source abstracts over a stream of keys**, not over a cursor. v1 has exactly one
+  cursor behind it, but Cluster will have N (ADR-0008) and the browser above must not know.
 - **Lists are virtualized.** Render cost is a function of viewport size, not keyspace size.
   Metadata (type, memory, TTL — four columns, no element count; PRD R2.4) is fetched lazily
   and fills in without shifting layout.
@@ -95,6 +117,11 @@ they are expensive to retrofit:
   goes to a separate state file under `$XDG_STATE_HOME/redis-pane/`.
 - **Secrets are references** (`passwordEnv`, `passwordCommand`). Literal passwords work but the
   file is refused when group- or world-readable.
+- **A reconnect re-arms tracking before anything claims to be live.** This is the invariant most
+  likely to rot silently, and it puts the product back where RedisInsight was if it does. It has
+  a test (ADR-0009, ADR-0011).
+- **Read-only Mode carries a reason** — `environment`, `replica`, or `user` — and shows it. The
+  `replica` reason is not user-liftable; never offer `⌃R` where the server will refuse anyway.
 - **There is no refresh button.** The open key is live by default and the Viewer holds no value
   cache; `r` is a scoped Refetch, not a global refresh. Degradation to manual is always visible
   in the header, never silent (ADR-0006).

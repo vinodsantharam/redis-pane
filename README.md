@@ -42,6 +42,7 @@ specification is the deliverable — it is kept current, not archived. The stack
 |---|---|
 | [docs/PRD.md](docs/PRD.md) | Problem, users, goals, numbered requirements (R1.x–R7.x), milestones M0–M4 |
 | [docs/DESIGN.md](docs/DESIGN.md) | Layout, navigation, keymap, visual language, screen-by-screen behaviour |
+| [docs/PLAN.md](docs/PLAN.md) | Implementation plan for M0 and M1 — workspace layout, tasks, and what each one proves |
 | [CONTEXT.md](CONTEXT.md) | The glossary. Several terms are deliberately distinguished and the distinctions are load-bearing |
 | [docs/adr/](docs/adr/) | Decisions, each with the alternatives that were rejected and why |
 | [CLAUDE.md](CLAUDE.md) | Working guidance for contributors and coding agents |

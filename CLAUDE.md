@@ -9,6 +9,7 @@ product and design intent live in:
 
 - [README.md](README.md) — what this is, and the five decisions that shape it
 - [docs/PRD.md](docs/PRD.md) — problem, users, requirements (R1.x–R7.x), milestones M0–M4
+- [docs/PLAN.md](docs/PLAN.md) — the M0/M1 task breakdown, workspace layout, and risk order
 - [docs/DESIGN.md](docs/DESIGN.md) — layout, navigation model, keymap, visual language, screens
 - [CONTEXT.md](CONTEXT.md) — the glossary. Read it before naming anything; several of these terms
   are deliberately distinguished and the distinctions are load-bearing
@@ -116,7 +117,9 @@ they are expensive to retrofit:
   in-app "save profile". Anything the app persists (last Connection, pane sizes, filter, scroll)
   goes to a separate state file under `$XDG_STATE_HOME/redis-pane/`.
 - **Secrets are references** (`passwordEnv`, `passwordCommand`). Literal passwords work but the
-  file is refused when group- or world-readable.
+  file is refused when group- or world-readable. **Unknown config fields are a parse error**, not
+  something to ignore — the file is hand-authored, so a misspelled `passwordEnv` is a credential
+  silently dropped. A Profile with no `env` gets `unknown`, never `local`.
 - **A reconnect re-arms tracking before anything claims to be live.** This is the invariant most
   likely to rot silently, and it puts the product back where RedisInsight was if it does. It has
   a test (ADR-0009, ADR-0011).

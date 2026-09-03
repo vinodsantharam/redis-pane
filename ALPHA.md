@@ -1,0 +1,112 @@
+# Trying redis-pane (alpha)
+
+Thanks for testing this. It's early — expect rough edges, and please say so when you hit one.
+
+## It cannot write anything
+
+This build is **read-only**. There is no delete, no edit, no rename — that work hasn't started
+yet (it's milestone M2). Every Redis command the app can issue is a read: `SCAN`, `TYPE`, `TTL`,
+`GET`/`HGETALL`/`LRANGE`/`SMEMBERS`/`ZRANGE`/`XRANGE`, `MEMORY USAGE`. Point it at anything —
+local, staging, even something you'd hesitate to open RedisInsight against — it cannot change a
+byte of it.
+
+## Install
+
+You'll need Rust. If you don't have it:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+Then, once you have access to this repo:
+
+```bash
+git clone https://github.com/vinodsantharam/redis-pane.git
+cd redis-pane
+cargo build --release
+```
+
+The binary is at `./target/release/redis-pane`.
+
+## Something to point it at
+
+Any Redis 6.0 or newer works (Valkey too). If you don't have one handy:
+
+```bash
+brew install redis && brew services start redis
+```
+
+or spin up a free instance on [Upstash](https://upstash.com) or [Redis Cloud](https://redis.io) —
+both work fine, TLS included.
+
+## Connecting
+
+Simplest — a URL directly:
+
+```bash
+redis-pane --url redis://localhost:6379
+```
+
+For anything with a password, use a Profile instead so the secret never touches your shell
+history. Write `~/.config/redis-pane/config.json`:
+
+```json
+{
+  "defaultProfile": "mine",
+  "profiles": {
+    "mine": {
+      "url": "rediss://default@your-host:6379",
+      "env": "staging",
+      "passwordEnv": "REDIS_PANE_PW"
+    }
+  }
+}
+```
+
+```bash
+chmod 600 ~/.config/redis-pane/config.json
+export REDIS_PANE_PW=your-actual-password
+redis-pane
+```
+
+(The file is refused outright if it's group- or world-readable — that's intentional, not a bug.)
+
+Sanity-check a connection without opening the full TUI:
+
+```bash
+redis-pane --profile mine --probe
+```
+
+## What to try
+
+- **`↑↓`** or **`j`/`k`** — move. **`→`** or **`l`** — open a key.
+- **`t`** — toggle tree/flat. Tree is the default.
+- **`/`** then type — filter the list. `Esc` clears it.
+- **`s`** — cycle sort: scan order → name → ttl → size → type.
+- **`y y`** / **`y v`** / **`y c`** — copy the key name / the value / a ready-to-run `redis-cli`
+  command.
+- **`⌃R`** — toggle Read-only Mode (some environments start locked and say why).
+- **`?`** — help, showing your actual keybindings.
+- **Resize the terminal.** Columns drop in order above 70 wide; below 70, opening a key pushes
+  into a full-width view with a breadcrumb back to the list.
+- **If your server supports `CLIENT TRACKING`**, open a key and change it from another terminal
+  (`redis-cli HSET the-key field value`) — it should update on screen with no keypress. If it
+  doesn't, or the header never says `● live`, that's exactly the kind of thing to report.
+
+## What's not there yet, on purpose
+
+- No editing, deleting, renaming, or TTL changes (M2).
+- No command palette, console, server dashboard, `MONITOR`, or pub/sub (M3).
+- No Cluster support — Sentinel works, Cluster is deferred.
+- Nothing older than Redis 6.0 / no RESP2 — you'll get a clear message naming the version, not a
+  crash.
+- A handful of known UI gaps are already tracked in `docs/UI_TASKS.md` if you want to check
+  before reporting something as new.
+
+## Reporting something
+
+Open an issue on this repo, or just message me directly. Useful to include: what you were doing,
+what you expected, what happened instead, and if relevant, what you were connected to (Redis
+version, and whether it's local/Upstash/Redis Cloud/something else).
+
+Genuinely appreciate you trying this out.

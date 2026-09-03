@@ -19,6 +19,8 @@ Mutation is M2, so it reads but does not yet write. The specification is still t
 deliverable and is kept current rather than archived. Stack: Rust + [ratatui](https://ratatui.rs)
 + tokio + [fred](https://docs.rs/fred).
 
+**Trying this out?** See [ALPHA.md](ALPHA.md) — install, connect, and a tour of what's there.
+
 ```bash
 cargo run -p redis-pane -- --print-target   # resolve a target, print it, exit
 cargo run -p redis-pane -- --probe          # connect and report what the server supports

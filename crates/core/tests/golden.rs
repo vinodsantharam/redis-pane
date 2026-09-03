@@ -789,3 +789,249 @@ fn fuzzy_mode_matches_characters_in_order() {
         "user:8812:session"
     );
 }
+
+// ── M1.8 / M1.9 — one frame, eight bodies ───────────────────────────────────
+
+use redis_pane_core::state::OpenKey;
+use redis_pane_core::state::value::{
+    BinaryValue, IndexedValue, JsonValue, MemberValue, PairValue, ScoredValue, StreamValue,
+    StringValue, Value,
+};
+
+fn opened(name: &str, value: Value, ttl: i32) -> State {
+    let mut state = many_keys();
+    state.open = Some(OpenKey::new(0, name.into(), value, ttl, 2_150, 60_000));
+    state
+}
+
+fn hash_value() -> Value {
+    Value::Hash(PairValue {
+        pairs: vec![
+            ("id".into(), "8812".into()),
+            ("device".into(), "ios/17.2".into()),
+            ("region".into(), "eu-west-1".into()),
+            ("plan".into(), "pro".into()),
+            ("locale".into(), "fr-FR".into()),
+        ],
+    })
+}
+
+#[test]
+fn golden_viewer_hash() {
+    assert_golden(
+        "viewer_hash",
+        &draw(&opened("user:8812:session", hash_value(), 2_537), 130, 22),
+    );
+}
+
+#[test]
+fn golden_viewer_zset() {
+    let v = Value::ZSet(ScoredValue {
+        entries: vec![
+            ("sku-100".into(), 1.0),
+            ("sku-221".into(), 2.0),
+            ("sku-874".into(), 3.5),
+        ],
+        total: 3,
+    });
+    assert_golden(
+        "viewer_zset",
+        &draw(&opened("user:8812:cart", v, 720), 130, 22),
+    );
+}
+
+#[test]
+fn golden_viewer_stream() {
+    let v = Value::Stream(StreamValue {
+        entries: vec![
+            (
+                "1724925600000-0".into(),
+                vec![
+                    ("order".into(), "1000".into()),
+                    ("amount".into(), "42".into()),
+                ],
+            ),
+            (
+                "1724925601000-0".into(),
+                vec![
+                    ("order".into(), "1001".into()),
+                    ("amount".into(), "17".into()),
+                ],
+            ),
+        ],
+        total: 500,
+    });
+    assert_golden(
+        "viewer_stream",
+        &draw(&opened("stream:orders", v, TTL_NONE), 130, 22),
+    );
+}
+
+#[test]
+fn golden_viewer_binary() {
+    let v = Value::Binary(BinaryValue {
+        bytes: (0u8..48).collect(),
+    });
+    assert_golden(
+        "viewer_binary",
+        &draw(&opened("blob:thumb", v, TTL_NONE), 130, 22),
+    );
+}
+
+#[test]
+fn golden_viewer_json() {
+    let v = Value::Json(JsonValue::parse(
+        r#"{"newnav":true,"ab_checkout":"B","rollout":0.25}"#,
+    ));
+    assert_golden(
+        "viewer_json",
+        &draw(&opened("config:feature-flags", v, TTL_NONE), 130, 22),
+    );
+}
+
+/// R3.1's proof, stated as a frame comparison rather than a claim: the header
+/// and footer are byte-identical across types, so navigation can be shared.
+#[test]
+fn the_frame_around_the_body_is_identical_for_every_type() {
+    let cases = vec![
+        Value::Str(StringValue::new("hello world", 60)),
+        hash_value(),
+        Value::List(IndexedValue {
+            items: vec!["x".into()],
+            total: 1,
+        }),
+        Value::Set(MemberValue {
+            members: vec!["m".into()],
+            total: 1,
+        }),
+        Value::ZSet(ScoredValue {
+            entries: vec![("m".into(), 1.0)],
+            total: 1,
+        }),
+        Value::Stream(StreamValue {
+            entries: vec![],
+            total: 0,
+        }),
+        Value::Json(JsonValue::parse("{}")),
+        Value::Binary(BinaryValue { bytes: vec![1] }),
+    ];
+
+    let mut first_header: Option<String> = None;
+    for value in cases {
+        let frame = draw(&opened("k", value, 600), 130, 22);
+        let lines: Vec<&str> = frame.lines().collect();
+        // Row 0 is the title bar; the value pane's key name and ttl rows are
+        // shared chrome and must not vary with the type.
+        let key_row = lines[2].split('│').nth(1).unwrap_or("").to_string();
+        let ttl_row = lines[4].split('│').nth(1).unwrap_or("").to_string();
+        let combined = format!("{key_row}|{ttl_row}");
+        match &first_header {
+            None => first_header = Some(combined),
+            Some(expected) => assert_eq!(
+                &combined, expected,
+                "the shared frame differed between types"
+            ),
+        }
+    }
+}
+
+// ── M1.10 — the liveness states, on screen ──────────────────────────────────
+
+#[test]
+fn golden_viewer_update_held_while_scrolled() {
+    let mut state = opened("user:8812:session", hash_value(), 2_537);
+    let open = state.open.as_mut().unwrap();
+    open.offset = 2;
+    open.at_rest = false;
+    open.absorb(hash_value(), 2_400, 2_200, 72_000);
+    assert_golden("viewer_changed_held", &draw(&state, 130, 22));
+}
+
+#[test]
+fn golden_viewer_deleted() {
+    let mut state = opened("lock:checkout:8812", hash_value(), 12);
+    state.open.as_mut().unwrap().deleted_at_ms = Some(71_000);
+    assert_golden("viewer_deleted", &draw(&state, 130, 22));
+}
+
+#[test]
+fn an_update_at_rest_lands_with_no_keypress() {
+    // The whole point of ADR-0006, asserted at the frame level.
+    let mut state = opened("k", hash_value(), 600);
+    let before = draw(&state, 130, 22);
+
+    let changed = Value::Hash(PairValue {
+        pairs: vec![("plan".into(), "enterprise".into())],
+    });
+    state
+        .open
+        .as_mut()
+        .unwrap()
+        .absorb(changed, 600, 2_150, 61_000);
+
+    let after = draw(&state, 130, 22);
+    assert_ne!(before, after, "the new value must be on screen already");
+    assert!(after.contains("enterprise"));
+    assert!(
+        !after.contains("r to load"),
+        "nothing was asked of the reader"
+    );
+}
+
+#[test]
+fn an_update_while_scrolled_is_announced_and_offers_the_effective_key() {
+    let mut state = opened("k", hash_value(), 600);
+    let open = state.open.as_mut().unwrap();
+    open.offset = 3;
+    open.at_rest = false;
+    open.absorb(
+        Value::Hash(PairValue {
+            pairs: vec![("plan".into(), "enterprise".into())],
+        }),
+        600,
+        2_150,
+        // CLOCK is 74_000, so this arrived two seconds ago.
+        72_000,
+    );
+
+    let frame = draw(&state, 130, 22);
+    assert!(frame.contains("changed 2s ago"), "{frame}");
+    assert!(frame.contains("r to load"), "{frame}");
+    assert!(
+        !frame.contains("enterprise"),
+        "nothing moved under the reader"
+    );
+}
+
+#[test]
+fn a_deleted_key_keeps_its_value_on_screen() {
+    let mut state = opened("k", hash_value(), 600);
+    state.open.as_mut().unwrap().deleted_at_ms = Some(63_000);
+    let frame = draw(&state, 130, 22);
+    assert!(frame.contains("✕ deleted"), "{frame}");
+    assert!(frame.contains("ios/17.2"), "the evidence survives: {frame}");
+}
+
+#[test]
+fn the_ttl_counts_down_between_frames_without_any_fetch() {
+    let state = opened("k", hash_value(), 600);
+    let at_open = render::frame(
+        &state,
+        &Theme::new(ColorDepth::Monochrome),
+        &FixedClock(60_000),
+        Rect::new(0, 0, 130, 22),
+    );
+    let a_minute_later = render::frame(
+        &state,
+        &Theme::new(ColorDepth::Monochrome),
+        &FixedClock(120_000),
+        Rect::new(0, 0, 130, 22),
+    );
+    let text = |b: &ratatui::buffer::Buffer| render::to_text(b);
+    assert!(text(&at_open).contains("ttl 10m"));
+    assert!(
+        text(&a_minute_later).contains("ttl 9m"),
+        "{}",
+        text(&a_minute_later)
+    );
+}

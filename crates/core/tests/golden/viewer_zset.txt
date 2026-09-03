@@ -1,11 +1,13 @@
 ─ redis-pane ─ ● staging · cache-01:6379/0 · from profile staging ─────────────────────────────────────────────────────── ● live ─
 
- / user:*:session                                  2 of 6 │ → to open
- KEY                               TYPE        SIZE   TTL │
+ KEY                               TYPE        SIZE   TTL │ user:8812:cart
+ user:8812:cart                    zset       412 B   12m │ zset · 3 members · 2.1 KB
+ user:8812:profile                 json       880 B     ∞ │ ttl 11m                                                        ● live
  user:8812:session                 hash      2.1 KB   42m │
- user:8813:session                 hash      1.9 KB   56m │
-                                                          │
-                                                          │
+ user:8813:session                 hash      1.9 KB   56m │ SCORE                             MEMBER
+ cart:91af3c9d2e                   zset      1.1 MB   12m │ 1                                 sku-100
+ feed:global:hot                   list     63.0 KB     ∞ │ 2                                 sku-221
+                                                          │ 3.5                               sku-874
                                                           │
                                                           │
                                                           │

@@ -38,4 +38,9 @@ pub enum Command {
     /// keyspace would be `KEYS *` with extra steps, and it would compete with
     /// `SCAN` for the connection while the list is still filling.
     FetchMetadata { indices: Vec<usize> },
+    /// Open a key: read it, arming tracking in the same breath.
+    ///
+    /// Distinct from [`Command::RefetchOpenKey`] only in that it changes which
+    /// key is open; both go through the one read path that always arms.
+    OpenKey { index: usize, name: Vec<u8> },
 }

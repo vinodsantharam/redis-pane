@@ -6,13 +6,17 @@
 //! [`loaded::LoadedSet`].
 
 pub mod loaded;
+pub mod open;
 pub mod scan;
 pub mod tree;
+pub mod value;
 pub mod view;
 
 pub use loaded::{KeyKind, LoadedSet};
+pub use open::OpenKey;
 pub use scan::ScanState;
 pub use tree::Tree;
+pub use value::{Value, Viewer};
 pub use view::{FilterMode, KeyView, SortBy};
 
 /// Where a Connection's target came from (ADR-0001).
@@ -246,6 +250,9 @@ pub struct State {
     pub tree_mode: bool,
     /// Set while `/` is capturing a filter.
     pub filtering: bool,
+    /// The key in the Viewer, if one is open. There is no cache behind this —
+    /// it holds what the server last said and nothing more (ADR-0006).
+    pub open: Option<OpenKey>,
 }
 
 impl State {

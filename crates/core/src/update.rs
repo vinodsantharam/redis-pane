@@ -3,7 +3,7 @@
 use crate::keymap::Action;
 use crate::msg::KeyCode;
 use crate::msg::KeyPress;
-use crate::state::{Link, ReadOnlyReason, ScanState, Tracking};
+use crate::state::{Link, OpenKey, ReadOnlyReason, ScanState, Tracking};
 use crate::{Command, Msg, State};
 
 /// Takes a message, returns new state plus commands for a shell to execute.
@@ -126,6 +126,43 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             state.scan = ScanState::Failed { error };
             (state, Vec::new())
         }
+        Msg::ValueLoaded {
+            index,
+            name,
+            value,
+            ttl_seconds,
+            size_bytes,
+            at_ms,
+        } => {
+            match &mut state.open {
+                // A read of the key already open is an update, and where it
+                // lands depends on where the reader is (ADR-0006).
+                Some(open) if open.index == index => {
+                    open.absorb(value, ttl_seconds, size_bytes, at_ms)
+                }
+                _ => {
+                    state.open = Some(OpenKey::new(
+                        index,
+                        name,
+                        value,
+                        ttl_seconds,
+                        size_bytes,
+                        at_ms,
+                    ))
+                }
+            }
+            (state, Vec::new())
+        }
+        Msg::ValueGone { at_ms } => {
+            // The value stays on screen, badged. During an incident the
+            // question is almost always what was in it, and this is the moment
+            // that answer becomes unrecoverable.
+            if let Some(open) = &mut state.open {
+                open.deleted_at_ms = Some(at_ms);
+                open.pending = None;
+            }
+            (state, Vec::new())
+        }
         Msg::Quit => quit(state),
     }
 }
@@ -193,7 +230,19 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             }
             (state, Vec::new())
         }
-        Action::Refetch => (state, vec![Command::RefetchOpenKey]),
+        Action::Refetch => {
+            // `r` is a scoped Refetch, not a global refresh. When an update is
+            // already waiting, it applies that instead of asking the server for
+            // something it has already been told.
+            if let Some(open) = &mut state.open
+                && open.pending.is_some()
+            {
+                open.take_pending();
+                open.at_rest = true;
+                return (state, Vec::new());
+            }
+            (state, vec![Command::RefetchOpenKey])
+        }
         Action::MoveDown => move_selection(state, 1),
         Action::MoveUp => move_selection(state, -1),
         Action::PageDown => {
@@ -211,6 +260,29 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
         Action::Bottom => {
             state.view.selected = state.row_count().saturating_sub(1);
             after_move(state)
+        }
+        Action::Open => {
+            let Some(index) = state.selected_key() else {
+                return (state, Vec::new());
+            };
+            let Some(name) = state.keys.name(index).map(|n| n.to_vec()) else {
+                return (state, Vec::new());
+            };
+            (state, vec![Command::OpenKey { index, name }])
+        }
+        Action::ViewerDown | Action::ViewerUp => {
+            if let Some(open) = &mut state.open {
+                let by: isize = if action == Action::ViewerDown { 1 } else { -1 };
+                let last = open.value.viewer().row_count().saturating_sub(1) as isize;
+                open.offset = (open.offset as isize + by).clamp(0, last) as usize;
+                // Scrolling away from the top means updates are announced
+                // rather than applied; returning to the top does not by itself
+                // undo that — the reader chooses when a held update lands.
+                if open.offset > 0 {
+                    open.at_rest = false;
+                }
+            }
+            (state, Vec::new())
         }
         Action::Filter => {
             state.filtering = true;
@@ -317,6 +389,13 @@ fn move_selection(mut state: State, by: isize) -> (State, Vec<Command>) {
 /// Scrolling reveals rows whose metadata has not been fetched, so every move
 /// asks for what is newly visible — and only what is visible (R2.4).
 fn after_move(mut state: State) -> (State, Vec<Command>) {
+    // Moving in the key list is not scrolling the value, so the Viewer returns
+    // to rest: whatever arrives next may land without asking.
+    if let Some(open) = &mut state.open
+        && open.offset == 0
+    {
+        open.at_rest = true;
+    }
     let height = state.visible_rows();
     state.view = state.view.scrolled_to_selection(height);
     let indices = state.rows_needing_metadata();

@@ -94,10 +94,11 @@ it cannot connect. No keyspace. — **Met.**
 Proves: the keyspace is legible, the values keep their shape, and the screen is never lying about
 how current it is.
 
-**Progress: 1–7 complete.** The Loaded set holds a million keys in 36MB, the keyspace source
+**Progress: 1–10 complete.** The Loaded set holds a million keys in 36MB, the keyspace source
 streams and cancels against a real server, the browser renders at every breakpoint with metadata
-filling in behind placeholders that hold their column, and filter, tree and sort all work by
-permuting an index vector rather than touching the arena.
+filling in behind placeholders that hold their column, filter, tree and sort all work by
+permuting an index vector rather than touching the arena, and every Redis type renders behind one
+shared frame whose liveness states are recorded as golden frames.
 
 | # | Task | Proves |
 |---|---|---|

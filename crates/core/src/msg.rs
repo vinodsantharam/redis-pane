@@ -124,6 +124,22 @@ pub enum Msg {
     MetadataBatch {
         entries: Vec<MetadataEntry>,
     },
+    /// A read of the open key completed, carrying what the server said.
+    ///
+    /// The only way a value enters the Viewer. There is no other path, which is
+    /// what makes a stale value unrepresentable (ADR-0006).
+    ValueLoaded {
+        index: usize,
+        name: String,
+        value: crate::state::Value,
+        ttl_seconds: i32,
+        size_bytes: u32,
+        at_ms: u64,
+    },
+    /// The open key is gone: deleted, expired, or evicted.
+    ValueGone {
+        at_ms: u64,
+    },
     /// The user asked to leave.
     Quit,
 }

@@ -16,3 +16,7 @@ End     bottom
 s       sort
 t       tree
 ⏎       fold
+→       open
+l       open
+⌃↓      scroll
+⌃↑      scroll

@@ -35,6 +35,12 @@ pub enum Action {
     ToggleTree,
     /// Expand or collapse the group under the cursor.
     ToggleGroup,
+    /// Open the selected key in the Viewer.
+    Open,
+    /// Move down inside the open value.
+    ViewerDown,
+    /// Move up inside the open value.
+    ViewerUp,
 }
 
 impl Action {
@@ -54,6 +60,8 @@ impl Action {
             Action::Sort => "sort",
             Action::ToggleTree => "tree",
             Action::ToggleGroup => "fold",
+            Action::Open => "open",
+            Action::ViewerDown | Action::ViewerUp => "scroll",
         }
     }
 }
@@ -172,6 +180,22 @@ impl Default for Keymap {
                 Binding {
                     key: KeyPress::plain(KeyCode::Enter),
                     action: Action::ToggleGroup,
+                },
+                Binding {
+                    key: KeyPress::plain(KeyCode::Right),
+                    action: Action::Open,
+                },
+                Binding {
+                    key: KeyPress::plain(KeyCode::Char('l')),
+                    action: Action::Open,
+                },
+                Binding {
+                    key: KeyPress::ctrl(KeyCode::Down),
+                    action: Action::ViewerDown,
+                },
+                Binding {
+                    key: KeyPress::ctrl(KeyCode::Up),
+                    action: Action::ViewerUp,
                 },
             ],
         }
@@ -311,6 +335,9 @@ mod tests {
             Action::Sort,
             Action::ToggleTree,
             Action::ToggleGroup,
+            Action::Open,
+            Action::ViewerDown,
+            Action::ViewerUp,
         ] {
             assert!(k.key_for(action).is_some(), "{action:?} has no binding");
         }

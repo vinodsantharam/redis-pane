@@ -25,7 +25,7 @@ pub fn frame(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect) -> Buf
 
     keys::render(state, theme, plan.keys, plan.density, &mut buf);
     if let Some(value) = plan.value {
-        value_pane(state, theme, value, &mut buf);
+        value_pane(state, theme, clock, value, &mut buf);
     }
     status_bar(state, theme, area, &mut buf);
 
@@ -47,8 +47,8 @@ pub fn frame(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect) -> Buf
 
 /// The value pane. Viewers land in M1.8; until then it states what is selected
 /// so the two-pane layout is real rather than a promise.
-fn value_pane(state: &State, theme: &Theme, area: Rect, buf: &mut Buffer) {
-    if area.height == 0 || area.width < 4 {
+fn value_pane(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect, buf: &mut Buffer) {
+    if area.height == 0 || area.width < 6 {
         return;
     }
     for y in 0..area.height {
@@ -60,28 +60,140 @@ fn value_pane(state: &State, theme: &Theme, area: Rect, buf: &mut Buffer) {
             theme.style(Token::Border),
         );
     }
-    // Through the row indirection, not the raw index: in tree mode the
-    // selected row may be a group header with no key behind it.
-    match state.selected_key().and_then(|i| state.keys.name_str(i)) {
-        Some(name) => {
-            put(buf, area.x + 1, area.y, &name, theme.style(Token::Text));
+
+    let Some(open) = &state.open else {
+        let label = if state.tree_mode && state.row_count() > 0 {
+            "a group is selected"
+        } else if state.row_count() > 0 {
+            "→ to open"
+        } else {
+            "no key selected"
+        };
+        put(buf, area.x + 1, area.y, label, theme.style(Token::Muted));
+        return;
+    };
+
+    // ── header: identical for every type (R3.1) ────────────────────────────
+    let now = clock.now_ms();
+    let x0 = area.x + 1;
+    put(buf, x0, area.y, &open.name, theme.style(Token::Text));
+
+    let viewer = open.value.viewer();
+    let kind = open.value.kind();
+    let summary = format!(
+        "{} · {} · {}",
+        kind.label(),
+        viewer.measure(),
+        keys::format_size(open.size_bytes)
+    );
+    put(buf, x0, area.y + 1, &summary, theme.style(Token::Muted));
+
+    // TTL is counted down locally: the most time-sensitive figure on screen
+    // costs no round trip (R3.9).
+    let ttl = keys::format_ttl(open.ttl_now(now));
+    put(
+        buf,
+        x0,
+        area.y + 2,
+        &format!("ttl {ttl}"),
+        theme.style(Token::Muted),
+    );
+
+    let currency = open.currency(state.liveness() == Liveness::Live, now);
+    let token = if open.deleted_at_ms.is_some() {
+        Token::Danger
+    } else if open.pending.is_some() {
+        Token::Warn
+    } else if currency.starts_with('●') {
+        Token::Ok
+    } else {
+        Token::Muted
+    };
+    put_right(
+        buf,
+        area.x,
+        area.y + 2,
+        area.width.saturating_sub(1),
+        &currency,
+        theme.style(token),
+    );
+    // A held update needs a way to ask for it, and the hint must name the
+    // effective binding (R7.5).
+    if open.pending.is_some()
+        && let Some(hint) = state.keymap.hint(crate::keymap::Action::Refetch)
+    {
+        put_right(
+            buf,
+            area.x,
+            area.y + 3,
+            area.width.saturating_sub(1),
+            &format!("{hint} to load"),
+            theme.style(Token::Muted),
+        );
+    }
+
+    // ── body: the only part that differs by type ───────────────────────────
+    let body_top = area.y + 4;
+    let body_height = (area.y + area.height).saturating_sub(body_top);
+    if body_height == 0 {
+        return;
+    }
+    let cols = viewer.columns();
+    let mut y = body_top;
+    let inner = area.width.saturating_sub(2);
+    let col_w = if cols.len() > 1 {
+        inner / cols.len() as u16
+    } else {
+        inner
+    };
+
+    if !cols.is_empty() {
+        for (i, heading) in cols.iter().enumerate() {
             put(
                 buf,
-                area.x + 1,
-                area.y + 2,
-                "value viewers land in M1.8",
+                x0 + i as u16 * col_w,
+                y,
+                heading,
                 theme.style(Token::Muted),
             );
         }
-        None => {
-            let label = if state.tree_mode && state.row_count() > 0 {
-                "a group is selected"
-            } else {
-                "no key selected"
-            };
-            put(buf, area.x + 1, area.y, label, theme.style(Token::Muted));
+        y += 1;
+    }
+
+    // Only visible rows are formatted, whatever the value's size.
+    let rows = (area.y + area.height).saturating_sub(y) as usize;
+    for r in 0..rows {
+        let i = open.offset + r;
+        if i >= viewer.row_count() {
+            break;
+        }
+        for (c, cell) in viewer.row(i).into_iter().enumerate() {
+            let width = if cols.len() > 1 { col_w } else { inner };
+            put(
+                buf,
+                x0 + c as u16 * col_w,
+                y + r as u16,
+                &clip(&cell, width.saturating_sub(1) as usize),
+                theme.style(if c == 0 && cols.len() > 1 {
+                    Token::Muted
+                } else {
+                    Token::Text
+                }),
+            );
         }
     }
+}
+
+fn clip(s: &str, width: usize) -> String {
+    if s.chars().count() <= width {
+        return s.to_string();
+    }
+    if width <= 1 {
+        return String::new();
+    }
+    let mut out: String = s.chars().take(width - 1).collect();
+    out.push('…');
+    out
 }
 
 /// The status bar: scan progress and its cancel affordance (DESIGN §6.2).

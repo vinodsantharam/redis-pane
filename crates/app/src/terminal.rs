@@ -127,6 +127,24 @@ pub async fn run(
     let mut scan_cancel: Option<CancellationToken> = None;
     start_scan(&client, None, &tx, &mut scan_cancel);
 
+    // Invalidation pushes arrive on their own task and become messages like
+    // everything else. This is what makes a value update with no keypress —
+    // and it is the whole reason this project exists (ADR-0006).
+    if tracking {
+        let mut invalidations = fred::interfaces::TrackingInterface::invalidation_rx(&client);
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            while let Ok(_invalidation) = invalidations.recv().await {
+                // The server has told us the open key changed, which also
+                // consumed the arming. Refetching is what re-arms, and the core
+                // decides whether the result lands or is announced.
+                if tx.send(Msg::Invalidated).await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
     loop {
         term.draw(|f| {
             let buf = render::frame(&state, &theme, clock, f.area());
@@ -170,11 +188,63 @@ pub async fn run(
                         }
                     });
                 }
-                // Liveness and reconnection wiring land with the Viewer (M1.10).
-                Command::RefetchOpenKey | Command::Reconnect { .. } => {}
+                Command::OpenKey { index, name } => {
+                    open_key(&client, index, name, &tx, area_width(&term))
+                }
+                Command::RefetchOpenKey => {
+                    if let Some(open) = &state.open {
+                        open_key(
+                            &client,
+                            open.index,
+                            open.name.as_bytes().to_vec(),
+                            &tx,
+                            area_width(&term),
+                        );
+                    }
+                }
+                // Reconnection wiring lands with M2.
+                Command::Reconnect { .. } => {}
             }
         }
     }
+}
+
+/// Read a key and send the result in. The one read path: it always re-arms,
+/// so there is no branch on which liveness can be silently lost (ADR-0006).
+fn open_key(
+    client: &Client,
+    index: usize,
+    name: Vec<u8>,
+    tx: &mpsc::Sender<Msg>,
+    pane_width: usize,
+) {
+    let client = client.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let msg = match crate::redis::read::read_value(&client, &name, pane_width).await {
+            Ok(Some(read)) => Msg::ValueLoaded {
+                index,
+                name: String::from_utf8_lossy(&name).into_owned(),
+                value: read.value,
+                ttl_seconds: read.ttl_seconds,
+                size_bytes: read.size_bytes,
+                at_ms,
+            },
+            Ok(None) => Msg::ValueGone { at_ms },
+            Err(_) => return,
+        };
+        let _ = tx.send(msg).await;
+    });
+}
+
+fn area_width(term: &Terminal<CrosstermBackend<Stdout>>) -> usize {
+    term.size()
+        .map(|s| (s.width / 2).max(20) as usize)
+        .unwrap_or(40)
 }
 
 fn start_scan(

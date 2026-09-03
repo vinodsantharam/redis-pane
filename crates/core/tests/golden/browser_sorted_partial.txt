@@ -1,8 +1,8 @@
 ─ redis-pane ─ ● staging · cache-01:6379/0 · from profile staging ─────────────────────────────────────────────────────── ● live ─
 
- KEY                               TYPE        SIZE   TTL │ user:8812:cart
+ KEY                               TYPE        SIZE   TTL │ → to open
  user:8812:cart                    zset       412 B   12m │
- user:8812:profile                 zset       880 B   12m │ value viewers land in M1.8
+ user:8812:profile                 zset       880 B   12m │
  unknown:a                         ·              ·     · │
  unknown:b                         ·              ·     · │
                                                           │

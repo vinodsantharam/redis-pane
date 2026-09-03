@@ -1,9 +1,17 @@
 //! Reading a value, arming tracking in the same breath (PLAN M1.9, M1.10).
 //!
-//! Every read of the open key goes through [`read_value`]. There is no sibling
-//! that reads without arming, and there should never be one: tracking is
-//! consumed by the invalidation it produces, so a read that skipped arming
-//! would leave the Viewer dark while the header still said live (ADR-0006).
+//! Every read of the open key goes through [`read_value`], which arms tracking
+//! in the same breath — because tracking is consumed by the invalidation it
+//! produces, and a read that skipped arming would leave the Viewer dark while
+//! the header still said live (ADR-0006).
+//!
+//! The one refinement, found against a real managed server: **there is nothing
+//! to arm on a server that refuses `CLIENT TRACKING`.** Upstash rejects
+//! `CLIENT CACHING` outright, so sending it unconditionally made every read
+//! fail — the app could browse a keyspace and open nothing in it. Arming is
+//! therefore driven by the capability probe, and by nothing else, which is what
+//! [`Arming`] exists to make explicit. A bare `bool` here would invite a caller
+//! to pass `false` for convenience, and that caller would silently go dark.
 
 use fred::prelude::*;
 use redis_pane_core::state::value::{
@@ -14,6 +22,19 @@ use redis_pane_core::state::value::{
 /// How much of a large collection to fetch. The Viewer is for reading, not for
 /// exporting; a bounded window keeps a 4MB list from arriving as one reply.
 const WINDOW: i64 = 500;
+
+/// Whether this connection can arm tracking at all.
+///
+/// Comes from the capability probe at connect (ADR-0007) and from nowhere else.
+/// It is not a preference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arming {
+    /// The server accepted `CLIENT TRACKING`; every read re-arms.
+    Enabled,
+    /// The server refused it. Liveness is already `○ manual`, so there is
+    /// nothing to arm and sending `CLIENT CACHING` would only fail the read.
+    Unsupported,
+}
 
 /// What a completed read produced.
 pub struct ReadValue {
@@ -27,13 +48,16 @@ pub async fn read_value(
     client: &Client,
     name: &[u8],
     pane_width: usize,
+    arming: Arming,
 ) -> Result<Option<ReadValue>, Error> {
     let key: Key = name.into();
 
     // Arm first: `CLIENT CACHING YES` applies to the next read-only command on
     // this connection. Do not "simplify" this into fred's Options.caching,
     // which is inert in 10.1.0.
-    let _: () = client.client_caching(true).await?;
+    if arming == Arming::Enabled {
+        let _: () = client.client_caching(true).await?;
+    }
     let kind: String = client.r#type(key.clone()).await?;
     if kind == "none" {
         return Ok(None);

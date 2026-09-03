@@ -112,6 +112,11 @@ one: after every invalidation, and after every reconnect.
   Viewer refetches. One fewer feature and one fewer binding.
 - The Viewer gains one piece of state it did not have: whether the viewport is at rest. That is
   the price of apply-if-idle, and it is the only new state this decision introduces.
+- **There is nothing to arm on a server that refuses tracking.** Arming unconditionally makes
+  every read fail on such a server — Upstash rejects `CLIENT CACHING` outright, so the app could
+  browse a keyspace and open nothing in it. Arming is driven by the capability probe and by
+  nothing else; the `Arming` enum exists so a caller cannot casually pass `false` and go dark.
+  This narrows the rule rather than weakening it: *every read arms wherever arming is possible*.
 - **`fred`'s `Options { caching: Some(true) }` does not work** (10.1.0). It compiles, and it reads
   as the idiomatic way to send `CLIENT CACHING YES` before a command, but the field is copied onto
   the command struct and never read by the router — nothing reaches the wire. A connection using

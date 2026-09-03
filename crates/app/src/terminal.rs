@@ -125,6 +125,13 @@ pub async fn run(
         },
     );
 
+    // Driven by the capability probe, never by preference (ADR-0007).
+    let arming = if tracking {
+        crate::redis::read::Arming::Enabled
+    } else {
+        crate::redis::read::Arming::Unsupported
+    };
+
     let mut scan_cancel: Option<CancellationToken> = None;
     start_scan(&client, None, &tx, &mut scan_cancel);
 
@@ -256,7 +263,7 @@ pub async fn run(
                     });
                 }
                 Command::OpenKey { index, name } => {
-                    open_key(&client, index, name, &tx, area_width(&term))
+                    open_key(&client, index, name, &tx, area_width(&term), arming)
                 }
                 Command::RefetchOpenKey => {
                     if let Some(open) = &state.open {
@@ -266,6 +273,7 @@ pub async fn run(
                             open.name.as_bytes().to_vec(),
                             &tx,
                             area_width(&term),
+                            arming,
                         );
                     }
                 }
@@ -299,6 +307,7 @@ fn open_key(
     name: Vec<u8>,
     tx: &mpsc::Sender<Msg>,
     pane_width: usize,
+    arming: crate::redis::read::Arming,
 ) {
     let client = client.clone();
     let tx = tx.clone();
@@ -307,7 +316,7 @@ fn open_key(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let msg = match crate::redis::read::read_value(&client, &name, pane_width).await {
+        let msg = match crate::redis::read::read_value(&client, &name, pane_width, arming).await {
             Ok(Some(read)) => Msg::ValueLoaded {
                 index,
                 name: String::from_utf8_lossy(&name).into_owned(),

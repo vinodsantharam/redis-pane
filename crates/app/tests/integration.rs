@@ -667,3 +667,48 @@ async fn reading_a_key_of_an_unexpected_type_produces_an_error_not_silence() {
     let _ = client.quit().await;
     let _ = writer.quit().await;
 }
+
+// ── a server that refuses tracking must still be readable ───────────────────
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn a_key_opens_on_a_server_that_refuses_tracking() {
+    // Found against Upstash, which rejects CLIENT CACHING outright: arming
+    // unconditionally made every read fail, so the app could browse a keyspace
+    // and open nothing in it. Simulated here with an ACL that denies CLIENT.
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer
+        .set("readable", "value", None, None, false)
+        .await
+        .unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let read = redis_pane::redis::read::read_value(
+        &client,
+        b"readable",
+        50,
+        redis_pane::redis::read::Arming::Unsupported,
+    )
+    .await
+    .expect("a read must succeed without arming")
+    .expect("the key exists");
+    assert_eq!(read.ttl_seconds, -1);
+
+    // And with arming, on a server that supports it, it still works.
+    let armed = redis_pane::redis::read::read_value(
+        &client,
+        b"readable",
+        50,
+        redis_pane::redis::read::Arming::Enabled,
+    )
+    .await
+    .unwrap();
+    assert!(armed.is_some());
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}

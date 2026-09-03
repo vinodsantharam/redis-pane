@@ -27,6 +27,18 @@ requirements and ADRs for decisions already made.
 - [ ] **The scan cap has no dedicated visual surfacing** beyond a status-bar line.
 - [ ] **Sub-70-column behavior is minimal** — single-pane works, no breadcrumb/stack nav.
 
+## Severity 0 — spec/code drift (found 2026-09-04, closed same day)
+
+- [x] **`type.*` and `accent` (selection) tokens were specified but never implemented.**
+  CLAUDE.md's own example of a semantic token was `Token::TypeHash`, and it did not exist —
+  every key rendered in plain text colour regardless of type, and "selected" was a foreground
+  change, not the highlight bar DESIGN §5 describes. Added a colour dot before every key name
+  (● known type, · pending — same convention as every other lazily-fetched cell), one hue per
+  Redis type (`type.*`, consistent in the keys pane and the value pane header), and a full-row
+  `Token::Selected` highlight (dark-on-amber in colour, reverse video in monochrome). Verified at
+  the buffer-cell level that the highlight has no gaps and that distinct types render with
+  distinct hues — not just that the code compiles.
+
 ## Severity 4 — polish
 
 - [x] **Binary/hex viewer navigation.** `⌃PgDn`/`⌃PgUp` page by 20 rows, `⌃Home`/`⌃End` jump

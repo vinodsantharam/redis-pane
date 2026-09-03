@@ -1,11 +1,11 @@
 ─ redis-pane ─ ● staging · cache-01:6379/0 · from profile staging ───────────────────────── ● live ─
 
 --- styles ---
-a fg=#444444
-b fg=#e0af68
-c fg=#8a8a8a
-d fg=#e6e6e6
-e fg=#7ac78e
+a fg=#444444 bg=Reset
+b fg=#e0af68 bg=Reset
+c fg=#8a8a8a bg=Reset
+d fg=#e6e6e6 bg=Reset
+e fg=#7ac78e bg=Reset
 --- map ---
 aaaaaaaaaaaaaaabbbbbbbbbcccdddddddddddddddcccccccccccccccccccccccaaaaaaaaaaaaaaaaaaaaaaaaaaaeeeeeeaa
 ....................................................................................................

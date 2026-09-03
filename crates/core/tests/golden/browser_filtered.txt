@@ -2,8 +2,8 @@
 
  / user:*:session                                  2 of 6 │ → to open
  KEY                               TYPE        SIZE   TTL │
- user:8812:session                 hash      2.1 KB   42m │
- user:8813:session                 hash      1.9 KB   56m │
+ ● user:8812:session               hash      2.1 KB   42m │
+ ● user:8813:session               hash      1.9 KB   56m │
                                                           │
                                                           │
                                                           │

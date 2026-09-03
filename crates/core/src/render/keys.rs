@@ -12,7 +12,7 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
-use crate::state::loaded::{KeyKind, TTL_NONE};
+use crate::state::loaded::TTL_NONE;
 use crate::state::{LoadedSet, State};
 use crate::theme::{Theme, Token};
 
@@ -192,6 +192,9 @@ fn tree_row(
             descendants,
             expanded,
         }) => {
+            if selected {
+                fill_row(buf, area, y, theme.style(Token::Selected));
+            }
             let name = state
                 .keys
                 .arena_slice(offset, len)
@@ -200,7 +203,7 @@ fn tree_row(
             let marker = if expanded { "▾" } else { "▸" };
             let indent = area.x + cols.name + depth * 2;
             let style = theme.style(if selected {
-                Token::BorderFocus
+                Token::Selected
             } else {
                 Token::Text
             });
@@ -214,13 +217,18 @@ fn tree_row(
             // A collapsed node states what it is hiding, so folding never loses
             // information about how much is down there.
             if let Some((x, w)) = cols.ttl.or(cols.size) {
+                let meta = if selected {
+                    Token::Selected
+                } else {
+                    Token::Muted
+                };
                 super::put_right(
                     buf,
                     area.x + x,
                     y,
                     w,
                     &descendants.to_string(),
-                    theme.style(Token::Muted),
+                    theme.style(meta),
                 );
             }
         }
@@ -265,12 +273,38 @@ fn key_row(
     indent: u16,
     buf: &mut Buffer,
 ) {
+    if selected {
+        fill_row(buf, area, y, theme.style(Token::Selected));
+    }
+
+    let kind = keys.kind(i);
+    // The dot carries the type's hue everywhere a key is listed — DESIGN §5's
+    // "consistent everywhere a type appears" — while the TYPE column spells
+    // the same fact out in words, which is what keeps it legible with no hue
+    // at all. Selection overrides both to the row's single highlight colour,
+    // same as every other cell on that row.
+    let dot_style = theme.style(if selected {
+        Token::Selected
+    } else {
+        crate::theme::type_token(kind)
+    });
+    let dot = if kind.is_some() { "●" } else { PENDING };
+    super::put(buf, area.x + cols.name + indent, y, dot, dot_style);
+
     let name_style = theme.style(if selected {
-        Token::BorderFocus
+        Token::Selected
     } else {
         Token::Text
     });
-    let meta_style = theme.style(Token::Muted);
+    let meta_style = theme.style(if selected {
+        Token::Selected
+    } else {
+        Token::Muted
+    });
+
+    // Two extra columns reserved for "<dot> ", so the name never overlaps it
+    // and the TYPE column keeps its position regardless of the dot's glyph.
+    const DOT_W: u16 = 2;
 
     // In tree mode only the leaf segment is shown: the ancestors are already on
     // screen as group rows above it, and repeating them wastes the column.
@@ -282,19 +316,25 @@ fn key_row(
     };
     super::put(
         buf,
-        area.x + cols.name + indent,
+        area.x + cols.name + indent + DOT_W,
         y,
-        &truncate(&name, cols.name_width.saturating_sub(indent) as usize),
+        &truncate(
+            &name,
+            cols.name_width.saturating_sub(indent + DOT_W) as usize,
+        ),
         name_style,
     );
 
     // Each of these renders a placeholder at the same position when the value
     // has not arrived, so nothing moves when it does.
     if let Some(x) = cols.kind {
-        let text = keys
-            .kind(i)
-            .map_or(PENDING.to_string(), |k| k.label().to_string());
-        super::put(buf, area.x + x, y, &text, kind_style(theme, keys.kind(i)));
+        let text = kind.map_or(PENDING.to_string(), |k| k.label().to_string());
+        let style = theme.style(if selected {
+            Token::Selected
+        } else {
+            crate::theme::type_token(kind)
+        });
+        super::put(buf, area.x + x, y, &text, style);
     }
     if let Some((x, w)) = cols.size {
         let text = keys.size(i).map_or(PENDING.to_string(), format_size);
@@ -306,11 +346,15 @@ fn key_row(
     }
 }
 
-fn kind_style(theme: &Theme, kind: Option<KeyKind>) -> ratatui::style::Style {
-    theme.style(match kind {
-        None => Token::Muted,
-        Some(_) => Token::Text,
-    })
+/// Paint an entire row with one style before drawing text over it.
+///
+/// `put()` resets a cell's style before applying its own, so a background
+/// painted here would otherwise be erased the moment any text is drawn on top
+/// of it — every subsequent `put`/`put_right` call on a selected row must
+/// carry the same [`Token::Selected`] style for the fill to read as one
+/// continuous bar rather than a background with holes in it.
+fn fill_row(buf: &mut Buffer, area: Rect, y: u16, style: ratatui::style::Style) {
+    super::put(buf, area.x, y, &" ".repeat(area.width as usize), style);
 }
 
 /// Truncate from the right with an ellipsis. Key names share long prefixes, so

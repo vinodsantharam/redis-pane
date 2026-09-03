@@ -80,13 +80,21 @@ fn value_pane(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect, buf: 
 
     let viewer = open.value.viewer();
     let kind = open.value.kind();
-    let summary = format!(
-        "{} · {} · {}",
+    // Consistent everywhere a type appears (DESIGN §5): the same hue the keys
+    // pane's dot uses, here on the one word that names the type.
+    let x1 = put(
+        buf,
+        x0,
+        area.y + 1,
         kind.label(),
+        theme.style(crate::theme::type_token(Some(kind))),
+    );
+    let rest = format!(
+        " · {} · {}",
         viewer.measure(),
         keys::format_size(open.size_bytes)
     );
-    put(buf, x0, area.y + 1, &summary, theme.style(Token::Muted));
+    put(buf, x1, area.y + 1, &rest, theme.style(Token::Muted));
 
     // TTL is counted down locally: the most time-sensitive figure on screen
     // costs no round trip (R3.9).
@@ -591,18 +599,26 @@ fn is_plain(s: &Style) -> bool {
 }
 
 fn describe_style(s: &Style) -> String {
-    let fg = match s.fg {
-        None => "fg=none".to_string(),
-        Some(ratatui::style::Color::Rgb(r, g, b)) => format!("fg=#{r:02x}{g:02x}{b:02x}"),
-        Some(ratatui::style::Color::Indexed(i)) => format!("fg=ansi{i}"),
-        Some(other) => format!("fg={other:?}"),
+    let color = |c: Option<ratatui::style::Color>, label: &str| match c {
+        None => format!("{label}=none"),
+        Some(ratatui::style::Color::Rgb(r, g, b)) => format!("{label}=#{r:02x}{g:02x}{b:02x}"),
+        Some(ratatui::style::Color::Indexed(i)) => format!("{label}=ansi{i}"),
+        Some(other) => format!("{label}={other:?}"),
+    };
+    let fg = color(s.fg, "fg");
+    // A background is rare enough (only Token::Selected sets one) that it is
+    // worth calling out explicitly rather than silently dropping it, which is
+    // what this function did before the selection-highlight feature existed.
+    let bg = match s.bg {
+        None => String::new(),
+        Some(_) => format!(" {}", color(s.bg, "bg")),
     };
     let mods = if s.add_modifier.is_empty() {
         String::new()
     } else {
         format!(" {:?}", s.add_modifier)
     };
-    format!("{fg}{mods}")
+    format!("{fg}{bg}{mods}")
 }
 
 #[cfg(test)]

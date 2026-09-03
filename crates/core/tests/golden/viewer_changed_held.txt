@@ -1,12 +1,12 @@
 ─ redis-pane ─ ● staging · cache-01:6379/0 · from profile staging ─────────────────────────────────────────────────────── ● live ─
 
  KEY                               TYPE        SIZE   TTL │ user:8812:session
- user:8812:cart                    zset       412 B   12m │ hash · 5 fields · 2.1 KB
- user:8812:profile                 json       880 B     ∞ │ ttl 42m                                       ● live · changed 2s ago
- user:8812:session                 hash      2.1 KB   42m │                                                             r to load
- user:8813:session                 hash      1.9 KB   56m │ FIELD                             VALUE
- cart:91af3c9d2e                   zset      1.1 MB   12m │ region                            eu-west-1
- feed:global:hot                   list     63.0 KB     ∞ │ plan                              pro
+ ● user:8812:cart                  zset       412 B   12m │ hash · 5 fields · 2.1 KB
+ ● user:8812:profile               json       880 B     ∞ │ ttl 42m                                       ● live · changed 2s ago
+ ● user:8812:session               hash      2.1 KB   42m │                                                             r to load
+ ● user:8813:session               hash      1.9 KB   56m │ FIELD                             VALUE
+ ● cart:91af3c9d2e                 zset      1.1 MB   12m │ region                            eu-west-1
+ ● feed:global:hot                 list     63.0 KB     ∞ │ plan                              pro
                                                           │ locale                            fr-FR
                                                           │
                                                           │

@@ -553,10 +553,15 @@ fn metadata_arriving_does_not_shift_a_single_column() {
     let pending_frame = draw(&pending(), 130, 26);
     let filled_frame = draw(&browsing(), 130, 26);
 
+    // `str::find` returns a *byte* offset, and the dot marker preceding a key
+    // name can be "●" (3 bytes, a known type) or the pending placeholder "·"
+    // (2 bytes) — both occupy exactly one terminal column, so a byte offset
+    // would report a false shift between them. Column position is measured in
+    // characters instead, which is what actually appears on screen.
     let column_of = |frame: &str, needle: &str| -> Vec<usize> {
         frame
             .lines()
-            .filter_map(|l| l.find(needle))
+            .filter_map(|l| l.find(needle).map(|byte_idx| l[..byte_idx].chars().count()))
             .collect::<Vec<_>>()
     };
 
@@ -756,8 +761,10 @@ fn tree_mode_shows_group_counts_and_leaf_names_only() {
     assert!(frame.contains("▾ 8812:"), "nested groups fold too: {frame}");
     // A leaf under `user:8812:` shows as `session`, not the whole path — the
     // ancestors are already on screen above it.
+    // Leaf rows now carry a type-coloured dot ahead of the name (the UI task
+    // this docstring predates), so the line starts with the dot, not the text.
     assert!(
-        frame.lines().any(|l| l.trim_start().starts_with("session")),
+        frame.lines().any(|l| l.trim_start().contains("● session")),
         "{frame}"
     );
 }
@@ -1208,4 +1215,109 @@ fn editing_is_visibly_distinct_from_plain_live_in_monochrome_too() {
         Rect::new(0, 0, 130, 22),
     );
     assert!(render::to_text(&mono).contains("editing"));
+}
+
+// ── UI task: type colour dots and the selection bar (style-verified) ────────
+
+use redis_pane_core::theme::Token;
+
+#[test]
+fn golden_browser_style_selection_and_type_colours() {
+    let state = many_keys();
+    let frame = render::frame(
+        &state,
+        &Theme::new(ColorDepth::TrueColor),
+        &CLOCK,
+        Rect::new(0, 0, 90, 12),
+    );
+    assert_golden("browser_style_truecolor", &render::to_golden(&frame));
+}
+
+/// Find the y coordinate of the rendered row containing `needle`, by reading
+/// the text a real frame produces rather than guessing chrome-row arithmetic.
+fn row_of(frame: &ratatui::buffer::Buffer, needle: &str) -> u16 {
+    render::to_text(frame)
+        .lines()
+        .position(|l| l.contains(needle))
+        .expect("row not found") as u16
+}
+
+#[test]
+fn the_selected_row_carries_a_background_all_the_way_across_not_just_on_the_name() {
+    // The tricky part of this feature: put() resets style before applying its
+    // own, so a background painted once and then written over by later cells
+    // would leave holes rather than one continuous bar.
+    let state = many_keys(); // selection defaults to row 0: user:8812:cart
+    let theme = Theme::new(ColorDepth::TrueColor);
+    let frame = render::frame(&state, &theme, &CLOCK, Rect::new(0, 0, 130, 12));
+    let y = row_of(&frame, "user:8812:cart");
+
+    let selected_bg = theme.style(Token::Selected).bg;
+    assert!(selected_bg.is_some());
+
+    // The bar spans exactly the keys pane, not the full 130-column frame —
+    // there is a value pane to the right of it, correctly unpainted.
+    let keys_pane_width = redis_pane_core::render::layout::layout(Rect::new(0, 0, 130, 12))
+        .keys
+        .width;
+
+    let mut gaps = Vec::new();
+    for x in 1..keys_pane_width {
+        match frame.cell((x, y)) {
+            Some(cell) if cell.style().bg == selected_bg => {}
+            other => gaps.push((x, other.map(|c| c.style().bg))),
+        }
+    }
+    assert!(gaps.is_empty(), "the selection bar has gaps: {gaps:?}");
+}
+
+#[test]
+fn an_unselected_row_carries_no_background_at_all() {
+    // The selection bar must not bleed into neighbouring rows.
+    let state = many_keys();
+    let theme = Theme::new(ColorDepth::TrueColor);
+    let frame = render::frame(&state, &theme, &CLOCK, Rect::new(0, 0, 130, 12));
+    let y = row_of(&frame, "user:8812:profile"); // row 1, not selected
+
+    let keys_pane_width = redis_pane_core::render::layout::layout(Rect::new(0, 0, 130, 12))
+        .keys
+        .width;
+    for x in 1..keys_pane_width {
+        let bg = frame.cell((x, y)).map(|c| c.style().bg);
+        assert!(
+            matches!(bg, Some(None) | Some(Some(ratatui::style::Color::Reset))),
+            "row 1 should carry no background, found {bg:?} at column {x}"
+        );
+    }
+}
+
+#[test]
+fn distinct_types_render_with_distinct_dot_colours_in_a_real_frame() {
+    // many_keys(): cart(zset) profile(json) session(hash) session(hash)
+    // cart(zset) hot(list) — enough variety to prove the dots are not all one
+    // colour, without hard-coding the exact hue table here. Row 0 (cart) is
+    // selected, so its dot is overridden to the selection colour; the rest
+    // show their real per-type hue.
+    let state = many_keys();
+    let theme = Theme::new(ColorDepth::TrueColor);
+    let frame = render::frame(&state, &theme, &CLOCK, Rect::new(0, 0, 130, 12));
+
+    let rows = [
+        "user:8812:profile",
+        "user:8812:session",
+        "cart:91af3c9d2e",
+        "feed:global:hot",
+    ];
+    let dot_colors: Vec<_> = rows
+        .iter()
+        .map(|needle| {
+            let y = row_of(&frame, needle);
+            frame.cell((1, y)).map(|c| c.style().fg)
+        })
+        .collect();
+    let unique: std::collections::HashSet<_> = dot_colors.iter().collect();
+    assert!(
+        unique.len() > 1,
+        "every row's dot rendered the same colour: {dot_colors:?}"
+    );
 }

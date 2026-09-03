@@ -138,11 +138,14 @@ async fn main() {
     } else {
         redis_pane::redis::read::Arming::Unsupported
     };
-    let read = redis_pane::redis::read::read_value(&client, &name, 50, arming)
-        .await
-        .expect("read");
+    let read_result = redis_pane::redis::read::read_value(&client, &name, 50, arming).await;
     let read_ms = t3.elapsed();
-    if let Some(read) = read {
+    // This is exactly what terminal.rs's open_key must also do: Ok(_) after
+    // Arming::Enabled means CLIENT CACHING YES already succeeded on the wire.
+    if arming == redis_pane::redis::read::Arming::Enabled && read_result.is_ok() {
+        (state, _) = update(state, Msg::TrackingArmed);
+    }
+    if let Ok(Some(read)) = read_result {
         (state, _) = update(
             state,
             Msg::ValueLoaded {
@@ -156,6 +159,11 @@ async fn main() {
         );
     }
     show("── a key open ──", &state, &clock);
+    println!(
+        "\nliveness after opening a key: {:?} (tracking_supported={})",
+        state.liveness(),
+        est.tracking_supported
+    );
 
     // ── a filter, applied to what is already loaded ────────────────────────
     state.list.filter = "user:*:session".into();

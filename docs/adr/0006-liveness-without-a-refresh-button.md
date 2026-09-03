@@ -112,6 +112,17 @@ one: after every invalidation, and after every reconnect.
   Viewer refetches. One fewer feature and one fewer binding.
 - The Viewer gains one piece of state it did not have: whether the viewport is at rest. That is
   the price of apply-if-idle, and it is the only new state this decision introduces.
+- **The shell never told the core that arming succeeded.** `read_value` awaited
+  `CLIENT CACHING YES` and it worked, but nothing sent `Msg::TrackingArmed` — the message the core
+  requires before it will report `Live` (that guard is the whole point of this ADR). The header
+  read `○ manual` on every server, including local Redis with tracking fully working, and no test
+  in the suite could catch it: the core's own tests supply `TrackingArmed` directly, and the
+  integration suite asserted the *server* pushed an invalidation without checking that the *shell*
+  ever reported the arming that made the read live in the first place. Found only by running the
+  real binary against Redis Cloud and asking why a server that accepts `CLIENT TRACKING` still
+  showed manual. Fixed by sending `TrackingArmed` from the one place both `OpenKey` and
+  `RefetchOpenKey` funnel through, whenever `Arming::Enabled` and the read succeeds — which is
+  exactly when arming is known to have happened on the wire.
 - **There is nothing to arm on a server that refuses tracking.** Arming unconditionally makes
   every read fail on such a server — Upstash rejects `CLIENT CACHING` outright, so the app could
   browse a keyspace and open nothing in it. Arming is driven by the capability probe and by

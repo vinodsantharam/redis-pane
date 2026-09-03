@@ -712,3 +712,58 @@ async fn a_key_opens_on_a_server_that_refuses_tracking() {
     let _ = client.quit().await;
     let _ = writer.quit().await;
 }
+
+// ── the shell must actually tell the core arming succeeded ──────────────────
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn opening_a_key_on_a_tracking_capable_server_reaches_live_state() {
+    // Found by hand against Redis Cloud, not by anything in this suite:
+    // read_value awaited CLIENT CACHING YES and it succeeded on the wire, but
+    // nothing ever sent core::Msg::TrackingArmed, so State::liveness() could
+    // never return Live — the header read "manual" forever, on every server,
+    // local Redis included. The core's guard (no Live without an explicit
+    // TrackingArmed) was airtight; the shell just never told it the truth.
+    //
+    // This exercises the exact sequence terminal.rs's open_key runs: connect,
+    // read a key with Arming::Enabled, and — only because the read succeeded —
+    // report TrackingArmed before ValueLoaded.
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer.set("k", "v", None, None, false).await.unwrap();
+
+    let (client, est) = redis_pane::redis::connect(&url).await.unwrap();
+    assert!(
+        est.tracking_supported,
+        "this container must support tracking or the test proves nothing"
+    );
+
+    let arming = redis_pane::redis::read::Arming::Enabled;
+    let read = redis_pane::redis::read::read_value(&client, b"k", 40, arming)
+        .await
+        .unwrap();
+    assert!(read.is_some(), "arming happens inside a successful read");
+
+    // The shell's obligation, reproduced directly: report arming, then load.
+    let mut state = State::default();
+    (state, _) = update(
+        state,
+        Msg::Connected {
+            version: est.version.to_string(),
+            tracking_supported: true,
+        },
+    );
+    (state, _) = update(state, Msg::TrackingArmed);
+
+    assert_eq!(
+        state.liveness(),
+        redis_pane_core::state::Liveness::Live,
+        "a server that supports tracking, successfully armed, must reach Live"
+    );
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}

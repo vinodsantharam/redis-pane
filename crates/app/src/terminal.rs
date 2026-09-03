@@ -301,6 +301,19 @@ pub async fn run(
 
 /// Read a key and send the result in. The one read path: it always re-arms,
 /// so there is no branch on which liveness can be silently lost (ADR-0006).
+///
+/// Both `Command::OpenKey` and `Command::RefetchOpenKey` — including the one
+/// an invalidation push triggers — call this, which is what unifies both
+/// re-arm invariants (ADR-0006, ADR-0009) into one place instead of two.
+///
+/// **Found by testing against real managed servers, not by any test in the
+/// suite:** `CLIENT CACHING YES` was sent and awaited inside `read_value`, but
+/// nothing ever told the core it had succeeded. `State::liveness()` correctly
+/// refuses to report `Live` without a `Msg::TrackingArmed` — that guard is the
+/// whole point of ADR-0009 — but nothing on this path ever sent one. The header
+/// read `○ manual` forever, on every server, including local Redis with
+/// tracking fully working. The core's invariant was airtight; the shell simply
+/// never told it the truth.
 fn open_key(
     client: &Client,
     index: usize,
@@ -316,7 +329,16 @@ fn open_key(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let msg = match crate::redis::read::read_value(&client, &name, pane_width, arming).await {
+        let result = crate::redis::read::read_value(&client, &name, pane_width, arming).await;
+
+        // `read_value` awaits `CLIENT CACHING YES` with `?` before doing
+        // anything else, so any Ok(_) here means arming already succeeded on
+        // the wire — this message is what makes that fact reach the core.
+        if arming == crate::redis::read::Arming::Enabled && result.is_ok() {
+            let _ = tx.send(Msg::TrackingArmed).await;
+        }
+
+        let msg = match result {
             Ok(Some(read)) => Msg::ValueLoaded {
                 index,
                 name: String::from_utf8_lossy(&name).into_owned(),

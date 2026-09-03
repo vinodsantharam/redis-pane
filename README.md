@@ -12,9 +12,9 @@ structured data as structured data and makes dangerous operations feel dangerous
 
 **Requires Redis 6.0+ (or Valkey).** RESP3 only.
 
-**In progress — [M0 is complete](docs/PLAN.md).** It connects, says exactly what it is connected
-to and why, survives the server restarting underneath it, and exits usefully when it cannot
-connect. There is no keyspace browser yet — that is M1. The specification is still the
+**In progress — [M0 and M1 are complete](docs/PLAN.md).** It browses a keyspace, renders every
+Redis type, and a key changing on the server updates on screen without anyone pressing anything.
+Mutation is M2, so it reads but does not yet write. The specification is still the
 deliverable and is kept current rather than archived. Stack: Rust + [ratatui](https://ratatui.rs)
 + tokio + [fred](https://docs.rs/fred).
 

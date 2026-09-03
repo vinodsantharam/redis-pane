@@ -124,6 +124,9 @@ they are expensive to retrofit:
   note that "just for the first frame" is how it starts.
 - **Mutations flow through one path** that produces a command preview before executing. Read-only
   mode and confirmation-scaling are enforced at that chokepoint, not at each call site.
+- **The clipboard is OSC 52, not a native API.** The product is meant to be used inside SSH
+  sessions, where a native clipboard call copies to the remote machine's clipboard — which is
+  nobody's. See `crates/app/src/clipboard.rs`.
 - **Colors are semantic tokens, never literals.** Themes remap tokens; widgets ask for
   `border-focus` or `type.hash`, never a hex value. Same for icons (Nerd Font vs. ASCII must be
   width-identical).

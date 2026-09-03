@@ -1035,3 +1035,153 @@ fn the_ttl_counts_down_between_frames_without_any_fetch() {
         text(&a_minute_later)
     );
 }
+
+// ── M1.12 — copy ────────────────────────────────────────────────────────────
+
+use redis_pane_core::keymap::{Action as Act, Keymap as Km};
+use redis_pane_core::msg::KeyCode as KC;
+use redis_pane_core::state::copy::{redis_cli_command, value_text};
+use redis_pane_core::{Command, Msg, update};
+
+fn press(state: State, c: char) -> (State, Vec<Command>) {
+    update(state, Msg::Key(KeyPress::plain(KC::Char(c))))
+}
+
+#[test]
+fn y_then_y_copies_the_key_name() {
+    let state = opened("user:8812:session", hash_value(), 600);
+    let (state, cmds) = press(state, 'y');
+    assert!(cmds.is_empty(), "the chord waits for its second key");
+    assert!(state.copy_pending);
+
+    let (state, cmds) = press(state, 'y');
+    assert!(!state.copy_pending);
+    match cmds.first() {
+        Some(Command::CopyToClipboard { text, label }) => {
+            assert_eq!(text, "user:8812:session");
+            assert_eq!(*label, "key");
+        }
+        other => panic!("expected a copy, got {other:?}"),
+    }
+}
+
+#[test]
+fn y_then_v_copies_the_whole_value() {
+    let state = opened("k", hash_value(), 600);
+    let (state, _) = press(state, 'y');
+    let (_, cmds) = press(state, 'v');
+    match cmds.first() {
+        Some(Command::CopyToClipboard { text, .. }) => {
+            assert_eq!(
+                text.lines().count(),
+                5,
+                "all five fields, not the visible ones"
+            );
+            assert!(text.contains("device\tios/17.2"));
+        }
+        other => panic!("expected a copy, got {other:?}"),
+    }
+}
+
+#[test]
+fn y_then_c_copies_a_command_that_would_actually_run() {
+    let state = opened("user:8812:session", hash_value(), 600);
+    let (state, _) = press(state, 'y');
+    let (_, cmds) = press(state, 'c');
+    match cmds.first() {
+        Some(Command::CopyToClipboard { text, .. }) => {
+            assert_eq!(
+                text,
+                "redis-cli -h cache-01 -p 6379 -n 0 HGETALL user:8812:session"
+            );
+        }
+        other => panic!("expected a copy, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_unrecognised_second_key_cancels_rather_than_guessing() {
+    // The clipboard is somewhere the user cannot see, so guessing is worse
+    // than doing nothing.
+    let state = opened("k", hash_value(), 600);
+    let (state, _) = press(state, 'y');
+    let (state, cmds) = press(state, 'z');
+    assert!(cmds.is_empty());
+    assert!(!state.copy_pending, "and the chord does not stay armed");
+}
+
+#[test]
+fn the_key_name_is_copyable_from_the_list_with_nothing_open() {
+    let mut state = many_keys();
+    state.open = None;
+    let (state, _) = press(state, 'y');
+    let (_, cmds) = press(state, 'y');
+    assert!(
+        matches!(cmds.first(), Some(Command::CopyToClipboard { .. })),
+        "a key name needs no open value"
+    );
+}
+
+#[test]
+fn copying_a_value_with_nothing_open_says_so_instead_of_copying_nothing() {
+    let mut state = many_keys();
+    state.open = None;
+    let (state, _) = press(state, 'y');
+    let (state, cmds) = press(state, 'v');
+    assert!(cmds.is_empty());
+    assert_eq!(state.notice_now(0), Some("nothing open to copy"));
+}
+
+#[test]
+fn the_confirmation_fades_on_its_own() {
+    // A notice you must dismiss is a modal dialog wearing a smaller hat.
+    let (state, _) = update(
+        opened("k", hash_value(), 600),
+        Msg::Copied {
+            label: "key",
+            at_ms: 70_000,
+        },
+    );
+    assert_eq!(state.notice_now(70_500), Some("copied key"));
+    assert_eq!(state.notice_now(74_000), None, "gone by 4 seconds");
+}
+
+#[test]
+fn golden_copy_notice() {
+    let (state, _) = update(
+        opened("user:8812:session", hash_value(), 2_537),
+        Msg::Copied {
+            label: "redis-cli command",
+            at_ms: 73_000,
+        },
+    );
+    assert_golden("copy_notice", &draw(&state, 130, 22));
+}
+
+#[test]
+fn the_copy_binding_appears_in_the_help_overlay() {
+    // Keybindings are data, so the overlay follows automatically (R7.5).
+    let mut keymap = Km::default();
+    assert!(keymap.hint(Act::Copy).is_some());
+    keymap.bind(Act::Copy, KeyPress::ctrl(KC::Char('y')));
+    let state = State { keymap, ..base() };
+    assert!(help_lines(&state).iter().any(|l| l.starts_with("⌃Y")));
+}
+
+#[test]
+fn the_command_uses_the_target_the_title_bar_is_showing() {
+    // A copied command that points at a different server than the one on
+    // screen would be actively dangerous.
+    let state = opened("k", hash_value(), 600);
+    let cmd = redis_cli_command(&state.connection.target, state.open.as_ref().unwrap());
+    assert!(cmd.contains("cache-01"), "{cmd}");
+    assert_eq!(state.connection.target, "cache-01:6379/0");
+}
+
+#[test]
+fn copying_a_value_is_not_affected_by_where_the_viewer_is_scrolled() {
+    let mut state = opened("k", hash_value(), 600);
+    state.open.as_mut().unwrap().offset = 3;
+    let full = value_text(&state.open.as_ref().unwrap().value);
+    assert_eq!(full.lines().count(), 5);
+}

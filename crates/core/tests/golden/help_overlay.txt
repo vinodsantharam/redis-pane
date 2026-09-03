@@ -20,3 +20,4 @@ t       tree
 l       open
 ⌃↓      scroll
 ⌃↑      scroll
+y       copy

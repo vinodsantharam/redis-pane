@@ -7,6 +7,7 @@
 //! This is a library as well as a binary so the integration suite can drive the
 //! shells directly rather than through a subprocess.
 
+pub mod clipboard;
 pub mod config_io;
 pub mod redis;
 pub mod state_file;

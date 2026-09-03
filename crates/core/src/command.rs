@@ -43,4 +43,9 @@ pub enum Command {
     /// Distinct from [`Command::RefetchOpenKey`] only in that it changes which
     /// key is open; both go through the one read path that always arms.
     OpenKey { index: usize, name: Vec<u8> },
+    /// Put text on the clipboard.
+    ///
+    /// The core builds the text; how it reaches a clipboard is the shell's
+    /// problem, and over SSH a harder one than it appears.
+    CopyToClipboard { text: String, label: &'static str },
 }

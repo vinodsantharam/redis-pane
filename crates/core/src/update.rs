@@ -3,6 +3,7 @@
 use crate::keymap::Action;
 use crate::msg::KeyCode;
 use crate::msg::KeyPress;
+use crate::state::copy::{CopyWhat, redis_cli_command, value_text};
 use crate::state::{Link, OpenKey, ReadOnlyReason, ScanState, Tracking};
 use crate::{Command, Msg, State};
 
@@ -163,6 +164,10 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             }
             (state, Vec::new())
         }
+        Msg::Copied { label, at_ms } => {
+            state.notice = Some((format!("copied {label}"), at_ms));
+            (state, Vec::new())
+        }
         Msg::Quit => quit(state),
     }
 }
@@ -209,6 +214,11 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
     // commands. Only Esc and Enter mean anything else.
     if state.filtering {
         return filter_key(state, key);
+    }
+    // `y` arms a chord; the next key says what to copy.
+    if state.copy_pending {
+        state.copy_pending = false;
+        return copy_key(state, key);
     }
     let Some(action) = state.keymap.action_for(&key) else {
         return (state, Vec::new());
@@ -284,6 +294,10 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             }
             (state, Vec::new())
         }
+        Action::Copy => {
+            state.copy_pending = true;
+            (state, Vec::new())
+        }
         Action::Filter => {
             state.filtering = true;
             (state, Vec::new())
@@ -342,6 +356,55 @@ fn group_prefix_at(state: &State, row: usize) -> Option<String> {
         out.push(sep);
     }
     Some(out)
+}
+
+/// The second half of the `y` chord.
+///
+/// `y y` copies the key, `y v` the value, `y c` a `redis-cli` command. Anything
+/// else cancels — an unrecognised second key should do nothing rather than
+/// guess, because the clipboard is somewhere the user cannot see.
+fn copy_key(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
+    let what = match key.code {
+        KeyCode::Char('y') | KeyCode::Char('k') => CopyWhat::Key,
+        KeyCode::Char('v') => CopyWhat::Value,
+        KeyCode::Char('c') => CopyWhat::Command,
+        _ => return (state, Vec::new()),
+    };
+
+    // The key name is copyable from the list alone; the other two need an open
+    // value, because there is nothing to copy until the server has said what it
+    // holds (ADR-0006).
+    let text = match what {
+        CopyWhat::Key => match state.open.as_ref().map(|o| o.name.clone()) {
+            Some(name) => name,
+            None => match state.selected_key().and_then(|i| state.keys.name_str(i)) {
+                Some(name) => name.into_owned(),
+                None => return (state, Vec::new()),
+            },
+        },
+        CopyWhat::Value => match &state.open {
+            Some(open) => value_text(&open.value),
+            None => {
+                state.notice = Some(("nothing open to copy".into(), 0));
+                return (state, Vec::new());
+            }
+        },
+        CopyWhat::Command => match &state.open {
+            Some(open) => redis_cli_command(&state.connection.target, open),
+            None => {
+                state.notice = Some(("nothing open to copy".into(), 0));
+                return (state, Vec::new());
+            }
+        },
+    };
+
+    (
+        state,
+        vec![Command::CopyToClipboard {
+            text,
+            label: what.label(),
+        }],
+    )
 }
 
 /// Keys typed while the filter is capturing.

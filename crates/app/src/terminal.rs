@@ -202,6 +202,21 @@ pub async fn run(
                         );
                     }
                 }
+                Command::CopyToClipboard { text, label } => {
+                    let truncated = crate::clipboard::was_truncated(&text);
+                    if crate::clipboard::copy(&text).is_ok() {
+                        // Redraw from scratch: the escape sequence went to the
+                        // same stdout ratatui is drawing on.
+                        let _ = term.clear();
+                        let at_ms = clock.now_ms();
+                        let label = if truncated {
+                            "value (truncated)"
+                        } else {
+                            label
+                        };
+                        let _ = tx.send(Msg::Copied { label, at_ms }).await;
+                    }
+                }
                 // Reconnection wiring lands with M2.
                 Command::Reconnect { .. } => {}
             }

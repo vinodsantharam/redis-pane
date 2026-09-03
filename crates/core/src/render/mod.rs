@@ -27,7 +27,7 @@ pub fn frame(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect) -> Buf
     if let Some(value) = plan.value {
         value_pane(state, theme, clock, value, &mut buf);
     }
-    status_bar(state, theme, area, &mut buf);
+    status_bar(state, theme, clock, area, &mut buf);
 
     if plan.hint_bar && area.height >= 3 {
         let hints = hint_bar(state);
@@ -197,21 +197,33 @@ fn clip(s: &str, width: usize) -> String {
 }
 
 /// The status bar: scan progress and its cancel affordance (DESIGN §6.2).
-fn status_bar(state: &State, theme: &Theme, area: Rect, buf: &mut Buffer) {
+fn status_bar(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect, buf: &mut Buffer) {
     let readout = state.scan.readout();
-    if (readout.is_empty() && state.list.sort_readout().is_none()) || area.height < 2 {
+    let quiet = readout.is_empty()
+        && state.list.sort_readout().is_none()
+        && state.notice_now(clock.now_ms()).is_none();
+    if quiet || area.height < 2 {
         return;
     }
     let y = area.height - if area.height >= 24 { 2 } else { 1 };
-    let token = match state.scan {
-        crate::state::ScanState::Capped { .. } | crate::state::ScanState::Failed { .. } => {
-            Token::Warn
+    let token = if state.notice_now(clock.now_ms()).is_some() {
+        Token::Ok
+    } else {
+        match state.scan {
+            crate::state::ScanState::Capped { .. } | crate::state::ScanState::Failed { .. } => {
+                Token::Warn
+            }
+            _ => Token::Muted,
         }
-        _ => Token::Muted,
     };
     let mut line = readout;
     if let Some(sort) = state.list.sort_readout() {
         line = format!("{line}   {sort}");
+    }
+    // A copy confirmation displaces the scan readout for a moment rather than
+    // claiming another row (G7).
+    if let Some(notice) = state.notice_now(clock.now_ms()) {
+        line = notice.to_string();
     }
     let x = put(buf, 1, y, &line, theme.style(token));
     if state.scan.is_running()

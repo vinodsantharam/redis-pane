@@ -140,6 +140,11 @@ pub enum Msg {
     ValueGone {
         at_ms: u64,
     },
+    /// Something was copied. Drives a notice that fades on its own.
+    Copied {
+        label: &'static str,
+        at_ms: u64,
+    },
     /// The user asked to leave.
     Quit,
 }

@@ -94,7 +94,7 @@ it cannot connect. No keyspace. — **Met.**
 Proves: the keyspace is legible, the values keep their shape, and the screen is never lying about
 how current it is.
 
-**Progress: 1–10 complete.** The Loaded set holds a million keys in 36MB, the keyspace source
+**Progress: complete.** The Loaded set holds a million keys in 36MB, the keyspace source
 streams and cancels against a real server, the browser renders at every breakpoint with metadata
 filling in behind placeholders that hold their column, filter, tree and sort all work by
 permuting an index vector rather than touching the arena, and every Redis type renders behind one
@@ -113,10 +113,10 @@ shared frame whose liveness states are recorded as golden frames.
 | 9 | Type Viewers: string, hash, list, set, zset, stream, JSON, binary | A golden frame per type against a testcontainer fixture |
 | 10 | Liveness UI on M0's transport: arm on open, apply / announce / held, deleted retention | Golden frames of all seven header states; a key modified externally lands without a keypress (R3.6–R3.11) |
 | 11 | Local TTL countdown | Injected-clock test; no round trip |
-| 12 | `y` copy — key, value, `redis-cli` command | Clipboard payloads are exact |
+| 12 | `y` copy — key, value, `redis-cli` command | Payloads are exact, the command matches the key's type, and OSC 52 puts it on the *local* clipboard over SSH |
 
 **Done when** a 100k-key keyspace is browsable in under a second, every type renders as itself,
-and a key changing on the server updates on screen without anyone pressing anything.
+and a key changing on the server updates on screen without anyone pressing anything. — **Met.**
 
 ## 5. Explicitly not in M0 or M1
 

@@ -41,6 +41,8 @@ pub enum Action {
     ViewerDown,
     /// Move up inside the open value.
     ViewerUp,
+    /// Begin a copy. The next key chooses what (R3.5).
+    Copy,
 }
 
 impl Action {
@@ -62,6 +64,7 @@ impl Action {
             Action::ToggleGroup => "fold",
             Action::Open => "open",
             Action::ViewerDown | Action::ViewerUp => "scroll",
+            Action::Copy => "copy",
         }
     }
 }
@@ -196,6 +199,10 @@ impl Default for Keymap {
                 Binding {
                     key: KeyPress::ctrl(KeyCode::Up),
                     action: Action::ViewerUp,
+                },
+                Binding {
+                    key: KeyPress::plain(KeyCode::Char('y')),
+                    action: Action::Copy,
                 },
             ],
         }
@@ -338,6 +345,7 @@ mod tests {
             Action::Open,
             Action::ViewerDown,
             Action::ViewerUp,
+            Action::Copy,
         ] {
             assert!(k.key_for(action).is_some(), "{action:?} has no binding");
         }

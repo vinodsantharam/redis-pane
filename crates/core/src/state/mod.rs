@@ -5,6 +5,7 @@
 //! sorting permutes an index vector rather than moving data — see
 //! [`loaded::LoadedSet`].
 
+pub mod copy;
 pub mod loaded;
 pub mod open;
 pub mod scan;
@@ -12,6 +13,7 @@ pub mod tree;
 pub mod value;
 pub mod view;
 
+pub use copy::CopyWhat;
 pub use loaded::{KeyKind, LoadedSet};
 pub use open::OpenKey;
 pub use scan::ScanState;
@@ -253,6 +255,12 @@ pub struct State {
     /// The key in the Viewer, if one is open. There is no cache behind this —
     /// it holds what the server last said and nothing more (ADR-0006).
     pub open: Option<OpenKey>,
+    /// Set between `y` and the key that says what to copy.
+    pub copy_pending: bool,
+    /// A transient confirmation and when it was raised. It fades on its own
+    /// rather than needing dismissal — a notice you must acknowledge is a
+    /// modal dialog wearing a smaller hat.
+    pub notice: Option<(String, u64)>,
 }
 
 impl State {
@@ -329,6 +337,18 @@ impl State {
         if self.view.selected > last {
             self.view.selected = last;
         }
+    }
+
+    /// How long a copy confirmation stays on screen.
+    pub const NOTICE_MS: u64 = 2_500;
+
+    /// The notice, if it has not faded yet. Computed from the injected clock,
+    /// so a golden frame can pin it (ADR-0011).
+    pub fn notice_now(&self, now_ms: u64) -> Option<&str> {
+        self.notice
+            .as_ref()
+            .filter(|(_, at)| now_ms.saturating_sub(*at) < Self::NOTICE_MS)
+            .map(|(text, _)| text.as_str())
     }
 
     pub fn liveness(&self) -> Liveness {

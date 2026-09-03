@@ -56,7 +56,10 @@ requirements and ADRs for decisions already made.
   M2 builds an actual editor — nothing sets `OpenKey::editing` yet — but correct on day one.
 - [x] **256-color/monochrome hardened and unit-tested.** Extracted a pure `resolve_color_depth`
   so the TERM/COLORTERM decision is tested without mutating the environment; `NO_COLOR`
-  (no-color.org) is now honoured. A real terminal glance is still worth doing — see below.
+  (no-color.org) is now honoured. Confirmed sane by eye against a real terminal at both
+  `TERM=xterm-256color` and `TERM=dumb` (2026-09-04).
+
+**Severity 4 fully closed (2026-09-04).**
 
 ---
 

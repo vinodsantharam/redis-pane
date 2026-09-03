@@ -12,12 +12,16 @@ structured data as structured data and makes dangerous operations feel dangerous
 
 **Requires Redis 6.0+ (or Valkey).** RESP3 only.
 
-**In progress — M0.1–M0.7 of [the plan](docs/PLAN.md) are complete.** The workspace builds, CI is green,
-and there is no UI yet. The specification is still the deliverable and is kept current rather
-than archived. Stack: Rust + [ratatui](https://ratatui.rs) + tokio + [fred](https://docs.rs/fred).
+**In progress — [M0 is complete](docs/PLAN.md).** It connects, says exactly what it is connected
+to and why, survives the server restarting underneath it, and exits usefully when it cannot
+connect. There is no keyspace browser yet — that is M1. The specification is still the
+deliverable and is kept current rather than archived. Stack: Rust + [ratatui](https://ratatui.rs)
++ tokio + [fred](https://docs.rs/fred).
 
 ```bash
-cargo run -p redis-pane -- --print-target
+cargo run -p redis-pane -- --print-target   # resolve a target, print it, exit
+cargo run -p redis-pane -- --probe          # connect and report what the server supports
+cargo run -p redis-pane                     # the TUI; ? for help, q to quit
 ```
 
 ## What it looks like

@@ -65,9 +65,10 @@ validation* are core and pure; config *reading* is a shell.
 
 Proves: the architecture holds, and the app can be trusted about what it is connected to.
 
-**Progress: 1–7 complete.** The workspace builds, the boundary is enforced by CI, the clock is
-injected, golden frames are recorded, the app runs as a TUI you can quit, and resolution and
-config parsing are done with their full test tables.
+**Progress: complete.** The boundary is enforced by CI, the clock is injected, resolution and
+config parsing carry their full test tables, the Redis shell connects over RESP3 and probes for
+`CLIENT TRACKING`, both re-arm invariants are asserted, and every readout in DESIGN §6.8 is a
+recorded golden frame.
 
 | # | Task | Proves |
 |---|---|---|
@@ -86,7 +87,7 @@ config parsing are done with their full test tables.
 
 **Done when** `redis-pane staging` opens against a real server, shows exactly what it is
 connected to and why, survives the server being restarted underneath it, and exits usefully when
-it cannot connect. No keyspace.
+it cannot connect. No keyspace. — **Met.**
 
 ## 4. M1 — Browse
 

@@ -10,7 +10,8 @@ structured data as structured data and makes dangerous operations feel dangerous
 
 ## Status
 
-**Requires Redis 6.0+ (or Valkey).** RESP3 only.
+**Requires Redis 6.0+ (or Valkey).** RESP3 only, TLS supported. Works against managed Redis —
+where `CLIENT TRACKING` is often refused, the header says `○ manual` rather than pretending.
 
 **In progress — [M0 and M1 are complete](docs/PLAN.md).** It browses a keyspace, renders every
 Redis type, and a key changing on the server updates on screen without anyone pressing anything.

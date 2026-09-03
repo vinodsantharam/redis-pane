@@ -47,6 +47,18 @@ pub struct Credentials {
 pub struct Resolution {
     pub connection: Connection,
     pub credentials: Credentials,
+    /// The URL to actually dial, credentials intact.
+    ///
+    /// Kept apart from [`Connection::target`], which is redacted for display.
+    /// Reconstructing one from the other would mean either dialling a redacted
+    /// URL or showing a password.
+    pub dial_url: String,
+}
+
+impl Resolution {
+    pub fn dial_url(&self) -> &str {
+        &self.dial_url
+    }
 }
 
 /// What the user asked for on the command line.
@@ -99,6 +111,7 @@ pub fn resolve(flags: &Flags, config: Option<&Config>, env: &EnvVars) -> Resolut
 
     // 2. A target given directly on the command line.
     if flags.names_a_target() {
+        let raw = flags.url.clone();
         let target = match &flags.url {
             Some(url) => format_url(url, flags.db),
             None => format_target(
@@ -108,6 +121,7 @@ pub fn resolve(flags: &Flags, config: Option<&Config>, env: &EnvVars) -> Resolut
             ),
         };
         let environment = infer_environment(&target);
+        let dial_url = dial_from(raw.as_deref(), &target);
         return Resolution {
             connection: Connection {
                 target,
@@ -115,6 +129,7 @@ pub fn resolve(flags: &Flags, config: Option<&Config>, env: &EnvVars) -> Resolut
                 source: Source::Flag,
             },
             credentials: env_credentials(env),
+            dial_url,
         };
     }
 
@@ -128,6 +143,7 @@ pub fn resolve(flags: &Flags, config: Option<&Config>, env: &EnvVars) -> Resolut
 
     // 4. The environment. REDIS_URL wholesale, or the discrete set — never both.
     if env.names_a_target() {
+        let raw = env.redis_url.clone();
         let target = match &env.redis_url {
             Some(url) => format_url(url, flags.db),
             None => format_target(
@@ -140,6 +156,7 @@ pub fn resolve(flags: &Flags, config: Option<&Config>, env: &EnvVars) -> Resolut
             ),
         };
         let environment = infer_environment(&target);
+        let dial_url = dial_from(raw.as_deref(), &target);
         return Resolution {
             connection: Connection {
                 target,
@@ -147,11 +164,13 @@ pub fn resolve(flags: &Flags, config: Option<&Config>, env: &EnvVars) -> Resolut
                 source: Source::Environment,
             },
             credentials: env_credentials(env),
+            dial_url,
         };
     }
 
     // 5. Nothing was configured.
     let target = format_target(DEFAULT_HOST, DEFAULT_PORT, flags.db.unwrap_or(0));
+    let dial_url = dial_from(None, &target);
     Resolution {
         connection: Connection {
             target,
@@ -159,6 +178,17 @@ pub fn resolve(flags: &Flags, config: Option<&Config>, env: &EnvVars) -> Resolut
             source: Source::Default,
         },
         credentials: env_credentials(env),
+        dial_url,
+    }
+}
+
+/// The URL to dial: the original when one was given, otherwise assembled from
+/// the target. The displayed target is redacted, so it cannot be reused here.
+fn dial_from(raw: Option<&str>, target: &str) -> String {
+    match raw {
+        Some(url) => url.to_string(),
+        None if target.contains("://") => target.to_string(),
+        None => format!("redis://{target}"),
     }
 }
 
@@ -178,6 +208,7 @@ fn env_credentials(env: &EnvVars) -> Credentials {
 
 fn from_profile(name: &str, profile: &Profile, db_override: Option<u8>) -> Resolution {
     let db = db_override.or(profile.db).unwrap_or(0);
+    let raw = profile.url.clone();
     let target = match &profile.url {
         Some(url) => format_url(url, Some(db)),
         None => format_target(
@@ -198,6 +229,7 @@ fn from_profile(name: &str, profile: &Profile, db_override: Option<u8>) -> Resol
         PasswordSource::None
     };
 
+    let dial_url = dial_from(raw.as_deref(), &target);
     Resolution {
         connection: Connection {
             target,
@@ -209,6 +241,7 @@ fn from_profile(name: &str, profile: &Profile, db_override: Option<u8>) -> Resol
             password,
             tls: profile.tls.unwrap_or(false),
         },
+        dial_url,
     }
 }
 
@@ -217,8 +250,31 @@ fn format_target(host: &str, port: u16, db: u8) -> String {
 }
 
 fn format_url(url: &str, db: Option<u8>) -> String {
+    let url = redact(url);
     match db {
         Some(db) => format!("{}/{db}", url.trim_end_matches('/')),
+        None => url,
+    }
+}
+
+/// Remove any password embedded in a URL.
+///
+/// The title bar shows the target permanently (ADR-0001), so a password in a
+/// `rediss://user:pass@host` URL would sit on screen for the whole session —
+/// through every screen-share, screenshot and pasted diagnostic. The userinfo
+/// is kept because a username is not a secret and identifies which ACL user is
+/// connected, which is exactly the kind of thing the Source readout exists for.
+pub fn redact(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let Some((userinfo, host)) = rest.split_once('@') else {
+        return url.to_string();
+    };
+    match userinfo.split_once(':') {
+        Some((user, _password)) if !user.is_empty() => format!("{scheme}://{user}:•••@{host}"),
+        // `redis://:password@host` — no username, so nothing worth keeping.
+        Some(_) => format!("{scheme}://•••@{host}"),
         None => url.to_string(),
     }
 }
@@ -556,5 +612,62 @@ mod credential_tests {
         let c = resolve(&flags, Some(&cfg), &env).credentials;
         assert_eq!(c.password, PasswordSource::Env("PROFILE_PW".into()));
         assert!(c.username.is_none(), "the stale username must not leak in");
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    //! A password must never reach the title bar. It is shown permanently
+    //! (ADR-0001), so anything in it is on screen for the whole session.
+
+    use super::*;
+
+    #[test]
+    fn a_password_in_a_url_is_replaced() {
+        assert_eq!(
+            redact("rediss://default:s3cret@cache.example.com:6379"),
+            "rediss://default:•••@cache.example.com:6379"
+        );
+    }
+
+    #[test]
+    fn the_username_survives_because_it_is_not_a_secret() {
+        // Which ACL user is connected is exactly the kind of fact the Source
+        // readout exists to make visible.
+        assert!(redact("rediss://app-reader:pw@h:6379").starts_with("rediss://app-reader:"));
+    }
+
+    #[test]
+    fn a_password_with_no_username_leaves_nothing_behind() {
+        assert_eq!(redact("redis://:s3cret@h:6379"), "redis://•••@h:6379");
+    }
+
+    #[test]
+    fn a_url_with_no_credentials_is_untouched() {
+        assert_eq!(redact("redis://cache-01:6379"), "redis://cache-01:6379");
+        assert_eq!(redact("cache-01:6379/0"), "cache-01:6379/0");
+    }
+
+    #[test]
+    fn resolution_never_produces_a_target_containing_a_password() {
+        let env = EnvVars {
+            redis_url: Some("rediss://default:hunter2@h.upstash.io:6379".into()),
+            ..EnvVars::default()
+        };
+        let target = resolve(&Flags::default(), None, &env).connection.target;
+        assert!(
+            !target.contains("hunter2"),
+            "leaked into the title bar: {target}"
+        );
+
+        let flags = Flags {
+            url: Some("rediss://default:hunter2@h:6379".into()),
+            ..Flags::default()
+        };
+        let target = resolve(&flags, None, &EnvVars::default()).connection.target;
+        assert!(
+            !target.contains("hunter2"),
+            "leaked into the title bar: {target}"
+        );
     }
 }

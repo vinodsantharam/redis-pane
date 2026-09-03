@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use fred::interfaces::{ClientInterface, TrackingInterface};
 use fred::prelude::*;
+use fred::types::config::TlsConnector;
 use fred::types::{InfoKind, RespVersion};
 use redis_pane_core::msg::MetadataEntry;
 use redis_pane_core::resolve::Credentials;
@@ -116,6 +117,16 @@ pub async fn connect_with(
     }
     if credentials.username.is_some() {
         config.username = credentials.username.clone();
+    }
+    // Managed Redis is TLS-only in practice — Upstash, Redis Cloud, Azure, and
+    // ElastiCache in transit-encryption mode all refuse plaintext. A `rediss://`
+    // URL already sets this; a Profile's `tls: true` is the other way to ask.
+    if credentials.tls && config.tls.is_none() {
+        config.tls = Some(
+            TlsConnector::default_rustls()
+                .map_err(|e| ConnectError::Unreachable(format!("TLS unavailable: {e}")))?
+                .into(),
+        );
     }
     // RESP2 is not spoken at all (ADR-0007): one reply shape per command, and
     // one code path per Viewer.

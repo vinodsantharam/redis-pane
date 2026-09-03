@@ -23,6 +23,12 @@ produces an unexplainable target when a stale export lingers in a shell.
 
 ## Consequences
 
+**The displayed target is redacted; the dialled URL is not.** A `rediss://user:pass@host` URL
+would otherwise put a password in the title bar for the whole session — through every
+screen-share, screenshot and pasted diagnostic. `Resolution` therefore carries both: `target` for
+display with the password replaced by `•••`, and `dial_url` for connecting. Reconstructing either
+from the other would mean dialling a redacted URL or showing a secret.
+
 Making the Source visible at all times is not decoration — it is the entire mitigation for
 resolving silently. It cannot be dropped for visual tidiness without reopening this decision.
 

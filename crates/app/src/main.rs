@@ -72,13 +72,7 @@ fn startup_failure(connection: &Connection, err: &ConnectError) -> String {
 
 /// Connect, report what the server supports, and exit. M0.8's proof, runnable
 /// by hand as well as by the suite.
-fn probe(connection: &Connection, credentials: &Credentials) -> i32 {
-    let url = if connection.target.contains("://") {
-        connection.target.clone()
-    } else {
-        format!("redis://{}", connection.target)
-    };
-
+fn probe(connection: &Connection, credentials: &Credentials, dial: &str) -> i32 {
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
@@ -87,7 +81,7 @@ fn probe(connection: &Connection, credentials: &Credentials) -> i32 {
         }
     };
 
-    match runtime.block_on(redis::connect_with(&url, credentials)) {
+    match runtime.block_on(redis::connect_with(dial, credentials)) {
         Ok((client, established)) => {
             println!(
                 "{} · {} · {}",
@@ -148,6 +142,9 @@ fn main() {
     };
     let resolution = resolve(&flags, config.as_ref(), &env_vars());
     let connection = resolution.connection.clone();
+    // The displayed target is redacted; connecting needs the original, so the
+    // two are deliberately kept apart rather than reconstructed from the label.
+    let dial = resolution.dial_url();
 
     if cli.print_target {
         println!(
@@ -160,16 +157,11 @@ fn main() {
     }
 
     if cli.probe {
-        std::process::exit(probe(&connection, &resolution.credentials));
+        std::process::exit(probe(&connection, &resolution.credentials, dial));
     }
 
     // Connect before taking over the terminal: a failure here is a diagnostic
     // in the shell, not an error box in a TUI (ADR-0009).
-    let url = if connection.target.contains("://") {
-        connection.target.clone()
-    } else {
-        format!("redis://{}", connection.target)
-    };
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
@@ -178,7 +170,7 @@ fn main() {
         }
     };
     let (client, established) =
-        match runtime.block_on(redis::connect_with(&url, &resolution.credentials)) {
+        match runtime.block_on(redis::connect_with(dial, &resolution.credentials)) {
             Ok(pair) => pair,
             Err(err @ (ConnectError::BelowFloor { .. } | ConnectError::NoResp3 { .. })) => {
                 eprintln!("{}", startup_failure(&connection, &err));

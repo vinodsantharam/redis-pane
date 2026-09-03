@@ -48,6 +48,11 @@ failure ADR-0006 exists to prevent.
 ## Consequences
 
 - One protocol, one reply shape, one code path per type Viewer.
+- **Confirmed in the wild.** Upstash reports `redis_version:8.4.0` and refuses `CLIENT TRACKING`,
+  exactly as this decision predicted from the ElastiCache Serverless case. A version check would
+  have claimed `● live` against a server that never agreed to tell us anything.
+- Managed Redis is TLS-only in practice, so TLS is not optional for this product: without it the
+  app reaches localhost and Docker and nothing a team actually runs.
 - The `○ manual` path is **production infrastructure, not a legacy path**. It must be built to
   the same standard as the live path: Read age visible, `r` bound, and the reason stated.
 - Capability probing happens once per Connection, at connect and on every reconnect.

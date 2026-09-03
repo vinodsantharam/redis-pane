@@ -1,0 +1,19 @@
+─ redis-pane ─ ● staging · cache-01:6379/0 · from profile staging ─────────────────────────────────────────────────────── ● live ─
+
+ / user:*:session                                  2 of 6 │ user:8812:session
+ KEY                               TYPE        SIZE   TTL │
+ user:8812:session                 hash      2.1 KB   42m │ value viewers land in M1.8
+ user:8813:session                 hash      1.9 KB   56m │
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+                                                          │

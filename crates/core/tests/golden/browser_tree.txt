@@ -1,0 +1,20 @@
+─ redis-pane ─ ● staging · cache-01:6379/0 · from profile staging ─────────────────────────────────────────────────────── ● live ─
+
+ KEY                               TYPE        SIZE   TTL │ a group is selected
+ ▾ cart:                                                1 │
+   91af3c9d2e                      zset      1.1 MB   12m │
+ ▾ feed:                                                1 │
+   ▾ global:                                            1 │
+     hot                           list     63.0 KB     ∞ │
+ ▾ user:                                                4 │
+   ▾ 8812:                                              3 │
+     cart                          zset       412 B   12m │
+     profile                       json       880 B     ∞ │
+     session                       hash      2.1 KB   42m │
+   ▾ 8813:                                              1 │
+     session                       hash      1.9 KB   56m │
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+    sorted by name

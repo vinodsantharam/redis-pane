@@ -1,6 +1,7 @@
 //! The single entry point into the core (PLAN M0.4).
 
 use crate::keymap::Action;
+use crate::msg::KeyCode;
 use crate::msg::KeyPress;
 use crate::state::{Link, ReadOnlyReason, ScanState, Tracking};
 use crate::{Command, Msg, State};
@@ -87,6 +88,7 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
         }
         Msg::ScanStarted { estimated_total } => {
             state.keys.clear();
+            state.rebuild_list();
             state.scan = ScanState::Running {
                 scanned: 0,
                 estimated_total,
@@ -150,6 +152,7 @@ fn scan_batch(mut state: State, keys: Vec<Vec<u8>>) -> (State, Vec<Command>) {
             estimated_total,
         };
     }
+    state.rebuild_list();
     // Keys render as they arrive; their metadata should follow, but only for
     // the rows a reader can actually see.
     let indices = state.rows_needing_metadata();
@@ -165,6 +168,11 @@ fn scan_batch(mut state: State, keys: Vec<Vec<u8>>) -> (State, Vec<Command>) {
 /// The hint bar and help overlay read the same map, so what is shown is always
 /// the effective binding after user overrides (R7.5).
 fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
+    // While the filter is capturing, ordinary characters are text rather than
+    // commands. Only Esc and Enter mean anything else.
+    if state.filtering {
+        return filter_key(state, key);
+    }
     let Some(action) = state.keymap.action_for(&key) else {
         return (state, Vec::new());
     };
@@ -201,7 +209,32 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             after_move(state)
         }
         Action::Bottom => {
-            state.view.selected = state.keys.len().saturating_sub(1);
+            state.view.selected = state.row_count().saturating_sub(1);
+            after_move(state)
+        }
+        Action::Filter => {
+            state.filtering = true;
+            (state, Vec::new())
+        }
+        Action::Sort => {
+            state.list.sort = state.list.sort.next();
+            state.rebuild_list();
+            after_move(state)
+        }
+        Action::ToggleTree => {
+            state.tree_mode = !state.tree_mode;
+            state.view.selected = 0;
+            state.view.offset = 0;
+            state.rebuild_list();
+            after_move(state)
+        }
+        Action::ToggleGroup => {
+            if state.tree_mode
+                && let Some(prefix) = group_prefix_at(&state, state.view.selected)
+            {
+                state.tree.toggle(&prefix);
+                state.rebuild_list();
+            }
             after_move(state)
         }
         Action::ToggleReadOnly => {
@@ -217,12 +250,65 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
     }
 }
 
+/// The full prefix of the group under the cursor, e.g. `user:8812:`.
+fn group_prefix_at(state: &State, row: usize) -> Option<String> {
+    use crate::state::tree::Row;
+    let Some(Row::Group { depth, .. }) = state.tree.row(row) else {
+        return None;
+    };
+    // Rebuild the prefix from the first key beneath this group, which is the
+    // next Key row at greater depth.
+    let index = (row + 1..state.tree.len()).find_map(|r| state.tree.key_index(r))?;
+    let name = state.keys.name_str(index)?;
+    let sep = state.tree.separator;
+    let mut out = String::new();
+    for (i, segment) in name.split(sep).enumerate() {
+        if i > depth as usize {
+            break;
+        }
+        out.push_str(segment);
+        out.push(sep);
+    }
+    Some(out)
+}
+
+/// Keys typed while the filter is capturing.
+fn filter_key(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
+    match key.code {
+        KeyCode::Esc => {
+            // Esc abandons the filter entirely rather than keeping a partial
+            // pattern nobody typed on purpose.
+            state.filtering = false;
+            state.list.filter.clear();
+            state.rebuild_list();
+            after_move(state)
+        }
+        KeyCode::Enter => {
+            state.filtering = false;
+            (state, Vec::new())
+        }
+        KeyCode::Backspace => {
+            state.list.filter.pop();
+            state.rebuild_list();
+            after_move(state)
+        }
+        KeyCode::Char(c) if !key.ctrl && !key.alt => {
+            state.list.filter.push(c);
+            state.view.selected = 0;
+            state.view.offset = 0;
+            state.rebuild_list();
+            after_move(state)
+        }
+        _ => (state, Vec::new()),
+    }
+}
+
 /// Move the selection, clamped to the Loaded set.
 fn move_selection(mut state: State, by: isize) -> (State, Vec<Command>) {
-    if state.keys.is_empty() {
+    if state.row_count() == 0 {
         return (state, Vec::new());
     }
-    let last = state.keys.len() as isize - 1;
+    let last = state.row_count() as isize - 1;
     let next = (state.view.selected as isize + by).clamp(0, last);
     state.view.selected = next as usize;
     after_move(state)

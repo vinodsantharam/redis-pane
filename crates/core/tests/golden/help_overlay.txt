@@ -12,3 +12,7 @@ PgDn    page
 PgUp    page
 Home    top
 End     bottom
+/       filter
+s       sort
+t       tree
+⏎       fold

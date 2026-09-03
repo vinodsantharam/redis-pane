@@ -170,6 +170,20 @@ impl LoadedSet {
         self.name(i).map(String::from_utf8_lossy)
     }
 
+    /// Where key `i`'s name starts in the arena.
+    ///
+    /// Exposed so a prefix index can address segments of a name without copying
+    /// them (R2.3).
+    pub fn name_offset(&self, i: usize) -> Option<u32> {
+        self.offsets.get(i).copied()
+    }
+
+    /// A borrowed slice of the arena.
+    pub fn arena_slice(&self, offset: u32, len: u16) -> Option<&[u8]> {
+        let start = offset as usize;
+        self.arena.get(start..start + len as usize)
+    }
+
     pub fn kind(&self, i: usize) -> Option<KeyKind> {
         self.kinds.get(i).copied().and_then(KeyKind::from_byte)
     }

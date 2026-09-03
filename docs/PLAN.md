@@ -94,9 +94,10 @@ it cannot connect. No keyspace. — **Met.**
 Proves: the keyspace is legible, the values keep their shape, and the screen is never lying about
 how current it is.
 
-**Progress: 1–4 complete.** The Loaded set holds a million keys in 36MB, the keyspace source
-streams, filters and cancels against a real server, and the browser renders at every breakpoint
-with metadata filling in behind placeholders that hold their column.
+**Progress: 1–7 complete.** The Loaded set holds a million keys in 36MB, the keyspace source
+streams and cancels against a real server, the browser renders at every breakpoint with metadata
+filling in behind placeholders that hold their column, and filter, tree and sort all work by
+permuting an index vector rather than touching the arena.
 
 | # | Task | Proves |
 |---|---|---|

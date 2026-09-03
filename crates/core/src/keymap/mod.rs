@@ -27,6 +27,14 @@ pub enum Action {
     PageDown,
     Top,
     Bottom,
+    /// Start capturing a filter pattern.
+    Filter,
+    /// Cycle the sort column.
+    Sort,
+    /// Fold the list on the separator, or unfold it.
+    ToggleTree,
+    /// Expand or collapse the group under the cursor.
+    ToggleGroup,
 }
 
 impl Action {
@@ -42,6 +50,10 @@ impl Action {
             Action::PageUp | Action::PageDown => "page",
             Action::Top => "top",
             Action::Bottom => "bottom",
+            Action::Filter => "filter",
+            Action::Sort => "sort",
+            Action::ToggleTree => "tree",
+            Action::ToggleGroup => "fold",
         }
     }
 }
@@ -144,6 +156,22 @@ impl Default for Keymap {
                 Binding {
                     key: KeyPress::plain(KeyCode::End),
                     action: Action::Bottom,
+                },
+                Binding {
+                    key: KeyPress::plain(KeyCode::Char('/')),
+                    action: Action::Filter,
+                },
+                Binding {
+                    key: KeyPress::plain(KeyCode::Char('s')),
+                    action: Action::Sort,
+                },
+                Binding {
+                    key: KeyPress::plain(KeyCode::Char('t')),
+                    action: Action::ToggleTree,
+                },
+                Binding {
+                    key: KeyPress::plain(KeyCode::Enter),
+                    action: Action::ToggleGroup,
                 },
             ],
         }
@@ -279,6 +307,10 @@ mod tests {
             Action::PageDown,
             Action::Top,
             Action::Bottom,
+            Action::Filter,
+            Action::Sort,
+            Action::ToggleTree,
+            Action::ToggleGroup,
         ] {
             assert!(k.key_for(action).is_some(), "{action:?} has no binding");
         }

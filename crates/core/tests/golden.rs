@@ -437,7 +437,7 @@ fn browsing() -> State {
         keys.set_ttl(i, *ttl);
         keys.set_size(i, *size);
     }
-    State {
+    let mut state = State {
         keys,
         scan: redis_pane_core::state::ScanState::Running {
             scanned: 41_203,
@@ -445,7 +445,11 @@ fn browsing() -> State {
         },
         link: up(Tk::Armed),
         ..base()
-    }
+    };
+    // The list renders through an index vector, which has to be built from the
+    // store before anything is on screen.
+    state.rebuild_list();
+    state
 }
 
 fn draw(state: &State, w: u16, h: u16) -> String {
@@ -498,11 +502,12 @@ fn rendering_cost_does_not_grow_with_the_keyspace() {
     for i in 0..200_000 {
         keys.push(format!("user:{i:08}:session").as_bytes());
     }
-    let big = State {
+    let mut big = State {
         keys,
         link: up(Tk::Armed),
         ..base()
     };
+    big.rebuild_list();
 
     let started = std::time::Instant::now();
     for _ in 0..50 {
@@ -532,7 +537,9 @@ fn pending() -> State {
     ] {
         keys.push(name.as_bytes());
     }
-    State { keys, ..browsing() }
+    let mut state = State { keys, ..browsing() };
+    state.rebuild_list();
+    state
 }
 
 #[test]
@@ -631,4 +638,154 @@ fn narrowing_never_costs_the_environment_or_the_source() {
             "the title bar must fill exactly the width at {width}"
         );
     }
+}
+
+// ── M1.5 / M1.6 / M1.7 — filter, tree, sort ─────────────────────────────────
+
+use redis_pane_core::state::{FilterMode, SortBy};
+
+fn many_keys() -> State {
+    let mut keys = LoadedSet::default();
+    let rows: &[(&str, KeyKind, i32, u32)] = &[
+        ("user:8812:cart", KeyKind::ZSet, 720, 412),
+        ("user:8812:profile", KeyKind::Json, TTL_NONE, 880),
+        ("user:8812:session", KeyKind::Hash, 2_537, 2_150),
+        ("user:8813:session", KeyKind::Hash, 3_400, 1_980),
+        ("cart:91af3c9d2e", KeyKind::ZSet, 720, 1_153_434),
+        ("feed:global:hot", KeyKind::List, TTL_NONE, 64_512),
+    ];
+    for (i, (name, kind, ttl, size)) in rows.iter().enumerate() {
+        keys.push(name.as_bytes());
+        keys.set_kind(i, *kind);
+        keys.set_ttl(i, *ttl);
+        keys.set_size(i, *size);
+    }
+    let mut state = State {
+        keys,
+        link: up(Tk::Armed),
+        ..base()
+    };
+    state.rebuild_list();
+    state
+}
+
+#[test]
+fn golden_filtered_list() {
+    let mut state = many_keys();
+    state.list.filter = "user:*:session".into();
+    state.rebuild_list();
+    assert_golden("browser_filtered", &draw(&state, 130, 20));
+}
+
+#[test]
+fn golden_tree_mode() {
+    let mut state = many_keys();
+    state.tree_mode = true;
+    state.rebuild_list();
+    assert_golden("browser_tree", &draw(&state, 130, 20));
+}
+
+#[test]
+fn golden_sorted_by_size_partially_known() {
+    let mut state = many_keys();
+    // Two rows never got their size, which is the ordinary case while a list is
+    // still filling.
+    state.keys.set_size(0, u32::MAX - 1);
+    let mut keys = LoadedSet::default();
+    for (i, name) in [
+        "user:8812:cart",
+        "user:8812:profile",
+        "unknown:a",
+        "unknown:b",
+    ]
+    .iter()
+    .enumerate()
+    {
+        keys.push(name.as_bytes());
+        if i < 2 {
+            keys.set_kind(i, KeyKind::ZSet);
+            keys.set_size(i, [412u32, 880][i]);
+            keys.set_ttl(i, 720);
+        }
+    }
+    state.keys = keys;
+    state.list.sort = SortBy::Size;
+    state.rebuild_list();
+    assert_golden("browser_sorted_partial", &draw(&state, 130, 20));
+}
+
+#[test]
+fn the_filter_line_states_how_much_it_matched() {
+    let mut state = many_keys();
+    state.list.filter = "user:*".into();
+    state.rebuild_list();
+    let frame = draw(&state, 130, 20);
+    assert!(frame.contains("/ user:*"), "{frame}");
+    assert!(
+        frame.contains("4 of 6"),
+        "the reader is told the scope: {frame}"
+    );
+}
+
+#[test]
+fn a_partial_sort_says_so_on_screen() {
+    // R2.5: ordering what arrived is fine; not saying so is not.
+    let mut state = many_keys();
+    let mut keys = LoadedSet::default();
+    keys.push(b"known");
+    keys.set_size(0, 100);
+    keys.push(b"unknown");
+    state.keys = keys;
+    state.list.sort = SortBy::Size;
+    state.rebuild_list();
+
+    let frame = draw(&state, 130, 20);
+    assert!(
+        frame.contains("1 of 2 known"),
+        "a partial sort must state its scope: {frame}"
+    );
+}
+
+#[test]
+fn tree_mode_shows_group_counts_and_leaf_names_only() {
+    let mut state = many_keys();
+    state.tree_mode = true;
+    state.rebuild_list();
+    let frame = draw(&state, 130, 20);
+    assert!(frame.contains("▾ user:"), "{frame}");
+    assert!(frame.contains("▾ 8812:"), "nested groups fold too: {frame}");
+    // A leaf under `user:8812:` shows as `session`, not the whole path — the
+    // ancestors are already on screen above it.
+    assert!(
+        frame.lines().any(|l| l.trim_start().starts_with("session")),
+        "{frame}"
+    );
+}
+
+#[test]
+fn filtering_narrows_the_tree_as_well_as_the_flat_list() {
+    let mut state = many_keys();
+    state.tree_mode = true;
+    state.list.filter = "cart".into();
+    state.rebuild_list();
+    let frame = draw(&state, 130, 20);
+    assert!(!frame.contains("session"), "filtered out: {frame}");
+    assert!(frame.contains("cart"), "{frame}");
+}
+
+#[test]
+fn fuzzy_mode_matches_characters_in_order() {
+    let mut state = many_keys();
+    state.list.mode = FilterMode::Fuzzy;
+    // `u88ses` would match 8812 *and* 8813 — fuzzy is deliberately generous.
+    state.list.filter = "u8812ses".into();
+    state.rebuild_list();
+    assert_eq!(state.list.len(), 1);
+    assert_eq!(
+        state
+            .keys
+            .name_str(state.list.index_at(0).unwrap())
+            .unwrap(),
+        "user:8812:session"
+    );
 }

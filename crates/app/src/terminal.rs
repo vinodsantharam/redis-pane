@@ -12,11 +12,11 @@ use crossterm::{execute, terminal};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
+use fred::prelude::Client;
 use redis_pane_core::clock::Clock;
 use redis_pane_core::msg::{KeyCode, KeyPress};
 use redis_pane_core::theme::{ColorDepth, Theme};
 use redis_pane_core::{Command, Msg, State, render, update};
-use fred::prelude::Client;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -109,10 +109,19 @@ pub async fn run(
     });
 
     let size = term.size()?;
-    (state, _) = update(state, Msg::Resized { cols: size.width, rows: size.height });
     (state, _) = update(
         state,
-        Msg::Connected { version: String::new(), tracking_supported: tracking },
+        Msg::Resized {
+            cols: size.width,
+            rows: size.height,
+        },
+    );
+    (state, _) = update(
+        state,
+        Msg::Connected {
+            version: String::new(),
+            tracking_supported: tracking,
+        },
     );
 
     let mut scan_cancel: Option<CancellationToken> = None;

@@ -7,9 +7,13 @@
 
 pub mod loaded;
 pub mod scan;
+pub mod tree;
+pub mod view;
 
 pub use loaded::{KeyKind, LoadedSet};
 pub use scan::ScanState;
+pub use tree::Tree;
+pub use view::{FilterMode, KeyView, SortBy};
 
 /// Where a Connection's target came from (ADR-0001).
 ///
@@ -235,6 +239,13 @@ pub struct State {
     /// Which rows are on screen and which is selected. Scrolling changes this,
     /// never the Loaded set (R2.6).
     pub view: crate::render::keys::Viewport,
+    /// The filtered, ordered index vector the list renders through.
+    pub list: KeyView,
+    /// Folded rows, when tree mode is on.
+    pub tree: Tree,
+    pub tree_mode: bool,
+    /// Set while `/` is capturing a filter.
+    pub filtering: bool,
 }
 
 impl State {
@@ -265,9 +276,52 @@ impl State {
     pub fn rows_needing_metadata(&self) -> Vec<usize> {
         let height = self.visible_rows();
         let start = self.view.scrolled_to_selection(height).offset;
-        (start..(start + height).min(self.keys.len()))
+        (start..(start + height).min(self.row_count()))
+            .filter_map(|row| self.key_at(row))
             .filter(|i| self.keys.kind(*i).is_none())
             .collect()
+    }
+
+    /// How many rows the list currently shows — after filtering, and after
+    /// folding if tree mode is on.
+    pub fn row_count(&self) -> usize {
+        if self.tree_mode {
+            self.tree.len()
+        } else {
+            self.list.len()
+        }
+    }
+
+    /// The Loaded set index shown at a display row, if that row is a key.
+    ///
+    /// In tree mode a row may be a group header, which has no key behind it.
+    pub fn key_at(&self, row: usize) -> Option<usize> {
+        if self.tree_mode {
+            self.tree.key_index(row)
+        } else {
+            self.list.index_at(row)
+        }
+    }
+
+    /// The key the selection is on, if any.
+    pub fn selected_key(&self) -> Option<usize> {
+        self.key_at(self.view.selected)
+    }
+
+    /// Recompute the list after the keys, the filter, the sort or the mode
+    /// changed. Tree mode needs name order to fold in one pass.
+    pub fn rebuild_list(&mut self) {
+        if self.tree_mode && self.list.sort == SortBy::Scan {
+            self.list.sort = SortBy::Name;
+        }
+        self.list.rebuild(&self.keys);
+        if self.tree_mode {
+            self.tree.rebuild(&self.keys, &self.list);
+        }
+        let last = self.row_count().saturating_sub(1);
+        if self.view.selected > last {
+            self.view.selected = last;
+        }
     }
 
     pub fn liveness(&self) -> Liveness {

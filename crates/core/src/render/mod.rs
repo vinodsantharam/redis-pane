@@ -60,7 +60,9 @@ fn value_pane(state: &State, theme: &Theme, area: Rect, buf: &mut Buffer) {
             theme.style(Token::Border),
         );
     }
-    match state.keys.name_str(state.view.selected) {
+    // Through the row indirection, not the raw index: in tree mode the
+    // selected row may be a group header with no key behind it.
+    match state.selected_key().and_then(|i| state.keys.name_str(i)) {
         Some(name) => {
             put(buf, area.x + 1, area.y, &name, theme.style(Token::Text));
             put(
@@ -72,13 +74,12 @@ fn value_pane(state: &State, theme: &Theme, area: Rect, buf: &mut Buffer) {
             );
         }
         None => {
-            put(
-                buf,
-                area.x + 1,
-                area.y,
-                "no key selected",
-                theme.style(Token::Muted),
-            );
+            let label = if state.tree_mode && state.row_count() > 0 {
+                "a group is selected"
+            } else {
+                "no key selected"
+            };
+            put(buf, area.x + 1, area.y, label, theme.style(Token::Muted));
         }
     }
 }
@@ -86,7 +87,7 @@ fn value_pane(state: &State, theme: &Theme, area: Rect, buf: &mut Buffer) {
 /// The status bar: scan progress and its cancel affordance (DESIGN §6.2).
 fn status_bar(state: &State, theme: &Theme, area: Rect, buf: &mut Buffer) {
     let readout = state.scan.readout();
-    if readout.is_empty() || area.height < 2 {
+    if (readout.is_empty() && state.list.sort_readout().is_none()) || area.height < 2 {
         return;
     }
     let y = area.height - if area.height >= 24 { 2 } else { 1 };
@@ -96,7 +97,11 @@ fn status_bar(state: &State, theme: &Theme, area: Rect, buf: &mut Buffer) {
         }
         _ => Token::Muted,
     };
-    let x = put(buf, 1, y, &readout, theme.style(token));
+    let mut line = readout;
+    if let Some(sort) = state.list.sort_readout() {
+        line = format!("{line}   {sort}");
+    }
+    let x = put(buf, 1, y, &line, theme.style(token));
     if state.scan.is_running()
         && let Some(hint) = state.keymap.hint(crate::keymap::Action::Cancel)
     {

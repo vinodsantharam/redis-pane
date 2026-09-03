@@ -118,27 +118,124 @@ pub fn render(state: &State, theme: &Theme, area: Rect, density: Density, buf: &
         return;
     }
     let cols = Columns::for_pane(area.width, density);
-    header(theme, area, cols, buf);
+    let mut y = area.y;
 
-    let body_height = area.height.saturating_sub(1) as usize;
+    // The filter line only exists when there is a filter, so an unfiltered list
+    // spends no rows on it (G7: screen space is a budget).
+    if state.filtering || !state.list.filter.is_empty() {
+        filter_line(state, theme, area, y, buf);
+        y += 1;
+    }
+    header(theme, Rect { y, ..area }, cols, buf);
+    y += 1;
+
+    let body_height = (area.y + area.height).saturating_sub(y) as usize;
     let view = state.view.scrolled_to_selection(body_height);
 
     for row in 0..body_height {
-        let i = view.offset + row;
-        if i >= state.keys.len() {
+        let display_row = view.offset + row;
+        if display_row >= state.row_count() {
             break;
         }
-        let y = area.y + 1 + row as u16;
-        key_row(
+        let at = y + row as u16;
+        let selected = display_row == view.selected;
+        if state.tree_mode {
+            tree_row(state, display_row, selected, theme, area, cols, at, buf);
+        } else if let Some(i) = state.list.index_at(display_row) {
+            key_row(&state.keys, i, selected, theme, area, cols, at, 0, buf);
+        }
+    }
+}
+
+/// `/ user:*:session          3,410 of 41,203`
+fn filter_line(state: &State, theme: &Theme, area: Rect, y: u16, buf: &mut Buffer) {
+    let x = super::put(buf, area.x + 1, y, "/ ", theme.style(Token::Warn));
+    let cursor = if state.filtering { "▏" } else { "" };
+    super::put(
+        buf,
+        x,
+        y,
+        &format!("{}{cursor}", state.list.filter),
+        theme.style(Token::Text),
+    );
+    let readout = state.list.match_readout(state.keys.len());
+    if !readout.is_empty() {
+        super::put_right(
+            buf,
+            area.x,
+            y,
+            area.width.saturating_sub(1),
+            &readout,
+            theme.style(Token::Muted),
+        );
+    }
+}
+
+/// A folded group, or a key nested under one.
+#[allow(clippy::too_many_arguments)]
+fn tree_row(
+    state: &State,
+    display_row: usize,
+    selected: bool,
+    theme: &Theme,
+    area: Rect,
+    cols: Columns,
+    y: u16,
+    buf: &mut Buffer,
+) {
+    use crate::state::tree::Row;
+    match state.tree.row(display_row) {
+        Some(Row::Group {
+            offset,
+            len,
+            depth,
+            descendants,
+            expanded,
+        }) => {
+            let name = state
+                .keys
+                .arena_slice(offset, len)
+                .map(String::from_utf8_lossy)
+                .unwrap_or_default();
+            let marker = if expanded { "▾" } else { "▸" };
+            let indent = area.x + cols.name + depth * 2;
+            let style = theme.style(if selected {
+                Token::BorderFocus
+            } else {
+                Token::Text
+            });
+            super::put(
+                buf,
+                indent,
+                y,
+                &format!("{marker} {name}{}", state.tree.separator),
+                style,
+            );
+            // A collapsed node states what it is hiding, so folding never loses
+            // information about how much is down there.
+            if let Some((x, w)) = cols.ttl.or(cols.size) {
+                super::put_right(
+                    buf,
+                    area.x + x,
+                    y,
+                    w,
+                    &descendants.to_string(),
+                    theme.style(Token::Muted),
+                );
+            }
+        }
+        Some(Row::Key { index, depth }) => key_row(
             &state.keys,
-            i,
-            i == view.selected,
+            index as usize,
+            selected,
             theme,
             area,
             cols,
             y,
+            depth * 2,
             buf,
-        );
+        ),
+        None => {}
     }
 }
 
@@ -165,6 +262,7 @@ fn key_row(
     area: Rect,
     cols: Columns,
     y: u16,
+    indent: u16,
     buf: &mut Buffer,
 ) {
     let name_style = theme.style(if selected {
@@ -174,12 +272,19 @@ fn key_row(
     });
     let meta_style = theme.style(Token::Muted);
 
-    let name = keys.name_str(i).unwrap_or_default();
+    // In tree mode only the leaf segment is shown: the ancestors are already on
+    // screen as group rows above it, and repeating them wastes the column.
+    let full = keys.name_str(i).unwrap_or_default();
+    let name = if indent > 0 {
+        full.rsplit(':').next().unwrap_or(&full).to_string()
+    } else {
+        full.to_string()
+    };
     super::put(
         buf,
-        area.x + cols.name,
+        area.x + cols.name + indent,
         y,
-        &truncate(&name, cols.name_width as usize),
+        &truncate(&name, cols.name_width.saturating_sub(indent) as usize),
         name_style,
     );
 

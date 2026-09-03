@@ -11,10 +11,11 @@ mod terminal;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use clap::Parser;
 use redis_pane_core::clock::Clock;
-use redis_pane_core::state::{Connection, Environment, Source, State};
-use redis_pane_core::theme::{ColorDepth, Theme};
-use redis_pane_core::{Msg, render, update};
+use redis_pane_core::resolve::{EnvVars, Flags, resolve};
+use redis_pane_core::state::State;
+use redis_pane_core::theme::Theme;
 
 /// Exit codes. A target that cannot be reached exits non-zero with a diagnostic
 /// naming the target, its Source, and the failure (R1.14, ADR-0009).
@@ -27,6 +28,35 @@ pub mod exit {
     pub const CONFIG: i32 = 3;
     /// The server is below the floor: RESP3 and Redis 6.0 (R1.13, ADR-0007).
     pub const UNSUPPORTED_SERVER: i32 = 4;
+}
+
+/// A terminal UI for Redis.
+///
+/// With no arguments, resolves a target from the default Profile, then the
+/// environment, then `127.0.0.1:6379`. It never prompts; the title bar always
+/// shows what was chosen and why (ADR-0001).
+#[derive(Debug, Parser)]
+#[command(name = "redis-pane", version, about, long_about = None)]
+struct Cli {
+    /// Profile to use, by name. A bare positional name works too.
+    #[arg(long, value_name = "NAME")]
+    profile: Option<String>,
+    /// Profile name, positionally.
+    #[arg(value_name = "PROFILE")]
+    positional_profile: Option<String>,
+    /// Connect to this URL, used wholesale.
+    #[arg(long, value_name = "URL")]
+    url: Option<String>,
+    #[arg(long, value_name = "HOST")]
+    host: Option<String>,
+    #[arg(long, value_name = "PORT")]
+    port: Option<u16>,
+    /// Database index. Fixed at launch; there is no in-app switcher (ADR-0005).
+    #[arg(long, value_name = "N")]
+    db: Option<u8>,
+    /// Resolve and print the target, then exit without connecting.
+    #[arg(long)]
+    print_target: bool,
 }
 
 /// The real clock. It lives here, in the shell, because the core must not be
@@ -42,31 +72,61 @@ impl Clock for SystemClock {
     }
 }
 
-fn main() {
-    let clock = SystemClock;
-    let now = clock.now_ms();
+fn env_vars() -> EnvVars {
+    let get = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    EnvVars {
+        redis_url: get("REDIS_URL"),
+        redis_host: get("REDIS_HOST"),
+        redis_port: get("REDIS_PORT"),
+        redis_user: get("REDIS_USER"),
+        redis_password: get("REDIS_PASSWORD"),
+    }
+}
 
-    // Placeholder until resolution lands in M0.6 — the shape is real, the
-    // values are not yet resolved from flags, Profile, or environment.
-    let state = State {
-        connection: Connection {
-            target: "127.0.0.1:6379/0".into(),
-            environment: Environment::Local,
-            source: Source::Default,
+fn main() {
+    let cli = Cli::parse();
+
+    let config = match config_io::default_path() {
+        Some(path) => match config_io::load(&path) {
+            Ok(config) => config,
+            Err(err) => {
+                // A config that cannot be trusted is fatal, and says why.
+                eprintln!("redis-pane: {err}");
+                std::process::exit(exit::CONFIG);
+            }
         },
+        None => None,
+    };
+
+    let flags = Flags {
+        url: cli.url,
+        host: cli.host,
+        port: cli.port,
+        db: cli.db,
+        profile: cli.profile.or(cli.positional_profile),
+    };
+    let connection = resolve(&flags, config.as_ref(), &env_vars());
+
+    if cli.print_target {
+        println!(
+            "{} · {} · {}",
+            connection.target,
+            connection.environment.label(),
+            connection.source.label()
+        );
+        std::process::exit(exit::OK);
+    }
+
+    let clock = SystemClock;
+    let state = State {
+        connection,
         ..State::default()
     };
-    let (state, _cmds) = update(state, Msg::Resized { cols: 100, rows: 2 });
-    let (state, _cmds) = update(
-        state,
-        Msg::ReadCompleted {
-            at_ms: now - 14_000,
-        },
-    );
+    let theme = Theme::new(terminal::detect_color_depth());
 
-    let area = ratatui::layout::Rect::new(0, 0, state.cols, state.rows);
-    let buf = render::frame(&state, &Theme::new(ColorDepth::TrueColor), &clock, area);
-    println!("{}", render::to_text(&buf));
-
+    if let Err(err) = terminal::run(state, theme, &clock) {
+        eprintln!("redis-pane: {err}");
+        std::process::exit(exit::CONNECTION);
+    }
     std::process::exit(exit::OK);
 }

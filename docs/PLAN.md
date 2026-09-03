@@ -47,6 +47,7 @@ redis-pane/
 │   │   ├── theme/             semantic tokens, palettes, capability degradation
 │   │   ├── keymap/            bindings as data
 │   │   ├── config/            schema types + validation
+│   │   ├── resolve.rs          flags -> Profile -> environment -> localhost
 │   │   └── clock.rs           Clock trait
 │   └── app/                   redis-pane — shells
 │       ├── main.rs            args, resolution entry, startup diagnostics, exit codes
@@ -64,8 +65,9 @@ validation* are core and pure; config *reading* is a shell.
 
 Proves: the architecture holds, and the app can be trusted about what it is connected to.
 
-**Progress: 1–4 complete.** The workspace builds, the boundary is enforced by CI, the clock is
-injected, and the first golden frames are recorded.
+**Progress: 1–7 complete.** The workspace builds, the boundary is enforced by CI, the clock is
+injected, golden frames are recorded, the app runs as a TUI you can quit, and resolution and
+config parsing are done with their full test tables.
 
 | # | Task | Proves |
 |---|---|---|

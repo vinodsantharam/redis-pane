@@ -55,7 +55,8 @@ found, `source ~/.cargo/env` first.
 
 ```bash
 cargo build --workspace                 # build
-cargo run -p redis-pane                 # run (no UI yet — scaffold prints and exits)
+cargo run -p redis-pane                 # run the TUI (q or ⌃C to quit)
+cargo run -p redis-pane -- --print-target   # resolve a target and exit, without connecting
 cargo test --workspace                  # all tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all                         # format

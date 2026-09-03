@@ -38,7 +38,8 @@ impl Source {
 ///
 /// `Unknown` is a real one: anything that is not loopback or a unix socket and
 /// was not tagged gets it, and starts in Read-only Mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Environment {
     Local,
     Staging,

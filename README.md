@@ -12,12 +12,12 @@ structured data as structured data and makes dangerous operations feel dangerous
 
 **Requires Redis 6.0+ (or Valkey).** RESP3 only.
 
-**Scaffolded — M0.1 of [the plan](docs/PLAN.md) is complete.** The workspace builds, CI is green,
+**In progress — M0.1–M0.7 of [the plan](docs/PLAN.md) are complete.** The workspace builds, CI is green,
 and there is no UI yet. The specification is still the deliverable and is kept current rather
 than archived. Stack: Rust + [ratatui](https://ratatui.rs) + tokio + [fred](https://docs.rs/fred).
 
 ```bash
-cargo run -p redis-pane
+cargo run -p redis-pane -- --print-target
 ```
 
 ## What it looks like

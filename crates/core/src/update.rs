@@ -1,5 +1,6 @@
 //! The single entry point into the core (PLAN M0.4).
 
+use crate::msg::{KeyCode, KeyPress};
 use crate::{Command, Msg, State};
 
 /// Takes a message, returns new state plus commands for a shell to execute.
@@ -9,6 +10,7 @@ use crate::{Command, Msg, State};
 /// keeps a frame a function of state alone (ADR-0011).
 pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
     match msg {
+        Msg::Key(key) => key_press(state, key),
         Msg::Resized { cols, rows } => {
             state.cols = cols;
             state.rows = rows;
@@ -18,11 +20,23 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             state.last_read_ms = Some(at_ms);
             (state, Vec::new())
         }
-        Msg::Quit => {
-            state.quitting = true;
-            (state, vec![Command::Quit])
-        }
+        Msg::Quit => quit(state),
     }
+}
+
+/// Provisional bindings. Keybindings are data (R7.5) and this becomes a lookup
+/// against the keymap in M0.12; until then the two that must always work are
+/// wired directly so the app is never unquittable.
+fn key_press(state: State, key: KeyPress) -> (State, Vec<Command>) {
+    if key.is_char('q') || (key.ctrl && key.code == KeyCode::Char('c')) {
+        return quit(state);
+    }
+    (state, Vec::new())
+}
+
+fn quit(mut state: State) -> (State, Vec<Command>) {
+    state.quitting = true;
+    (state, vec![Command::Quit])
 }
 
 #[cfg(test)]
@@ -61,6 +75,49 @@ mod tests {
         let a = update(State::default(), Msg::Resized { cols: 80, rows: 24 });
         let b = update(State::default(), Msg::Resized { cols: 80, rows: 24 });
         assert_eq!(a, b);
+    }
+
+    // ── M0.5: synthetic events drive the core with no terminal attached ─────
+
+    #[test]
+    fn q_quits() {
+        let (s, cmds) = update(
+            State::default(),
+            Msg::Key(KeyPress::plain(KeyCode::Char('q'))),
+        );
+        assert!(s.quitting);
+        assert_eq!(cmds, vec![Command::Quit]);
+    }
+
+    #[test]
+    fn ctrl_c_quits() {
+        let (s, cmds) = update(
+            State::default(),
+            Msg::Key(KeyPress::ctrl(KeyCode::Char('c'))),
+        );
+        assert!(s.quitting);
+        assert_eq!(cmds, vec![Command::Quit]);
+    }
+
+    #[test]
+    fn ctrl_q_is_not_q() {
+        let (s, cmds) = update(
+            State::default(),
+            Msg::Key(KeyPress::ctrl(KeyCode::Char('q'))),
+        );
+        assert!(!s.quitting);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn an_unbound_key_changes_nothing() {
+        let before = State::default();
+        let (after, cmds) = update(
+            before.clone(),
+            Msg::Key(KeyPress::plain(KeyCode::Char('z'))),
+        );
+        assert_eq!(before, after);
+        assert!(cmds.is_empty());
     }
 
     #[test]

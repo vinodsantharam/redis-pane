@@ -327,11 +327,11 @@ the reader's time.
 - With two panes, is the split fixed at a ratio, or does it default to whichever pane has focus?
 - Does the keys pane need a permanent column header row, or can the columns be implied by the
   data and explained once in help?
-- Below 70 columns, is single-pane stack navigation worth building, or should the app simply
-  say the terminal is too small? The implementation currently renders a single-pane key list
-  there, keeping `TYPE` and `TTL`; the breadcrumb and stack navigation are not built.
 
-**Resolved since v0.4** — tree is the default key view (R2.3): fewer rows at rest outweighs the
+**Resolved since v0.4** — stack navigation below 70 columns is built: `Open` pushes from the key
+list to a full-width value pane with a breadcrumb header (`Esc back · key-name`) in place of the
+column headers there is no room for; `Esc` pops back, ahead of an unrelated in-flight scan but
+behind closing help or dismissing an error. Tree is the default key view (R2.3): fewer rows at rest outweighs the
 one extra keypress to reach a leaf, decided from real use against seeded keyspaces on Upstash and
 Redis Cloud rather than from the mockup alone.
 

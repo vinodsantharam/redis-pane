@@ -1,0 +1,24 @@
+─ redis-pane ─ ● staging · from profile staging ─── ● live ─
+
+ Esc back  ·  user:8812:session
+ hash · 5 fields · 2.1 KB
+ ttl 42m                                             ● live
+
+ FIELD                        VALUE
+ id                           8812
+ device                       ios/17.2
+ region                       eu-west-1
+ plan                         pro
+ locale                       fr-FR
+
+
+
+
+
+
+
+
+
+
+
+ Esc back   r refetch   ⌃R read-only   ? help   q quit

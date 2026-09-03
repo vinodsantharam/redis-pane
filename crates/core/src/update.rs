@@ -3,6 +3,7 @@
 use crate::keymap::Action;
 use crate::msg::KeyCode;
 use crate::msg::KeyPress;
+use crate::render::layout::SinglePaneView;
 use crate::state::copy::{CopyWhat, redis_cli_command, value_text};
 use crate::state::{Link, OpenKey, ReadOnlyReason, ScanState, Tracking};
 use crate::{Command, Msg, State};
@@ -268,6 +269,12 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
                 state.error = None;
                 return (state, Vec::new());
             }
+            // The "pop" half of stack navigation: back to the list you were
+            // just looking at, before an unrelated background scan.
+            if state.single_pane_view == SinglePaneView::Value {
+                state.single_pane_view = SinglePaneView::Keys;
+                return (state, Vec::new());
+            }
             // Every in-flight operation is cancellable (PRD R7.3).
             if state.scan.is_running() {
                 return (state, vec![Command::CancelScan]);
@@ -312,6 +319,11 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             let Some(name) = state.keys.name(index).map(|n| n.to_vec()) else {
                 return (state, Vec::new());
             };
+            // Below 70 columns this is the "push" half of stack navigation
+            // (DESIGN §2). Setting it unconditionally is harmless at any wider
+            // density, where layout() never consults it — both panes already
+            // show, so there is nothing this can visibly change.
+            state.single_pane_view = SinglePaneView::Value;
             (state, vec![Command::OpenKey { index, name }])
         }
         Action::ViewerDown => scroll_viewer(state, ViewerMove::By(1)),
@@ -1469,5 +1481,103 @@ mod viewer_scroll_tests {
         ] {
             assert!(keymap.hint(action).is_some(), "{action:?} has no binding");
         }
+    }
+}
+
+#[cfg(test)]
+mod stack_navigation_tests {
+    //! Below 70 columns there is one pane at a time (DESIGN §2). Opening a
+    //! key pushes into it; Esc pops back — a stack two rungs deep, not a full
+    //! navigation history, because that is all this layout ever needs.
+
+    use super::*;
+    use crate::msg::KeyCode;
+    use crate::state::LoadedSet;
+
+    fn browsing() -> State {
+        let mut keys = LoadedSet::default();
+        keys.push(b"k1");
+        keys.push(b"k2");
+        let mut state = State {
+            keys,
+            rows: 30,
+            ..State::default()
+        };
+        state.rebuild_list();
+        state
+    }
+
+    #[test]
+    fn opening_a_key_pushes_into_value_view() {
+        let state = browsing();
+        assert_eq!(state.single_pane_view, SinglePaneView::Keys);
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('l'))));
+        assert_eq!(state.single_pane_view, SinglePaneView::Value);
+        assert!(matches!(cmds.first(), Some(Command::OpenKey { .. })));
+    }
+
+    #[test]
+    fn esc_pops_back_to_keys_from_value_view() {
+        let state = browsing();
+        let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('l'))));
+        assert_eq!(state.single_pane_view, SinglePaneView::Value);
+
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Esc)));
+        assert_eq!(state.single_pane_view, SinglePaneView::Keys);
+        assert!(
+            cmds.is_empty(),
+            "popping the stack is not itself a scan cancellation"
+        );
+    }
+
+    #[test]
+    fn esc_closes_help_before_popping_the_value_view() {
+        // Nearest thing first: an overlay you opened on top of everything
+        // closes before backing out of the navigation underneath it.
+        let mut state = browsing();
+        (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('l'))));
+        state.help_open = true;
+
+        let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Esc)));
+        assert!(!state.help_open);
+        assert_eq!(
+            state.single_pane_view,
+            SinglePaneView::Value,
+            "one Esc closes one thing, not two"
+        );
+    }
+
+    #[test]
+    fn esc_pops_the_value_view_before_cancelling_an_unrelated_scan() {
+        let mut state = browsing();
+        (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('l'))));
+        (state, _) = update(
+            state,
+            Msg::ScanStarted {
+                estimated_total: 10,
+            },
+        );
+        assert!(state.scan.is_running());
+
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Esc)));
+        assert_eq!(state.single_pane_view, SinglePaneView::Keys);
+        assert!(
+            cmds.is_empty(),
+            "the scan must still be running, not cancelled by this Esc"
+        );
+        assert!(state.scan.is_running());
+    }
+
+    #[test]
+    fn opening_a_key_at_a_wide_terminal_is_harmless() {
+        // The flag is set unconditionally on Open; at any density wider than
+        // Single, layout() never consults it, so this must change nothing an
+        // actual reader can see.
+        let state = browsing();
+        let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('l'))));
+        assert_eq!(state.single_pane_view, SinglePaneView::Value);
+        // No assertion on rendered output here — render::layout's own test
+        // (`single_pane_view_is_ignored_at_any_wider_density`) is the proof;
+        // this just confirms the state transition still happens uniformly.
     }
 }

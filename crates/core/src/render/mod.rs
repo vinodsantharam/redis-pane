@@ -20,12 +20,16 @@ use crate::theme::{Theme, Token, env_token};
 /// Render the whole frame into a fresh buffer of the given size.
 pub fn frame(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect) -> Buffer {
     let mut buf = Buffer::empty(area);
-    let plan = layout::layout(area);
+    let plan = layout::layout(area, state.single_pane_view);
     title_bar(state, theme, clock, area, &mut buf);
 
     keys::render(state, theme, plan.keys, plan.density, &mut buf);
     if let Some(value) = plan.value {
-        value_pane(state, theme, clock, value, &mut buf);
+        // Standalone below 70 columns: the value fills the whole pane with no
+        // adjacent keys pane to separate from, and the list it came from is
+        // off screen, so its own header carries a breadcrumb back to it.
+        let standalone = plan.density == layout::Density::Single;
+        value_pane(state, theme, clock, value, standalone, &mut buf);
     }
     status_bar(state, theme, clock, area, &mut buf);
 
@@ -47,18 +51,29 @@ pub fn frame(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect) -> Buf
 
 /// The value pane. Viewers land in M1.8; until then it states what is selected
 /// so the two-pane layout is real rather than a promise.
-fn value_pane(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect, buf: &mut Buffer) {
+fn value_pane(
+    state: &State,
+    theme: &Theme,
+    clock: &dyn Clock,
+    area: Rect,
+    standalone: bool,
+    buf: &mut Buffer,
+) {
     if area.height == 0 || area.width < 6 {
         return;
     }
-    for y in 0..area.height {
-        put(
-            buf,
-            area.x.saturating_sub(1),
-            area.y + y,
-            "│",
-            theme.style(Token::Border),
-        );
+    // The left rule separates keys from value in the two-pane layouts; there
+    // is nothing to separate from when this pane is the entire screen.
+    if !standalone {
+        for y in 0..area.height {
+            put(
+                buf,
+                area.x.saturating_sub(1),
+                area.y + y,
+                "│",
+                theme.style(Token::Border),
+            );
+        }
     }
 
     let Some(open) = &state.open else {
@@ -76,7 +91,26 @@ fn value_pane(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect, buf: 
     // ── header: identical for every type (R3.1) ────────────────────────────
     let now = clock.now_ms();
     let x0 = area.x + 1;
-    put(buf, x0, area.y, &open.name, theme.style(Token::Text));
+    // Standalone (below 70 columns), the list this key came from is off
+    // screen entirely — DESIGN §2's "breadcrumb replaces columns". The
+    // effective binding, not a hard-coded key, per R7.5.
+    if standalone {
+        let hint = state
+            .keymap
+            .hint(crate::keymap::Action::Cancel)
+            .unwrap_or_default();
+        let x1 = put(
+            buf,
+            x0,
+            area.y,
+            &format!("{hint} back"),
+            theme.style(Token::Muted),
+        );
+        put(buf, x1, area.y, "  ·  ", theme.style(Token::Border));
+        put(buf, x1 + 5, area.y, &open.name, theme.style(Token::Text));
+    } else {
+        put(buf, x0, area.y, &open.name, theme.style(Token::Text));
+    }
 
     let viewer = open.value.viewer();
     let kind = open.value.kind();

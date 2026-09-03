@@ -27,7 +27,12 @@ requirements and ADRs for decisions already made.
   `tree_mode: true` set at session start in `main.rs` (not on `State::default()`, which many
   tests rely on as a blank slate). DESIGN §9 and PRD R2.3 updated.
 - [ ] **The scan cap has no dedicated visual surfacing** beyond a status-bar line.
-- [ ] **Sub-70-column behavior is minimal** — single-pane works, no breadcrumb/stack nav.
+- [x] **Sub-70-column stack navigation.** `Open` pushes into a full-width value pane with a
+  breadcrumb header (`Esc back · key-name`, following the effective binding per R7.5) replacing
+  the column headers there is no room for; `Esc` pops back — after closing help or dismissing an
+  error, ahead of cancelling an unrelated scan. `SinglePaneView` is inert at any wider density
+  (tested directly). Existing Density::Single flat/tree browsing was already built and is
+  untouched — all its golden fixtures pass byte-for-byte unmodified.
 
 ## Severity 0 — spec/code drift (found 2026-09-04, closed same day)
 

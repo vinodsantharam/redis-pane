@@ -252,6 +252,9 @@ pub struct State {
     pub tree_mode: bool,
     /// Set while `/` is capturing a filter.
     pub filtering: bool,
+    /// Below 70 columns there is one pane at a time; this says which.
+    /// Ignored at any wider density, where both panes always show.
+    pub single_pane_view: crate::render::layout::SinglePaneView,
     /// The key in the Viewer, if one is open. There is no cache behind this —
     /// it holds what the server last said and nothing more (ADR-0006).
     pub open: Option<OpenKey>,

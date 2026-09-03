@@ -1257,9 +1257,12 @@ fn the_selected_row_carries_a_background_all_the_way_across_not_just_on_the_name
 
     // The bar spans exactly the keys pane, not the full 130-column frame —
     // there is a value pane to the right of it, correctly unpainted.
-    let keys_pane_width = redis_pane_core::render::layout::layout(Rect::new(0, 0, 130, 12))
-        .keys
-        .width;
+    let keys_pane_width = redis_pane_core::render::layout::layout(
+        Rect::new(0, 0, 130, 12),
+        redis_pane_core::render::layout::SinglePaneView::Keys,
+    )
+    .keys
+    .width;
 
     let mut gaps = Vec::new();
     for x in 1..keys_pane_width {
@@ -1279,9 +1282,12 @@ fn an_unselected_row_carries_no_background_at_all() {
     let frame = render::frame(&state, &theme, &CLOCK, Rect::new(0, 0, 130, 12));
     let y = row_of(&frame, "user:8812:profile"); // row 1, not selected
 
-    let keys_pane_width = redis_pane_core::render::layout::layout(Rect::new(0, 0, 130, 12))
-        .keys
-        .width;
+    let keys_pane_width = redis_pane_core::render::layout::layout(
+        Rect::new(0, 0, 130, 12),
+        redis_pane_core::render::layout::SinglePaneView::Keys,
+    )
+    .keys
+    .width;
     for x in 1..keys_pane_width {
         let bg = frame.cell((x, y)).map(|c| c.style().bg);
         assert!(
@@ -1320,4 +1326,72 @@ fn distinct_types_render_with_distinct_dot_colours_in_a_real_frame() {
         unique.len() > 1,
         "every row's dot rendered the same colour: {dot_colors:?}"
     );
+}
+
+// ── severity-3 #8: stack navigation below 70 columns ────────────────────────
+
+use redis_pane_core::render::layout::SinglePaneView;
+
+#[test]
+fn golden_single_pane_value_view_60_cols() {
+    let mut state = opened("user:8812:session", hash_value(), 2_537);
+    state.single_pane_view = SinglePaneView::Value;
+    assert_golden("single_pane_value_60", &draw(&state, 60, 24));
+}
+
+#[test]
+fn the_default_single_pane_state_still_renders_the_key_list_unchanged() {
+    // Regression guard: adding Value mode must not disturb the existing,
+    // already-shipped Keys mode at the same width.
+    let state = many_keys();
+    assert_eq!(state.single_pane_view, SinglePaneView::Keys);
+    let frame = draw(&state, 60, 24);
+    assert!(
+        frame.contains("KEY"),
+        "the flat/tree list header must still be there"
+    );
+}
+
+#[test]
+fn standalone_value_view_has_no_stray_border_character_at_the_left_edge() {
+    // The two-pane layouts draw a "│" one column left of the value pane; at
+    // full width there is no adjacent pane to separate from, and that
+    // character must not appear over the content instead.
+    let mut state = opened("k", hash_value(), 600);
+    state.single_pane_view = SinglePaneView::Value;
+    let frame = draw(&state, 60, 24);
+    for line in frame.lines() {
+        assert!(
+            !line.starts_with('│'),
+            "stray separator at the left edge: {line:?}"
+        );
+    }
+}
+
+#[test]
+fn the_breadcrumb_names_the_key_and_the_effective_back_binding() {
+    let mut state = opened("user:8812:session", hash_value(), 2_537);
+    state.single_pane_view = SinglePaneView::Value;
+    let frame = draw(&state, 60, 24);
+    assert!(frame.contains("back"), "{frame}");
+    assert!(frame.contains("user:8812:session"), "{frame}");
+
+    // R7.5: the breadcrumb must follow a rebinding, not a hard-coded "Esc".
+    let mut keymap = redis_pane_core::keymap::Keymap::default();
+    keymap.bind(
+        redis_pane_core::keymap::Action::Cancel,
+        KeyPress::plain(KeyCode::Char('h')),
+    );
+    state.keymap = keymap;
+    let rebound = draw(&state, 60, 24);
+    assert!(rebound.contains("h back"), "{rebound}");
+}
+
+#[test]
+fn a_key_opened_narrow_shows_its_real_value_not_a_placeholder() {
+    let mut state = opened("user:8812:session", hash_value(), 2_537);
+    state.single_pane_view = SinglePaneView::Value;
+    let frame = draw(&state, 60, 24);
+    assert!(frame.contains("device"), "{frame}");
+    assert!(frame.contains("ios/17.2"), "{frame}");
 }

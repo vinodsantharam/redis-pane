@@ -5,7 +5,7 @@
 
 use clap::Parser;
 use fred::interfaces::ClientLike;
-use redis_pane_core::resolve::{EnvVars, Flags, resolve};
+use redis_pane_core::resolve::{Credentials, EnvVars, Flags, resolve};
 use redis_pane_core::state::{Connection, ReadOnlyReason, State};
 use redis_pane_core::theme::Theme;
 
@@ -72,7 +72,7 @@ fn startup_failure(connection: &Connection, err: &ConnectError) -> String {
 
 /// Connect, report what the server supports, and exit. M0.8's proof, runnable
 /// by hand as well as by the suite.
-fn probe(connection: &Connection) -> i32 {
+fn probe(connection: &Connection, credentials: &Credentials) -> i32 {
     let url = if connection.target.contains("://") {
         connection.target.clone()
     } else {
@@ -87,7 +87,7 @@ fn probe(connection: &Connection) -> i32 {
         }
     };
 
-    match runtime.block_on(redis::connect(&url)) {
+    match runtime.block_on(redis::connect_with(&url, credentials)) {
         Ok((client, established)) => {
             println!(
                 "{} · {} · {}",
@@ -96,6 +96,12 @@ fn probe(connection: &Connection) -> i32 {
                 connection.source.label()
             );
             println!("redis {}", established.version);
+            if let Some(reason) = established.read_only {
+                println!("read-only: {} (not liftable)", reason.label());
+            }
+            if let Some(condition) = established.condition {
+                println!("condition: {}", condition.readout());
+            }
             println!(
                 "liveness: {}",
                 if established.tracking_supported {
@@ -140,7 +146,8 @@ fn main() {
         db: cli.db,
         profile: cli.profile.or(cli.positional_profile),
     };
-    let connection = resolve(&flags, config.as_ref(), &env_vars());
+    let resolution = resolve(&flags, config.as_ref(), &env_vars());
+    let connection = resolution.connection.clone();
 
     if cli.print_target {
         println!(
@@ -153,7 +160,7 @@ fn main() {
     }
 
     if cli.probe {
-        std::process::exit(probe(&connection));
+        std::process::exit(probe(&connection, &resolution.credentials));
     }
 
     // Connect before taking over the terminal: a failure here is a diagnostic
@@ -170,28 +177,33 @@ fn main() {
             std::process::exit(exit::CONNECTION);
         }
     };
-    let (client, established) = match runtime.block_on(redis::connect(&url)) {
-        Ok(pair) => pair,
-        Err(err @ (ConnectError::BelowFloor { .. } | ConnectError::NoResp3 { .. })) => {
-            eprintln!("{}", startup_failure(&connection, &err));
-            std::process::exit(exit::UNSUPPORTED_SERVER);
-        }
-        Err(err) => {
-            eprintln!("{}", startup_failure(&connection, &err));
-            std::process::exit(exit::CONNECTION);
-        }
-    };
+    let (client, established) =
+        match runtime.block_on(redis::connect_with(&url, &resolution.credentials)) {
+            Ok(pair) => pair,
+            Err(err @ (ConnectError::BelowFloor { .. } | ConnectError::NoResp3 { .. })) => {
+                eprintln!("{}", startup_failure(&connection, &err));
+                std::process::exit(exit::UNSUPPORTED_SERVER);
+            }
+            Err(err) => {
+                eprintln!("{}", startup_failure(&connection, &err));
+                std::process::exit(exit::CONNECTION);
+            }
+        };
 
     let clock = SystemClock;
-    // `prod` and `unknown` start guarded (R4.5, ADR-0004). The reason is carried
-    // so the header can say *why*, and so `⌃R` knows whether it may lift it.
-    let read_only = connection
-        .environment
-        .read_only_by_default()
-        .then_some(ReadOnlyReason::Environment);
+    // `prod` and `unknown` start guarded (R4.5, ADR-0004). A replica outranks
+    // the Environment: that reason cannot be lifted, so claiming the weaker one
+    // would offer a toggle the server will refuse (R1.15, ADR-0009).
+    let read_only = established.read_only.or_else(|| {
+        connection
+            .environment
+            .read_only_by_default()
+            .then_some(ReadOnlyReason::Environment)
+    });
     let state = State {
         connection,
         read_only,
+        condition: established.condition,
         ..State::default()
     };
     let theme = Theme::new(terminal::detect_color_depth());

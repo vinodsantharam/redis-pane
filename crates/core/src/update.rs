@@ -168,6 +168,34 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             state.notice = Some((format!("copied {label}"), at_ms));
             (state, Vec::new())
         }
+        Msg::ServerState {
+            read_only,
+            condition,
+        } => {
+            // A replica outranks an Environment guard: that reason cannot be
+            // lifted, so claiming the weaker one would offer a toggle the
+            // server will refuse anyway (ADR-0009). A user-imposed guard is
+            // never taken away by the server changing its mind.
+            state.read_only = match (read_only, state.read_only) {
+                (Some(reason), _) => Some(reason),
+                (None, Some(ReadOnlyReason::Replica)) => state
+                    .connection
+                    .environment
+                    .read_only_by_default()
+                    .then_some(ReadOnlyReason::Environment),
+                (None, existing) => existing,
+            };
+            state.condition = condition;
+            (state, Vec::new())
+        }
+        Msg::Failed {
+            command,
+            detail,
+            at_ms,
+        } => {
+            state.error = Some((format!("{command}: {detail}"), at_ms));
+            (state, Vec::new())
+        }
         Msg::Quit => quit(state),
     }
 }
@@ -230,8 +258,14 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             (state, Vec::new())
         }
         Action::Cancel => {
+            // Esc backs out of the nearest thing first: an overlay, then an
+            // error, then an in-flight scan. One keypress, one meaning.
             if state.help_open {
                 state.help_open = false;
+                return (state, Vec::new());
+            }
+            if state.error.is_some() {
+                state.error = None;
                 return (state, Vec::new());
             }
             // Every in-flight operation is cancellable (PRD R7.3).
@@ -1140,5 +1174,167 @@ mod metadata_tests {
         let (state, cmds) = update(State::default(), Msg::Key(KeyPress::plain(KeyCode::Down)));
         assert_eq!(state.view.selected, 0);
         assert!(cmds.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod honesty_tests {
+    //! The three ways the app could quietly claim something untrue, each with
+    //! a test so it cannot come back.
+
+    use super::*;
+    use crate::msg::KeyCode;
+    use crate::state::{Environment, Liveness, ServerCondition};
+
+    /// R7.4: an error is never swallowed. A Redis failure that produces no
+    /// visible effect is indistinguishable from the app deciding to do nothing.
+    #[test]
+    fn a_failure_surfaces_with_the_command_that_caused_it() {
+        let (state, _) = update(
+            State::default(),
+            Msg::Failed {
+                command: "reading user:8812:session".into(),
+                detail: "WRONGTYPE Operation against a key".into(),
+                at_ms: 1_000,
+            },
+        );
+        let shown = state.error_text().expect("the failure must be visible");
+        assert!(shown.contains("reading user:8812:session"), "{shown}");
+        assert!(shown.contains("WRONGTYPE"), "{shown}");
+    }
+
+    #[test]
+    fn an_error_does_not_fade_the_way_a_confirmation_does() {
+        // A confirmation nobody reads has cost nothing. An error nobody reads
+        // is an error nobody handled.
+        let (state, _) = update(
+            State::default(),
+            Msg::Failed {
+                command: "c".into(),
+                detail: "d".into(),
+                at_ms: 0,
+            },
+        );
+        assert!(state.error_text().is_some());
+        assert!(
+            state.notice_now(State::NOTICE_MS * 10).is_none(),
+            "a copy notice would be gone by now"
+        );
+        assert!(state.error_text().is_some(), "the error is not");
+    }
+
+    #[test]
+    fn esc_dismisses_an_error_before_it_touches_anything_else() {
+        let (state, _) = update(
+            State::default(),
+            Msg::Failed {
+                command: "c".into(),
+                detail: "d".into(),
+                at_ms: 0,
+            },
+        );
+        let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Esc)));
+        assert!(state.error_text().is_none());
+    }
+
+    /// ADR-0009: the shell now reports reconnects, and the core must drop the
+    /// liveness claim when it does.
+    #[test]
+    fn a_reported_reconnect_drops_the_liveness_claim_until_re_armed() {
+        let (state, _) = update(
+            State::default(),
+            Msg::Connected {
+                version: "8.4.0".into(),
+                tracking_supported: true,
+            },
+        );
+        let (state, _) = update(state, Msg::TrackingArmed);
+        assert_eq!(state.liveness(), Liveness::Live);
+
+        let (state, _) = update(state, Msg::ConnectionLost);
+        assert_eq!(state.liveness(), Liveness::Disconnected);
+
+        // The shell re-probes and re-announces; still not live until armed.
+        let (state, cmds) = update(
+            state,
+            Msg::Connected {
+                version: "8.4.0".into(),
+                tracking_supported: true,
+            },
+        );
+        assert_ne!(state.liveness(), Liveness::Live);
+        assert!(cmds.contains(&Command::RefetchOpenKey));
+    }
+
+    /// R1.15: a replica outranks an Environment guard, and cannot be lifted.
+    #[test]
+    fn a_replica_guard_outranks_an_environment_guard() {
+        let state = State {
+            read_only: Some(ReadOnlyReason::Environment),
+            ..State::default()
+        };
+        let (state, _) = update(
+            state,
+            Msg::ServerState {
+                read_only: Some(ReadOnlyReason::Replica),
+                condition: None,
+            },
+        );
+        assert_eq!(state.read_only, Some(ReadOnlyReason::Replica));
+        assert!(!state.read_only_liftable(), "⌃R must not offer to lift it");
+    }
+
+    #[test]
+    fn a_failover_away_from_a_replica_falls_back_to_the_environment_guard() {
+        // Sentinel promotes the replica we were reading. The `replica` reason
+        // no longer applies, but a prod Environment guard still does.
+        let mut state = State {
+            read_only: Some(ReadOnlyReason::Replica),
+            ..State::default()
+        };
+        state.connection.environment = Environment::Prod;
+        let (state, _) = update(
+            state,
+            Msg::ServerState {
+                read_only: None,
+                condition: None,
+            },
+        );
+        assert_eq!(state.read_only, Some(ReadOnlyReason::Environment));
+    }
+
+    #[test]
+    fn the_server_changing_its_mind_never_lifts_a_user_imposed_guard() {
+        let state = State {
+            read_only: Some(ReadOnlyReason::User),
+            ..State::default()
+        };
+        let (state, _) = update(
+            state,
+            Msg::ServerState {
+                read_only: None,
+                condition: None,
+            },
+        );
+        assert_eq!(state.read_only, Some(ReadOnlyReason::User));
+    }
+
+    #[test]
+    fn a_condition_that_rejects_writes_reaches_the_chrome() {
+        let (state, _) = update(
+            State::default(),
+            Msg::ServerState {
+                read_only: None,
+                condition: Some(ServerCondition::Misconf),
+            },
+        );
+        assert_eq!(state.condition, Some(ServerCondition::Misconf));
+        assert!(
+            state
+                .condition
+                .unwrap()
+                .readout()
+                .contains("writes rejected")
+        );
     }
 }

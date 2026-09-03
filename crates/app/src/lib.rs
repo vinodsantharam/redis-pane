@@ -10,6 +10,7 @@
 pub mod clipboard;
 pub mod config_io;
 pub mod redis;
+pub mod secret;
 pub mod state_file;
 pub mod terminal;
 

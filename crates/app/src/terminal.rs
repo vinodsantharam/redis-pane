@@ -12,6 +12,7 @@ use crossterm::{execute, terminal};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
+use fred::interfaces::EventInterface;
 use fred::prelude::Client;
 use redis_pane_core::clock::Clock;
 use redis_pane_core::msg::{KeyCode, KeyPress};
@@ -127,6 +128,62 @@ pub async fn run(
     let mut scan_cancel: Option<CancellationToken> = None;
     start_scan(&client, None, &tx, &mut scan_cancel);
 
+    // fred reconnects underneath us, and the server on the other side remembers
+    // nothing about what we were watching. Telling the core lets it drop the
+    // liveness claim and re-arm — the invariant ADR-0009 exists for, which
+    // until now was enforced only where it was tested (PLAN M0.10).
+    {
+        let mut reconnects = client.reconnect_rx();
+        let tx = tx.clone();
+        let probe = client.clone();
+        tokio::spawn(async move {
+            while reconnects.recv().await.is_ok() {
+                // A fresh connection tracks nothing, so capability must be
+                // re-probed rather than remembered.
+                let tracking = crate::redis::probe_tracking_public(&probe).await;
+                let (read_only, condition) = crate::redis::server_conditions(&probe).await;
+                let _ = tx
+                    .send(Msg::ServerState {
+                        read_only,
+                        condition,
+                    })
+                    .await;
+                if tx
+                    .send(Msg::Connected {
+                        version: String::new(),
+                        tracking_supported: tracking,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+    }
+    {
+        let mut errors = client.error_rx();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            while let Ok((error, _server)) = errors.recv().await {
+                // A connection-level error means the link is gone; anything
+                // else is a command failure and belongs in a notification.
+                let msg = if matches!(error.kind(), fred::error::ErrorKind::IO) {
+                    Msg::ConnectionLost
+                } else {
+                    Msg::Failed {
+                        command: "connection".into(),
+                        detail: error.details().to_string(),
+                        at_ms: 0,
+                    }
+                };
+                if tx.send(msg).await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
     // Invalidation pushes arrive on their own task and become messages like
     // everything else. This is what makes a value update with no keypress —
     // and it is the whole reason this project exists (ADR-0006).
@@ -181,10 +238,20 @@ pub async fn run(
                     let client = client.clone();
                     let tx = tx.clone();
                     tokio::spawn(async move {
-                        if let Ok(entries) = crate::redis::fetch_metadata(&client, &window).await
-                            && !entries.is_empty()
-                        {
-                            let _ = tx.send(Msg::MetadataBatch { entries }).await;
+                        match crate::redis::fetch_metadata(&client, &window).await {
+                            Ok(entries) if !entries.is_empty() => {
+                                let _ = tx.send(Msg::MetadataBatch { entries }).await;
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Msg::Failed {
+                                        command: "fetching metadata".into(),
+                                        detail: e.details().to_string(),
+                                        at_ms: 0,
+                                    })
+                                    .await;
+                            }
                         }
                     });
                 }
@@ -250,7 +317,13 @@ fn open_key(
                 at_ms,
             },
             Ok(None) => Msg::ValueGone { at_ms },
-            Err(_) => return,
+            // Never swallowed: a Redis error that produces no visible effect is
+            // indistinguishable from the app deciding to do nothing (R7.4).
+            Err(e) => Msg::Failed {
+                command: format!("reading {}", String::from_utf8_lossy(&name)),
+                detail: e.details().to_string(),
+                at_ms,
+            },
         };
         let _ = tx.send(msg).await;
     });

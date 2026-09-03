@@ -201,12 +201,15 @@ fn status_bar(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect, buf: 
     let readout = state.scan.readout();
     let quiet = readout.is_empty()
         && state.list.sort_readout().is_none()
-        && state.notice_now(clock.now_ms()).is_none();
+        && state.notice_now(clock.now_ms()).is_none()
+        && state.error_text().is_none();
     if quiet || area.height < 2 {
         return;
     }
     let y = area.height - if area.height >= 24 { 2 } else { 1 };
-    let token = if state.notice_now(clock.now_ms()).is_some() {
+    let token = if state.error_text().is_some() {
+        Token::Danger
+    } else if state.notice_now(clock.now_ms()).is_some() {
         Token::Ok
     } else {
         match state.scan {
@@ -221,9 +224,17 @@ fn status_bar(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect, buf: 
         line = format!("{line}   {sort}");
     }
     // A copy confirmation displaces the scan readout for a moment rather than
-    // claiming another row (G7).
+    // claiming another row (G7). A failure outranks both and stays until it is
+    // dismissed, because an error nobody read is an error nobody handled.
     if let Some(notice) = state.notice_now(clock.now_ms()) {
         line = notice.to_string();
+    }
+    if let Some(error) = state.error_text() {
+        let dismiss = state
+            .keymap
+            .hint(crate::keymap::Action::Cancel)
+            .unwrap_or_default();
+        line = format!("✕ {error}   {dismiss} dismiss");
     }
     let x = put(buf, 1, y, &line, theme.style(token));
     if state.scan.is_running()

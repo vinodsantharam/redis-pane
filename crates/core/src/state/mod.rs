@@ -261,6 +261,10 @@ pub struct State {
     /// rather than needing dismissal — a notice you must acknowledge is a
     /// modal dialog wearing a smaller hat.
     pub notice: Option<(String, u64)>,
+    /// The last failure, and when. Errors stay until the next one or until
+    /// dismissed with `Esc`: unlike a confirmation, a failure that fades before
+    /// it is read has told nobody anything (R7.4).
+    pub error: Option<(String, u64)>,
 }
 
 impl State {
@@ -349,6 +353,12 @@ impl State {
             .as_ref()
             .filter(|(_, at)| now_ms.saturating_sub(*at) < Self::NOTICE_MS)
             .map(|(text, _)| text.as_str())
+    }
+
+    /// The failure to show, if there is one. Unlike [`State::notice_now`] this
+    /// does not expire.
+    pub fn error_text(&self) -> Option<&str> {
+        self.error.as_ref().map(|(text, _)| text.as_str())
     }
 
     pub fn liveness(&self) -> Liveness {

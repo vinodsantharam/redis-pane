@@ -17,6 +17,38 @@
 use crate::config::{Config, Profile};
 use crate::state::{Connection, Environment, Source};
 
+/// Where a password comes from — a *description*, not the secret itself.
+///
+/// Secrets are references (ADR-0002), and resolving a reference means reading
+/// an environment variable or running a command, both of which are I/O. So the
+/// core says what to fetch and the shell fetches it. A literal passes through
+/// only because the config file is refused when it is group- or world-readable.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PasswordSource {
+    #[default]
+    None,
+    Literal(String),
+    /// The name of an environment variable holding the password.
+    Env(String),
+    /// A command whose stdout is the password.
+    Command(String),
+}
+
+/// What is needed to authenticate, as references.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Credentials {
+    pub username: Option<String>,
+    pub password: PasswordSource,
+    pub tls: bool,
+}
+
+/// Everything resolution produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolution {
+    pub connection: Connection,
+    pub credentials: Credentials,
+}
+
 /// What the user asked for on the command line.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Flags {
@@ -56,7 +88,7 @@ const DEFAULT_PORT: u16 = 6379;
 /// Resolve a Connection from flags, config and environment.
 ///
 /// Never fails and never prompts: the fallback is always `127.0.0.1:6379`.
-pub fn resolve(flags: &Flags, config: Option<&Config>, env: &EnvVars) -> Connection {
+pub fn resolve(flags: &Flags, config: Option<&Config>, env: &EnvVars) -> Resolution {
     // 1. An explicit --profile names a Profile, and outranks everything but a
     //    target given directly on the command line.
     if let Some(name) = &flags.profile
@@ -76,10 +108,13 @@ pub fn resolve(flags: &Flags, config: Option<&Config>, env: &EnvVars) -> Connect
             ),
         };
         let environment = infer_environment(&target);
-        return Connection {
-            target,
-            environment,
-            source: Source::Flag,
+        return Resolution {
+            connection: Connection {
+                target,
+                environment,
+                source: Source::Flag,
+            },
+            credentials: env_credentials(env),
         };
     }
 
@@ -105,23 +140,43 @@ pub fn resolve(flags: &Flags, config: Option<&Config>, env: &EnvVars) -> Connect
             ),
         };
         let environment = infer_environment(&target);
-        return Connection {
-            target,
-            environment,
-            source: Source::Environment,
+        return Resolution {
+            connection: Connection {
+                target,
+                environment,
+                source: Source::Environment,
+            },
+            credentials: env_credentials(env),
         };
     }
 
     // 5. Nothing was configured.
     let target = format_target(DEFAULT_HOST, DEFAULT_PORT, flags.db.unwrap_or(0));
-    Connection {
-        target,
-        environment: Environment::Local,
-        source: Source::Default,
+    Resolution {
+        connection: Connection {
+            target,
+            environment: Environment::Local,
+            source: Source::Default,
+        },
+        credentials: env_credentials(env),
     }
 }
 
-fn from_profile(name: &str, profile: &Profile, db_override: Option<u8>) -> Connection {
+/// `REDIS_USER` and `REDIS_PASSWORD`. Used only when the target itself came
+/// from the environment or the command line — never merged into a Profile,
+/// whose credentials are stated in the file (ADR-0001).
+fn env_credentials(env: &EnvVars) -> Credentials {
+    Credentials {
+        username: env.redis_user.clone(),
+        password: match &env.redis_password {
+            Some(p) => PasswordSource::Literal(p.clone()),
+            None => PasswordSource::None,
+        },
+        tls: false,
+    }
+}
+
+fn from_profile(name: &str, profile: &Profile, db_override: Option<u8>) -> Resolution {
     let db = db_override.or(profile.db).unwrap_or(0);
     let target = match &profile.url {
         Some(url) => format_url(url, Some(db)),
@@ -131,10 +186,29 @@ fn from_profile(name: &str, profile: &Profile, db_override: Option<u8>) -> Conne
             db,
         ),
     };
-    Connection {
-        target,
-        environment: profile.environment(),
-        source: Source::Profile(name.to_string()),
+    // Reference forms are checked before the literal, so a Profile carrying
+    // both does not silently use the one ADR-0002 discourages.
+    let password = if let Some(var) = &profile.password_env {
+        PasswordSource::Env(var.clone())
+    } else if let Some(cmd) = &profile.password_command {
+        PasswordSource::Command(cmd.clone())
+    } else if let Some(literal) = &profile.password {
+        PasswordSource::Literal(literal.clone())
+    } else {
+        PasswordSource::None
+    };
+
+    Resolution {
+        connection: Connection {
+            target,
+            environment: profile.environment(),
+            source: Source::Profile(name.to_string()),
+        },
+        credentials: Credentials {
+            username: profile.username.clone(),
+            password,
+            tls: profile.tls.unwrap_or(false),
+        },
     }
 }
 
@@ -261,7 +335,7 @@ mod tests {
         ];
 
         for c in cases {
-            let got = resolve(&c.flags, c.config, &c.env);
+            let got = resolve(&c.flags, c.config, &c.env).connection;
             assert_eq!(got.target, c.target, "{}", c.why);
             assert_eq!(got.source, c.source, "{}", c.why);
         }
@@ -276,7 +350,7 @@ mod tests {
             redis_port: Some("9999".into()),
             ..EnvVars::default()
         };
-        let got = resolve(&Flags::default(), None, &env);
+        let got = resolve(&Flags::default(), None, &env).connection;
         assert_eq!(got.target, "redis://real-target:6379");
         assert!(!got.target.contains("stale-leftover"));
         assert!(!got.target.contains("9999"));
@@ -289,7 +363,10 @@ mod tests {
             redis_port: Some("6390".into()),
             ..EnvVars::default()
         };
-        assert_eq!(resolve(&Flags::default(), None, &env).target, "box:6390/0");
+        assert_eq!(
+            resolve(&Flags::default(), None, &env).connection.target,
+            "box:6390/0"
+        );
     }
 
     #[test]
@@ -297,7 +374,7 @@ mod tests {
         // Every combination resolves to something. There is no "ask the user".
         for config in [None, Some(&config_with_default())] {
             for env in [EnvVars::default(), env_url("redis://x:1")] {
-                let got = resolve(&Flags::default(), config, &env);
+                let got = resolve(&Flags::default(), config, &env).connection;
                 assert!(!got.target.is_empty());
             }
         }
@@ -310,7 +387,9 @@ mod tests {
             ..Flags::default()
         };
         assert_eq!(
-            resolve(&flags, None, &EnvVars::default()).environment,
+            resolve(&flags, None, &EnvVars::default())
+                .connection
+                .environment,
             Environment::Unknown
         );
     }
@@ -323,7 +402,9 @@ mod tests {
                 ..Flags::default()
             };
             assert_eq!(
-                resolve(&flags, None, &EnvVars::default()).environment,
+                resolve(&flags, None, &EnvVars::default())
+                    .connection
+                    .environment,
                 Environment::Local
             );
         }
@@ -335,7 +416,9 @@ mod tests {
         // declared Environment is a statement of fact, not a guess.
         let cfg = config_with_default();
         assert_eq!(
-            resolve(&Flags::default(), Some(&cfg), &EnvVars::default()).environment,
+            resolve(&Flags::default(), Some(&cfg), &EnvVars::default())
+                .connection
+                .environment,
             Environment::Staging
         );
     }
@@ -349,7 +432,9 @@ mod tests {
         };
         // Falls through to the default Profile; the name is validated at load.
         assert_eq!(
-            resolve(&flags, Some(&cfg), &EnvVars::default()).source,
+            resolve(&flags, Some(&cfg), &EnvVars::default())
+                .connection
+                .source,
             Source::Profile("staging".into())
         );
     }
@@ -363,8 +448,113 @@ mod tests {
             ..Flags::default()
         };
         assert_eq!(
-            resolve(&flags, Some(&cfg), &EnvVars::default()).target,
+            resolve(&flags, Some(&cfg), &EnvVars::default())
+                .connection
+                .target,
             "redis.prod:6380/7"
         );
+    }
+}
+
+#[cfg(test)]
+mod credential_tests {
+    //! Secrets are references, and the reference has to actually reach the
+    //! connection — parsing it and then dropping it is worse than not
+    //! supporting it, because the config file looks like it works.
+
+    use super::*;
+
+    fn config(json: &str) -> Config {
+        crate::config::parse(json).unwrap()
+    }
+
+    fn creds_for(json: &str, profile: &str) -> Credentials {
+        let cfg = config(json);
+        let flags = Flags {
+            profile: Some(profile.into()),
+            ..Flags::default()
+        };
+        resolve(&flags, Some(&cfg), &EnvVars::default()).credentials
+    }
+
+    #[test]
+    fn password_env_survives_resolution_as_a_reference() {
+        let c = creds_for(
+            r#"{"profiles":{"p":{"host":"h","passwordEnv":"REDIS_PW"}}}"#,
+            "p",
+        );
+        assert_eq!(c.password, PasswordSource::Env("REDIS_PW".into()));
+    }
+
+    #[test]
+    fn password_command_survives_resolution() {
+        let c = creds_for(
+            r#"{"profiles":{"p":{"host":"h","passwordCommand":"pass show redis"}}}"#,
+            "p",
+        );
+        assert_eq!(
+            c.password,
+            PasswordSource::Command("pass show redis".into())
+        );
+    }
+
+    #[test]
+    fn a_reference_wins_over_a_literal_in_the_same_profile() {
+        // Otherwise adding the recommended form to a Profile that already has a
+        // literal would silently change nothing.
+        let c = creds_for(
+            r#"{"profiles":{"p":{"host":"h","password":"hunter2","passwordEnv":"REDIS_PW"}}}"#,
+            "p",
+        );
+        assert_eq!(c.password, PasswordSource::Env("REDIS_PW".into()));
+    }
+
+    #[test]
+    fn a_username_and_tls_flag_reach_the_connection_too() {
+        let c = creds_for(
+            r#"{"profiles":{"p":{"host":"h","username":"app","tls":true}}}"#,
+            "p",
+        );
+        assert_eq!(c.username.as_deref(), Some("app"));
+        assert!(c.tls);
+    }
+
+    #[test]
+    fn a_profile_with_no_credentials_asks_for_none() {
+        let c = creds_for(r#"{"profiles":{"p":{"host":"h"}}}"#, "p");
+        assert_eq!(c.password, PasswordSource::None);
+        assert!(c.username.is_none());
+    }
+
+    #[test]
+    fn the_environment_supplies_credentials_when_the_target_came_from_there() {
+        let env = EnvVars {
+            redis_url: Some("redis://box:6379".into()),
+            redis_user: Some("app".into()),
+            redis_password: Some("s3cret".into()),
+            ..EnvVars::default()
+        };
+        let c = resolve(&Flags::default(), None, &env).credentials;
+        assert_eq!(c.username.as_deref(), Some("app"));
+        assert_eq!(c.password, PasswordSource::Literal("s3cret".into()));
+    }
+
+    #[test]
+    fn a_profiles_credentials_are_not_merged_with_the_environments() {
+        // ADR-0001 forbids component-level merging: a stale REDIS_PASSWORD must
+        // not attach itself to a Profile that states its own credentials.
+        let cfg = config(r#"{"profiles":{"p":{"host":"h","passwordEnv":"PROFILE_PW"}}}"#);
+        let env = EnvVars {
+            redis_password: Some("stale".into()),
+            redis_user: Some("stale-user".into()),
+            ..EnvVars::default()
+        };
+        let flags = Flags {
+            profile: Some("p".into()),
+            ..Flags::default()
+        };
+        let c = resolve(&flags, Some(&cfg), &env).credentials;
+        assert_eq!(c.password, PasswordSource::Env("PROFILE_PW".into()));
+        assert!(c.username.is_none(), "the stale username must not leak in");
     }
 }

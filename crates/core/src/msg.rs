@@ -145,6 +145,23 @@ pub enum Msg {
         label: &'static str,
         at_ms: u64,
     },
+    /// Conditions the server reported: replica status, and anything currently
+    /// rejecting writes (R1.15). Sent at connect and on every reconnect,
+    /// because a failover can change the answer.
+    ServerState {
+        read_only: Option<crate::state::ReadOnlyReason>,
+        condition: Option<crate::state::ServerCondition>,
+    },
+    /// An operation failed. Carries the command that failed (R7.4).
+    ///
+    /// Errors are never swallowed: a Redis error that produces no visible
+    /// effect is indistinguishable from the app deciding to do nothing, which
+    /// is the class of defect this project exists to remove.
+    Failed {
+        command: String,
+        detail: String,
+        at_ms: u64,
+    },
     /// The user asked to leave.
     Quit,
 }

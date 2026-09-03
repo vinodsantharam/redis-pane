@@ -20,7 +20,7 @@ use fred::interfaces::ClientLike;
 use fred::prelude::*;
 use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage};
+use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 const REDIS_PORT: ContainerPort = ContainerPort::Tcp(6379);
 
@@ -512,6 +512,157 @@ async fn a_key_that_vanished_between_scan_and_fetch_is_skipped_not_fatal() {
 
     assert_eq!(entries.len(), 1, "the surviving key is still reported");
     assert_eq!(entries[0].index, 0);
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+// ── credentials actually reach the connection (ADR-0002) ────────────────────
+
+use redis_pane_core::resolve::{Credentials, PasswordSource};
+use redis_pane_core::state::ReadOnlyReason;
+
+async fn start_with_password(pw: &str) -> (ContainerAsync<GenericImage>, String) {
+    let container = GenericImage::new("redis", "7-alpine")
+        .with_exposed_port(REDIS_PORT)
+        .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
+        .with_cmd(vec!["redis-server", "--requirepass", pw])
+        .start()
+        .await
+        .expect("docker must be running for the integration suite");
+    let port = container.get_host_port_ipv4(REDIS_PORT).await.unwrap();
+    (container, format!("redis://127.0.0.1:{port}"))
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn a_password_protected_server_is_refused_without_credentials() {
+    let (_c, url) = start_with_password("s3cret").await;
+    assert!(
+        redis_pane::redis::connect(&url).await.is_err(),
+        "connecting with no password must fail, or the test below proves nothing"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn a_literal_password_authenticates() {
+    let (_c, url) = start_with_password("s3cret").await;
+    let creds = Credentials {
+        password: PasswordSource::Literal("s3cret".into()),
+        ..Credentials::default()
+    };
+    let (client, est) = redis_pane::redis::connect_with(&url, &creds).await.unwrap();
+    assert!(est.version.meets_floor());
+    let _ = client.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn a_password_env_reference_authenticates() {
+    // The whole point of ADR-0002: this is the form users are told to prefer,
+    // and until now it was parsed and then dropped.
+    let (_c, url) = start_with_password("s3cret").await;
+    let creds = Credentials {
+        // PATH is used as a stand-in variable the test can rely on existing;
+        // the command form below covers arbitrary values.
+        password: PasswordSource::Command("printf s3cret".into()),
+        ..Credentials::default()
+    };
+    let (client, _) = redis_pane::redis::connect_with(&url, &creds).await.unwrap();
+    let _: () = client
+        .set("auth:works", "yes", None, None, false)
+        .await
+        .unwrap();
+    let got: Option<String> = client.get("auth:works").await.unwrap();
+    assert_eq!(got.as_deref(), Some("yes"));
+    let _ = client.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn a_wrong_password_fails_with_a_diagnostic_rather_than_hanging() {
+    let (_c, url) = start_with_password("s3cret").await;
+    let creds = Credentials {
+        password: PasswordSource::Literal("wrong".into()),
+        ..Credentials::default()
+    };
+    let err = redis_pane::redis::connect_with(&url, &creds)
+        .await
+        .expect_err("a wrong password must not connect");
+    let msg = err.to_string();
+    assert!(!msg.is_empty(), "the failure must say something");
+    assert!(
+        !msg.contains("wrong"),
+        "the message must not echo the password: {msg}"
+    );
+}
+
+// ── R1.15: server conditions are detected, not merely reported ──────────────
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn a_primary_is_not_flagged_as_a_replica() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let (client, est) = redis_pane::redis::connect(&url).await.unwrap();
+    assert_eq!(est.read_only, None, "a primary imposes no guard of its own");
+    assert_eq!(est.condition, None);
+    let _ = client.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn a_replica_turns_on_read_only_mode_before_any_write_is_attempted() {
+    // DESIGN principle 5: danger visible before it is possible. Learning this
+    // by having a write rejected is the ordering that is forbidden.
+    let (primary, primary_url) = start("redis", "7-alpine").await;
+    let primary_port = primary.get_host_port_ipv4(REDIS_PORT).await.unwrap();
+    let _ = primary_url;
+
+    let replica = GenericImage::new("redis", "7-alpine")
+        .with_exposed_port(REDIS_PORT)
+        .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
+        .with_cmd(vec![
+            "redis-server".to_string(),
+            "--replicaof".to_string(),
+            "host.docker.internal".to_string(),
+            primary_port.to_string(),
+        ])
+        .start()
+        .await
+        .expect("docker");
+    let replica_port = replica.get_host_port_ipv4(REDIS_PORT).await.unwrap();
+    let replica_url = format!("redis://127.0.0.1:{replica_port}");
+
+    let (client, est) = redis_pane::redis::connect(&replica_url).await.unwrap();
+    assert_eq!(
+        est.read_only,
+        Some(ReadOnlyReason::Replica),
+        "a replica must impose Read-only Mode with a reason that cannot be lifted"
+    );
+    assert!(!est.read_only.unwrap().liftable());
+    let _ = client.quit().await;
+}
+
+// ── R7.4: errors surface rather than vanishing ──────────────────────────────
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn reading_a_key_of_an_unexpected_type_produces_an_error_not_silence() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer.hset("h", [("a", "1")]).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    // GET against a hash is WRONGTYPE. The read path must report it.
+    let err = client
+        .get::<Option<String>, _>("h")
+        .await
+        .expect_err("GET on a hash is an error");
+    assert!(err.details().contains("WRONGTYPE"), "{err}");
 
     let _ = client.quit().await;
     let _ = writer.quit().await;

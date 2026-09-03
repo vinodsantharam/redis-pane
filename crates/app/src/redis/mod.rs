@@ -24,7 +24,9 @@ use fred::interfaces::{ClientInterface, TrackingInterface};
 use fred::prelude::*;
 use fred::types::{InfoKind, RespVersion};
 use redis_pane_core::msg::MetadataEntry;
+use redis_pane_core::resolve::Credentials;
 use redis_pane_core::server::{FLOOR, Version};
+use redis_pane_core::state::{ReadOnlyReason, ServerCondition};
 
 /// Why a connection could not be established or kept.
 #[derive(Debug)]
@@ -44,6 +46,8 @@ pub enum ConnectError {
     NoResp3 { detail: String },
     /// Connected, but `INFO server` did not report a parseable version.
     UnknownVersion(String),
+    /// A password reference could not be resolved (ADR-0002).
+    Credentials(String),
 }
 
 impl std::fmt::Display for ConnectError {
@@ -61,6 +65,7 @@ impl std::fmt::Display for ConnectError {
                  redis-pane speaks RESP3 only and needs {FLOOR} or newer.\n\
                  The server said: {detail}"
             ),
+            ConnectError::Credentials(why) => write!(f, "{why}"),
             ConnectError::UnknownVersion(raw) => {
                 write!(
                     f,
@@ -77,12 +82,41 @@ pub struct Established {
     pub version: Version,
     /// The result of *attempting* `CLIENT TRACKING`, never an inference.
     pub tracking_supported: bool,
+    /// Set when the server reported `role:slave`. Read-only Mode goes on with
+    /// reason `replica`, and `⌃R` cannot lift it (R1.15, ADR-0009).
+    pub read_only: Option<ReadOnlyReason>,
+    /// A condition currently rejecting writes.
+    pub condition: Option<ServerCondition>,
 }
 
 /// Connect over RESP3, check the floor, then probe for tracking.
 pub async fn connect(url: &str) -> Result<(Client, Established), ConnectError> {
+    connect_with(url, &Credentials::default()).await
+}
+
+/// Connect, authenticating with the credentials a Profile or the environment
+/// supplied.
+///
+/// Without this, a Profile's `passwordEnv` is parsed, validated, and then
+/// dropped — which makes the whole config file work on localhost and nowhere
+/// else (ADR-0002).
+pub async fn connect_with(
+    url: &str,
+    credentials: &Credentials,
+) -> Result<(Client, Established), ConnectError> {
     let mut config =
         Config::from_url(url).map_err(|e| ConnectError::Unreachable(format!("{url}: {e}")))?;
+
+    // A Profile's credentials are the more specific statement of intent, so
+    // they win over anything embedded in the URL.
+    let password = crate::secret::resolve(&credentials.password)
+        .map_err(|e| ConnectError::Credentials(e.to_string()))?;
+    if password.is_some() {
+        config.password = password;
+    }
+    if credentials.username.is_some() {
+        config.username = credentials.username.clone();
+    }
     // RESP2 is not spoken at all (ADR-0007): one reply shape per command, and
     // one code path per Viewer.
     config.version = RespVersion::RESP3;
@@ -106,13 +140,63 @@ pub async fn connect(url: &str) -> Result<(Client, Established), ConnectError> {
     }
 
     let tracking_supported = probe_tracking(&client).await;
+    let (read_only, condition) = server_conditions(&client).await;
     Ok((
         client,
         Established {
             version,
             tracking_supported,
+            read_only,
+            condition,
         },
     ))
+}
+
+/// Detect the conditions that will reject writes (R1.15, ADR-0009).
+///
+/// Detected rather than merely reported, so danger is visible *before* it is
+/// possible. Learning that a server is a replica by having a write rejected is
+/// exactly the ordering DESIGN principle 5 forbids.
+pub async fn server_conditions(
+    client: &Client,
+) -> (Option<ReadOnlyReason>, Option<ServerCondition>) {
+    let info: String = client
+        .info(Some(InfoKind::Default))
+        .await
+        .unwrap_or_default();
+
+    let field = |name: &str| -> Option<String> {
+        info.lines()
+            .find_map(|l| l.strip_prefix(name))
+            .map(|v| v.trim().to_string())
+    };
+
+    let read_only = match field("role:").as_deref() {
+        Some("slave") | Some("replica") => Some(ReadOnlyReason::Replica),
+        _ => None,
+    };
+
+    // A failing background save makes Redis refuse writes with -MISCONF, and it
+    // stays broken until someone intervenes — worth a banner, not a surprise.
+    let misconf = matches!(field("rdb_last_bgsave_status:").as_deref(), Some("err"));
+    let used: u64 = field("used_memory:")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let max: u64 = field("maxmemory:")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    let condition = if misconf {
+        Some(ServerCondition::Misconf)
+    } else if max > 0 && used >= max {
+        Some(ServerCondition::Oom)
+    } else if field("loading:").as_deref() == Some("1") {
+        Some(ServerCondition::Loading { percent: 0 })
+    } else {
+        None
+    };
+
+    (read_only, condition)
 }
 
 async fn server_version(client: &Client) -> Result<Version, ConnectError> {
@@ -133,6 +217,10 @@ async fn server_version(client: &Client) -> Result<Version, ConnectError> {
 /// A version check is not a substitute: managed platforms disable `CLIENT`
 /// subcommands on their own schedule, so the only reliable question is the one
 /// the server answers (ADR-0007).
+pub async fn probe_tracking_public(client: &Client) -> bool {
+    probe_tracking(client).await
+}
+
 async fn probe_tracking(client: &Client) -> bool {
     // OPTIN, no prefixes, no broadcast: tracking applies only to reads we
     // explicitly arm, which is what scopes it to one key rather than to every

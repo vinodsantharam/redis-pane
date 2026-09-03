@@ -156,6 +156,32 @@ fn main() {
         std::process::exit(probe(&connection));
     }
 
+    // Connect before taking over the terminal: a failure here is a diagnostic
+    // in the shell, not an error box in a TUI (ADR-0009).
+    let url = if connection.target.contains("://") {
+        connection.target.clone()
+    } else {
+        format!("redis://{}", connection.target)
+    };
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("redis-pane: {e}");
+            std::process::exit(exit::CONNECTION);
+        }
+    };
+    let (client, established) = match runtime.block_on(redis::connect(&url)) {
+        Ok(pair) => pair,
+        Err(err @ (ConnectError::BelowFloor { .. } | ConnectError::NoResp3 { .. })) => {
+            eprintln!("{}", startup_failure(&connection, &err));
+            std::process::exit(exit::UNSUPPORTED_SERVER);
+        }
+        Err(err) => {
+            eprintln!("{}", startup_failure(&connection, &err));
+            std::process::exit(exit::CONNECTION);
+        }
+    };
+
     let clock = SystemClock;
     // `prod` and `unknown` start guarded (R4.5, ADR-0004). The reason is carried
     // so the header can say *why*, and so `⌃R` knows whether it may lift it.
@@ -170,7 +196,8 @@ fn main() {
     };
     let theme = Theme::new(terminal::detect_color_depth());
 
-    if let Err(err) = terminal::run(state, theme, &clock) {
+    let tracking = established.tracking_supported;
+    if let Err(err) = runtime.block_on(terminal::run(state, theme, &clock, client, tracking)) {
         eprintln!("redis-pane: {err}");
         std::process::exit(exit::CONNECTION);
     }

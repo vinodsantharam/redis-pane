@@ -16,6 +16,9 @@ use redis_pane_core::clock::Clock;
 use redis_pane_core::msg::{KeyCode, KeyPress};
 use redis_pane_core::theme::{ColorDepth, Theme};
 use redis_pane_core::{Command, Msg, State, render, update};
+use fred::prelude::Client;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 /// Restores the terminal on drop, including when the process is unwinding.
 /// Leaving a terminal in raw mode after a panic is the rudest thing a TUI can
@@ -61,7 +64,17 @@ pub fn translate(key: KeyEvent) -> Option<Msg> {
 }
 
 /// Run the event loop until the core says to quit.
-pub fn run(mut state: State, theme: Theme, clock: &dyn Clock) -> std::io::Result<()> {
+///
+/// The render loop never does I/O. Redis work happens on tokio tasks that send
+/// [`Msg`]s into this loop; the loop reads state and draws. A keystroke is
+/// therefore answerable in one frame regardless of what the network is doing.
+pub async fn run(
+    mut state: State,
+    theme: Theme,
+    clock: &dyn Clock,
+    client: Client,
+    tracking: bool,
+) -> std::io::Result<()> {
     terminal::enable_raw_mode()?;
     execute!(stdout(), terminal::EnterAlternateScreen)?;
     let _guard = Guard;
@@ -69,14 +82,41 @@ pub fn run(mut state: State, theme: Theme, clock: &dyn Clock) -> std::io::Result
     let mut term: Terminal<CrosstermBackend<Stdout>> =
         Terminal::new(CrosstermBackend::new(stdout()))?;
 
+    let (tx, mut rx) = mpsc::channel::<Msg>(256);
+
+    // Keyboard reads block, so they live on their own thread and arrive as
+    // messages like everything else.
+    let input_tx = tx.clone();
+    std::thread::spawn(move || {
+        loop {
+            match event::read() {
+                Ok(Event::Key(k)) => {
+                    if let Some(msg) = translate(k)
+                        && input_tx.blocking_send(msg).is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(Event::Resize(cols, rows)) => {
+                    if input_tx.blocking_send(Msg::Resized { cols, rows }).is_err() {
+                        return;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => return,
+            }
+        }
+    });
+
     let size = term.size()?;
+    (state, _) = update(state, Msg::Resized { cols: size.width, rows: size.height });
     (state, _) = update(
         state,
-        Msg::Resized {
-            cols: size.width,
-            rows: size.height,
-        },
+        Msg::Connected { version: String::new(), tracking_supported: tracking },
     );
+
+    let mut scan_cancel: Option<CancellationToken> = None;
+    start_scan(&client, None, &tx, &mut scan_cancel);
 
     loop {
         term.draw(|f| {
@@ -84,37 +124,66 @@ pub fn run(mut state: State, theme: Theme, clock: &dyn Clock) -> std::io::Result
             *f.buffer_mut() = buf;
         })?;
 
-        let msg = match event::read()? {
-            Event::Key(k) => translate(k),
-            Event::Resize(cols, rows) => Some(Msg::Resized { cols, rows }),
-            _ => None,
+        let Some(msg) = rx.recv().await else {
+            return Ok(());
         };
-
-        let Some(msg) = msg else { continue };
         let commands;
         (state, commands) = update(state, msg);
 
-        // Exhaustive on purpose: `Command` is not `#[non_exhaustive]`, so a new
-        // variant fails to compile here rather than being silently dropped.
-        let mut quitting = false;
         for command in commands {
             match command {
-                Command::Quit => quitting = true,
-                // This loop has no Redis connection to act on; the async
-                // wiring lands with M1.3's browser. Listed explicitly rather
-                // than caught by a wildcard so a future variant still fails to
-                // compile here.
-                Command::RefetchOpenKey
-                | Command::Reconnect { .. }
-                | Command::StartScan { .. }
-                | Command::CancelScan
-                | Command::FetchMetadata { .. } => {}
+                Command::Quit => return Ok(()),
+                Command::StartScan { pattern } => {
+                    start_scan(&client, pattern, &tx, &mut scan_cancel)
+                }
+                Command::CancelScan => {
+                    if let Some(token) = scan_cancel.take() {
+                        token.cancel();
+                    }
+                }
+                Command::FetchMetadata { indices } => {
+                    // Resolve names here, on the UI side, so the task owns no
+                    // reference into state.
+                    let window: Vec<(usize, Vec<u8>)> = indices
+                        .iter()
+                        .filter_map(|i| state.keys.name(*i).map(|n| (*i, n.to_vec())))
+                        .collect();
+                    if window.is_empty() {
+                        continue;
+                    }
+                    let client = client.clone();
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        if let Ok(entries) = crate::redis::fetch_metadata(&client, &window).await
+                            && !entries.is_empty()
+                        {
+                            let _ = tx.send(Msg::MetadataBatch { entries }).await;
+                        }
+                    });
+                }
+                // Liveness and reconnection wiring land with the Viewer (M1.10).
+                Command::RefetchOpenKey | Command::Reconnect { .. } => {}
             }
         }
-        if quitting {
-            return Ok(());
-        }
     }
+}
+
+fn start_scan(
+    client: &Client,
+    pattern: Option<String>,
+    tx: &mpsc::Sender<Msg>,
+    slot: &mut Option<CancellationToken>,
+) {
+    if let Some(previous) = slot.take() {
+        previous.cancel();
+    }
+    let token = CancellationToken::new();
+    *slot = Some(token.clone());
+    let client = client.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        crate::redis::scan::stream_keys(&client, pattern.as_deref(), tx, token).await;
+    });
 }
 
 /// What the terminal can display. A real probe belongs in M0.3's follow-up;

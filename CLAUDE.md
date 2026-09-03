@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project state
 
-**Greenfield — no code yet.** The repository currently contains only planning documents. The
+**Scaffolded (M0.1 complete).** The workspace builds and CI is green; there is no UI yet. The
 product and design intent live in:
 
 - [README.md](README.md) — what this is, and the five decisions that shape it
@@ -50,15 +50,36 @@ Once `Cargo.toml` exists, fill in the commands below.
 
 ## Commands
 
-Not yet applicable — no build system exists. When scaffolding lands, this section must list:
-build, run against a local Redis, test (including how to run a *single* test), lint, and format.
-Do not leave it as prose.
+All commands run from the repository root. Cargo lives at `~/.cargo/bin`; if `cargo` is not
+found, `source ~/.cargo/env` first.
 
-Two suites are planned (ADR-0011) and the distinction belongs here when they exist: the default
-`cargo test` run is the functional core plus golden-frame snapshots and needs no Docker; the
-integration suite uses `testcontainers` against real Redis and covers `SCAN` streaming, tracking
-invalidation across a reconnect, capability probing where `CLIENT TRACKING` is refused, and error
-mapping for `-LOADING`, `-OOM`, `-MISCONF` and `-READONLY`.
+```bash
+cargo build --workspace                 # build
+cargo run -p redis-pane                 # run (no UI yet — scaffold prints and exits)
+cargo test --workspace                  # all tests
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all                         # format
+cargo fmt --all -- --check              # verify formatting, as CI does
+```
+
+Run a **single** test by path:
+
+```bash
+cargo test -p redis-pane-core clock::tests::fixed_clock_does_not_advance
+```
+
+Verify the core/shell boundary locally, the way the `boundary` CI job does — it must print
+nothing (ADR-0011):
+
+```bash
+cargo tree -p redis-pane-core -e normal | grep -iE 'crossterm|tokio|fred'
+```
+
+Two suites are planned (ADR-0011) and the distinction matters: the default `cargo test` run is
+the functional core plus golden-frame snapshots and needs no Docker; the integration suite uses
+`testcontainers` against real Redis and covers `SCAN` streaming, tracking invalidation across a
+reconnect, capability probing where `CLIENT TRACKING` is refused, and error mapping for
+`-LOADING`, `-OOM`, `-MISCONF` and `-READONLY`. The integration suite does not exist yet.
 
 ## Architecture guidance
 

@@ -1,0 +1,27 @@
+# redis-pane — the imperative shells around the core (ADR-0011).
+#
+# Everything that touches the outside world lives here: the terminal, the Redis
+# connection, the filesystem, and the clock.
+[package]
+name = "redis-pane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "redis-pane"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.6", features = ["derive"] }
+crossterm = "0.29.0"
+fred = "10.1.0"
+redis-pane-core = { version = "0.1.0", path = "../core" }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }

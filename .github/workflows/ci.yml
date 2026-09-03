@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: fmt · clippy · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  boundary:
+    name: core has no I/O dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # ADR-0011: the functional core must be unable to reach the outside world.
+      # This is the compiler-enforced half of that rule — see crates/core/Cargo.toml.
+      - name: Assert crossterm, tokio and fred are absent from redis-pane-core
+        run: |
+          if cargo tree -p redis-pane-core -e normal | grep -iE 'crossterm|tokio|fred'; then
+            echo "::error::redis-pane-core gained an I/O dependency. See ADR-0011."
+            exit 1
+          fi
+          echo "boundary intact"

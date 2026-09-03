@@ -1,0 +1,19 @@
+# redis-pane-core — the functional core (ADR-0011).
+#
+# This crate MUST NOT depend on tokio, fred, or crossterm. The core takes a
+# message and returns new state plus commands; it never performs I/O and never
+# reads the clock. That rule is enforced by this dependency list and by the
+# `boundary` job in CI, not by review.
+[package]
+name = "redis-pane-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ratatui = { version = "0.30", default-features = false }

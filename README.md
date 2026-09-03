@@ -12,9 +12,13 @@ structured data as structured data and makes dangerous operations feel dangerous
 
 **Requires Redis 6.0+ (or Valkey).** RESP3 only.
 
-**Planning. There is no code yet.** This repository currently holds the specification, and the
-specification is the deliverable — it is kept current, not archived. The stack is settled
-(Rust + [ratatui](https://ratatui.rs) + tokio); scaffolding has not started.
+**Scaffolded — M0.1 of [the plan](docs/PLAN.md) is complete.** The workspace builds, CI is green,
+and there is no UI yet. The specification is still the deliverable and is kept current rather
+than archived. Stack: Rust + [ratatui](https://ratatui.rs) + tokio + [fred](https://docs.rs/fred).
+
+```bash
+cargo run -p redis-pane
+```
 
 ## What it looks like
 

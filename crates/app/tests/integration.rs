@@ -18,7 +18,6 @@ use std::time::Duration;
 
 use fred::interfaces::ClientLike;
 use fred::prelude::*;
-use redis_pane_core::server::Version;
 use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage};
@@ -74,26 +73,22 @@ async fn connects_to_redis_7_and_tracking_is_available() {
 
 #[tokio::test]
 #[ignore = "needs docker"]
-async fn a_server_below_the_floor_is_refused_by_version_not_by_probing() {
-    // Redis 5 has no RESP3 at all, so this must fail before any capability
-    // question is asked (ADR-0007).
+async fn a_server_below_the_floor_is_refused_with_a_diagnostic_not_a_protocol_error() {
+    // Redis 5 predates HELLO, so it is caught at RESP3 negotiation rather than
+    // by the version check. That makes this message the one a real user on an
+    // old server reads, so it must explain rather than leak
+    // `ERR unknown command HELLO`.
     let (_c, url) = start("redis", "5-alpine").await;
     match redis_pane::redis::connect(&url).await {
+        Err(err @ redis_pane::redis::ConnectError::NoResp3 { .. }) => {
+            let msg = err.to_string();
+            assert!(msg.contains("RESP3"), "{msg}");
+            assert!(msg.contains("6.0.0"), "{msg}");
+        }
         Err(redis_pane::redis::ConnectError::BelowFloor { found }) => {
-            assert!(
-                found
-                    < Version {
-                        major: 6,
-                        minor: 0,
-                        patch: 0
-                    },
-                "found {found}"
-            );
+            assert!(!found.meets_floor(), "found {found}");
         }
-        Err(other) => {
-            // RESP3 negotiation may fail first; either way it must not connect.
-            eprintln!("refused, as required: {other}");
-        }
+        Err(other) => panic!("refused, but with an unhelpful message: {other}"),
         Ok(_) => panic!("Redis 5 must not be accepted"),
     }
 }
@@ -230,9 +225,14 @@ async fn a_reconnect_loses_tracking_which_is_why_it_must_be_re_armed() {
 /// on a machine with no Docker daemon, and it exercises the identical code path.
 #[tokio::test]
 #[ignore = "needs REDIS_PANE_TEST_URL"]
-async fn tracking_round_trip_against_a_supplied_server() {
+async fn tracking_round_trip_when_a_server_url_is_supplied() {
     let Some(url) = env_url() else {
-        eprintln!("REDIS_PANE_TEST_URL not set; nothing to do");
+        // Nothing to assert against. Say so unmistakably: a green line that
+        // proves nothing is worse than a missing one.
+        eprintln!(
+            "SKIPPED (no assertions ran): set REDIS_PANE_TEST_URL to exercise \
+             tracking_round_trip_when_a_server_url_is_supplied"
+        );
         return;
     };
 

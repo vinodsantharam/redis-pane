@@ -107,7 +107,7 @@ fn probe(connection: &Connection) -> i32 {
             let _ = runtime.block_on(client.quit());
             exit::OK
         }
-        Err(err @ ConnectError::BelowFloor { .. }) => {
+        Err(err @ (ConnectError::BelowFloor { .. } | ConnectError::NoResp3 { .. })) => {
             eprintln!("{}", startup_failure(connection, &err));
             exit::UNSUPPORTED_SERVER
         }

@@ -53,5 +53,11 @@ failure ADR-0006 exists to prevent.
 - Capability probing happens once per Connection, at connect and on every reconnect.
 - The test matrix is Redis 6.2, Redis 7.x, and Valkey, plus one deployment that refuses
   `CLIENT TRACKING` to exercise the fallback.
+- **In practice the floor is enforced by RESP3 negotiation, not by the version check.** `HELLO`
+  arrived *in* Redis 6.0, so an older server fails at `HELLO 3` before its version is ever read;
+  the version comparison remains as defence in depth for a server that speaks RESP3 and still
+  reports something older. This matters for the diagnostic: a user on Redis 5 must be told the
+  server predates the floor, not shown ``ERR unknown command `HELLO` `` (verified against
+  redis:5-alpine).
 - Anyone on Redis 5 or older is told plainly, at launch, with the version and the floor. Being
   refused with a reason is better than being admitted into a hollowed-out product.

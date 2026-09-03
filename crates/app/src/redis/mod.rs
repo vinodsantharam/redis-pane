@@ -29,6 +29,15 @@ pub enum ConnectError {
     Unreachable(String),
     /// Connected, but the server is below the floor (ADR-0007).
     BelowFloor { found: Version },
+    /// The server rejected `HELLO 3`, so it does not speak RESP3 at all.
+    ///
+    /// In practice this, not [`ConnectError::BelowFloor`], is how an old server
+    /// is caught: `HELLO` arrived *in* Redis 6.0, so protocol negotiation
+    /// already excludes everything under the floor. The version check remains
+    /// as defence in depth for a server that speaks RESP3 and still reports an
+    /// older version, but this is the variant a user on Redis 5 actually sees —
+    /// which is why it must not leak the raw protocol error.
+    NoResp3 { detail: String },
     /// Connected, but `INFO server` did not report a parseable version.
     UnknownVersion(String),
 }
@@ -41,6 +50,12 @@ impl std::fmt::Display for ConnectError {
                 f,
                 "server is Redis {found}; redis-pane needs {FLOOR} or newer.\n\
                  RESP3 is required and is not available before {FLOOR}."
+            ),
+            ConnectError::NoResp3 { detail } => write!(
+                f,
+                "server rejected RESP3 (HELLO 3), so it predates Redis {FLOOR}.\n\
+                 redis-pane speaks RESP3 only and needs {FLOOR} or newer.\n\
+                 The server said: {detail}"
             ),
             ConnectError::UnknownVersion(raw) => {
                 write!(
@@ -71,10 +86,15 @@ pub async fn connect(url: &str) -> Result<(Client, Established), ConnectError> {
     let client = Builder::from_config(config)
         .build()
         .map_err(|e| ConnectError::Unreachable(e.to_string()))?;
-    client
-        .init()
-        .await
-        .map_err(|e| ConnectError::Unreachable(describe(&e)))?;
+    client.init().await.map_err(|e| {
+        let detail = describe(&e);
+        // Turn an unhelpful protocol error into the diagnostic the user needs.
+        if rejected_hello(&detail) {
+            ConnectError::NoResp3 { detail }
+        } else {
+            ConnectError::Unreachable(detail)
+        }
+    })?;
 
     let version = server_version(&client).await?;
     if !version.meets_floor() {
@@ -147,6 +167,12 @@ pub fn backoff_for(attempt: u32) -> Duration {
     Duration::from_millis(ms.min(8_000))
 }
 
+/// Whether a connect failure was the server refusing `HELLO`.
+fn rejected_hello(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    lower.contains("unknown command") && lower.contains("hello")
+}
+
 fn describe(e: &Error) -> String {
     match e.details().is_empty() {
         true => format!("{e}"),
@@ -164,6 +190,27 @@ mod tests {
         assert_eq!(backoff_for(1), Duration::from_millis(500));
         assert_eq!(backoff_for(3), Duration::from_millis(2_000));
         assert_eq!(backoff_for(20), Duration::from_millis(8_000));
+    }
+
+    #[test]
+    fn a_rejected_hello_is_recognised_as_an_old_server() {
+        assert!(rejected_hello(
+            "Unknown: ERR unknown command `HELLO`, with args beginning with: `3`"
+        ));
+        assert!(!rejected_hello("IO: Connection refused"));
+        assert!(!rejected_hello(
+            "Auth: WRONGPASS invalid username-password pair"
+        ));
+    }
+
+    #[test]
+    fn the_no_resp3_message_explains_rather_than_leaking_the_protocol_error() {
+        let msg = ConnectError::NoResp3 {
+            detail: "ERR unknown command `HELLO`".into(),
+        }
+        .to_string();
+        assert!(msg.contains("predates Redis 6.0.0"), "{msg}");
+        assert!(msg.contains("RESP3"), "{msg}");
     }
 
     #[test]

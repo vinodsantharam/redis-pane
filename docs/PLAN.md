@@ -78,7 +78,7 @@ config parsing are done with their full test tables.
 | 5 | Terminal shell: raw mode, event loop, resize, quit | Synthetic events drive `update` without a terminal |
 | 6 | Connection resolution chain, flags → Profile → env → localhost, carrying **Source** | Table-driven tests over the whole precedence matrix (R1.2, ADR-0001) |
 | 7 | Config schema, strict parse rejecting unknown fields, permission refusal | Line/column errors; a typo'd `passwordEnv` fails loudly; group-readable file refused (R1.5, R1.7) |
-| 8 | Redis shell: `fred`, RESP3, version floor, **capability probe** | Connects to 6.2 and 7.x; a server refusing `CLIENT TRACKING` degrades to `○ manual` (R1.13, ADR-0007) |
+| 8 | Redis shell: `fred`, RESP3, version floor, **capability probe** | Connects to 6.2 and 7.x; Redis 5 is refused with a diagnostic rather than a protocol error; a server refusing `CLIENT TRACKING` degrades to `○ manual` (R1.13, ADR-0007) |
 | 9 | Startup diagnostics and exit codes | Unreachable target exits non-zero with target, Source and cause on stderr (R1.14) |
 | 10 | Reconnect with visible backoff, **both re-arm invariants** | Server killed mid-session: the header never reads `● live` until tracking is re-armed. A second write after an invalidation still produces a push, proving the Refetch re-armed (ADR-0006, ADR-0009) |
 | 11 | Title bar: Environment dot, target, db, Source, Read-only reason | Golden frames of every readout in DESIGN §6.8, including `replica … locked` |

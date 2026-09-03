@@ -120,6 +120,17 @@ pub fn render(state: &State, theme: &Theme, area: Rect, density: Density, buf: &
     let cols = Columns::for_pane(area.width, density);
     let mut y = area.y;
 
+    // A capped scan means the list on screen is not the whole keyspace — a
+    // fact worth more than a status-bar line that a copy confirmation can
+    // displace for a few seconds. Filtering, sorting and tree/flat all leave
+    // this row alone: none of them re-scan, so "capped" stays true and stays
+    // visible until a real ScanStarted resets it. Reserved only while it is
+    // true (G7), same rule as the filter line just below it.
+    if state.keys.is_capped() {
+        cap_banner(state, theme, area, y, buf);
+        y += 1;
+    }
+
     // The filter line only exists when there is a filter, so an unfiltered list
     // spends no rows on it (G7: screen space is a budget).
     if state.filtering || !state.list.filter.is_empty() {
@@ -148,6 +159,22 @@ pub fn render(state: &State, theme: &Theme, area: Rect, density: Density, buf: &
 }
 
 /// `/ user:*:session          3,410 of 41,203`
+/// The cap banner: a persistent warning that scanning stopped early, so what
+/// is on screen is a prefix of the keyspace, not the whole of it.
+///
+/// Reuses `ScanState::readout()`'s own wording rather than inventing new copy
+/// — this is the same fact the status bar already states, moved somewhere it
+/// cannot be silently displaced by a copy confirmation or a sort readout.
+fn cap_banner(state: &State, theme: &Theme, area: Rect, y: u16, buf: &mut Buffer) {
+    super::put(
+        buf,
+        area.x + 1,
+        y,
+        &format!("⚠ {}", state.scan.readout()),
+        theme.style(Token::Warn),
+    );
+}
+
 fn filter_line(state: &State, theme: &Theme, area: Rect, y: u16, buf: &mut Buffer) {
     let x = super::put(buf, area.x + 1, y, "/ ", theme.style(Token::Warn));
     let cursor = if state.filtering { "▏" } else { "" };

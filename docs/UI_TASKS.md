@@ -26,13 +26,18 @@ requirements and ADRs for decisions already made.
 - [x] **Tree vs. flat as the default view** — tree, decided by the user from real usage.
   `tree_mode: true` set at session start in `main.rs` (not on `State::default()`, which many
   tests rely on as a blank slate). DESIGN §9 and PRD R2.3 updated.
-- [ ] **The scan cap has no dedicated visual surfacing** beyond a status-bar line.
+- [x] **The scan cap gets a persistent banner** above the key list — `⚠ 2,000,000 key limit
+  reached — narrow the filter` — reserved only while capped (G7), and immune to being displaced
+  by a copy confirmation or sort readout the way the status-bar line alone was. Correctly
+  survives filtering/sorting/tree-toggle, since none of those re-scan.
 - [x] **Sub-70-column stack navigation.** `Open` pushes into a full-width value pane with a
   breadcrumb header (`Esc back · key-name`, following the effective binding per R7.5) replacing
   the column headers there is no room for; `Esc` pops back — after closing help or dismissing an
   error, ahead of cancelling an unrelated scan. `SinglePaneView` is inert at any wider density
   (tested directly). Existing Density::Single flat/tree browsing was already built and is
   untouched — all its golden fixtures pass byte-for-byte unmodified.
+
+**Severity 3 fully closed (2026-09-04).**
 
 ## Severity 0 — spec/code drift (found 2026-09-04, closed same day)
 

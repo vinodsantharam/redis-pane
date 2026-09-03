@@ -317,8 +317,6 @@ the reader's time.
 
 ## 9. Open design questions
 
-- Where does the scan cap surface once it is hit — a status-bar state, or something more
-  insistent? It is a rare condition that matters a great deal when it happens.
 - Should the keys pane get liveness too, or does the open key remain the only tracked thing?
   Tracking the visible rows would show deletions as they happen, at the cost of tracking-table
   churn on every scroll.
@@ -328,7 +326,12 @@ the reader's time.
 - Does the keys pane need a permanent column header row, or can the columns be implied by the
   data and explained once in help?
 
-**Resolved since v0.4** — stack navigation below 70 columns is built: `Open` pushes from the key
+**Resolved since v0.4** — the scan cap gets a persistent banner row above the key list, not just
+a status-bar line: a copy confirmation or a sort readout could otherwise displace the one signal
+that what is on screen is a prefix of the keyspace, not the whole of it — a wrong "no matches"
+looking identical to "never scanned that far" was the actual risk. Reserved only while capped
+(G7), and correctly survives filtering, sorting and tree/flat toggling, none of which re-scan.
+Stack navigation below 70 columns is built: `Open` pushes from the key
 list to a full-width value pane with a breadcrumb header (`Esc back · key-name`) in place of the
 column headers there is no room for; `Esc` pops back, ahead of an unrelated in-flight scan but
 behind closing help or dismissing an error. Tree is the default key view (R2.3): fewer rows at rest outweighs the

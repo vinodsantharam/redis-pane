@@ -1,0 +1,14 @@
+─ redis-pane ─ ● staging · cache-01:6379/0 · from profile staging ─────────────────────────────────────────────────────── ● live ─
+
+ ⚠ 3 key limit reached — narrow the filter                │ → to open
+ KEY                               TYPE        SIZE   TTL │
+ · a:1                             ·              ·     · │
+ · a:2                             ·              ·     · │
+ · a:3                             ·              ·     · │
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+ 3 key limit reached — narrow the filter

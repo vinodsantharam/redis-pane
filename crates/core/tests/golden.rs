@@ -1395,3 +1395,116 @@ fn a_key_opened_narrow_shows_its_real_value_not_a_placeholder() {
     assert!(frame.contains("device"), "{frame}");
     assert!(frame.contains("ios/17.2"), "{frame}");
 }
+
+// ── severity-3 #7: the scan cap gets a persistent banner, not a status line ─
+
+fn capped_state() -> State {
+    let mut keys = LoadedSet::with_cap(3);
+    for name in ["a:1", "a:2", "a:3", "a:4"] {
+        keys.push(name.as_bytes());
+    }
+    assert!(
+        keys.is_capped(),
+        "the fixture must actually be capped, or this proves nothing"
+    );
+    let mut state = State {
+        keys,
+        scan: redis_pane_core::state::ScanState::Capped { at: 3 },
+        link: up(Tk::Armed),
+        ..base()
+    };
+    state.rebuild_list();
+    state
+}
+
+#[test]
+fn golden_capped_keyspace() {
+    assert_golden("browser_capped", &draw(&capped_state(), 130, 14));
+}
+
+#[test]
+fn the_banner_names_the_cap_and_what_to_do_about_it() {
+    let frame = draw(&capped_state(), 130, 14);
+    assert!(frame.contains('⚠'), "{frame}");
+    assert!(frame.contains("3"), "{frame}");
+    assert!(frame.contains("narrow the filter"), "{frame}");
+}
+
+#[test]
+fn an_uncapped_keyspace_shows_no_banner_and_spends_no_row_on_it() {
+    let state = many_keys();
+    assert!(!state.keys.is_capped());
+    let capped_frame = draw(&capped_state(), 130, 14);
+    let plain_frame = draw(&state, 130, 14);
+    assert!(!plain_frame.contains('⚠'), "{plain_frame}");
+    // The uncapped list's column header must sit one row higher than the
+    // capped one's — proof the banner row is genuinely not reserved when it
+    // is not needed, not just left blank.
+    let header_row = |f: &str| {
+        f.lines()
+            .position(|l| l.contains("KEY") && l.contains("TYPE"))
+    };
+    assert!(
+        header_row(&plain_frame) < header_row(&capped_frame),
+        "plain={:?} capped={:?}",
+        header_row(&plain_frame),
+        header_row(&capped_frame)
+    );
+}
+
+#[test]
+fn the_banner_survives_filtering_because_the_underlying_set_is_still_incomplete() {
+    // Filtering narrows what is shown, not what was actually scanned — the
+    // set stays capped, and hiding that fact behind a short match list would
+    // be worse: a filtered "no results" would look identical to "we never
+    // got that far."
+    let mut state = capped_state();
+    state.list.filter = "a:1".into();
+    state.rebuild_list();
+    assert!(state.keys.is_capped());
+    let frame = draw(&state, 130, 14);
+    assert!(frame.contains('⚠'), "{frame}");
+    assert!(
+        frame.contains('/'),
+        "the filter line must still be there too: {frame}"
+    );
+}
+
+#[test]
+fn the_banner_is_not_displaced_by_a_copy_confirmation() {
+    // The entire point: today's status-bar line can be overwritten by
+    // anything else that wants that row for a few seconds. This one cannot.
+    let mut state = capped_state();
+    let (next, _) = update(
+        state.clone(),
+        Msg::Copied {
+            label: "key",
+            at_ms: 73_000,
+        },
+    );
+    state = next;
+    let frame = draw(&state, 130, 14);
+    assert!(
+        frame.contains('⚠'),
+        "the cap banner must survive a transient notice: {frame}"
+    );
+    assert!(
+        frame.contains("copied key"),
+        "the notice itself should still show too: {frame}"
+    );
+}
+
+#[test]
+fn the_banner_coexists_with_the_filter_line_in_the_documented_order() {
+    let mut state = capped_state();
+    state.list.filter = "a:".into();
+    state.rebuild_list();
+    let frame = draw(&state, 130, 14);
+    let lines: Vec<&str> = frame.lines().collect();
+    let banner_row = lines.iter().position(|l| l.contains('⚠')).unwrap();
+    let filter_row = lines.iter().position(|l| l.starts_with(" /")).unwrap();
+    assert!(
+        banner_row < filter_row,
+        "the cap banner should sit above the filter line"
+    );
+}

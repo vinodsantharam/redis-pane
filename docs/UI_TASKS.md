@@ -23,7 +23,9 @@ requirements and ADRs for decisions already made.
 
 ## Severity 3 — parked design questions, now answerable from real use
 
-- [ ] **Tree vs. flat as the default view** (DESIGN §9) — decidable now from real usage.
+- [x] **Tree vs. flat as the default view** — tree, decided by the user from real usage.
+  `tree_mode: true` set at session start in `main.rs` (not on `State::default()`, which many
+  tests rely on as a blank slate). DESIGN §9 and PRD R2.3 updated.
 - [ ] **The scan cap has no dedicated visual surfacing** beyond a status-bar line.
 - [ ] **Sub-70-column behavior is minimal** — single-pane works, no breadcrumb/stack nav.
 

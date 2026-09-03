@@ -196,6 +196,12 @@ fn main() {
         connection,
         read_only,
         condition: established.condition,
+        // Tree is the default view (DESIGN §9, resolved): it shows fewer rows
+        // at rest, and `t` is one keypress from flat for anyone who wants it.
+        // Set here rather than on State::default() — a great many tests use
+        // that as a blank-slate baseline and rely on tree_mode being false
+        // unless a test opts in explicitly.
+        tree_mode: true,
         ..State::default()
     };
     let theme = Theme::new(terminal::detect_color_depth());

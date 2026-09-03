@@ -322,8 +322,6 @@ the reader's time.
 - Should the keys pane get liveness too, or does the open key remain the only tracked thing?
   Tracking the visible rows would show deletions as they happen, at the cost of tracking-table
   churn on every scroll.
-- Tree vs. flat as the *default* key view. Tree shows fewer rows but adds a concept and a
-  keypress to reach a leaf; flat is one less idea and honest about scale.
 - Does the dashboard belong in v1 at all, or is the slowlog plus a memory figure in the status
   bar the whole of what triage actually needs? This is now the largest remaining scope risk.
 - With two panes, is the split fixed at a ratio, or does it default to whichever pane has focus?
@@ -332,6 +330,10 @@ the reader's time.
 - Below 70 columns, is single-pane stack navigation worth building, or should the app simply
   say the terminal is too small? The implementation currently renders a single-pane key list
   there, keeping `TYPE` and `TTL`; the breadcrumb and stack navigation are not built.
+
+**Resolved since v0.4** — tree is the default key view (R2.3): fewer rows at rest outweighs the
+one extra keypress to reach a leaf, decided from real use against seeded keyspaces on Upstash and
+Redis Cloud rather than from the mockup alone.
 
 **Resolved since v0.2** — the sidebar (removed; [ADR-0005](adr/0005-one-connection-per-process.md)),
 tabs vs. sidebar for multiple Connections (dissolved with it), the Console's shape (an overlay;

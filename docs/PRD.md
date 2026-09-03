@@ -127,8 +127,10 @@ config file; a **Connection** is a live session, which may be **ad-hoc** (no Pro
 ### 6.2 Keyspace browsing
 - **R2.1** Incremental `SCAN` with live streaming results; never `KEYS`.
 - **R2.2** Glob filter plus fuzzy filter over already-loaded keys.
-- **R2.3** Optional hierarchical grouping by separator (`:` default) — `user:1:session` folds
-  into a tree — toggleable with flat view.
+- **R2.3** Hierarchical grouping by separator (`:` default) — `user:1:session` folds into a
+  tree — is the default view; `t` is one keypress from flat. Tree shows fewer rows at rest, which
+  matters more than the one extra keypress to reach a leaf, once there is a real keyspace to look
+  at rather than a mockup.
 - **R2.4** Per-key metadata inline, lazily fetched: type, memory usage, and TTL. Element count
   is deliberately **not** a column — it is noise for strings, it costs a fourth round trip per
   key, and the Viewer header states it the moment a key is opened.

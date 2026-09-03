@@ -64,6 +64,9 @@ validation* are core and pure; config *reading* is a shell.
 
 Proves: the architecture holds, and the app can be trusted about what it is connected to.
 
+**Progress: 1–4 complete.** The workspace builds, the boundary is enforced by CI, the clock is
+injected, and the first golden frames are recorded.
+
 | # | Task | Proves |
 |---|---|---|
 | 1 | Workspace scaffold, CI running `fmt`, `clippy -D warnings`, `test` | The boundary compiles; core has no I/O deps |

@@ -1,6 +1,6 @@
 # ADR-0006 — Liveness without a refresh button
 
-**Status:** Accepted · **Date:** 2026-08-26 · **Verified against Redis 8.4.0 on 2026-09-03**
+**Status:** Accepted · **Date:** 2026-08-26 · **Verified against Redis 8.4.0 on 2026-08-26**
 
 ## Context
 

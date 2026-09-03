@@ -1,0 +1,10 @@
+─ redis-pane ─ ● staging · cache-01:6379/0 · from profile staging ──────────────────────────────────
+                                                                                      read 14s ago
+--- styles ---
+a fg=#444444
+b fg=#e0af68
+c fg=#8a8a8a
+d fg=#e6e6e6
+--- map ---
+aaaaaaaaaaaaaaabbbbbbbbbcccdddddddddddddddcccccccccccccccccccccccaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+......................................................................................cccccccccccc..

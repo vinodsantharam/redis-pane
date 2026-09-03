@@ -954,6 +954,7 @@ dependencies = [
  "clap",
  "crossterm",
  "fred",
+ "ratatui",
  "redis-pane-core",
  "serde_json",
  "tokio",

@@ -16,17 +16,9 @@ pub mod msg;
 pub mod render;
 pub mod state;
 pub mod theme;
+pub mod update;
 
 pub use command::Command;
 pub use msg::Msg;
 pub use state::State;
-
-/// The single entry point into the core.
-///
-/// Everything that can happen arrives as a `Msg`; everything the shells must do
-/// leaves as a `Command`. No other path in or out exists, which is what makes a
-/// frame a function of state alone.
-pub fn update(state: State, msg: Msg) -> (State, Vec<Command>) {
-    let _ = msg;
-    (state, Vec::new())
-}
+pub use update::update;

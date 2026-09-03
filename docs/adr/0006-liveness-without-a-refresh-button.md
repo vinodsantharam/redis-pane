@@ -112,6 +112,12 @@ one: after every invalidation, and after every reconnect.
   Viewer refetches. One fewer feature and one fewer binding.
 - The Viewer gains one piece of state it did not have: whether the viewport is at rest. That is
   the price of apply-if-idle, and it is the only new state this decision introduces.
+- **`fred`'s `Options { caching: Some(true) }` does not work** (10.1.0). It compiles, and it reads
+  as the idiomatic way to send `CLIENT CACHING YES` before a command, but the field is copied onto
+  the command struct and never read by the router — nothing reaches the wire. A connection using
+  it reports tracking as enabled while arming nothing, which is this project's characteristic bug
+  wearing a library's clothes. Arming goes through an explicit `client_caching(true)` call, and
+  the integration suite is what catches a regression here.
 - The Refetch path is the *only* place a value is read, precisely so the arming step cannot be
   forgotten on one of several paths. This is the same chokepoint argument as mutations.
 - Reversing this means reintroducing a cache, which is where the original bug lives. Treat the

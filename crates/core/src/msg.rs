@@ -69,6 +69,21 @@ pub enum Msg {
     Resized { cols: u16, rows: u16 },
     /// A read of the open key completed at this clock reading.
     ReadCompleted { at_ms: u64 },
+    /// The shell connected. `tracking_supported` is the result of *attempting*
+    /// `CLIENT TRACKING`, never an inference from the version (ADR-0007).
+    Connected {
+        version: String,
+        tracking_supported: bool,
+    },
+    /// The link dropped mid-session.
+    ConnectionLost,
+    /// A reconnect attempt is scheduled. Backoff is visible, never a silent wait.
+    ReconnectScheduled { attempt: u32, retry_in_ms: u64 },
+    /// The server accepted `CLIENT CACHING YES` for the open key. Only this
+    /// message can make the header say `live`.
+    TrackingArmed,
+    /// An invalidation push arrived for the open key. It consumed the arming.
+    Invalidated,
     /// The user asked to leave.
     Quit,
 }

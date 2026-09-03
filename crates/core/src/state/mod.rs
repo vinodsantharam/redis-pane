@@ -82,6 +82,69 @@ impl Default for Connection {
     }
 }
 
+/// Whether the server is tracking the open key for us.
+///
+/// This enum is the reason [`Liveness::Live`] cannot be claimed by accident.
+/// `Live` is derivable only from [`Tracking::Armed`] or [`Tracking::Consumed`],
+/// and the only way into `Armed` is a [`crate::Msg::TrackingArmed`] that the
+/// shell sends *after* the server has actually accepted the arming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tracking {
+    /// The server refused `CLIENT TRACKING`. Managed platforms do this
+    /// independently of the version they report, so this is production
+    /// infrastructure, not a legacy path (ADR-0007).
+    Unsupported,
+    /// The server supports tracking, but nothing is armed right now — we have
+    /// just connected, or just reconnected. **Not live.**
+    Available,
+    /// Armed for the open key. The server will push an invalidation.
+    Armed,
+    /// An invalidation arrived and consumed the arming (verified against Redis
+    /// 8.4.0 — five writes produce one push, and nothing after it). A Refetch
+    /// is in flight to re-arm. This state must be transient; if it persists,
+    /// the Viewer has gone dark.
+    Consumed,
+}
+
+/// The state of the link to the server (ADR-0009).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Link {
+    /// Before the first successful connect.
+    #[default]
+    Connecting,
+    Up {
+        version: String,
+        tracking: Tracking,
+    },
+    /// Dropped mid-session. The UI stays interactive and the Viewer keeps its
+    /// last read value; it never exits.
+    Reconnecting {
+        attempt: u32,
+        retry_in_ms: u64,
+    },
+}
+
+/// What the Viewer header says about how current it is (ADR-0006).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Liveness {
+    /// `● live` — the server will tell us when this key changes.
+    Live,
+    /// `○ manual` — Read age plus an explicit Refetch.
+    Manual,
+    /// `✕ disconnected` — the last read value is still on screen, badged.
+    Disconnected,
+}
+
+impl Liveness {
+    pub fn readout(&self) -> &'static str {
+        match self {
+            Liveness::Live => "● live",
+            Liveness::Manual => "○ manual",
+            Liveness::Disconnected => "✕ disconnected",
+        }
+    }
+}
+
 /// The whole of what the application knows.
 ///
 /// Note what is absent: any cached value for the open key. Reads always hit the
@@ -97,4 +160,27 @@ pub struct State {
     pub last_read_ms: Option<u64>,
     /// Set once the core has been told to shut down.
     pub quitting: bool,
+    pub link: Link,
+}
+
+impl State {
+    /// What the header may claim about currency.
+    ///
+    /// There is deliberately no setter for this. Liveness is *derived* from the
+    /// link and the tracking state, so no code path can set the header to
+    /// `live` without the server having actually armed — which is the failure
+    /// ADR-0009 exists to prevent, and the one most likely to rot silently.
+    pub fn liveness(&self) -> Liveness {
+        match &self.link {
+            Link::Connecting | Link::Reconnecting { .. } => Liveness::Disconnected,
+            Link::Up { tracking, .. } => match tracking {
+                Tracking::Armed | Tracking::Consumed => Liveness::Live,
+                // Connected, and the server supports tracking — but nothing is
+                // armed yet. Not live, and this is exactly the state a
+                // reconnect lands in.
+                Tracking::Available => Liveness::Manual,
+                Tracking::Unsupported => Liveness::Manual,
+            },
+        }
+    }
 }

@@ -15,4 +15,16 @@
 pub enum Command {
     /// Tear down the terminal and exit.
     Quit,
+    /// Re-read the open key from the server.
+    ///
+    /// **This always re-arms tracking**, and there is deliberately no variant
+    /// that reads without arming. Tracking is consumed by the invalidation it
+    /// produces (verified against Redis 8.4.0), so a read path that skipped
+    /// arming would leave the Viewer permanently dark while the header still
+    /// said `live` — the original RedisInsight defect by another route. Making
+    /// it one command is what stops that being possible on one branch of
+    /// several (ADR-0006).
+    RefetchOpenKey,
+    /// Try to connect again after the given delay.
+    Reconnect { after_ms: u64 },
 }

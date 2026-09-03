@@ -1,34 +1,16 @@
 //! `redis-pane` — a terminal UI for Redis.
 //!
-//! This binary is the imperative shell (ADR-0011). It owns the terminal, the
-//! Redis connection, the filesystem and the clock; `redis-pane-core` owns
-//! everything else and cannot reach any of them.
-
-mod config_io;
-mod redis;
-mod state_file;
-mod terminal;
-
-use std::time::{SystemTime, UNIX_EPOCH};
+//! The binary is a thin wrapper: it parses arguments, resolves a target, and
+//! hands off to the shells in the library.
 
 use clap::Parser;
-use redis_pane_core::clock::Clock;
+use fred::interfaces::ClientLike;
 use redis_pane_core::resolve::{EnvVars, Flags, resolve};
-use redis_pane_core::state::State;
+use redis_pane_core::state::{Connection, State};
 use redis_pane_core::theme::Theme;
 
-/// Exit codes. A target that cannot be reached exits non-zero with a diagnostic
-/// naming the target, its Source, and the failure (R1.14, ADR-0009).
-pub mod exit {
-    /// Everything worked.
-    pub const OK: i32 = 0;
-    /// The resolved target could not be reached, or refused us.
-    pub const CONNECTION: i32 = 2;
-    /// The config file is malformed, or refused for being too readable.
-    pub const CONFIG: i32 = 3;
-    /// The server is below the floor: RESP3 and Redis 6.0 (R1.13, ADR-0007).
-    pub const UNSUPPORTED_SERVER: i32 = 4;
-}
+use redis_pane::redis::ConnectError;
+use redis_pane::{SystemClock, config_io, exit, redis, terminal};
 
 /// A terminal UI for Redis.
 ///
@@ -57,19 +39,9 @@ struct Cli {
     /// Resolve and print the target, then exit without connecting.
     #[arg(long)]
     print_target: bool,
-}
-
-/// The real clock. It lives here, in the shell, because the core must not be
-/// able to read it (ADR-0011).
-struct SystemClock;
-
-impl Clock for SystemClock {
-    fn now_ms(&self) -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
-    }
+    /// Connect, report what the server supports, then exit.
+    #[arg(long)]
+    probe: bool,
 }
 
 fn env_vars() -> EnvVars {
@@ -80,6 +52,69 @@ fn env_vars() -> EnvVars {
         redis_port: get("REDIS_PORT"),
         redis_user: get("REDIS_USER"),
         redis_password: get("REDIS_PASSWORD"),
+    }
+}
+
+/// The diagnostic printed when a target cannot be reached (R1.14, ADR-0009).
+///
+/// It names the target *and* its Source, because "connection refused" without
+/// saying which server was tried, and why that server was chosen, sends the
+/// reader off to guess at their own environment. This is the only UI some
+/// users will ever see, so it is worth writing well.
+fn startup_failure(connection: &Connection, err: &ConnectError) -> String {
+    format!(
+        "redis-pane: cannot connect to {} ({}, {})\n  {err}",
+        connection.target,
+        connection.environment.label(),
+        connection.source.label(),
+    )
+}
+
+/// Connect, report what the server supports, and exit. M0.8's proof, runnable
+/// by hand as well as by the suite.
+fn probe(connection: &Connection) -> i32 {
+    let url = if connection.target.contains("://") {
+        connection.target.clone()
+    } else {
+        format!("redis://{}", connection.target)
+    };
+
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("redis-pane: {e}");
+            return exit::CONNECTION;
+        }
+    };
+
+    match runtime.block_on(redis::connect(&url)) {
+        Ok((client, established)) => {
+            println!(
+                "{} · {} · {}",
+                connection.target,
+                connection.environment.label(),
+                connection.source.label()
+            );
+            println!("redis {}", established.version);
+            println!(
+                "liveness: {}",
+                if established.tracking_supported {
+                    "CLIENT TRACKING accepted — push-driven"
+                } else {
+                    "CLIENT TRACKING refused — degrading to manual"
+                }
+            );
+            let _ = runtime.block_on(client.quit());
+            exit::OK
+        }
+        Err(err @ ConnectError::BelowFloor { .. }) => {
+            eprintln!("{}", startup_failure(connection, &err));
+            exit::UNSUPPORTED_SERVER
+        }
+        Err(err) => {
+            eprintln!("{}", startup_failure(connection, &err));
+            exit::CONNECTION
+        }
     }
 }
 
@@ -115,6 +150,10 @@ fn main() {
             connection.source.label()
         );
         std::process::exit(exit::OK);
+    }
+
+    if cli.probe {
+        std::process::exit(probe(&connection));
     }
 
     let clock = SystemClock;

@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use ratatui::layout::Rect;
 use redis_pane_core::clock::{Clock, FixedClock};
 use redis_pane_core::render;
-use redis_pane_core::state::{Connection, Environment, Source, State};
+use redis_pane_core::state::{Connection, Environment, Link, Source, State, Tracking};
 use redis_pane_core::theme::{ColorDepth, Theme};
 
 fn golden_path(name: &str) -> PathBuf {
@@ -61,6 +61,10 @@ fn staging_state() -> State {
         },
         last_read_ms: Some(60_000),
         quitting: false,
+        link: Link::Up {
+            version: "8.4.0".into(),
+            tracking: Tracking::Armed,
+        },
     }
 }
 

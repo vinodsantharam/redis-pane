@@ -15,6 +15,7 @@ pub mod keymap;
 pub mod msg;
 pub mod render;
 pub mod resolve;
+pub mod server;
 pub mod state;
 pub mod theme;
 pub mod update;

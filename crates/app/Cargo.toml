@@ -21,8 +21,12 @@ workspace = true
 anyhow = "1.0.104"
 clap = { version = "4.6.6", features = ["derive"] }
 crossterm = "0.29.0"
-fred = "10.1.0"
+fred = { version = "10.1", features = ["i-server", "i-keys", "i-tracking"] }
 ratatui = { version = "0.30", features = ["crossterm"] }
 redis-pane-core = { version = "0.1.0", path = "../core" }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
+
+[dev-dependencies]
+testcontainers = "0.28.0"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }

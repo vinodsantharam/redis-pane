@@ -100,6 +100,10 @@ pub fn run(mut state: State, theme: Theme, clock: &dyn Clock) -> std::io::Result
         for command in commands {
             match command {
                 Command::Quit => quitting = true,
+                // M0.5 has no Redis connection to act on yet; the wiring lands
+                // with the async runtime. Listed explicitly rather than caught
+                // by a wildcard so a future variant still fails to compile.
+                Command::RefetchOpenKey | Command::Reconnect { .. } => {}
             }
         }
         if quitting {

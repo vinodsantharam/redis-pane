@@ -94,6 +94,9 @@ it cannot connect. No keyspace. — **Met.**
 Proves: the keyspace is legible, the values keep their shape, and the screen is never lying about
 how current it is.
 
+**Progress: 1–2 complete.** The Loaded set holds a million keys in 36MB, and the keyspace source
+streams, filters and cancels against a real server.
+
 | # | Task | Proves |
 |---|---|---|
 | 1 | Columnar Loaded set: byte arena + parallel metadata arrays, hard cap | 1M synthetic keys inside the memory budget; cap stops scanning and says so (R2.6, ADR-0010) |

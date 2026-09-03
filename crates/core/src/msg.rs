@@ -66,9 +66,14 @@ pub enum Msg {
     /// A key was pressed.
     Key(KeyPress),
     /// The terminal was resized. Drives the layout breakpoints in DESIGN §2.
-    Resized { cols: u16, rows: u16 },
+    Resized {
+        cols: u16,
+        rows: u16,
+    },
     /// A read of the open key completed at this clock reading.
-    ReadCompleted { at_ms: u64 },
+    ReadCompleted {
+        at_ms: u64,
+    },
     /// The shell connected. `tracking_supported` is the result of *attempting*
     /// `CLIENT TRACKING`, never an inference from the version (ADR-0007).
     Connected {
@@ -78,12 +83,31 @@ pub enum Msg {
     /// The link dropped mid-session.
     ConnectionLost,
     /// A reconnect attempt is scheduled. Backoff is visible, never a silent wait.
-    ReconnectScheduled { attempt: u32, retry_in_ms: u64 },
+    ReconnectScheduled {
+        attempt: u32,
+        retry_in_ms: u64,
+    },
     /// The server accepted `CLIENT CACHING YES` for the open key. Only this
     /// message can make the header say `live`.
     TrackingArmed,
     /// An invalidation push arrived for the open key. It consumed the arming.
     Invalidated,
+    /// A traversal began. `estimated_total` is `DBSIZE` at that moment.
+    ScanStarted {
+        estimated_total: u64,
+    },
+    /// A page of keys arrived. The core never sees the cursor that produced it,
+    /// so one cursor can become N without the browser noticing (ADR-0008).
+    ScanBatch {
+        keys: Vec<Vec<u8>>,
+    },
+    /// The traversal finished on its own.
+    ScanComplete,
+    /// The traversal stopped early because the shell was asked to stop.
+    ScanCancelled,
+    ScanFailed {
+        error: String,
+    },
     /// The user asked to leave.
     Quit,
 }

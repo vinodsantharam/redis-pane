@@ -2,7 +2,7 @@
 
 use crate::keymap::Action;
 use crate::msg::KeyPress;
-use crate::state::{Link, ReadOnlyReason, Tracking};
+use crate::state::{Link, ReadOnlyReason, ScanState, Tracking};
 use crate::{Command, Msg, State};
 
 /// Takes a message, returns new state plus commands for a shell to execute.
@@ -85,8 +85,64 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             }
             (state, vec![Command::RefetchOpenKey])
         }
+        Msg::ScanStarted { estimated_total } => {
+            state.keys.clear();
+            state.scan = ScanState::Running {
+                scanned: 0,
+                estimated_total,
+            };
+            (state, Vec::new())
+        }
+        Msg::ScanBatch { keys } => scan_batch(state, keys),
+        Msg::ScanComplete => {
+            // A cap reached mid-scan already told its own story; completing
+            // afterwards must not overwrite it with a smaller truth.
+            if !matches!(state.scan, ScanState::Capped { .. }) {
+                state.scan = ScanState::Complete {
+                    total: state.keys.len() as u64,
+                };
+            }
+            (state, Vec::new())
+        }
+        Msg::ScanCancelled => {
+            if !matches!(state.scan, ScanState::Capped { .. }) {
+                state.scan = ScanState::Cancelled {
+                    scanned: state.keys.len() as u64,
+                };
+            }
+            (state, Vec::new())
+        }
+        Msg::ScanFailed { error } => {
+            state.scan = ScanState::Failed { error };
+            (state, Vec::new())
+        }
         Msg::Quit => quit(state),
     }
+}
+
+/// Absorb a page of keys, stopping the traversal if the cap is reached.
+///
+/// This is the single place the cap is enforced, so there is no path that grows
+/// the Loaded set past it (ADR-0010).
+fn scan_batch(mut state: State, keys: Vec<Vec<u8>>) -> (State, Vec<Command>) {
+    for key in keys {
+        if !state.keys.push(&key) {
+            state.scan = ScanState::Capped {
+                at: state.keys.len(),
+            };
+            return (state, vec![Command::CancelScan]);
+        }
+    }
+    if let ScanState::Running {
+        estimated_total, ..
+    } = state.scan
+    {
+        state.scan = ScanState::Running {
+            scanned: state.keys.len() as u64,
+            estimated_total,
+        };
+    }
+    (state, Vec::new())
 }
 
 /// Resolve a keypress through the keymap, never against hard-coded keys.
@@ -104,7 +160,14 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             (state, Vec::new())
         }
         Action::Cancel => {
-            state.help_open = false;
+            if state.help_open {
+                state.help_open = false;
+                return (state, Vec::new());
+            }
+            // Every in-flight operation is cancellable (PRD R7.3).
+            if state.scan.is_running() {
+                return (state, vec![Command::CancelScan]);
+            }
             (state, Vec::new())
         }
         Action::Refetch => (state, vec![Command::RefetchOpenKey]),
@@ -462,5 +525,200 @@ mod liveness_invariants {
             };
             assert_eq!(state.liveness(), expected, "for {link:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod scan_tests {
+    //! The keyspace traversal, as seen by the core: batches arrive, the cap is
+    //! enforced in one place, and cancellation is always available.
+
+    use super::*;
+    use crate::msg::KeyCode;
+    use crate::state::LoadedSet;
+
+    fn started(estimated_total: u64) -> State {
+        let (s, _) = update(State::default(), Msg::ScanStarted { estimated_total });
+        s
+    }
+
+    fn batch(n: usize, from: usize) -> Vec<Vec<u8>> {
+        (from..from + n)
+            .map(|i| format!("k:{i}").into_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn a_scan_starts_empty_and_reports_progress_against_an_estimate() {
+        let s = started(180_000);
+        assert!(s.keys.is_empty());
+        assert_eq!(
+            s.scan,
+            ScanState::Running {
+                scanned: 0,
+                estimated_total: 180_000
+            }
+        );
+
+        let (s, cmds) = update(
+            s,
+            Msg::ScanBatch {
+                keys: batch(500, 0),
+            },
+        );
+        assert!(cmds.is_empty());
+        assert_eq!(s.keys.len(), 500);
+        assert_eq!(s.scan.readout(), "scanning 500 of ~180,000");
+    }
+
+    #[test]
+    fn batches_accumulate_so_results_render_as_they_arrive() {
+        let mut s = started(1_000);
+        for i in 0..4 {
+            (s, _) = update(
+                s,
+                Msg::ScanBatch {
+                    keys: batch(250, i * 250),
+                },
+            );
+        }
+        assert_eq!(s.keys.len(), 1_000);
+        assert_eq!(s.keys.name_str(0).unwrap(), "k:0");
+        assert_eq!(s.keys.name_str(999).unwrap(), "k:999");
+    }
+
+    #[test]
+    fn starting_a_new_scan_discards_the_previous_one() {
+        let (s, _) = update(started(10), Msg::ScanBatch { keys: batch(5, 0) });
+        assert_eq!(s.keys.len(), 5);
+        let (s, _) = update(
+            s,
+            Msg::ScanStarted {
+                estimated_total: 10,
+            },
+        );
+        assert!(
+            s.keys.is_empty(),
+            "a filter change must not append to stale results"
+        );
+    }
+
+    #[test]
+    fn reaching_the_cap_stops_the_scan_and_says_so() {
+        let mut s = State {
+            keys: LoadedSet::with_cap(600),
+            ..State::default()
+        };
+        (s, _) = update(
+            s,
+            Msg::ScanStarted {
+                estimated_total: 10_000,
+            },
+        );
+        let (s, cmds) = update(
+            s,
+            Msg::ScanBatch {
+                keys: batch(1_000, 0),
+            },
+        );
+
+        assert_eq!(
+            cmds,
+            vec![Command::CancelScan],
+            "the shell must be told to stop"
+        );
+        assert_eq!(s.keys.len(), 600);
+        assert!(s.keys.is_capped());
+        assert_eq!(s.scan, ScanState::Capped { at: 600 });
+        assert!(s.scan.readout().contains("narrow the filter"));
+    }
+
+    #[test]
+    fn a_completion_arriving_after_the_cap_does_not_erase_it() {
+        // The shell's CancelScan will be answered by ScanComplete or
+        // ScanCancelled. Neither may overwrite the more important fact.
+        let mut s = State {
+            keys: LoadedSet::with_cap(10),
+            ..State::default()
+        };
+        (s, _) = update(
+            s,
+            Msg::ScanStarted {
+                estimated_total: 100,
+            },
+        );
+        (s, _) = update(s, Msg::ScanBatch { keys: batch(50, 0) });
+        assert!(matches!(s.scan, ScanState::Capped { .. }));
+
+        let (s, _) = update(s, Msg::ScanComplete);
+        assert!(
+            matches!(s.scan, ScanState::Capped { .. }),
+            "the cap is the story"
+        );
+
+        let mut s2 = State {
+            keys: LoadedSet::with_cap(10),
+            ..State::default()
+        };
+        (s2, _) = update(
+            s2,
+            Msg::ScanStarted {
+                estimated_total: 100,
+            },
+        );
+        (s2, _) = update(s2, Msg::ScanBatch { keys: batch(50, 0) });
+        let (s2, _) = update(s2, Msg::ScanCancelled);
+        assert!(matches!(s2.scan, ScanState::Capped { .. }));
+    }
+
+    #[test]
+    fn completing_normally_reports_the_total() {
+        let (s, _) = update(
+            started(700),
+            Msg::ScanBatch {
+                keys: batch(700, 0),
+            },
+        );
+        let (s, _) = update(s, Msg::ScanComplete);
+        assert_eq!(s.scan, ScanState::Complete { total: 700 });
+        assert_eq!(s.scan.readout(), "700 keys");
+    }
+
+    #[test]
+    fn esc_cancels_an_in_flight_scan() {
+        let s = started(10_000);
+        let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Esc)));
+        assert_eq!(cmds, vec![Command::CancelScan]);
+    }
+
+    #[test]
+    fn esc_closes_help_first_and_leaves_the_scan_alone() {
+        // Help is the nearer thing to back out of. Cancelling the scan as well
+        // would make one keypress do two unrelated things.
+        let mut s = started(10_000);
+        s.help_open = true;
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Esc)));
+        assert!(!s.help_open);
+        assert!(cmds.is_empty());
+        assert!(s.scan.is_running());
+    }
+
+    #[test]
+    fn esc_with_nothing_in_flight_does_nothing() {
+        let (_, cmds) = update(State::default(), Msg::Key(KeyPress::plain(KeyCode::Esc)));
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn a_failed_scan_keeps_what_it_had_and_names_the_error() {
+        let (s, _) = update(started(100), Msg::ScanBatch { keys: batch(30, 0) });
+        let (s, _) = update(
+            s,
+            Msg::ScanFailed {
+                error: "LOADING".into(),
+            },
+        );
+        assert_eq!(s.keys.len(), 30, "partial results are still worth showing");
+        assert!(s.scan.readout().contains("LOADING"));
     }
 }

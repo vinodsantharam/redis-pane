@@ -293,3 +293,143 @@ async fn tracking_round_trip_when_a_server_url_is_supplied() {
     let _ = client.quit().await;
     let _ = writer.quit().await;
 }
+
+// ── M1.2 — the keyspace source streams, resumes and cancels ─────────────────
+
+use redis_pane_core::state::ScanState;
+use redis_pane_core::{Msg, State, update};
+use tokio_util::sync::CancellationToken;
+
+/// Populate a server with `n` keys, quickly.
+async fn seed(url: &str, n: usize) -> Client {
+    let client = Builder::from_config(Config::from_url(url).unwrap())
+        .build()
+        .unwrap();
+    client.init().await.unwrap();
+    for chunk in 0..(n / 1_000) {
+        let pipeline = client.pipeline();
+        for i in 0..1_000 {
+            let k = format!("user:{:08}:session", chunk * 1_000 + i);
+            let _: () = pipeline.set(&k, "v", None, None, false).await.unwrap();
+        }
+        let _: () = pipeline.all().await.unwrap();
+    }
+    client
+}
+
+/// Drive the core with everything the scan sends, exactly as the app does.
+async fn drain_into_core(mut rx: tokio::sync::mpsc::Receiver<Msg>) -> State {
+    let mut state = State::default();
+    while let Some(msg) = rx.recv().await {
+        let (next, _cmds) = update(state, msg);
+        state = next;
+    }
+    state
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn a_hundred_thousand_keys_stream_into_the_loaded_set() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = seed(&url, 100_000).await;
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let cancel = CancellationToken::new();
+
+    let pump = tokio::spawn(async move { drain_into_core(rx).await });
+    redis_pane::redis::scan::stream_keys(&client, None, tx, cancel).await;
+    let state = pump.await.unwrap();
+
+    // SCAN may return a key more than once across a full iteration, so the
+    // Loaded set can exceed DBSIZE. What must hold is that everything was seen.
+    assert!(
+        state.keys.len() >= 100_000,
+        "scanned {} of 100,000",
+        state.keys.len()
+    );
+    assert_eq!(
+        state.scan,
+        ScanState::Complete {
+            total: state.keys.len() as u64
+        }
+    );
+    assert!(!state.keys.is_capped());
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn a_pattern_narrows_the_traversal_without_using_keys() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = seed(&url, 10_000).await;
+    let _: () = writer.set("other:1", "v", None, None, false).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let pump = tokio::spawn(async move { drain_into_core(rx).await });
+    redis_pane::redis::scan::stream_keys(&client, Some("other:*"), tx, CancellationToken::new())
+        .await;
+    let state = pump.await.unwrap();
+
+    assert_eq!(state.keys.len(), 1);
+    assert_eq!(state.keys.name_str(0).unwrap(), "other:1");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn cancelling_stops_the_traversal_promptly_and_keeps_what_arrived() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = seed(&url, 100_000).await;
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let cancel = CancellationToken::new();
+    let trigger = cancel.clone();
+
+    // Cancel once a few pages have landed — the Esc-during-a-scan case.
+    let pump = tokio::spawn(async move {
+        let mut state = State::default();
+        let mut batches = 0;
+        while let Some(msg) = rx.recv().await {
+            if matches!(msg, Msg::ScanBatch { .. }) {
+                batches += 1;
+                if batches == 3 {
+                    trigger.cancel();
+                }
+            }
+            let (next, _) = update(state, msg);
+            state = next;
+        }
+        state
+    });
+
+    let started = std::time::Instant::now();
+    redis_pane::redis::scan::stream_keys(&client, None, tx, cancel).await;
+    let elapsed = started.elapsed();
+    let state = pump.await.unwrap();
+
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "cancellation must be answered at the next page boundary, took {elapsed:?}"
+    );
+    assert!(
+        matches!(state.scan, ScanState::Cancelled { .. }),
+        "got {:?}",
+        state.scan
+    );
+    assert!(!state.keys.is_empty(), "partial results are kept");
+    assert!(
+        state.keys.len() < 100_000,
+        "cancelling must actually stop it, got {}",
+        state.keys.len()
+    );
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}

@@ -15,6 +15,8 @@
 //! cannot return `Live` without an arming having been reported. This module is
 //! responsible for the other half: actually doing it.
 
+pub mod scan;
+
 use std::time::Duration;
 
 use fred::interfaces::{ClientInterface, TrackingInterface};

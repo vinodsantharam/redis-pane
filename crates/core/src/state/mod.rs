@@ -2,8 +2,14 @@
 //!
 //! The key list is columnar and capped (ADR-0010): key names live in one byte
 //! arena addressed by `(offset, len)`, metadata lives in parallel arrays, and
-//! sorting permutes an index vector rather than moving data. None of that
-//! exists yet — see `docs/PLAN.md` M1.1.
+//! sorting permutes an index vector rather than moving data — see
+//! [`loaded::LoadedSet`].
+
+pub mod loaded;
+pub mod scan;
+
+pub use loaded::{KeyKind, LoadedSet};
+pub use scan::ScanState;
 
 /// Where a Connection's target came from (ADR-0001).
 ///
@@ -223,6 +229,9 @@ pub struct State {
     /// Bindings in force. Hints read from here so they show the effective key.
     pub keymap: crate::keymap::Keymap,
     pub help_open: bool,
+    /// Every key scanned so far, columnar and capped (ADR-0010).
+    pub keys: LoadedSet,
+    pub scan: ScanState,
 }
 
 impl State {

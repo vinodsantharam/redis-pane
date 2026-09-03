@@ -2303,11 +2303,13 @@ dependencies = [
  "clap",
  "crossterm",
  "fred",
+ "futures",
  "ratatui",
  "redis-pane-core",
  "serde_json",
  "testcontainers",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

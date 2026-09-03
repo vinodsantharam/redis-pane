@@ -27,4 +27,9 @@ pub enum Command {
     RefetchOpenKey,
     /// Try to connect again after the given delay.
     Reconnect { after_ms: u64 },
+    /// Begin traversing the keyspace. `SCAN` only, never `KEYS` — cursor-based,
+    /// streaming and resumable (R2.1).
+    StartScan { pattern: Option<String> },
+    /// Stop an in-flight traversal. Every long operation is cancellable.
+    CancelScan,
 }

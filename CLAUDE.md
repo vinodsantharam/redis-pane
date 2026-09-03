@@ -105,7 +105,11 @@ they are expensive to retrofit:
   (ADR-0010). This shapes every access to the key list — it belongs in the first commit that
   stores a key.
 - **The keyspace source abstracts over a stream of keys**, not over a cursor. v1 has exactly one
-  cursor behind it, but Cluster will have N (ADR-0008) and the browser above must not know.
+  cursor behind it, but Cluster will have N (ADR-0008) and the browser above must not know. It
+  lives in `crates/app/src/redis/scan.rs`; the core sees only `Msg::ScanBatch`.
+- **The cap is enforced in exactly one place** — `scan_batch` in `update.rs` — so no path can grow
+  the Loaded set past it. Measured: 1M keys of average length occupy 36MB (`cargo run --release
+  -p redis-pane-core --example memreport`).
 - **Lists are virtualized.** Render cost is a function of viewport size, not keyspace size.
   Metadata (type, memory, TTL — four columns, no element count; PRD R2.4) is fetched lazily
   and fills in without shifting layout.

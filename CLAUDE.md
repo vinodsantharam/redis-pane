@@ -147,6 +147,13 @@ they are expensive to retrofit:
 - **Config is `~/.config/redis-pane/config.json`, and the app only ever reads it.** There is no
   in-app "save profile". Anything the app persists (last Connection, pane sizes, filter, scroll)
   goes to a separate state file under `$XDG_STATE_HOME/redis-pane/`.
+- **A password reference is resolved in the shell, never the core.** `resolve()` returns a
+  `PasswordSource` saying *where* the secret lives; `crates/app/src/secret.rs` fetches it. Nothing
+  logs a password, and a `passwordCommand` failure reports only an exit status — both the command
+  and its stderr can carry the secret.
+- **Every connection path goes through `connect_with`.** `connect()` is the credential-less
+  convenience used by tests; a path that calls it works on localhost and fails on every server
+  with a password.
 - **Secrets are references** (`passwordEnv`, `passwordCommand`). Literal passwords work but the
   file is refused when group- or world-readable. **Unknown config fields are a parse error**, not
   something to ignore — the file is hand-authored, so a misspelled `passwordEnv` is a credential
@@ -175,4 +182,6 @@ they are expensive to retrofit:
 - Prefer adding to the command palette over adding a keybinding; every action must be reachable
   from the palette (R5.1), and only frequent actions earn a key.
 - Errors surface as non-blocking notifications carrying the failing command (R7.4) — never
-  `panic!` on a Redis error, and never swallow one silently.
+  `panic!` on a Redis error, and never swallow one silently. In practice this defect takes the
+  shape of a bare `Err(_) => return` inside a task: the operation vanishes and nothing changes on
+  screen, which is indistinguishable from the app deciding to do nothing.

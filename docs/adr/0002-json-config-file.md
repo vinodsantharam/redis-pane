@@ -22,5 +22,10 @@ ends up inside a symlinked dotfiles repo.
 
 ## Consequences
 
+Resolving a reference is I/O, so the split is: the core decides *where* the secret lives
+(`PasswordSource::Env` / `Command` / `Literal`) and the shell fetches it. Neither a
+`passwordCommand` nor its stderr appears in any error message — either can contain the secret,
+and someone testing their config may well have written `echo hunter2`.
+
 Changing format later is a migration for every user who has hand-written this file, so the shape
 should be treated as close to frozen once released.

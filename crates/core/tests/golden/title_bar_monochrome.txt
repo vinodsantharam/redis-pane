@@ -1,7 +1,7 @@
-─ redis-pane ─ ● staging · cache-01:6379/0 · from profile staging ──────────────────────────────────
-                                                                                      read 14s ago
+─ redis-pane ─ ● staging · cache-01:6379/0 · from profile staging ───────────────────────── ● live ─
+
 --- styles ---
 a fg=Reset DIM
 --- map ---
-aaaaaaaaaaaaaaa.........aaa...............aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-......................................................................................aaaaaaaaaaaa..
+aaaaaaaaaaaaaaa.........aaa...............aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa......aa
+....................................................................................................

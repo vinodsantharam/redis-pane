@@ -1,7 +1,8 @@
 //! The single entry point into the core (PLAN M0.4).
 
-use crate::msg::{KeyCode, KeyPress};
-use crate::state::{Link, Tracking};
+use crate::keymap::Action;
+use crate::msg::KeyPress;
+use crate::state::{Link, ReadOnlyReason, Tracking};
 use crate::{Command, Msg, State};
 
 /// Takes a message, returns new state plus commands for a shell to execute.
@@ -88,14 +89,36 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
     }
 }
 
-/// Provisional bindings. Keybindings are data (R7.5) and this becomes a lookup
-/// against the keymap in M0.12; until then the two that must always work are
-/// wired directly so the app is never unquittable.
-fn key_press(state: State, key: KeyPress) -> (State, Vec<Command>) {
-    if key.is_char('q') || (key.ctrl && key.code == KeyCode::Char('c')) {
-        return quit(state);
+/// Resolve a keypress through the keymap, never against hard-coded keys.
+///
+/// The hint bar and help overlay read the same map, so what is shown is always
+/// the effective binding after user overrides (R7.5).
+fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
+    let Some(action) = state.keymap.action_for(&key) else {
+        return (state, Vec::new());
+    };
+    match action {
+        Action::Quit => quit(state),
+        Action::Help => {
+            state.help_open = !state.help_open;
+            (state, Vec::new())
+        }
+        Action::Cancel => {
+            state.help_open = false;
+            (state, Vec::new())
+        }
+        Action::Refetch => (state, vec![Command::RefetchOpenKey]),
+        Action::ToggleReadOnly => {
+            // A replica will refuse writes whatever we believe, so this is not
+            // a toggle the user gets to win (ADR-0009).
+            match state.read_only {
+                Some(ReadOnlyReason::Replica) => {}
+                Some(_) => state.read_only = None,
+                None => state.read_only = Some(ReadOnlyReason::User),
+            }
+            (state, Vec::new())
+        }
     }
-    (state, Vec::new())
 }
 
 fn quit(mut state: State) -> (State, Vec<Command>) {
@@ -106,6 +129,7 @@ fn quit(mut state: State) -> (State, Vec<Command>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::msg::KeyCode;
     use crate::state::{Environment, Source};
 
     #[test]
@@ -182,6 +206,61 @@ mod tests {
         );
         assert_eq!(before, after);
         assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn question_mark_toggles_the_help_overlay_and_esc_closes_it() {
+        let (s, _) = update(
+            State::default(),
+            Msg::Key(KeyPress::plain(KeyCode::Char('?'))),
+        );
+        assert!(s.help_open);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Esc)));
+        assert!(!s.help_open);
+    }
+
+    #[test]
+    fn r_asks_for_a_refetch_which_is_the_only_read_path() {
+        let (_, cmds) = update(
+            State::default(),
+            Msg::Key(KeyPress::plain(KeyCode::Char('r'))),
+        );
+        assert_eq!(cmds, vec![Command::RefetchOpenKey]);
+    }
+
+    #[test]
+    fn ctrl_r_toggles_read_only_but_a_replica_cannot_be_lifted() {
+        // Off -> user-imposed.
+        let (s, _) = update(
+            State::default(),
+            Msg::Key(KeyPress::ctrl(KeyCode::Char('r'))),
+        );
+        assert_eq!(s.read_only, Some(ReadOnlyReason::User));
+        // And back off again.
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('r'))));
+        assert_eq!(s.read_only, None);
+
+        // A replica refuses to be lifted, because the server would refuse the
+        // write regardless and a toggle that does nothing is a toggle that lies.
+        let replica = State {
+            read_only: Some(ReadOnlyReason::Replica),
+            ..State::default()
+        };
+        let (s, _) = update(replica, Msg::Key(KeyPress::ctrl(KeyCode::Char('r'))));
+        assert_eq!(s.read_only, Some(ReadOnlyReason::Replica));
+    }
+
+    #[test]
+    fn a_rebound_key_takes_effect_in_update_not_just_in_the_hint() {
+        let mut keymap = crate::keymap::Keymap::default();
+        keymap.bind(Action::Quit, KeyPress::ctrl(KeyCode::Char('x')));
+        let state = State {
+            keymap,
+            ..State::default()
+        };
+        let (s, cmds) = update(state, Msg::Key(KeyPress::ctrl(KeyCode::Char('x'))));
+        assert!(s.quitting);
+        assert_eq!(cmds, vec![Command::Quit]);
     }
 
     #[test]

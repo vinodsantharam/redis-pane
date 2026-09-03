@@ -6,7 +6,7 @@
 use clap::Parser;
 use fred::interfaces::ClientLike;
 use redis_pane_core::resolve::{EnvVars, Flags, resolve};
-use redis_pane_core::state::{Connection, State};
+use redis_pane_core::state::{Connection, ReadOnlyReason, State};
 use redis_pane_core::theme::Theme;
 
 use redis_pane::redis::ConnectError;
@@ -157,8 +157,15 @@ fn main() {
     }
 
     let clock = SystemClock;
+    // `prod` and `unknown` start guarded (R4.5, ADR-0004). The reason is carried
+    // so the header can say *why*, and so `⌃R` knows whether it may lift it.
+    let read_only = connection
+        .environment
+        .read_only_by_default()
+        .then_some(ReadOnlyReason::Environment);
     let state = State {
         connection,
+        read_only,
         ..State::default()
     };
     let theme = Theme::new(terminal::detect_color_depth());

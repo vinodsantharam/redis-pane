@@ -1,0 +1,14 @@
+─ redis-pane ─ ● staging · cache-01:6379/0 · from profile staging ───────────────────────── ● live ─
+
+                                       ┌─ keys ────────────┐
+                                       │                   │
+                                       │ q       quit      │
+                                       │ ⌃C      quit      │
+                                       │ r       refetch   │
+                                       │ ⌃R      read-only │
+                                       │ ?       help      │
+                                       │ Esc     back      │
+                                       │                   │
+                                       └───────────────────┘
+
+ Esc back   r refetch   ⌃R read-only   ? help   q quit

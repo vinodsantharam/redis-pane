@@ -145,6 +145,61 @@ impl Liveness {
     }
 }
 
+/// Why Read-only Mode is on (ADR-0009, R4.5).
+///
+/// The reason is displayed, because only some of them can be lifted. A guard
+/// whose origin is invisible is a guard the user will misread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadOnlyReason {
+    /// The Environment is `prod` or `unknown`.
+    Environment,
+    /// The server reported `role:slave`. **Not liftable** — the server will
+    /// refuse writes whatever the app believes, so offering `⌃R` here would be
+    /// a toggle that lies.
+    Replica,
+    /// The user asked for it.
+    User,
+}
+
+impl ReadOnlyReason {
+    pub fn label(&self) -> &'static str {
+        match self {
+            ReadOnlyReason::Environment => "environment",
+            ReadOnlyReason::Replica => "replica",
+            ReadOnlyReason::User => "user",
+        }
+    }
+
+    /// Whether `⌃R` can turn this off.
+    pub fn liftable(&self) -> bool {
+        !matches!(self, ReadOnlyReason::Replica)
+    }
+}
+
+/// A server state that rejects writes or defers them (ADR-0009).
+///
+/// Detected rather than merely reported, so danger is visible *before* it is
+/// possible (DESIGN principle 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerCondition {
+    /// `maxmemory` reached; writes are refused.
+    Oom,
+    /// RDB saves are failing; writes are refused.
+    Misconf,
+    /// The dataset is loading after a restart.
+    Loading { percent: u8 },
+}
+
+impl ServerCondition {
+    pub fn readout(&self) -> String {
+        match self {
+            ServerCondition::Oom => "✕ OOM · writes rejected".into(),
+            ServerCondition::Misconf => "✕ MISCONF · writes rejected".into(),
+            ServerCondition::Loading { percent } => format!("⟳ loading {percent}%"),
+        }
+    }
+}
+
 /// The whole of what the application knows.
 ///
 /// Note what is absent: any cached value for the open key. Reads always hit the
@@ -161,6 +216,13 @@ pub struct State {
     /// Set once the core has been told to shut down.
     pub quitting: bool,
     pub link: Link,
+    /// Read-only Mode and why, if it is on (R4.5, ADR-0009).
+    pub read_only: Option<ReadOnlyReason>,
+    /// A server condition worth a banner, if there is one.
+    pub condition: Option<ServerCondition>,
+    /// Bindings in force. Hints read from here so they show the effective key.
+    pub keymap: crate::keymap::Keymap,
+    pub help_open: bool,
 }
 
 impl State {
@@ -170,6 +232,12 @@ impl State {
     /// link and the tracking state, so no code path can set the header to
     /// `live` without the server having actually armed — which is the failure
     /// ADR-0009 exists to prevent, and the one most likely to rot silently.
+    /// Whether Read-only Mode can be lifted right now. A replica cannot, so the
+    /// hint must read `locked` rather than offering a key that will not work.
+    pub fn read_only_liftable(&self) -> bool {
+        self.read_only.is_some_and(|r| r.liftable())
+    }
+
     pub fn liveness(&self) -> Liveness {
         match &self.link {
             Link::Connecting | Link::Reconnecting { .. } => Liveness::Disconnected,

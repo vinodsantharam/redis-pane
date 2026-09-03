@@ -10,14 +10,73 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 
 use crate::clock::Clock;
-use crate::state::State;
+use crate::keymap::{Action, key_label};
+use crate::state::{Link, Liveness, State};
 use crate::theme::{Theme, Token, env_token};
 
 /// Render the whole frame into a fresh buffer of the given size.
 pub fn frame(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect) -> Buffer {
     let mut buf = Buffer::empty(area);
     title_bar(state, theme, clock, area, &mut buf);
+    if area.height >= 3 {
+        let hints = hint_bar(state);
+        put(
+            &mut buf,
+            1,
+            area.height - 1,
+            &hints,
+            theme.style(Token::Muted),
+        );
+    }
+    if state.help_open {
+        help_overlay(state, theme, area, &mut buf);
+    }
     buf
+}
+
+/// A dismissible overlay rather than resident chrome (G7): screen space is a
+/// budget, and the help is only needed while it is being read.
+fn help_overlay(state: &State, theme: &Theme, area: Rect, buf: &mut Buffer) {
+    let lines = help_lines(state);
+    let inner_w = lines.iter().map(|l| l.chars().count()).max().unwrap_or(10);
+    let w = (inner_w + 4).min(area.width as usize);
+    let h = (lines.len() + 4).min(area.height as usize);
+    let x0 = (area.width as usize - w) / 2;
+    let y0 = (area.height as usize - h) / 2;
+
+    let border = theme.style(Token::BorderFocus);
+    for y in 0..h {
+        let row = (y0 + y) as u16;
+        let line = if y == 0 || y == h - 1 {
+            format!(
+                "{}{}{}",
+                if y == 0 { "┌" } else { "└" },
+                "─".repeat(w - 2),
+                if y == 0 { "┐" } else { "┘" }
+            )
+        } else {
+            format!("│{}│", " ".repeat(w - 2))
+        };
+        put(buf, x0 as u16, row, &line, border);
+    }
+    put(
+        buf,
+        x0 as u16 + 2,
+        y0 as u16,
+        " keys ",
+        theme.style(Token::Text),
+    );
+    for (i, line) in lines.iter().enumerate() {
+        if y0 + 2 + i < y0 + h - 1 {
+            put(
+                buf,
+                x0 as u16 + 2,
+                (y0 + 2 + i) as u16,
+                line,
+                theme.style(Token::Text),
+            );
+        }
+    }
 }
 
 /// The title bar: what we are connected to, and where that came from.
@@ -67,13 +126,108 @@ fn title_bar(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect, buf: &
     );
     put(buf, x, 0, " ", theme.style(Token::Border));
 
-    // The read age is why this frame depends on the injected clock: it is a
-    // function of *when* the frame was drawn, not only of what is in State.
-    if area.height > 1 {
-        let age = read_age(state, clock);
-        let x = w.saturating_sub(age.chars().count() + 2) as u16;
-        put(buf, x, 1, &age, theme.style(Token::Muted));
+    // The safety and liveness readout, right-aligned on the title row.
+    let readout = status_readout(state, clock);
+    let width: usize = readout.iter().map(|(t, _)| t.chars().count()).sum();
+    if width + 4 < w {
+        // A space either side, so the readout does not abut the border rule.
+        let mut x = (w - width - 3) as u16;
+        x = put(buf, x, 0, " ", theme.style(Token::Border));
+        for (text, token) in &readout {
+            x = put(buf, x, 0, text, theme.style(*token));
+        }
+        put(buf, x, 0, " ", theme.style(Token::Border));
     }
+}
+
+/// What the title bar says about safety and currency, right to left.
+///
+/// This is DESIGN §6.8's table expressed as code. The ordering is deliberate:
+/// a condition that rejects writes outranks Read-only Mode, because it is the
+/// more surprising fact and the one that explains a failure the user is about
+/// to hit.
+pub fn status_readout(state: &State, clock: &dyn Clock) -> Vec<(String, Token)> {
+    let mut out: Vec<(String, Token)> = Vec::new();
+
+    if let Some(condition) = state.condition {
+        out.push((condition.readout(), Token::Danger));
+        out.push(("  ".into(), Token::Muted));
+    }
+
+    if let Some(reason) = state.read_only {
+        out.push((format!("READ-ONLY {}", reason.label()), Token::Warn));
+        // Never offer a key where the server will refuse anyway (ADR-0009).
+        let hint = if reason.liftable() {
+            state
+                .keymap
+                .hint(Action::ToggleReadOnly)
+                .unwrap_or_default()
+        } else {
+            "locked".into()
+        };
+        out.push((format!(" {hint}"), Token::Muted));
+        out.push(("  ".into(), Token::Muted));
+    }
+
+    let liveness = state.liveness();
+    out.push((
+        liveness.readout().to_string(),
+        match liveness {
+            Liveness::Live => Token::Ok,
+            Liveness::Manual => Token::Muted,
+            Liveness::Disconnected => Token::Danger,
+        },
+    ));
+
+    // Anything short of live owes the reader a fact and a way to act. While
+    // reconnecting, the useful fact is when the next attempt happens: ADR-0009
+    // requires the backoff be visible, because a silent wait is a freeze
+    // wearing a different name.
+    match &state.link {
+        Link::Reconnecting { retry_in_ms, .. } => {
+            out.push((
+                format!(" · retry {}s", retry_in_ms.div_ceil(1000)),
+                Token::Muted,
+            ));
+        }
+        _ if liveness != Liveness::Live => {
+            out.push((format!(" · {}", read_age(state, clock)), Token::Muted));
+        }
+        _ => {}
+    }
+    if liveness != Liveness::Live
+        && let Some(hint) = state.keymap.hint(Action::Refetch)
+    {
+        out.push((format!("  {hint}"), Token::Muted));
+    }
+    out
+}
+
+/// The hint bar: the effective binding for each action, never a hard-coded
+/// label (R7.5).
+pub fn hint_bar(state: &State) -> String {
+    [
+        Action::Cancel,
+        Action::Refetch,
+        Action::ToggleReadOnly,
+        Action::Help,
+        Action::Quit,
+    ]
+    .into_iter()
+    .filter_map(|a| state.keymap.key_for(a).map(|k| (a, k)))
+    .map(|(a, k)| format!("{} {}", key_label(&k), a.label()))
+    .collect::<Vec<_>>()
+    .join("   ")
+}
+
+/// The help overlay: every binding in force, read from the same keymap.
+pub fn help_lines(state: &State) -> Vec<String> {
+    state
+        .keymap
+        .bindings()
+        .iter()
+        .map(|b| format!("{:<6}  {}", key_label(&b.key), b.action.label()))
+        .collect()
 }
 
 /// How long ago the displayed value was read. Shown whenever Liveness is

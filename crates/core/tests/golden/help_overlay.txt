@@ -1,0 +1,6 @@
+q       quit
+⌃C      quit
+r       refetch
+⌃R      read-only
+?       help
+Esc     back

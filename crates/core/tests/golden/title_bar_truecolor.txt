@@ -1,10 +1,11 @@
-─ redis-pane ─ ● staging · cache-01:6379/0 · from profile staging ──────────────────────────────────
-                                                                                      read 14s ago
+─ redis-pane ─ ● staging · cache-01:6379/0 · from profile staging ───────────────────────── ● live ─
+
 --- styles ---
 a fg=#444444
 b fg=#e0af68
 c fg=#8a8a8a
 d fg=#e6e6e6
+e fg=#7ac78e
 --- map ---
-aaaaaaaaaaaaaaabbbbbbbbbcccdddddddddddddddcccccccccccccccccccccccaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-......................................................................................cccccccccccc..
+aaaaaaaaaaaaaaabbbbbbbbbcccdddddddddddddddcccccccccccccccccccccccaaaaaaaaaaaaaaaaaaaaaaaaaaaeeeeeeaa
+....................................................................................................

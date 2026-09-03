@@ -1,0 +1,9 @@
+healthy and live                            ● live
+tracking refused, degraded to manual        ○ manual · read 14s ago  r
+connected but not yet armed                 ○ manual · read 14s ago  r
+connection lost                             ✕ disconnected · retry 4s  r
+read-only by Environment                    READ-ONLY environment ⌃R  ● live
+read-only because the target is a replica   READ-ONLY replica locked  ● live
+read-only by choice                         READ-ONLY user ⌃R  ● live
+maxmemory reached                           ✕ OOM · writes rejected  READ-ONLY environment ⌃R  ● live
+server restarting                           ⟳ loading 43%  ○ manual · read 14s ago  r

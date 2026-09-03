@@ -17,10 +17,12 @@ injected clock, columnar arena, push liveness) that proving it end to end early 
 than completing any horizontal layer.
 
 **Liveness transport lands in M0, not M1.** It is the riskiest assumption in the project:
-capability probing, push handling, and re-arming across a reconnect. M0 already builds the
-connection layer, so the transport is proven there and M1 only adds the interface on top. If
-`CLIENT TRACKING` turns out not to work the way [ADR-0006](adr/0006-liveness-without-a-refresh-button.md)
-assumes, that must surface in week one, not in month two.
+capability probing, push handling, and re-arming. The transport was validated against Redis 8.4.0
+before this plan was written — see the Verification table in
+[ADR-0006](adr/0006-liveness-without-a-refresh-button.md), which confirmed the mechanism and
+turned up one behaviour the design had not accounted for: tracking is consumed by its own
+invalidation, so every Refetch must re-arm. M0 builds the connection layer anyway, so the
+transport is proven there and M1 only adds the interface on top.
 
 **Golden frames from the first screen.** The design mockups already produced during planning are
 character grids generated deterministically from fixed state — structurally the same artifact as
@@ -73,7 +75,7 @@ Proves: the architecture holds, and the app can be trusted about what it is conn
 | 7 | Config schema, strict parse rejecting unknown fields, permission refusal | Line/column errors; a typo'd `passwordEnv` fails loudly; group-readable file refused (R1.5, R1.7) |
 | 8 | Redis shell: `fred`, RESP3, version floor, **capability probe** | Connects to 6.2 and 7.x; a server refusing `CLIENT TRACKING` degrades to `○ manual` (R1.13, ADR-0007) |
 | 9 | Startup diagnostics and exit codes | Unreachable target exits non-zero with target, Source and cause on stderr (R1.14) |
-| 10 | Reconnect with visible backoff, **re-arm invariant** | Server killed mid-session: the header never reads `● live` until tracking is re-armed (ADR-0009) |
+| 10 | Reconnect with visible backoff, **both re-arm invariants** | Server killed mid-session: the header never reads `● live` until tracking is re-armed. A second write after an invalidation still produces a push, proving the Refetch re-armed (ADR-0006, ADR-0009) |
 | 11 | Title bar: Environment dot, target, db, Source, Read-only reason | Golden frames of every readout in DESIGN §6.8, including `replica … locked` |
 | 12 | Help overlay, keymap as data, hint bar | An overridden binding changes the on-screen hint (R7.5) |
 

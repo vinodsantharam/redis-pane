@@ -91,7 +91,9 @@ they are expensive to retrofit:
   Every Redis type gets a viewer behind one shared trait/interface so the frame (header, body,
   footer) and navigation are identical across types.
 - **The Viewer never caches a value.** Reads always hit the server; liveness is push-driven via
-  `CLIENT TRACKING ON OPTIN` armed for the open key alone. Any memo keyed by key-name reintroduces
+  `CLIENT TRACKING ON OPTIN` armed for the open key alone. **Tracking is consumed by its own
+  invalidation**, so every Refetch must re-arm — one read path, so the arming cannot be forgotten
+  on one branch of several (verified against Redis 8.4.0; ADR-0006). Any memo keyed by key-name reintroduces
   the exact RedisInsight bug this project was started over — see ADR-0006 before adding one, and
   note that "just for the first frame" is how it starts.
 - **Mutations flow through one path** that produces a command preview before executing. Read-only
@@ -120,8 +122,8 @@ they are expensive to retrofit:
   file is refused when group- or world-readable. **Unknown config fields are a parse error**, not
   something to ignore — the file is hand-authored, so a misspelled `passwordEnv` is a credential
   silently dropped. A Profile with no `env` gets `unknown`, never `local`.
-- **A reconnect re-arms tracking before anything claims to be live.** This is the invariant most
-  likely to rot silently, and it puts the product back where RedisInsight was if it does. It has
+- **Two re-arm invariants, not one:** after every invalidation, and after every reconnect.
+  Both are the invariant most likely to rot silently, and it puts the product back where RedisInsight was if it does. It has
   a test (ADR-0009, ADR-0011).
 - **Read-only Mode carries a reason** — `environment`, `replica`, or `user` — and shows it. The
   `replica` reason is not user-liftable; never offer `⌃R` where the server will refuse anyway.

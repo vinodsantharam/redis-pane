@@ -1,6 +1,6 @@
 # ADR-0006 — Liveness without a refresh button
 
-**Status:** Accepted · **Date:** 2026-08-26
+**Status:** Accepted · **Date:** 2026-08-26 · **Verified against Redis 8.4.0 on 2026-09-03**
 
 ## Context
 
@@ -30,6 +30,12 @@ fixed.
 one in the Viewer — using `CLIENT CACHING YES` before its read. An invalidation triggers one
 Refetch. There is no polling and no idle traffic, and the server tracks one key per session
 rather than the tens of thousands a browse would otherwise touch.
+
+**Every Refetch re-arms.** Tracking is *consumed* by the invalidation it produces, not standing:
+once the server has told you a key changed, it stops tracking that key until you read it again
+under `CLIENT CACHING YES`. A Refetch that does not re-arm leaves the Viewer permanently dark
+while the header still reads `● live` — the original defect, reached by a different route. This
+is an invariant, and it is verified below rather than assumed.
 
 **Apply if at rest, announce if scrolled, never while editing.** An open editor is never touched
 by an arriving update.
@@ -64,6 +70,32 @@ a browse of a 180k-key keyspace makes the server track most of the keyspace on t
 and push far more invalidation than the UI can use. `OPTIN` costs one extra command per key
 opened and bounds the whole feature to one entry.
 
+## Verification
+
+Measured directly against Redis 8.4.0 over a raw RESP3 socket, reading the protocol bytes rather
+than trusting a client library. All findings below are reproduced from actual pushes.
+
+| Claim | Result |
+|---|---|
+| An armed key produces an invalidation push on write | **Confirmed** — `>2 $10 invalidate *1 $11 spike:armed` |
+| `OPTIN` genuinely scopes: a read without `CLIENT CACHING YES` is not tracked | **Confirmed** — silence |
+| `DEL` produces an invalidation | **Confirmed** |
+| Expiry produces an invalidation, both lazy and active | **Confirmed** — fires even when no client touches the key |
+| A field write to a hash invalidates the whole key | **Confirmed** — the Viewer's actual case |
+| A fresh connection is not tracking anything | **Confirmed** — validates the reconnect invariant in [ADR-0009](0009-connection-lifecycle.md) |
+| **Tracking is consumed by its own invalidation** | **Confirmed, and not previously accounted for** — see below |
+| `CLIENT TRACKINGINFO` exposes readable state | **Confirmed** — `flags: on, optin` |
+
+The last row is the finding that changed this ADR. Five rapid writes to an armed key produced
+**one** push, not five: the server coalesces, because after the first invalidation it is no
+longer tracking that key. A subsequent write produced nothing at all until the key was read
+again under `CLIENT CACHING YES`.
+
+The coalescing is welcome — no flood from a hot key. The consumption is the trap. It means the
+Refetch cycle is `invalidate → read with CLIENT CACHING YES → armed again`, and any Refetch path
+that omits the arming step goes silently dark. There are therefore **two** re-arm invariants, not
+one: after every invalidation, and after every reconnect.
+
 ## Consequences
 
 - **RESP3 is a hard requirement of the Redis client library**, which settles the open choice in
@@ -80,6 +112,8 @@ opened and bounds the whole feature to one entry.
   Viewer refetches. One fewer feature and one fewer binding.
 - The Viewer gains one piece of state it did not have: whether the viewport is at rest. That is
   the price of apply-if-idle, and it is the only new state this decision introduces.
+- The Refetch path is the *only* place a value is read, precisely so the arming step cannot be
+  forgotten on one of several paths. This is the same chokepoint argument as mutations.
 - Reversing this means reintroducing a cache, which is where the original bug lives. Treat the
   no-cache rule (R3.6) as the load-bearing half; the transport can change, the absence of a
   cache should not.

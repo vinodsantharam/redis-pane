@@ -157,7 +157,9 @@ config file; a **Connection** is a live session, which may be **ad-hoc** (no Pro
   application can reach. See [ADR-0006](adr/0006-liveness-without-a-refresh-button.md).
 - **R3.7** The open key is **live by default**: `CLIENT TRACKING ON OPTIN` is armed for exactly
   that one key, and a Refetch is triggered by the server's invalidation push. No polling, no
-  idle traffic, one tracked key per session.
+  idle traffic, one tracked key per session. **Every Refetch re-arms**, because tracking is
+  consumed by the invalidation it produces — a Refetch that does not re-arm goes silently dark
+  while still claiming to be live (verified; ADR-0006).
 - **R3.8** An arriving update applies immediately when the Viewer is at rest, and is announced
   (`changed 2s ago · r to load`) when the user has scrolled. An open editor is never touched.
 - **R3.9** TTL renders as a countdown computed locally. It never costs a round trip.

@@ -212,7 +212,7 @@ fn value_pane(
         if i >= viewer.row_count() {
             break;
         }
-        for (c, cell) in viewer.row(i).into_iter().enumerate() {
+        for (c, cell) in viewer.row(i, now).into_iter().enumerate() {
             let width = if cols.len() > 1 { col_w } else { inner };
             put(
                 buf,

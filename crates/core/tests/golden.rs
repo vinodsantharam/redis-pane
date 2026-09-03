@@ -849,20 +849,24 @@ fn golden_viewer_zset() {
 
 #[test]
 fn golden_viewer_stream() {
+    // Newest first (XREVRANGE), and close enough to CLOCK (74_000) for the AGE
+    // column to show something real rather than saturating to "just now" —
+    // real stream IDs carry genuine epoch millis, which this fixed test clock
+    // deliberately does not use anywhere else in this file.
     let v = Value::Stream(StreamValue {
         entries: vec![
             (
-                "1724925600000-0".into(),
-                vec![
-                    ("order".into(), "1000".into()),
-                    ("amount".into(), "42".into()),
-                ],
-            ),
-            (
-                "1724925601000-0".into(),
+                "72000-0".into(),
                 vec![
                     ("order".into(), "1001".into()),
                     ("amount".into(), "17".into()),
+                ],
+            ),
+            (
+                "10000-0".into(),
+                vec![
+                    ("order".into(), "1000".into()),
+                    ("amount".into(), "42".into()),
                 ],
             ),
         ],
@@ -1189,7 +1193,7 @@ fn the_command_uses_the_target_the_title_bar_is_showing() {
 fn copying_a_value_is_not_affected_by_where_the_viewer_is_scrolled() {
     let mut state = opened("k", hash_value(), 600);
     state.open.as_mut().unwrap().offset = 3;
-    let full = value_text(&state.open.as_ref().unwrap().value);
+    let full = value_text(&state.open.as_ref().unwrap().value, 0);
     assert_eq!(full.lines().count(), 5);
 }
 

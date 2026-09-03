@@ -34,10 +34,16 @@ impl CopyWhat {
 /// Tabs rather than aligned columns, because this is going into a terminal or
 /// an editor, not back into this pane. The whole value is included even where
 /// the Viewer is scrolled — a partial copy is a trap.
-pub fn value_text(value: &Value) -> String {
+///
+/// `now_ms` fixes what a Stream's AGE column reads at the moment of copying —
+/// callers should pass the time the value was actually read
+/// ([`OpenKey::read_at_ms`]), not an ambient clock, since a copy is a snapshot
+/// of what was read, not a live view (and `update()`, where every copy is
+/// built, is pure and has no clock of its own — ADR-0011).
+pub fn value_text(value: &Value, now_ms: u64) -> String {
     let viewer = value.viewer();
     (0..viewer.row_count())
-        .map(|i| viewer.row(i).join("\t"))
+        .map(|i| viewer.row(i, now_ms).join("\t"))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -99,13 +105,13 @@ mod tests {
 
     #[test]
     fn the_value_copies_as_tab_separated_rows() {
-        assert_eq!(value_text(&hash()), "id\t8812\nplan\tpro");
+        assert_eq!(value_text(&hash(), 0), "id\t8812\nplan\tpro");
     }
 
     #[test]
     fn a_string_copies_as_its_text() {
         let v = Value::Str(StringValue::new("hello", 40));
-        assert_eq!(value_text(&v), "hello");
+        assert_eq!(value_text(&v, 0), "hello");
     }
 
     #[test]
@@ -115,7 +121,7 @@ mod tests {
             entries: (0..100).map(|i| (format!("m{i}"), i as f64)).collect(),
             total: 100,
         });
-        assert_eq!(value_text(&v).lines().count(), 100);
+        assert_eq!(value_text(&v, 0).lines().count(), 100);
     }
 
     #[test]

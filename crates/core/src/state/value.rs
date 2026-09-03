@@ -70,7 +70,11 @@ pub trait Viewer {
 
     /// One row of cells. Called only for visible rows: render cost is a
     /// function of viewport size, not value size.
-    fn row(&self, i: usize) -> Vec<String>;
+    ///
+    /// `now_ms` comes from the injected clock (ADR-0011), not read directly —
+    /// only Stream's age column uses it, but every type takes it, so no
+    /// special-casing is needed at the one call site that draws a row.
+    fn row(&self, i: usize, now_ms: u64) -> Vec<String>;
 }
 
 // ── string ──────────────────────────────────────────────────────────────────
@@ -115,7 +119,7 @@ impl Viewer for StringValue {
     fn row_count(&self) -> usize {
         self.lines.len()
     }
-    fn row(&self, i: usize) -> Vec<String> {
+    fn row(&self, i: usize, _now_ms: u64) -> Vec<String> {
         vec![self.lines.get(i).cloned().unwrap_or_default()]
     }
 }
@@ -137,7 +141,7 @@ impl Viewer for PairValue {
     fn row_count(&self) -> usize {
         self.pairs.len()
     }
-    fn row(&self, i: usize) -> Vec<String> {
+    fn row(&self, i: usize, _now_ms: u64) -> Vec<String> {
         self.pairs
             .get(i)
             .map(|(k, v)| vec![k.clone(), v.clone()])
@@ -164,7 +168,7 @@ impl Viewer for IndexedValue {
     fn row_count(&self) -> usize {
         self.items.len()
     }
-    fn row(&self, i: usize) -> Vec<String> {
+    fn row(&self, i: usize, _now_ms: u64) -> Vec<String> {
         self.items
             .get(i)
             .map(|v| vec![i.to_string(), v.clone()])
@@ -190,7 +194,7 @@ impl Viewer for MemberValue {
     fn row_count(&self) -> usize {
         self.members.len()
     }
-    fn row(&self, i: usize) -> Vec<String> {
+    fn row(&self, i: usize, _now_ms: u64) -> Vec<String> {
         self.members
             .get(i)
             .map(|m| vec![m.clone()])
@@ -218,7 +222,7 @@ impl Viewer for ScoredValue {
     fn row_count(&self) -> usize {
         self.entries.len()
     }
-    fn row(&self, i: usize) -> Vec<String> {
+    fn row(&self, i: usize, _now_ms: u64) -> Vec<String> {
         self.entries
             .get(i)
             .map(|(m, s)| vec![format_score(*s), m.clone()])
@@ -248,12 +252,12 @@ impl Viewer for StreamValue {
         plural(self.total, "entry")
     }
     fn columns(&self) -> &'static [&'static str] {
-        &["ID", "FIELDS"]
+        &["ID", "AGE", "FIELDS"]
     }
     fn row_count(&self) -> usize {
         self.entries.len()
     }
-    fn row(&self, i: usize) -> Vec<String> {
+    fn row(&self, i: usize, now_ms: u64) -> Vec<String> {
         self.entries
             .get(i)
             .map(|(id, fields)| {
@@ -262,9 +266,32 @@ impl Viewer for StreamValue {
                     .map(|(k, v)| format!("{k}={v}"))
                     .collect::<Vec<_>>()
                     .join("  ");
-                vec![id.clone(), rendered]
+                vec![id.clone(), stream_entry_age(id, now_ms), rendered]
             })
             .unwrap_or_default()
+    }
+}
+
+/// The relative age of a stream entry, computed from the millisecond
+/// timestamp Redis embeds in every ID's leading component — no extra fetch,
+/// no stored state, ticking correctly between frames exactly the way the TTL
+/// countdown does (R3.9, ADR-0011): a pure function of the ID and the clock.
+///
+/// A custom ID (`XADD key 5-0 ...`) is syntactically identical to a real
+/// timestamp — Redis does not distinguish them — so an implausibly small
+/// value produces an implausibly large age rather than a special case. That
+/// is honest, not wrong: the entry really was assigned that ID.
+pub fn stream_entry_age(id: &str, now_ms: u64) -> String {
+    let Some(ms) = id.split('-').next().and_then(|s| s.parse::<u64>().ok()) else {
+        return "—".into();
+    };
+    let secs = now_ms.saturating_sub(ms) / 1000;
+    match secs {
+        0 => "just now".into(),
+        s if s < 60 => format!("{s}s ago"),
+        s if s < 3_600 => format!("{}m ago", s / 60),
+        s if s < 86_400 => format!("{}h ago", s / 3_600),
+        s => format!("{}d ago", s / 86_400),
     }
 }
 
@@ -306,7 +333,7 @@ impl Viewer for JsonValue {
     fn row_count(&self) -> usize {
         self.lines.len()
     }
-    fn row(&self, i: usize) -> Vec<String> {
+    fn row(&self, i: usize, _now_ms: u64) -> Vec<String> {
         vec![self.lines.get(i).cloned().unwrap_or_default()]
     }
 }
@@ -330,7 +357,7 @@ impl Viewer for BinaryValue {
     fn row_count(&self) -> usize {
         self.bytes.len().div_ceil(HEX_WIDTH)
     }
-    fn row(&self, i: usize) -> Vec<String> {
+    fn row(&self, i: usize, _now_ms: u64) -> Vec<String> {
         let start = i * HEX_WIDTH;
         let chunk =
             &self.bytes[start.min(self.bytes.len())..(start + HEX_WIDTH).min(self.bytes.len())];
@@ -404,10 +431,10 @@ mod tests {
             let v = value.viewer();
             assert!(!v.measure().is_empty(), "{:?} has no measure", value.kind());
             assert!(v.row_count() > 0, "{:?} has no rows", value.kind());
-            assert!(!v.row(0).is_empty(), "{:?} row 0 is empty", value.kind());
+            assert!(!v.row(0, 0).is_empty(), "{:?} row 0 is empty", value.kind());
             // Out of range is answered, not panicked on: scrolling shares one
             // implementation and must be safe for every type.
-            let _ = v.row(9_999);
+            let _ = v.row(9_999, 0);
         }
     }
 
@@ -477,7 +504,7 @@ mod tests {
         let v = BinaryValue {
             bytes: b"AB\x00\xff".to_vec(),
         };
-        let row = v.row(0);
+        let row = v.row(0, 0);
         assert_eq!(row[0], "00000000");
         assert_eq!(row[1], "41 42 00 ff");
         assert_eq!(row[2], "AB..", "unprintables become dots, not gaps");
@@ -496,5 +523,63 @@ mod tests {
         // value to accumulate.
         let v = PairValue::default();
         assert_eq!(v.row_count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod stream_timeline_tests {
+    //! Severity-2 #1: the AGE column, computed live from the millisecond
+    //! timestamp Redis embeds in every entry ID — no fetch, no stored state,
+    //! same discipline as the TTL countdown (R3.9, ADR-0011).
+
+    use super::*;
+
+    #[test]
+    fn each_unit_tier_renders_correctly() {
+        assert_eq!(stream_entry_age("0-0", 0), "just now");
+        assert_eq!(stream_entry_age("0-0", 30_000), "30s ago");
+        assert_eq!(stream_entry_age("0-0", 120_000), "2m ago");
+        assert_eq!(stream_entry_age("0-0", 7_200_000), "2h ago");
+        assert_eq!(stream_entry_age("0-0", 172_800_000), "2d ago");
+    }
+
+    #[test]
+    fn age_is_computed_from_the_leading_millisecond_component_only() {
+        // The sequence number after the dash must never leak into the math.
+        assert_eq!(stream_entry_age("1000-0", 2_000), "1s ago");
+        assert_eq!(stream_entry_age("1000-999", 2_000), "1s ago");
+    }
+
+    #[test]
+    fn a_malformed_id_shows_a_dash_rather_than_a_wrong_number_or_a_panic() {
+        assert_eq!(stream_entry_age("not-an-id", 1_000), "—");
+        assert_eq!(stream_entry_age("", 1_000), "—");
+    }
+
+    #[test]
+    fn a_custom_low_id_is_shown_honestly_not_specially_cased() {
+        // XADD key 5-0 ... is syntactically valid and indistinguishable from a
+        // real timestamp; the large resulting age is correct, not a bug.
+        let age = stream_entry_age("5-0", 999_999_999);
+        assert!(age.ends_with("d ago"), "{age}");
+    }
+
+    #[test]
+    fn the_age_column_sits_between_id_and_fields() {
+        let v = StreamValue::default();
+        assert_eq!(v.columns(), ["ID", "AGE", "FIELDS"]);
+    }
+
+    #[test]
+    fn the_age_ticks_between_two_renders_of_the_same_entry_with_no_refetch() {
+        // Exactly the TTL discipline: the same stored entry, two different
+        // clock readings, two different ages — nothing about the value itself
+        // needs to change for the display to be current.
+        let v = StreamValue {
+            entries: vec![("60000-0".into(), vec![("k".into(), "v".into())])],
+            total: 1,
+        };
+        assert_eq!(v.row(0, 61_000)[1], "1s ago");
+        assert_eq!(v.row(0, 120_000)[1], "1m ago");
     }
 }

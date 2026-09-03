@@ -144,8 +144,13 @@ async fn string_value(client: &Client, key: Key, width: usize) -> Result<Value, 
 
 async fn stream_value(client: &Client, key: Key) -> Result<Value, Error> {
     let total: i64 = client.xlen(key.clone()).await.unwrap_or(0);
+    // XREVRANGE, not XRANGE: DESIGN §6.3 asks for a reverse-chronological
+    // timeline, and it is not only ordering. XRANGE("-", "+", COUNT) takes the
+    // *oldest* COUNT entries — on a stream past the window size, that was the
+    // ancient history, not the recent activity a triage view actually needs.
+    // XREVRANGE("+", "-", COUNT) takes the most recent COUNT, newest first.
     let entries: Vec<(String, Vec<(String, String)>)> = client
-        .xrange(key, "-", "+", Some(WINDOW as u64))
+        .xrevrange(key, "+", "-", Some(WINDOW as u64))
         .await
         .unwrap_or_default();
     Ok(Value::Stream(StreamValue {

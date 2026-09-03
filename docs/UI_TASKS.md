@@ -2,7 +2,8 @@
 
 Working list of UI/functionality gaps, audited against DESIGN.md and PRD.md on 2026-09-03.
 Ordered by severity. This is a tracking doc, not a spec — see PRD.md/DESIGN.md for the actual
-requirements and ADRs for decisions already made.
+requirements and ADRs for decisions already made. `[~]` marks an item partially closed on
+purpose — what was done, and what was cut and why, are in its own note rather than a new item.
 
 ## Severity 1 — the current UI actively misleads or breaks
 
@@ -15,8 +16,16 @@ requirements and ADRs for decisions already made.
 
 ## Severity 2 — real functional gaps in what's shipped
 
-- [ ] **Streams have no timeline (R3.4).** Renders as generic `ID | FIELDS` rows; no
-  time-relative view, no consumer-group state (`XINFO GROUPS`/`XPENDING`).
+- [~] **Streams have no timeline (R3.4).** Partially closed — scoped down to what could be
+  done properly in one pass; two real pieces of DESIGN §6.3's target are explicitly not built.
+  **Done:** reverse-chronological order (`XREVRANGE`, not `XRANGE` — this was not just an
+  ordering preference: `XRANGE("-", "+", COUNT)` takes the *oldest* `COUNT` entries, so a stream
+  past the window was silently showing ancient history instead of recent activity, verified
+  against a real container). A live **AGE** column, computed from the millisecond timestamp Redis
+  embeds in every entry ID — no fetch, no stored state, ticking between frames exactly like the
+  TTL countdown (R3.9). **Not done, cut deliberately rather than half-built:** expandable fields
+  (an interactive drill-down, its own feature) and the consumer-group panel (`XINFO GROUPS`/
+  `XPENDING` — a separate fetch and a separate view, not a per-entry field).
 - [ ] **Mouse support is entirely absent (R7.3).** No click-to-focus, scroll, or drag-to-resize.
 - [ ] **The split ratio is fixed, not resizable** (hardcoded 45/55). Blocks mouse
   drag-to-resize from being useful once built.

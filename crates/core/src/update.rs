@@ -424,7 +424,7 @@ fn copy_key(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             },
         },
         CopyWhat::Value => match &state.open {
-            Some(open) => value_text(&open.value),
+            Some(open) => value_text(&open.value, open.read_at_ms),
             None => {
                 state.notice = Some(("nothing open to copy".into(), 0));
                 return (state, Vec::new());

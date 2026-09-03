@@ -767,3 +767,92 @@ async fn opening_a_key_on_a_tracking_capable_server_reaches_live_state() {
     let _ = client.quit().await;
     let _ = writer.quit().await;
 }
+
+// ── severity-2 #1: streams read newest-first, with a live AGE column ────────
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn a_stream_is_read_newest_first_not_oldest_first() {
+    // The actual bug this fixed: XRANGE("-", "+", COUNT) takes the *oldest*
+    // COUNT entries. On a stream past the window, a triage view built on it
+    // was silently showing ancient history instead of recent activity.
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+
+    for i in 0..10 {
+        let _: String = writer
+            .xadd("orders", false, None, "*", vec![("seq", i.to_string())])
+            .await
+            .unwrap();
+    }
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let value = redis_pane::redis::read::read_value(
+        &client,
+        b"orders",
+        40,
+        redis_pane::redis::read::Arming::Unsupported,
+    )
+    .await
+    .unwrap()
+    .expect("the stream exists")
+    .value;
+
+    let redis_pane_core::state::Value::Stream(stream) = value else {
+        panic!("expected a stream value");
+    };
+    assert_eq!(stream.total, 10);
+    // First entry back must be seq=9 (the most recently added), not seq=0.
+    let first_fields = &stream.entries[0].1;
+    assert_eq!(first_fields[0], ("seq".to_string(), "9".to_string()));
+    let last_fields = &stream.entries[9].1;
+    assert_eq!(last_fields[0], ("seq".to_string(), "0".to_string()));
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn a_freshly_added_entry_reads_as_just_added() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: String = writer
+        .xadd("events", false, None, "*", vec![("kind", "login")])
+        .await
+        .unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let value = redis_pane::redis::read::read_value(
+        &client,
+        b"events",
+        40,
+        redis_pane::redis::read::Arming::Unsupported,
+    )
+    .await
+    .unwrap()
+    .expect("the stream exists")
+    .value;
+
+    let redis_pane_core::state::Value::Stream(stream) = value else {
+        panic!("expected a stream value");
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    // The ID Redis actually assigned, run through the real formatter, must
+    // read as "just now" — proving the ID's timestamp component genuinely is
+    // real wall-clock epoch millis, not a guess about Redis's ID format.
+    let age = redis_pane_core::state::value::stream_entry_age(&stream.entries[0].0, now_ms);
+    assert_eq!(age, "just now", "id was {}", stream.entries[0].0);
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}

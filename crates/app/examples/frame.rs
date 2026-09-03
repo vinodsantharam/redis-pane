@@ -61,7 +61,9 @@ async fn main() {
         connection: Connection {
             target: format!("{display}/0"),
             environment: Environment::Staging,
-            source: Source::Profile("upstash".into()),
+            source: Source::Profile(
+                std::env::var("REDIS_PANE_PROFILE_NAME").unwrap_or_else(|_| "profile".into()),
+            ),
         },
         ..State::default()
     };

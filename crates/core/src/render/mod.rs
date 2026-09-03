@@ -5,6 +5,9 @@
 //! terminals — that is the shell's problem. This is what lets golden-frame
 //! tests exist at all (ADR-0011).
 
+pub mod keys;
+pub mod layout;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -17,8 +20,16 @@ use crate::theme::{Theme, Token, env_token};
 /// Render the whole frame into a fresh buffer of the given size.
 pub fn frame(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect) -> Buffer {
     let mut buf = Buffer::empty(area);
+    let plan = layout::layout(area);
     title_bar(state, theme, clock, area, &mut buf);
-    if area.height >= 3 {
+
+    keys::render(state, theme, plan.keys, plan.density, &mut buf);
+    if let Some(value) = plan.value {
+        value_pane(state, theme, value, &mut buf);
+    }
+    status_bar(state, theme, area, &mut buf);
+
+    if plan.hint_bar && area.height >= 3 {
         let hints = hint_bar(state);
         put(
             &mut buf,
@@ -32,6 +43,71 @@ pub fn frame(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect) -> Buf
         help_overlay(state, theme, area, &mut buf);
     }
     buf
+}
+
+/// The value pane. Viewers land in M1.8; until then it states what is selected
+/// so the two-pane layout is real rather than a promise.
+fn value_pane(state: &State, theme: &Theme, area: Rect, buf: &mut Buffer) {
+    if area.height == 0 || area.width < 4 {
+        return;
+    }
+    for y in 0..area.height {
+        put(
+            buf,
+            area.x.saturating_sub(1),
+            area.y + y,
+            "│",
+            theme.style(Token::Border),
+        );
+    }
+    match state.keys.name_str(state.view.selected) {
+        Some(name) => {
+            put(buf, area.x + 1, area.y, &name, theme.style(Token::Text));
+            put(
+                buf,
+                area.x + 1,
+                area.y + 2,
+                "value viewers land in M1.8",
+                theme.style(Token::Muted),
+            );
+        }
+        None => {
+            put(
+                buf,
+                area.x + 1,
+                area.y,
+                "no key selected",
+                theme.style(Token::Muted),
+            );
+        }
+    }
+}
+
+/// The status bar: scan progress and its cancel affordance (DESIGN §6.2).
+fn status_bar(state: &State, theme: &Theme, area: Rect, buf: &mut Buffer) {
+    let readout = state.scan.readout();
+    if readout.is_empty() || area.height < 2 {
+        return;
+    }
+    let y = area.height - if area.height >= 24 { 2 } else { 1 };
+    let token = match state.scan {
+        crate::state::ScanState::Capped { .. } | crate::state::ScanState::Failed { .. } => {
+            Token::Warn
+        }
+        _ => Token::Muted,
+    };
+    let x = put(buf, 1, y, &readout, theme.style(token));
+    if state.scan.is_running()
+        && let Some(hint) = state.keymap.hint(crate::keymap::Action::Cancel)
+    {
+        put(
+            buf,
+            x + 2,
+            y,
+            &format!("{hint} cancel"),
+            theme.style(Token::Muted),
+        );
+    }
 }
 
 /// A dismissible overlay rather than resident chrome (G7): screen space is a
@@ -90,54 +166,76 @@ fn title_bar(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect, buf: &
     }
     let w = area.width as usize;
     let border = theme.style(Token::Border);
-
     buf.set_string(0, 0, "─".repeat(w), border);
-    let mut x = 0u16;
-    x = put(buf, x, 0, "─ redis-pane ─ ", theme.style(Token::Border));
-    x = put(
-        buf,
-        x,
-        0,
-        "● ",
-        theme.style(env_token(state.connection.environment)),
-    );
-    x = put(
-        buf,
-        x,
-        0,
-        state.connection.environment.label(),
-        theme.style(env_token(state.connection.environment)),
-    );
-    x = put(buf, x, 0, " · ", theme.style(Token::Muted));
-    x = put(
-        buf,
-        x,
-        0,
-        &state.connection.target,
-        theme.style(Token::Text),
-    );
-    x = put(buf, x, 0, " · ", theme.style(Token::Muted));
-    x = put(
-        buf,
-        x,
-        0,
-        &state.connection.source.label(),
-        theme.style(Token::Muted),
-    );
-    put(buf, x, 0, " ", theme.style(Token::Border));
 
-    // The safety and liveness readout, right-aligned on the title row.
-    let readout = status_readout(state, clock);
-    let width: usize = readout.iter().map(|(t, _)| t.chars().count()).sum();
-    if width + 4 < w {
-        // A space either side, so the readout does not abut the border rule.
-        let mut x = (w - width - 3) as u16;
-        x = put(buf, x, 0, " ", theme.style(Token::Border));
+    let env = state.connection.environment;
+    let source = state.connection.source.label();
+    let prefix = "─ redis-pane ─ ";
+
+    // DESIGN §2 fixes the priority: the Environment and the Source are never
+    // sacrificed. That pair is the entire mitigation for resolving a Connection
+    // silently (ADR-0001), so losing it to a narrow window would quietly remove
+    // the safeguard exactly when the screen is cramped and the user is rushed.
+    // Everything else yields to it — the target first, then the readout.
+    let required =
+        prefix.chars().count() + 2 + env.label().chars().count() + 3 + source.chars().count() + 1;
+
+    // Trim the readout from the end until it fits. Liveness goes before the
+    // safety badge, because the Viewer header carries liveness too (§6.4) while
+    // READ-ONLY appears nowhere else.
+    let mut readout = status_readout(state, clock);
+    let readout_width =
+        |r: &[(String, Token)]| -> usize { r.iter().map(|(t, _)| t.chars().count()).sum() };
+    while !readout.is_empty() && required + readout_width(&readout) + 3 > w {
+        readout.pop();
+    }
+    let readout_w = readout_width(&readout);
+    let left_budget = w.saturating_sub(readout_w + 3);
+
+    let mut x = 0u16;
+    x = put(buf, x, 0, prefix, border);
+    x = put(buf, x, 0, "● ", theme.style(env_token(env)));
+    x = put(buf, x, 0, env.label(), theme.style(env_token(env)));
+
+    // Whatever is left over, the target may have — truncated from the left, so
+    // the part that distinguishes one host from another survives.
+    let target_budget = left_budget.saturating_sub(required + 3);
+    if target_budget >= 4 {
+        let target = truncate_left(&state.connection.target, target_budget);
+        x = put(buf, x, 0, " · ", theme.style(Token::Muted));
+        x = put(buf, x, 0, &target, theme.style(Token::Text));
+    }
+
+    x = put(buf, x, 0, " · ", theme.style(Token::Muted));
+    x = put(buf, x, 0, &source, theme.style(Token::Muted));
+    put(buf, x, 0, " ", border);
+
+    if readout_w > 0 && readout_w + 4 < w {
+        let mut x = (w - readout_w - 3) as u16;
+        x = put(buf, x, 0, " ", border);
         for (text, token) in &readout {
             x = put(buf, x, 0, text, theme.style(*token));
         }
-        put(buf, x, 0, " ", theme.style(Token::Border));
+        put(buf, x, 0, " ", border);
     }
+}
+
+/// Truncate a target from the left, keeping the end.
+///
+/// Hosts differ at the end (`cache-01` vs `cache-02`, and the port), so cutting
+/// the front keeps what distinguishes one server from another.
+fn truncate_left(s: &str, width: usize) -> String {
+    let len = s.chars().count();
+    if len <= width {
+        return s.to_string();
+    }
+    if width <= 1 {
+        return String::new();
+    }
+    let keep = width - 1;
+    let mut out = String::from("…");
+    out.extend(s.chars().skip(len - keep));
+    out
 }
 
 /// What the title bar says about safety and currency, right to left.
@@ -256,8 +354,22 @@ pub fn read_age(state: &State, clock: &dyn Clock) -> String {
 /// invisible under truecolor, where the foreground is overwritten anyway, and
 /// very visible in monochrome, where a border's DIM bled into every character
 /// painted on top of it. Resetting first is the fix.
-fn put(buf: &mut Buffer, x: u16, y: u16, s: &str, style: Style) -> u16 {
-    if x >= buf.area.width {
+/// Write text right-aligned inside a field of `width` starting at `x`.
+///
+/// Right alignment is what makes a column of sizes or TTLs scannable: the
+/// magnitudes line up instead of the first digits.
+pub(crate) fn put_right(buf: &mut Buffer, x: u16, y: u16, width: u16, s: &str, style: Style) {
+    let len = s.chars().count() as u16;
+    put(buf, x + width.saturating_sub(len), y, s, style);
+}
+
+pub(crate) fn put(buf: &mut Buffer, x: u16, y: u16, s: &str, style: Style) -> u16 {
+    // Clip rather than panic. `Buffer::set_string` panics on an out-of-bounds
+    // index, and a panic in a TUI leaves the user's terminal in raw mode — the
+    // rudest possible failure, and one that would arrive precisely when the
+    // window is small and awkward. Every write goes through here, so this one
+    // check makes the whole renderer safe at any size.
+    if x >= buf.area.width || y >= buf.area.height {
         return x;
     }
     buf.set_string(x, y, s, Style::reset().patch(style));
@@ -348,4 +460,46 @@ fn describe_style(s: &Style) -> String {
         format!(" {:?}", s.add_modifier)
     };
     format!("{fg}{mods}")
+}
+
+#[cfg(test)]
+mod safety {
+    //! A TUI that panics leaves the terminal in raw mode. Rendering must
+    //! survive any size the user's window manager can produce.
+
+    use super::*;
+    use crate::clock::FixedClock;
+    use crate::state::{LoadedSet, State};
+    use crate::theme::ColorDepth;
+
+    fn populated() -> State {
+        let mut keys = LoadedSet::default();
+        for i in 0..50 {
+            keys.push(format!("key:{i}").as_bytes());
+        }
+        State {
+            keys,
+            ..State::default()
+        }
+    }
+
+    #[test]
+    fn no_terminal_size_can_make_rendering_panic() {
+        let theme = Theme::new(ColorDepth::TrueColor);
+        let clock = FixedClock(1_000);
+        for w in [0u16, 1, 2, 7, 8, 20, 69, 70, 89, 90, 119, 120, 300] {
+            for h in [0u16, 1, 2, 3, 5, 23, 24, 60] {
+                let _ = frame(&populated(), &theme, &clock, Rect::new(0, 0, w, h));
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_keyspace_renders_at_every_size() {
+        let theme = Theme::new(ColorDepth::Monochrome);
+        let clock = FixedClock(1_000);
+        for (w, h) in [(0u16, 0u16), (1, 1), (80, 24), (200, 60)] {
+            let _ = frame(&State::default(), &theme, &clock, Rect::new(0, 0, w, h));
+        }
+    }
 }

@@ -1,0 +1,26 @@
+─ redis-pane ─ ● staging · from profile staging ─── ● live ─
+
+ KEY                                          TYPE      TTL
+ user:8812:session                            hash      42m
+ user:8812:profile                            json        ∞
+ user:8812:cart                               zset      12m
+ user:8813:session                            hash      56m
+ cart:91af3c9d2e                              zset      12m
+ feed:global:hot                              list        ∞
+ lock:checkout:8812                           string    12s
+ stream:orders                                stream      ∞
+
+
+
+
+
+
+
+
+
+
+
+
+
+ scanning 41,203 of ~180,000  Esc cancel
+ Esc back   r refetch   ⌃R read-only   ? help   q quit

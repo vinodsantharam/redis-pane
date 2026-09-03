@@ -232,6 +232,9 @@ pub struct State {
     /// Every key scanned so far, columnar and capped (ADR-0010).
     pub keys: LoadedSet,
     pub scan: ScanState,
+    /// Which rows are on screen and which is selected. Scrolling changes this,
+    /// never the Loaded set (R2.6).
+    pub view: crate::render::keys::Viewport,
 }
 
 impl State {
@@ -245,6 +248,26 @@ impl State {
     /// hint must read `locked` rather than offering a key that will not work.
     pub fn read_only_liftable(&self) -> bool {
         self.read_only.is_some_and(|r| r.liftable())
+    }
+
+    /// How many key rows are visible, given the current terminal height.
+    ///
+    /// Title row, blank, column header, status bar and hint bar are chrome.
+    pub fn visible_rows(&self) -> usize {
+        (self.rows as usize).saturating_sub(6).max(1)
+    }
+
+    /// Visible rows whose metadata has not arrived yet (R2.4).
+    ///
+    /// Only ever the window on screen. Fetching metadata for the whole Loaded
+    /// set would be `KEYS *` with extra steps, and it would compete with `SCAN`
+    /// for the connection while the list is still filling.
+    pub fn rows_needing_metadata(&self) -> Vec<usize> {
+        let height = self.visible_rows();
+        let start = self.view.scrolled_to_selection(height).offset;
+        (start..(start + height).min(self.keys.len()))
+            .filter(|i| self.keys.kind(*i).is_none())
+            .collect()
     }
 
     pub fn liveness(&self) -> Liveness {

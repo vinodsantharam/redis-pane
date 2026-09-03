@@ -22,6 +22,7 @@ use std::time::Duration;
 use fred::interfaces::{ClientInterface, TrackingInterface};
 use fred::prelude::*;
 use fred::types::{InfoKind, RespVersion};
+use redis_pane_core::msg::MetadataEntry;
 use redis_pane_core::server::{FLOOR, Version};
 
 /// Why a connection could not be established or kept.
@@ -180,6 +181,52 @@ fn describe(e: &Error) -> String {
         true => format!("{e}"),
         false => format!("{:?}: {}", e.kind(), e.details()),
     }
+}
+
+/// Fetch type, TTL and memory usage for a window of keys (R2.4, PLAN M1.4).
+///
+/// Three commands per key, pipelined so the whole window costs one round trip
+/// rather than `3 × window`. Only ever the visible rows: fetching metadata for
+/// a whole keyspace would be `KEYS *` with extra steps, and it would compete
+/// with `SCAN` for the connection while the list is still filling.
+///
+/// A key that vanished between the scan and this fetch is reported as gone
+/// rather than failing the batch — the keyspace moves while we walk it.
+pub async fn fetch_metadata(
+    client: &Client,
+    keys: &[(usize, Vec<u8>)],
+) -> Result<Vec<MetadataEntry>, Error> {
+    use redis_pane_core::state::KeyKind;
+
+    let pipeline = client.pipeline();
+    for (_, name) in keys {
+        let key: Key = name.as_slice().into();
+        let _: () = pipeline.r#type(key.clone()).await?;
+        let _: () = pipeline.ttl(key.clone()).await?;
+        let _: () = pipeline.memory_usage(key, None).await?;
+    }
+    let replies: Vec<Value> = pipeline.all().await?;
+
+    let mut out = Vec::with_capacity(keys.len());
+    for (slot, (index, _)) in keys.iter().enumerate() {
+        let kind = replies.get(slot * 3).and_then(|v| v.as_str());
+        let ttl = replies.get(slot * 3 + 1).and_then(|v| v.as_i64());
+        let size = replies.get(slot * 3 + 2).and_then(|v| v.as_i64());
+
+        // TYPE answers "none" for a key that no longer exists.
+        let Some(kind) = kind.filter(|k| k != "none") else {
+            continue;
+        };
+        out.push(MetadataEntry {
+            index: *index,
+            kind: KeyKind::from_redis(&kind),
+            // Redis returns -1 for no expiry and -2 for a missing key; both map
+            // to "no expiry" here, and the missing case was filtered above.
+            ttl_seconds: ttl.unwrap_or(-1).max(-1) as i32,
+            size_bytes: size.unwrap_or(0).clamp(0, u32::MAX as i64 - 1) as u32,
+        });
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

@@ -94,15 +94,16 @@ it cannot connect. No keyspace. — **Met.**
 Proves: the keyspace is legible, the values keep their shape, and the screen is never lying about
 how current it is.
 
-**Progress: 1–2 complete.** The Loaded set holds a million keys in 36MB, and the keyspace source
-streams, filters and cancels against a real server.
+**Progress: 1–4 complete.** The Loaded set holds a million keys in 36MB, the keyspace source
+streams, filters and cancels against a real server, and the browser renders at every breakpoint
+with metadata filling in behind placeholders that hold their column.
 
 | # | Task | Proves |
 |---|---|---|
 | 1 | Columnar Loaded set: byte arena + parallel metadata arrays, hard cap | 1M synthetic keys inside the memory budget; cap stops scanning and says so (R2.6, ADR-0010) |
 | 2 | Keyspace source: a stream of keys with progress, `SCAN` driver behind it | 100k-key scan streams, resumes, and cancels on `Esc`; the abstraction hides the cursor count (R2.1, ADR-0008) |
-| 3 | Virtualized key list, four columns, responsive breakpoints | Golden frames at 118 / 100 / 80 / 70 columns (R2.4, R7.1) |
-| 4 | Lazy metadata fetch with placeholders | Pending cells render without shifting layout |
+| 3 | Virtualized key list, four columns, responsive breakpoints | A golden frame in each band of DESIGN §2 — 130, 119, 100, 80, 70, 60 — and a frame drawn from a 200k-key Loaded set in under 16ms (R2.4, R2.6, R7.1) |
+| 4 | Lazy metadata fetch with placeholders | Pending cells render without shifting layout, and only the visible window is ever fetched — three pipelined commands per row, not per keyspace (R2.4) |
 | 5 | Filter: glob and fuzzy over the Loaded set | Unit tests plus a golden frame |
 | 6 | Tree / flat toggle, prefix index over the same arena | No second copy of the key names (R2.3) |
 | 7 | Sort across the Loaded set | Sorting a lazily-fetched column orders what arrived, parks the rest, states the count — and issues no mass fetch (R2.5) |

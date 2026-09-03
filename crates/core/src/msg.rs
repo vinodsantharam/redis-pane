@@ -1,5 +1,17 @@
 //! `Msg` — everything that can happen (PLAN M0.4).
 
+/// Metadata for one key, as fetched.
+///
+/// `ttl_seconds` uses the store's convention: `-1` means the key has no expiry,
+/// which is a fact about the key rather than a gap in what we know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetadataEntry {
+    pub index: usize,
+    pub kind: crate::state::KeyKind,
+    pub ttl_seconds: i32,
+    pub size_bytes: u32,
+}
+
 /// A key, described without reference to any terminal library.
 ///
 /// The shell translates crossterm's events into these. That translation is the
@@ -107,6 +119,10 @@ pub enum Msg {
     ScanCancelled,
     ScanFailed {
         error: String,
+    },
+    /// Lazily-fetched metadata arrived for some rows (R2.4).
+    MetadataBatch {
+        entries: Vec<MetadataEntry>,
     },
     /// The user asked to leave.
     Quit,

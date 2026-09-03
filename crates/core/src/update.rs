@@ -94,6 +94,14 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             (state, Vec::new())
         }
         Msg::ScanBatch { keys } => scan_batch(state, keys),
+        Msg::MetadataBatch { entries } => {
+            for e in entries {
+                state.keys.set_kind(e.index, e.kind);
+                state.keys.set_ttl(e.index, e.ttl_seconds);
+                state.keys.set_size(e.index, e.size_bytes);
+            }
+            (state, Vec::new())
+        }
         Msg::ScanComplete => {
             // A cap reached mid-scan already told its own story; completing
             // afterwards must not overwrite it with a smaller truth.
@@ -142,7 +150,14 @@ fn scan_batch(mut state: State, keys: Vec<Vec<u8>>) -> (State, Vec<Command>) {
             estimated_total,
         };
     }
-    (state, Vec::new())
+    // Keys render as they arrive; their metadata should follow, but only for
+    // the rows a reader can actually see.
+    let indices = state.rows_needing_metadata();
+    if indices.is_empty() {
+        (state, Vec::new())
+    } else {
+        (state, vec![Command::FetchMetadata { indices }])
+    }
 }
 
 /// Resolve a keypress through the keymap, never against hard-coded keys.
@@ -171,6 +186,24 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             (state, Vec::new())
         }
         Action::Refetch => (state, vec![Command::RefetchOpenKey]),
+        Action::MoveDown => move_selection(state, 1),
+        Action::MoveUp => move_selection(state, -1),
+        Action::PageDown => {
+            let page = state.visible_rows() as isize;
+            move_selection(state, page)
+        }
+        Action::PageUp => {
+            let page = state.visible_rows() as isize;
+            move_selection(state, -page)
+        }
+        Action::Top => {
+            state.view.selected = 0;
+            after_move(state)
+        }
+        Action::Bottom => {
+            state.view.selected = state.keys.len().saturating_sub(1);
+            after_move(state)
+        }
         Action::ToggleReadOnly => {
             // A replica will refuse writes whatever we believe, so this is not
             // a toggle the user gets to win (ADR-0009).
@@ -181,6 +214,30 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             }
             (state, Vec::new())
         }
+    }
+}
+
+/// Move the selection, clamped to the Loaded set.
+fn move_selection(mut state: State, by: isize) -> (State, Vec<Command>) {
+    if state.keys.is_empty() {
+        return (state, Vec::new());
+    }
+    let last = state.keys.len() as isize - 1;
+    let next = (state.view.selected as isize + by).clamp(0, last);
+    state.view.selected = next as usize;
+    after_move(state)
+}
+
+/// Scrolling reveals rows whose metadata has not been fetched, so every move
+/// asks for what is newly visible — and only what is visible (R2.4).
+fn after_move(mut state: State) -> (State, Vec<Command>) {
+    let height = state.visible_rows();
+    state.view = state.view.scrolled_to_selection(height);
+    let indices = state.rows_needing_metadata();
+    if indices.is_empty() {
+        (state, Vec::new())
+    } else {
+        (state, vec![Command::FetchMetadata { indices }])
     }
 }
 
@@ -537,8 +594,13 @@ mod scan_tests {
     use crate::msg::KeyCode;
     use crate::state::LoadedSet;
 
+    /// A scan on a realistically sized terminal, so `visible_rows` is sane.
     fn started(estimated_total: u64) -> State {
-        let (s, _) = update(State::default(), Msg::ScanStarted { estimated_total });
+        let base = State {
+            rows: 30,
+            ..State::default()
+        };
+        let (s, _) = update(base, Msg::ScanStarted { estimated_total });
         s
     }
 
@@ -566,9 +628,19 @@ mod scan_tests {
                 keys: batch(500, 0),
             },
         );
-        assert!(cmds.is_empty());
         assert_eq!(s.keys.len(), 500);
         assert_eq!(s.scan.readout(), "scanning 500 of ~180,000");
+
+        // The keys render immediately; their metadata is requested separately,
+        // and only for the rows on screen (R2.4).
+        let Some(Command::FetchMetadata { indices }) = cmds.first() else {
+            panic!("expected a metadata request, got {cmds:?}");
+        };
+        assert_eq!(
+            indices.len(),
+            s.visible_rows(),
+            "500 keys arrived, but only the visible window is fetched"
+        );
     }
 
     #[test]
@@ -720,5 +792,125 @@ mod scan_tests {
         );
         assert_eq!(s.keys.len(), 30, "partial results are still worth showing");
         assert!(s.scan.readout().contains("LOADING"));
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    //! Metadata is fetched lazily and only for what is on screen (R2.4).
+
+    use super::*;
+    use crate::msg::{KeyCode, MetadataEntry};
+    use crate::state::KeyKind;
+    use crate::state::loaded::TTL_NONE;
+
+    fn browsing(n: usize) -> State {
+        let mut state = State {
+            rows: 30,
+            ..State::default()
+        };
+        (state, _) = update(
+            state,
+            Msg::ScanStarted {
+                estimated_total: n as u64,
+            },
+        );
+        let keys = (0..n).map(|i| format!("k:{i}").into_bytes()).collect();
+        let (state, _) = update(state, Msg::ScanBatch { keys });
+        state
+    }
+
+    #[test]
+    fn only_the_visible_window_is_ever_requested() {
+        let state = browsing(10_000);
+        let indices = state.rows_needing_metadata();
+        assert_eq!(indices.len(), state.visible_rows());
+        assert!(
+            indices.iter().all(|i| *i < state.visible_rows()),
+            "requested a row nobody can see"
+        );
+    }
+
+    #[test]
+    fn arriving_metadata_lands_on_the_right_rows() {
+        let state = browsing(100);
+        let (state, _) = update(
+            state,
+            Msg::MetadataBatch {
+                entries: vec![MetadataEntry {
+                    index: 2,
+                    kind: KeyKind::Hash,
+                    ttl_seconds: 2_537,
+                    size_bytes: 2_150,
+                }],
+            },
+        );
+        assert_eq!(state.keys.kind(2), Some(KeyKind::Hash));
+        assert_eq!(state.keys.ttl(2), Some(2_537));
+        assert_eq!(state.keys.size(2), Some(2_150));
+        assert_eq!(state.keys.kind(1), None, "its neighbours are untouched");
+    }
+
+    #[test]
+    fn rows_that_already_have_metadata_are_not_requested_again() {
+        let state = browsing(100);
+        let entries = (0..state.visible_rows())
+            .map(|i| MetadataEntry {
+                index: i,
+                kind: KeyKind::String,
+                ttl_seconds: TTL_NONE,
+                size_bytes: 10,
+            })
+            .collect();
+        let (state, _) = update(state, Msg::MetadataBatch { entries });
+        assert!(
+            state.rows_needing_metadata().is_empty(),
+            "the visible window is fully known, so nothing more is owed"
+        );
+    }
+
+    #[test]
+    fn scrolling_asks_for_what_scrolling_revealed() {
+        let state = browsing(10_000);
+        let entries = (0..state.visible_rows())
+            .map(|i| MetadataEntry {
+                index: i,
+                kind: KeyKind::String,
+                ttl_seconds: TTL_NONE,
+                size_bytes: 10,
+            })
+            .collect();
+        let (state, _) = update(state, Msg::MetadataBatch { entries });
+
+        // Page down past the known rows.
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::PageDown)));
+        let Some(Command::FetchMetadata { indices }) = cmds.first() else {
+            panic!("scrolling into unknown rows must ask for them, got {cmds:?}");
+        };
+        assert!(!indices.is_empty());
+        assert!(
+            indices.iter().all(|i| state.keys.kind(*i).is_none()),
+            "already-known rows must not be re-fetched"
+        );
+    }
+
+    #[test]
+    fn navigation_is_clamped_to_the_loaded_set() {
+        let state = browsing(5);
+        let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::End)));
+        assert_eq!(state.view.selected, 4);
+        let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Down)));
+        assert_eq!(state.view.selected, 4, "cannot walk off the end");
+        let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Home)));
+        assert_eq!(state.view.selected, 0);
+        let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Up)));
+        assert_eq!(state.view.selected, 0, "nor off the start");
+    }
+
+    #[test]
+    fn navigating_an_empty_keyspace_does_nothing_rather_than_panicking() {
+        let (state, cmds) = update(State::default(), Msg::Key(KeyPress::plain(KeyCode::Down)));
+        assert_eq!(state.view.selected, 0);
+        assert!(cmds.is_empty());
     }
 }

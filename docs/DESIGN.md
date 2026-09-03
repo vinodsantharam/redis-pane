@@ -330,7 +330,8 @@ the reader's time.
 - Does the keys pane need a permanent column header row, or can the columns be implied by the
   data and explained once in help?
 - Below 70 columns, is single-pane stack navigation worth building, or should the app simply
-  say the terminal is too small?
+  say the terminal is too small? The implementation currently renders a single-pane key list
+  there, keeping `TYPE` and `TTL`; the breadcrumb and stack navigation are not built.
 
 **Resolved since v0.2** — the sidebar (removed; [ADR-0005](adr/0005-one-connection-per-process.md)),
 tabs vs. sidebar for multiple Connections (dissolved with it), the Console's shape (an overlay;

@@ -21,6 +21,12 @@ pub enum Action {
     Help,
     /// Back out of whatever is open; cancel an in-flight operation.
     Cancel,
+    MoveUp,
+    MoveDown,
+    PageUp,
+    PageDown,
+    Top,
+    Bottom,
 }
 
 impl Action {
@@ -32,6 +38,10 @@ impl Action {
             Action::ToggleReadOnly => "read-only",
             Action::Help => "help",
             Action::Cancel => "back",
+            Action::MoveUp | Action::MoveDown => "move",
+            Action::PageUp | Action::PageDown => "page",
+            Action::Top => "top",
+            Action::Bottom => "bottom",
         }
     }
 }
@@ -101,6 +111,39 @@ impl Default for Keymap {
                 Binding {
                     key: KeyPress::plain(KeyCode::Esc),
                     action: Action::Cancel,
+                },
+                // Vim keys and arrow keys both work, always (DESIGN principle 7).
+                Binding {
+                    key: KeyPress::plain(KeyCode::Down),
+                    action: Action::MoveDown,
+                },
+                Binding {
+                    key: KeyPress::plain(KeyCode::Char('j')),
+                    action: Action::MoveDown,
+                },
+                Binding {
+                    key: KeyPress::plain(KeyCode::Up),
+                    action: Action::MoveUp,
+                },
+                Binding {
+                    key: KeyPress::plain(KeyCode::Char('k')),
+                    action: Action::MoveUp,
+                },
+                Binding {
+                    key: KeyPress::plain(KeyCode::PageDown),
+                    action: Action::PageDown,
+                },
+                Binding {
+                    key: KeyPress::plain(KeyCode::PageUp),
+                    action: Action::PageUp,
+                },
+                Binding {
+                    key: KeyPress::plain(KeyCode::Home),
+                    action: Action::Top,
+                },
+                Binding {
+                    key: KeyPress::plain(KeyCode::End),
+                    action: Action::Bottom,
                 },
             ],
         }
@@ -230,8 +273,41 @@ mod tests {
             Action::ToggleReadOnly,
             Action::Help,
             Action::Cancel,
+            Action::MoveUp,
+            Action::MoveDown,
+            Action::PageUp,
+            Action::PageDown,
+            Action::Top,
+            Action::Bottom,
         ] {
             assert!(k.key_for(action).is_some(), "{action:?} has no binding");
         }
+    }
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::*;
+
+    #[test]
+    fn vim_keys_and_arrow_keys_both_work_always() {
+        // DESIGN principle 7: familiar to two tribes, no modal purity tests.
+        let k = Keymap::default();
+        for (key, action) in [
+            (KeyCode::Char('j'), Action::MoveDown),
+            (KeyCode::Down, Action::MoveDown),
+            (KeyCode::Char('k'), Action::MoveUp),
+            (KeyCode::Up, Action::MoveUp),
+        ] {
+            assert_eq!(k.action_for(&KeyPress::plain(key)), Some(action));
+        }
+    }
+
+    #[test]
+    fn the_hint_prefers_the_arrow_key_which_needs_no_explaining() {
+        assert_eq!(
+            Keymap::default().hint(Action::MoveDown).as_deref(),
+            Some("↓")
+        );
     }
 }

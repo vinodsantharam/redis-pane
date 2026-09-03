@@ -433,3 +433,86 @@ async fn cancelling_stops_the_traversal_promptly_and_keeps_what_arrived() {
     let _ = client.quit().await;
     let _ = writer.quit().await;
 }
+
+// ── M1.4 — lazy metadata, fetched only for what is on screen ────────────────
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn metadata_is_fetched_for_a_window_and_matches_the_server() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+
+    let _: () = writer
+        .set("m:string", "hello", None, None, false)
+        .await
+        .unwrap();
+    let _: () = writer
+        .hset("m:hash", [("a", "1"), ("b", "2")])
+        .await
+        .unwrap();
+    let _: () = writer.rpush("m:list", vec!["x", "y", "z"]).await.unwrap();
+    let _: () = writer
+        .set("m:ttl", "v", Some(Expiration::EX(600)), None, false)
+        .await
+        .unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let window: Vec<(usize, Vec<u8>)> = vec![
+        (0, b"m:string".to_vec()),
+        (1, b"m:hash".to_vec()),
+        (2, b"m:list".to_vec()),
+        (3, b"m:ttl".to_vec()),
+    ];
+    let entries = redis_pane::redis::fetch_metadata(&client, &window)
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 4);
+
+    use redis_pane_core::state::KeyKind;
+    assert_eq!(entries[0].kind, KeyKind::String);
+    assert_eq!(entries[1].kind, KeyKind::Hash);
+    assert_eq!(entries[2].kind, KeyKind::List);
+
+    // A key with no expiry reports -1, which the store keeps distinct from
+    // "not yet fetched".
+    assert_eq!(entries[0].ttl_seconds, -1);
+    assert!(
+        (500..=600).contains(&entries[3].ttl_seconds),
+        "got {}",
+        entries[3].ttl_seconds
+    );
+    assert!(
+        entries.iter().all(|e| e.size_bytes > 0),
+        "MEMORY USAGE returned nothing"
+    );
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn a_key_that_vanished_between_scan_and_fetch_is_skipped_not_fatal() {
+    // The keyspace moves while we walk it, so this is ordinary, not exceptional.
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer.set("m:here", "v", None, None, false).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let window: Vec<(usize, Vec<u8>)> = vec![(0, b"m:here".to_vec()), (1, b"m:gone".to_vec())];
+    let entries = redis_pane::redis::fetch_metadata(&client, &window)
+        .await
+        .unwrap();
+
+    assert_eq!(entries.len(), 1, "the surviving key is still reported");
+    assert_eq!(entries[0].index, 0);
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}

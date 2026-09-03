@@ -1,0 +1,26 @@
+─ redis-pane ─ ● staging · cache-01:6379/0 · from profile staging ─────────────────────────────────────────────────────── ● live ─
+
+ KEY                               TYPE        SIZE   TTL │ user:8812:session
+ user:8812:session                 ·              ·     · │
+ user:8812:profile                 ·              ·     · │ value viewers land in M1.8
+ user:8812:cart                    ·              ·     · │
+ user:8813:session                 ·              ·     · │
+ cart:91af3c9d2e                   ·              ·     · │
+ feed:global:hot                   ·              ·     · │
+ lock:checkout:8812                ·              ·     · │
+ stream:orders                     ·              ·     · │
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+ scanning 41,203 of ~180,000  Esc cancel
+ Esc back   r refetch   ⌃R read-only   ? help   q quit

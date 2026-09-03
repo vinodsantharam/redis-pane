@@ -107,7 +107,8 @@ pub fn run(mut state: State, theme: Theme, clock: &dyn Clock) -> std::io::Result
                 Command::RefetchOpenKey
                 | Command::Reconnect { .. }
                 | Command::StartScan { .. }
-                | Command::CancelScan => {}
+                | Command::CancelScan
+                | Command::FetchMetadata { .. } => {}
             }
         }
         if quitting {

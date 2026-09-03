@@ -412,3 +412,223 @@ fn rebinding_refetch_changes_the_degraded_readout() {
     let text = readout(&state);
     assert!(text.ends_with("  u"), "{text}");
 }
+
+// ── M1.3 — the keyspace browser at every breakpoint ─────────────────────────
+
+use redis_pane_core::state::LoadedSet;
+use redis_pane_core::state::loaded::{KeyKind, TTL_NONE};
+
+/// A browser with realistic keys, all metadata fetched.
+fn browsing() -> State {
+    let mut keys = LoadedSet::default();
+    let rows: &[(&str, KeyKind, i32, u32)] = &[
+        ("user:8812:session", KeyKind::Hash, 2_537, 2_150),
+        ("user:8812:profile", KeyKind::Json, TTL_NONE, 880),
+        ("user:8812:cart", KeyKind::ZSet, 720, 412),
+        ("user:8813:session", KeyKind::Hash, 3_400, 1_980),
+        ("cart:91af3c9d2e", KeyKind::ZSet, 720, 1_153_434),
+        ("feed:global:hot", KeyKind::List, TTL_NONE, 64_512),
+        ("lock:checkout:8812", KeyKind::String, 12, 41),
+        ("stream:orders", KeyKind::Stream, TTL_NONE, 8_400_000),
+    ];
+    for (i, (name, kind, ttl, size)) in rows.iter().enumerate() {
+        keys.push(name.as_bytes());
+        keys.set_kind(i, *kind);
+        keys.set_ttl(i, *ttl);
+        keys.set_size(i, *size);
+    }
+    State {
+        keys,
+        scan: redis_pane_core::state::ScanState::Running {
+            scanned: 41_203,
+            estimated_total: 180_000,
+        },
+        link: up(Tk::Armed),
+        ..base()
+    }
+}
+
+fn draw(state: &State, w: u16, h: u16) -> String {
+    let buf = render::frame(
+        state,
+        &Theme::new(ColorDepth::Monochrome),
+        &CLOCK,
+        Rect::new(0, 0, w, h),
+    );
+    render::to_text(&buf)
+}
+
+/// The full four-column layout begins at 120 (DESIGN §2), not at the 118 the
+/// planning mockups happened to be drawn at.
+#[test]
+fn golden_browser_130_cols_full_density() {
+    assert_golden("browser_130", &draw(&browsing(), 130, 26));
+}
+
+#[test]
+fn golden_browser_119_cols_sheds_size() {
+    assert_golden("browser_119", &draw(&browsing(), 119, 26));
+}
+
+#[test]
+fn golden_browser_100_cols() {
+    assert_golden("browser_100", &draw(&browsing(), 100, 26));
+}
+
+#[test]
+fn golden_browser_80_cols() {
+    assert_golden("browser_80", &draw(&browsing(), 80, 26));
+}
+
+#[test]
+fn golden_browser_70_cols() {
+    assert_golden("browser_70", &draw(&browsing(), 70, 26));
+}
+
+#[test]
+fn golden_browser_single_pane_60_cols() {
+    assert_golden("browser_60", &draw(&browsing(), 60, 26));
+}
+
+#[test]
+fn rendering_cost_does_not_grow_with_the_keyspace() {
+    // R2.6: a million-key Loaded set must draw like a ten-key one. If this ever
+    // becomes false the list has stopped being virtualized.
+    let mut keys = LoadedSet::default();
+    for i in 0..200_000 {
+        keys.push(format!("user:{i:08}:session").as_bytes());
+    }
+    let big = State {
+        keys,
+        link: up(Tk::Armed),
+        ..base()
+    };
+
+    let started = std::time::Instant::now();
+    for _ in 0..50 {
+        let _ = draw(&big, 130, 26);
+    }
+    let per_frame = started.elapsed() / 50;
+    assert!(
+        per_frame < std::time::Duration::from_millis(16),
+        "a frame took {per_frame:?}; a keystroke must be answerable in one frame"
+    );
+}
+
+// ── M1.4 — placeholders hold their column ───────────────────────────────────
+
+/// The same keys with nothing fetched yet.
+fn pending() -> State {
+    let mut keys = LoadedSet::default();
+    for name in [
+        "user:8812:session",
+        "user:8812:profile",
+        "user:8812:cart",
+        "user:8813:session",
+        "cart:91af3c9d2e",
+        "feed:global:hot",
+        "lock:checkout:8812",
+        "stream:orders",
+    ] {
+        keys.push(name.as_bytes());
+    }
+    State { keys, ..browsing() }
+}
+
+#[test]
+fn golden_browser_metadata_pending() {
+    assert_golden("browser_pending", &draw(&pending(), 130, 26));
+}
+
+/// M1.4's proof: a value arriving must land exactly where its placeholder was.
+#[test]
+fn metadata_arriving_does_not_shift_a_single_column() {
+    let pending_frame = draw(&pending(), 130, 26);
+    let filled_frame = draw(&browsing(), 130, 26);
+
+    let column_of = |frame: &str, needle: &str| -> Vec<usize> {
+        frame
+            .lines()
+            .filter_map(|l| l.find(needle))
+            .collect::<Vec<_>>()
+    };
+
+    // The key names are the anchor: they must occupy identical columns whether
+    // or not the metadata beside them has arrived.
+    assert_eq!(
+        column_of(&pending_frame, "user:8812:session"),
+        column_of(&filled_frame, "user:8812:session"),
+        "a key name moved when metadata arrived"
+    );
+
+    // And the header row is geometry, not data — it cannot move at all.
+    let header_of = |frame: &str| {
+        frame
+            .lines()
+            .find(|l| l.contains("KEY") && l.contains("TYPE"))
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(
+        header_of(&pending_frame),
+        header_of(&filled_frame),
+        "the column header shifted, so every cell under it did too"
+    );
+}
+
+#[test]
+fn a_pending_cell_is_visibly_waiting_rather_than_blank() {
+    // Blank would read as "there is nothing here", which is a different claim.
+    let frame = draw(&pending(), 130, 26);
+    assert!(frame.contains('·'), "pending cells must show a placeholder");
+    assert!(
+        !frame.contains("∞"),
+        "nothing is known yet, so no TTL facts"
+    );
+
+    let filled = draw(&browsing(), 130, 26);
+    assert!(
+        filled.contains('∞'),
+        "a key with no expiry states that fact"
+    );
+}
+
+/// DESIGN §2: as the terminal narrows the target is truncated from the left,
+/// but the Environment and the Source are never sacrificed.
+///
+/// That readout is the entire mitigation for resolving a Connection silently
+/// (ADR-0001), so it losing a race with the width is not a cosmetic bug.
+#[test]
+fn narrowing_never_costs_the_environment_or_the_source() {
+    let state = State {
+        connection: Connection {
+            target: "redis-primary.eu-west-1.internal:6379/0".into(),
+            environment: Environment::Prod,
+            source: Source::Profile("prod".into()),
+        },
+        link: up(Tk::Armed),
+        read_only: Some(ReadOnlyReason::Environment),
+        ..browsing()
+    };
+
+    for width in [70u16, 80, 100, 119, 130, 200] {
+        let title = draw(&state, width, 26).lines().next().unwrap().to_string();
+        assert!(
+            title.contains("prod"),
+            "Environment lost at {width}: {title}"
+        );
+        assert!(
+            title.contains("from profile prod"),
+            "Source lost at {width}: {title}"
+        );
+        assert!(
+            title.contains("READ-ONLY"),
+            "the safety readout was overwritten at {width}: {title}"
+        );
+        assert_eq!(
+            title.chars().count(),
+            width as usize,
+            "the title bar must fill exactly the width at {width}"
+        );
+    }
+}

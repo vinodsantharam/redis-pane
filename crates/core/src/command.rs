@@ -32,4 +32,10 @@ pub enum Command {
     StartScan { pattern: Option<String> },
     /// Stop an in-flight traversal. Every long operation is cancellable.
     CancelScan,
+    /// Fetch type, TTL and memory usage for these rows of the Loaded set.
+    ///
+    /// Only ever the visible window (R2.4). Fetching metadata for a whole
+    /// keyspace would be `KEYS *` with extra steps, and it would compete with
+    /// `SCAN` for the connection while the list is still filling.
+    FetchMetadata { indices: Vec<usize> },
 }

@@ -20,4 +20,8 @@ t       tree
 l       open
 ⌃↓      scroll
 ⌃↑      scroll
+⌃PGDN   page value
+⌃PGUP   page value
+⌃HOME   value top
+⌃END    value bottom
 y       copy

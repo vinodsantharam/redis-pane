@@ -41,6 +41,14 @@ pub enum Action {
     ViewerDown,
     /// Move up inside the open value.
     ViewerUp,
+    /// Page down inside the open value.
+    ViewerPageDown,
+    /// Page up inside the open value.
+    ViewerPageUp,
+    /// Jump to the top of the open value.
+    ViewerTop,
+    /// Jump to the bottom of the open value.
+    ViewerBottom,
     /// Begin a copy. The next key chooses what (R3.5).
     Copy,
 }
@@ -64,6 +72,9 @@ impl Action {
             Action::ToggleGroup => "fold",
             Action::Open => "open",
             Action::ViewerDown | Action::ViewerUp => "scroll",
+            Action::ViewerPageDown | Action::ViewerPageUp => "page value",
+            Action::ViewerTop => "value top",
+            Action::ViewerBottom => "value bottom",
             Action::Copy => "copy",
         }
     }
@@ -199,6 +210,22 @@ impl Default for Keymap {
                 Binding {
                     key: KeyPress::ctrl(KeyCode::Up),
                     action: Action::ViewerUp,
+                },
+                Binding {
+                    key: KeyPress::ctrl(KeyCode::PageDown),
+                    action: Action::ViewerPageDown,
+                },
+                Binding {
+                    key: KeyPress::ctrl(KeyCode::PageUp),
+                    action: Action::ViewerPageUp,
+                },
+                Binding {
+                    key: KeyPress::ctrl(KeyCode::Home),
+                    action: Action::ViewerTop,
+                },
+                Binding {
+                    key: KeyPress::ctrl(KeyCode::End),
+                    action: Action::ViewerBottom,
                 },
                 Binding {
                     key: KeyPress::plain(KeyCode::Char('y')),
@@ -345,6 +372,10 @@ mod tests {
             Action::Open,
             Action::ViewerDown,
             Action::ViewerUp,
+            Action::ViewerPageDown,
+            Action::ViewerPageUp,
+            Action::ViewerTop,
+            Action::ViewerBottom,
             Action::Copy,
         ] {
             assert!(k.key_for(action).is_some(), "{action:?} has no binding");

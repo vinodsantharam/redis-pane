@@ -128,10 +128,20 @@ impl OpenKey {
             return format!("✕ deleted {}", ago(now_ms, gone));
         }
         if self.editing && self.pending.is_some() {
-            return "● live · changed · held".into();
+            return "✎ editing · changed · held".into();
         }
         if let Some(p) = &self.pending {
             return format!("● live · changed {}", ago(now_ms, p.at_ms));
+        }
+        // No update is waiting, but the reader has an unsaved buffer open.
+        // Without this branch the header would read a plain "● live" while
+        // editing, which says nothing about the one fact that matters most
+        // right now: what is on screen is not what is saved. There is no
+        // editor UI yet (M2), so `editing` is never set by shipped code today —
+        // this exists so the header is correct the day one lands, rather than
+        // silently wrong from the first edit built.
+        if self.editing {
+            return "✎ editing".into();
         }
         if live {
             "● live".into()
@@ -196,7 +206,7 @@ mod tests {
         k.editing = true;
         k.absorb(pair("v2"), 500, 120, 12_000);
         assert_eq!(k.value, pair("v1"));
-        assert_eq!(k.currency(true, 12_000), "● live · changed · held");
+        assert_eq!(k.currency(true, 12_000), "✎ editing · changed · held");
     }
 
     #[test]
@@ -251,5 +261,49 @@ mod tests {
         // One value, replaced wholesale by a read. There is no map from key
         // name to value anywhere in this type (ADR-0006).
         assert_eq!(k.value.viewer().row_count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod editing_indicator_tests {
+    //! Severity-4 UI task: the header must say when there is an unsaved
+    //! buffer open, not just when an update is waiting for one. No editor
+    //! exists yet (M2), so nothing sets `editing` today — this is forward
+    //! plumbing, tested now so it is correct on day one rather than
+    //! discovered wrong.
+
+    use super::*;
+    use crate::state::value::PairValue;
+
+    fn pair() -> Value {
+        Value::Hash(PairValue {
+            pairs: vec![("f".into(), "v".into())],
+        })
+    }
+
+    #[test]
+    fn editing_with_nothing_pending_says_so_rather_than_reading_as_plain_live() {
+        let mut k = OpenKey::new(0, "k".into(), pair(), -1, 10, 0);
+        k.editing = true;
+        assert_eq!(k.currency(true, 0), "✎ editing");
+        assert_ne!(
+            k.currency(true, 0),
+            "● live",
+            "must not look like an ordinary live read"
+        );
+    }
+
+    #[test]
+    fn editing_with_a_pending_update_still_says_held() {
+        let mut k = OpenKey::new(0, "k".into(), pair(), -1, 10, 0);
+        k.editing = true;
+        k.absorb(pair(), -1, 10, 1_000);
+        assert_eq!(k.currency(true, 1_000), "✎ editing · changed · held");
+    }
+
+    #[test]
+    fn not_editing_is_unaffected() {
+        let k = OpenKey::new(0, "k".into(), pair(), -1, 10, 0);
+        assert_eq!(k.currency(true, 0), "● live");
     }
 }

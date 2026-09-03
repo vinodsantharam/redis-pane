@@ -29,10 +29,15 @@ requirements and ADRs for decisions already made.
 
 ## Severity 4 — polish
 
-- [x] **Binary/hex viewer has no jump-to-offset or search-by-byte.**
-- [x] **No visual distinction for a key currently mid-edit** vs. merely open.
-- [x] **256-color and monochrome paths are untested on a real degraded terminal**
-  (golden frames only).
+- [x] **Binary/hex viewer navigation.** `⌃PgDn`/`⌃PgUp` page by 20 rows, `⌃Home`/`⌃End` jump
+  to start/end — shared by every viewer, not just binary. Search-by-byte was scope-cut into
+  severity 1's general search-within-value rather than built as a one-off.
+- [x] **Visual distinction for a key currently mid-edit.** Header now reads `✎ editing` (or
+  `✎ editing · changed · held` with a pending update) instead of a plain `● live`. Inert until
+  M2 builds an actual editor — nothing sets `OpenKey::editing` yet — but correct on day one.
+- [x] **256-color/monochrome hardened and unit-tested.** Extracted a pure `resolve_color_depth`
+  so the TERM/COLORTERM decision is tested without mutating the environment; `NO_COLOR`
+  (no-color.org) is now honoured. A real terminal glance is still worth doing — see below.
 
 ---
 

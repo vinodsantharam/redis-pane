@@ -1,14 +1,14 @@
-─ redis-pane ─ ● staging · cache-01:637┌─ keys ────────────┐aging ───────────────────────── ● live ─
-                                       │                   │
- KEY                                TYP│ q       quit      │elected
-                                       │ ⌃C      quit      │
-                                       │ r       refetch   │
-                                       │ ⌃R      read-only │
-                                       │ ?       help      │
-                                       │ Esc     back      │
-                                       │ ↓       move      │
-                                       │ j       move      │
-                                       │ ↑       move      │
-                                       │ k       move      │
-                                       │ PgDn    page      │
-                                       └───────────────────┘
+─ redis-pane ─ ● staging · cache-01:63┌─ keys ───────────────┐ing ───────────────────────── ● live ─
+                                      │                      │
+ KEY                                TY│ q       quit         │ected
+                                      │ ⌃C      quit         │
+                                      │ r       refetch      │
+                                      │ ⌃R      read-only    │
+                                      │ ?       help         │
+                                      │ Esc     back         │
+                                      │ ↓       move         │
+                                      │ j       move         │
+                                      │ ↑       move         │
+                                      │ k       move         │
+                                      │ PgDn    page         │
+                                      └──────────────────────┘

@@ -102,7 +102,10 @@ fn value_pane(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect, buf: 
     let currency = open.currency(state.liveness() == Liveness::Live, now);
     let token = if open.deleted_at_ms.is_some() {
         Token::Danger
-    } else if open.pending.is_some() {
+    } else if open.pending.is_some() || open.editing {
+        // Editing shares Warn with a held update: something to pay attention
+        // to, nothing broken. Checked before the plain `●` case below, or an
+        // idle edit with no pending change would render as plain green live.
         Token::Warn
     } else if currency.starts_with('●') {
         Token::Ok

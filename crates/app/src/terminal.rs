@@ -387,11 +387,37 @@ fn start_scan(
 /// What the terminal can display. A real probe belongs in M0.3's follow-up;
 /// `COLORTERM` is the part that is both cheap and reliable.
 pub fn detect_color_depth() -> ColorDepth {
-    match std::env::var("COLORTERM").as_deref() {
-        Ok("truecolor") | Ok("24bit") => ColorDepth::TrueColor,
-        _ => match std::env::var("TERM").as_deref() {
-            Ok(t) if t.contains("256") => ColorDepth::Ansi256,
-            Ok("dumb") | Err(_) => ColorDepth::Monochrome,
+    resolve_color_depth(
+        std::env::var("NO_COLOR").ok(),
+        std::env::var("COLORTERM").ok(),
+        std::env::var("TERM").ok(),
+    )
+}
+
+/// The pure decision, taken out of [`detect_color_depth`] so it can be tested
+/// without mutating the process environment — this workspace forbids
+/// `unsafe`, which `std::env::set_var` requires in edition 2024, so a function
+/// that reads the environment directly cannot be unit tested at all.
+///
+/// Severity-4 UI task: this had no dedicated tests before, only the golden
+/// frames' assertion that each `ColorDepth` renders distinctly once selected —
+/// nothing pinned *which* depth a given environment resolves to. `NO_COLOR`
+/// (<https://no-color.org>) is now honoured too: a user who has set it wants
+/// monochrome regardless of what the terminal claims to support, and ignoring
+/// it was the one real gap here.
+fn resolve_color_depth(
+    no_color: Option<String>,
+    colorterm: Option<String>,
+    term: Option<String>,
+) -> ColorDepth {
+    if no_color.is_some() {
+        return ColorDepth::Monochrome;
+    }
+    match colorterm.as_deref() {
+        Some("truecolor") | Some("24bit") => ColorDepth::TrueColor,
+        _ => match term.as_deref() {
+            Some(t) if t.contains("256") => ColorDepth::Ansi256,
+            Some("dumb") | None => ColorDepth::Monochrome,
             _ => ColorDepth::Ansi256,
         },
     }
@@ -400,6 +426,73 @@ pub fn detect_color_depth() -> ColorDepth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn depth(no_color: Option<&str>, colorterm: Option<&str>, term: Option<&str>) -> ColorDepth {
+        resolve_color_depth(
+            no_color.map(String::from),
+            colorterm.map(String::from),
+            term.map(String::from),
+        )
+    }
+
+    #[test]
+    fn truecolor_from_colorterm() {
+        assert_eq!(depth(None, Some("truecolor"), None), ColorDepth::TrueColor);
+        assert_eq!(
+            depth(None, Some("24bit"), Some("xterm")),
+            ColorDepth::TrueColor
+        );
+    }
+
+    #[test]
+    fn ansi256_when_term_says_so() {
+        assert_eq!(
+            depth(None, None, Some("xterm-256color")),
+            ColorDepth::Ansi256
+        );
+        assert_eq!(
+            depth(None, None, Some("screen-256color")),
+            ColorDepth::Ansi256
+        );
+    }
+
+    #[test]
+    fn monochrome_for_a_dumb_terminal_or_no_term_at_all() {
+        assert_eq!(depth(None, None, Some("dumb")), ColorDepth::Monochrome);
+        assert_eq!(depth(None, None, None), ColorDepth::Monochrome);
+    }
+
+    #[test]
+    fn an_unrecognised_but_present_term_defaults_to_ansi256() {
+        // A terminal that sets TERM to something we do not recognise is more
+        // likely to support some colour than none; monochrome is reserved for
+        // the terminal actively declaring "dumb" or declaring nothing.
+        assert_eq!(depth(None, None, Some("screen")), ColorDepth::Ansi256);
+        assert_eq!(depth(None, None, Some("vt100")), ColorDepth::Ansi256);
+    }
+
+    #[test]
+    fn no_color_forces_monochrome_regardless_of_everything_else() {
+        // https://no-color.org — a user who sets this wants monochrome even if
+        // the terminal is fully capable of truecolor.
+        assert_eq!(
+            depth(Some("1"), Some("truecolor"), Some("xterm-256color")),
+            ColorDepth::Monochrome
+        );
+        assert_eq!(
+            depth(Some(""), None, None),
+            ColorDepth::Monochrome,
+            "presence is what matters, not the value"
+        );
+    }
+
+    #[test]
+    fn colorterm_wins_over_term_when_both_are_present() {
+        assert_eq!(
+            depth(None, Some("truecolor"), Some("dumb")),
+            ColorDepth::TrueColor
+        );
+    }
 
     #[test]
     fn a_plain_char_translates() {

@@ -1185,3 +1185,27 @@ fn copying_a_value_is_not_affected_by_where_the_viewer_is_scrolled() {
     let full = value_text(&state.open.as_ref().unwrap().value);
     assert_eq!(full.lines().count(), 5);
 }
+
+// ── severity-4: editing indicator in the value pane header ──────────────────
+
+#[test]
+fn golden_viewer_editing_with_nothing_pending() {
+    let mut state = opened("user:8812:session", hash_value(), 2_537);
+    state.open.as_mut().unwrap().editing = true;
+    assert_golden("viewer_editing", &draw(&state, 130, 22));
+}
+
+#[test]
+fn editing_is_visibly_distinct_from_plain_live_in_monochrome_too() {
+    // Colour is never the only carrier of meaning (DESIGN §5): the word
+    // "editing" must appear even with hue gone entirely.
+    let mut state = opened("k", hash_value(), 600);
+    state.open.as_mut().unwrap().editing = true;
+    let mono = render::frame(
+        &state,
+        &Theme::new(ColorDepth::Monochrome),
+        &CLOCK,
+        Rect::new(0, 0, 130, 22),
+    );
+    assert!(render::to_text(&mono).contains("editing"));
+}

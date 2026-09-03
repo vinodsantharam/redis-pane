@@ -314,20 +314,15 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             };
             (state, vec![Command::OpenKey { index, name }])
         }
-        Action::ViewerDown | Action::ViewerUp => {
-            if let Some(open) = &mut state.open {
-                let by: isize = if action == Action::ViewerDown { 1 } else { -1 };
-                let last = open.value.viewer().row_count().saturating_sub(1) as isize;
-                open.offset = (open.offset as isize + by).clamp(0, last) as usize;
-                // Scrolling away from the top means updates are announced
-                // rather than applied; returning to the top does not by itself
-                // undo that — the reader chooses when a held update lands.
-                if open.offset > 0 {
-                    open.at_rest = false;
-                }
-            }
-            (state, Vec::new())
-        }
+        Action::ViewerDown => scroll_viewer(state, ViewerMove::By(1)),
+        Action::ViewerUp => scroll_viewer(state, ViewerMove::By(-1)),
+        // A page is approximated at 20 rows: the viewer does not know its own
+        // rendered height here, and a fixed page beats no paging at all for a
+        // 500-entry zset or a large hex dump.
+        Action::ViewerPageDown => scroll_viewer(state, ViewerMove::By(20)),
+        Action::ViewerPageUp => scroll_viewer(state, ViewerMove::By(-20)),
+        Action::ViewerTop => scroll_viewer(state, ViewerMove::Absolute(0)),
+        Action::ViewerBottom => scroll_viewer(state, ViewerMove::Absolute(usize::MAX)),
         Action::Copy => {
             state.copy_pending = true;
             (state, Vec::new())
@@ -501,6 +496,33 @@ fn after_move(mut state: State) -> (State, Vec<Command>) {
     } else {
         (state, vec![Command::FetchMetadata { indices }])
     }
+}
+
+/// Where a viewer scroll ends up: relative or absolute.
+enum ViewerMove {
+    By(isize),
+    /// Clamped to the last row; `usize::MAX` means "the end".
+    Absolute(usize),
+}
+
+/// Scroll the open value. Shared by every viewer, because the frame around a
+/// value is one abstraction (R3.1) — a hex dump and a hash pane both scroll
+/// this way.
+fn scroll_viewer(mut state: State, mv: ViewerMove) -> (State, Vec<Command>) {
+    if let Some(open) = &mut state.open {
+        let last = open.value.viewer().row_count().saturating_sub(1);
+        open.offset = match mv {
+            ViewerMove::By(by) => (open.offset as isize + by).clamp(0, last as isize) as usize,
+            ViewerMove::Absolute(n) => n.min(last),
+        };
+        // Scrolling away from the top means updates are announced rather than
+        // applied; returning to the top does not by itself undo that — the
+        // reader chooses when a held update lands.
+        if open.offset > 0 {
+            open.at_rest = false;
+        }
+    }
+    (state, Vec::new())
 }
 
 fn quit(mut state: State) -> (State, Vec<Command>) {
@@ -1336,5 +1358,116 @@ mod honesty_tests {
                 .readout()
                 .contains("writes rejected")
         );
+    }
+}
+
+#[cfg(test)]
+mod viewer_scroll_tests {
+    //! Severity-4 UI task: paging and jump-to-start/end for the open value —
+    //! useful on a 500-entry zset or a large hex dump, where single-line
+    //! Ctrl+Up/Down alone is too slow to be worth using.
+
+    use super::*;
+    use crate::msg::KeyCode;
+    use crate::state::open::OpenKey;
+    use crate::state::value::{MemberValue, Value};
+
+    fn open_with(n: usize) -> State {
+        let value = Value::Set(MemberValue {
+            members: (0..n).map(|i| format!("m{i}")).collect(),
+            total: n,
+        });
+        State {
+            open: Some(OpenKey::new(0, "k".into(), value, -1, 10, 0)),
+            ..State::default()
+        }
+    }
+
+    fn press(state: State, code: KeyCode, ctrl: bool) -> (State, Vec<Command>) {
+        let key = if ctrl {
+            KeyPress::ctrl(code)
+        } else {
+            KeyPress::plain(code)
+        };
+        update(state, Msg::Key(key))
+    }
+
+    #[test]
+    fn page_down_moves_by_twenty_rows_and_clamps_at_the_end() {
+        let (state, _) = press(open_with(100), KeyCode::PageDown, true);
+        assert_eq!(state.open.unwrap().offset, 20);
+    }
+
+    #[test]
+    fn page_down_past_the_end_clamps_rather_than_overshooting() {
+        let (state, _) = press(open_with(10), KeyCode::PageDown, true);
+        assert_eq!(state.open.unwrap().offset, 9, "clamped to the last row");
+    }
+
+    #[test]
+    fn page_up_moves_back_and_clamps_at_zero() {
+        let mut state = open_with(100);
+        state.open.as_mut().unwrap().offset = 25;
+        let (state, _) = press(state, KeyCode::PageUp, true);
+        assert_eq!(state.open.as_ref().unwrap().offset, 5);
+
+        let (state, _) = press(state, KeyCode::PageUp, true);
+        assert_eq!(state.open.unwrap().offset, 0, "clamped, not negative");
+    }
+
+    #[test]
+    fn ctrl_home_jumps_to_the_top_in_one_keystroke() {
+        let mut state = open_with(500);
+        state.open.as_mut().unwrap().offset = 300;
+        let (state, _) = press(state, KeyCode::Home, true);
+        assert_eq!(state.open.unwrap().offset, 0);
+    }
+
+    #[test]
+    fn ctrl_end_jumps_to_the_last_row_in_one_keystroke() {
+        let (state, _) = press(open_with(500), KeyCode::End, true);
+        assert_eq!(state.open.unwrap().offset, 499);
+    }
+
+    #[test]
+    fn jumping_away_from_the_top_means_updates_are_announced_not_applied() {
+        // The existing apply-if-idle rule (ADR-0006) must hold for paging and
+        // jumping exactly as it already does for single-step scrolling.
+        let (state, _) = press(open_with(500), KeyCode::End, true);
+        assert!(!state.open.unwrap().may_apply());
+    }
+
+    #[test]
+    fn jumping_back_to_the_top_does_not_by_itself_restore_at_rest() {
+        // Consistent with the existing single-step behaviour: the reader
+        // chooses when a held update lands, rather than it being inferred from
+        // scroll position alone.
+        let mut state = open_with(500);
+        state.open.as_mut().unwrap().offset = 300;
+        state.open.as_mut().unwrap().at_rest = false;
+        let (state, _) = press(state, KeyCode::Home, true);
+        let open = state.open.unwrap();
+        assert_eq!(open.offset, 0);
+        assert!(!open.at_rest);
+    }
+
+    #[test]
+    fn scrolling_with_nothing_open_does_nothing() {
+        let (state, cmds) = press(State::default(), KeyCode::PageDown, true);
+        assert!(state.open.is_none());
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn the_hints_for_paging_and_jumping_are_reachable_in_the_help_overlay() {
+        let keymap = crate::keymap::Keymap::default();
+        for action in [
+            crate::keymap::Action::ViewerPageDown,
+            crate::keymap::Action::ViewerPageUp,
+            crate::keymap::Action::ViewerTop,
+            crate::keymap::Action::ViewerBottom,
+        ] {
+            assert!(keymap.hint(action).is_some(), "{action:?} has no binding");
+        }
     }
 }

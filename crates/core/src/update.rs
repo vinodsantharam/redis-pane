@@ -143,6 +143,15 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             size_bytes,
             at_ms,
         } => {
+            // A value came back, so the key is there. Says so on the row too —
+            // the same two-pane agreement `ValueGone` keeps in the other
+            // direction, and what un-badges a key that was deleted and then
+            // written again. Setting the kind rather than merely clearing the
+            // tombstone means the row is right immediately instead of showing
+            // a pending placeholder until the next scroll refetches it.
+            state.keys.set_kind(index, value.kind());
+            state.keys.set_ttl(index, ttl_seconds);
+            state.keys.set_size(index, size_bytes);
             match &mut state.open {
                 // A read of the key already open is an update, and where it
                 // lands depends on where the reader is (ADR-0006).
@@ -169,6 +178,15 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             if let Some(open) = &mut state.open {
                 open.deleted_at_ms = Some(at_ms);
                 open.pending = None;
+                // The row this key came from learns it too. Without this the
+                // two panes state different things about one key at the same
+                // moment — the Viewer badged `✕ deleted` while the list still
+                // showed `● string 64 B` — and the list is the more believable
+                // of the two, because it is the one that looks untouched.
+                // Nothing else would correct it: metadata is only refetched for
+                // rows whose type is unknown, and this row's is known and wrong.
+                let index = open.index;
+                state.keys.set_gone(index);
             }
             (state, Vec::new())
         }
@@ -1260,6 +1278,72 @@ mod metadata_tests {
     use crate::msg::{KeyCode, MetadataEntry};
     use crate::state::KeyKind;
     use crate::state::loaded::TTL_NONE;
+
+    /// The two panes must never state different things about one key.
+    ///
+    /// Found in use: with a key open and then deleted, the Viewer badged
+    /// `✕ deleted just now` while that key's row in the list still read
+    /// `● string 64 B ∞`. Nothing would have corrected it — metadata is only
+    /// refetched for rows whose type is *unknown*, and this row's was known
+    /// and stale — so the list quietly kept the more believable of two
+    /// contradictory claims.
+    #[test]
+    fn a_deleted_open_key_is_badged_in_the_list_as_well_as_the_viewer() {
+        use crate::state::value::{StringValue, Value};
+
+        let state = browsing(10);
+        let (state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                index: 3,
+                name: "k:3".into(),
+                value: Value::Str(StringValue::new("v", 40)),
+                ttl_seconds: -1,
+                size_bytes: 64,
+                at_ms: 1_000,
+            },
+        );
+        assert_eq!(state.keys.kind(3), Some(KeyKind::String));
+        assert!(!state.keys.is_gone(3));
+
+        let (state, _) = update(state, Msg::ValueGone { at_ms: 2_000 });
+        assert!(
+            state.open.as_ref().unwrap().deleted_at_ms.is_some(),
+            "the Viewer knows"
+        );
+        assert!(state.keys.is_gone(3), "and so must the row it came from");
+        assert!(!state.keys.is_gone(2), "its neighbours are untouched");
+    }
+
+    #[test]
+    fn a_key_that_comes_back_stops_saying_gone() {
+        use crate::state::value::{PairValue, Value};
+
+        let mut state = browsing(10);
+        state.keys.set_gone(3);
+        let (state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                index: 3,
+                name: "k:3".into(),
+                value: Value::Hash(PairValue::default()),
+                ttl_seconds: 90,
+                size_bytes: 128,
+                at_ms: 3_000,
+            },
+        );
+        assert!(
+            !state.keys.is_gone(3),
+            "a value came back, so the key is there"
+        );
+        assert_eq!(
+            state.keys.kind(3),
+            Some(KeyKind::Hash),
+            "and the row is right at once, not a placeholder until the next scroll"
+        );
+        assert_eq!(state.keys.ttl(3), Some(90));
+        assert_eq!(state.keys.size(3), Some(128));
+    }
 
     fn browsing(n: usize) -> State {
         let mut state = State {

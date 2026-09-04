@@ -40,6 +40,14 @@ purpose — what was done, and what was cut and why, are in its own note rather 
     unconditionally and the core never once constructed `Command::StartScan`, leaving its shell
     handler unreachable. `r` now acts on the focused pane, and the hint bar says which
     (`r rescan` vs `r refetch`) rather than naming one half of it at all times.
+- [x] **The two panes could state different things about one key — found by testing, fixed
+  2026-09-04.** With a key open and then deleted, the Viewer badged `✕ deleted just now` while
+  that key's row in the list still read `● string 64 B ∞`. `Msg::ValueGone` told the Viewer and
+  not the Loaded set, and nothing would ever have corrected it: metadata is refetched only for
+  rows whose type is *unknown*, and this row's was known and stale. The list is the more
+  believable of the two contradictory claims precisely because it looks untouched. Both
+  directions are now kept in step — `ValueGone` tombstones the row, and `ValueLoaded` writes the
+  kind, TTL and size back, which un-badges a key that was deleted and then written again.
 - [x] **Pane focus did not exist (DESIGN §4) — found by testing, fixed 2026-09-04.** R2.7 says
   `r` "acts on the focused pane", and DESIGN §4 has listed `Tab` as *Cycle pane focus* from the
   start; neither was implemented. The first cut of the rescan above inferred focus from

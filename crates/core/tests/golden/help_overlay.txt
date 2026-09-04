@@ -1,3 +1,4 @@
+Tab     focus
 q       quit
 ⌃C      quit
 r       refetch / rescan

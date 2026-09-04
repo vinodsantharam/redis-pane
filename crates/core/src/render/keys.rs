@@ -137,7 +137,13 @@ pub fn render(state: &State, theme: &Theme, area: Rect, density: Density, buf: &
         filter_line(state, theme, area, y, buf);
         y += 1;
     }
-    header(theme, Rect { y, ..area }, cols, buf);
+    header(
+        theme,
+        Rect { y, ..area },
+        cols,
+        state.keys_pane_focused(),
+        buf,
+    );
     y += 1;
 
     let body_height = (area.y + area.height).saturating_sub(y) as usize;
@@ -274,8 +280,13 @@ fn tree_row(
     }
 }
 
-fn header(theme: &Theme, area: Rect, cols: Columns, buf: &mut Buffer) {
-    let style = theme.style(Token::Muted);
+fn header(theme: &Theme, area: Rect, cols: Columns, focused: bool, buf: &mut Buffer) {
+    // The column header doubles as the focus indicator (DESIGN §4). `r` means
+    // different things in the two panes, so which one has focus has to be
+    // legible without pressing anything — a hint bar at the bottom of the
+    // screen is not where someone looks to answer "where am I". Emphasis only:
+    // no glyph, no extra row, identical width either way (G7).
+    let style = theme.style(if focused { Token::Text } else { Token::Muted });
     super::put(buf, area.x + cols.name, area.y, "KEY", style);
     if let Some(x) = cols.kind {
         super::put(buf, area.x + x, area.y, "TYPE", style);

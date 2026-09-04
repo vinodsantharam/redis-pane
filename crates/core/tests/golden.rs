@@ -946,6 +946,53 @@ fn golden_viewer_stream() {
     );
 }
 
+// ── focus is visible, because `r` means different things per pane ───────────
+
+#[test]
+fn which_pane_has_focus_is_visible_without_pressing_anything() {
+    use redis_pane_core::render::layout::Pane;
+    let keys_focused = State {
+        focus: Pane::Keys,
+        ..opened("user:8812:session", hash_value(), 2_537)
+    };
+    let value_focused = State {
+        focus: Pane::Value,
+        ..opened("user:8812:session", hash_value(), 2_537)
+    };
+    let a = render::to_golden(&render::frame(
+        &keys_focused,
+        &Theme::new(ColorDepth::TrueColor),
+        &CLOCK,
+        Rect::new(0, 0, 130, 22),
+    ));
+    let b = render::to_golden(&render::frame(
+        &value_focused,
+        &Theme::new(ColorDepth::TrueColor),
+        &CLOCK,
+        Rect::new(0, 0, 130, 22),
+    ));
+    let text_of = |g: &str| g.split("--- styles ---").next().unwrap().to_string();
+    assert_eq!(
+        text_of(&a),
+        text_of(&b),
+        "focus is emphasis, not content — no glyph, no reflow, no width change"
+    );
+    assert_ne!(a, b, "but it must be visible in the styles");
+}
+
+#[test]
+fn focus_survives_the_loss_of_colour() {
+    // It says which pane `r` will act on, so it is information rather than
+    // decoration, and this module's rule is that losing colour loses emphasis
+    // and never information. Muted is DIM in monochrome where Text is plain.
+    let theme = Theme::new(ColorDepth::Monochrome);
+    assert_ne!(
+        theme.style(redis_pane_core::theme::Token::Text),
+        theme.style(redis_pane_core::theme::Token::Muted),
+        "the focused and unfocused pane headers would be indistinguishable"
+    );
+}
+
 // ── the header must not pass a window off as the whole value ────────────────
 
 #[test]
@@ -1368,7 +1415,7 @@ fn the_selected_row_carries_a_background_all_the_way_across_not_just_on_the_name
     // there is a value pane to the right of it, correctly unpainted.
     let keys_pane_width = redis_pane_core::render::layout::layout(
         Rect::new(0, 0, 130, 12),
-        redis_pane_core::render::layout::SinglePaneView::Keys,
+        redis_pane_core::render::layout::Pane::Keys,
     )
     .keys
     .width;
@@ -1393,7 +1440,7 @@ fn an_unselected_row_carries_no_background_at_all() {
 
     let keys_pane_width = redis_pane_core::render::layout::layout(
         Rect::new(0, 0, 130, 12),
-        redis_pane_core::render::layout::SinglePaneView::Keys,
+        redis_pane_core::render::layout::Pane::Keys,
     )
     .keys
     .width;
@@ -1439,12 +1486,12 @@ fn distinct_types_render_with_distinct_dot_colours_in_a_real_frame() {
 
 // ── severity-3 #8: stack navigation below 70 columns ────────────────────────
 
-use redis_pane_core::render::layout::SinglePaneView;
+use redis_pane_core::render::layout::Pane;
 
 #[test]
 fn golden_single_pane_value_view_60_cols() {
     let mut state = opened("user:8812:session", hash_value(), 2_537);
-    state.single_pane_view = SinglePaneView::Value;
+    state.focus = Pane::Value;
     assert_golden("single_pane_value_60", &draw(&state, 60, 24));
 }
 
@@ -1453,7 +1500,7 @@ fn the_default_single_pane_state_still_renders_the_key_list_unchanged() {
     // Regression guard: adding Value mode must not disturb the existing,
     // already-shipped Keys mode at the same width.
     let state = many_keys();
-    assert_eq!(state.single_pane_view, SinglePaneView::Keys);
+    assert_eq!(state.focus, Pane::Keys);
     let frame = draw(&state, 60, 24);
     assert!(
         frame.contains("KEY"),
@@ -1467,7 +1514,7 @@ fn standalone_value_view_has_no_stray_border_character_at_the_left_edge() {
     // full width there is no adjacent pane to separate from, and that
     // character must not appear over the content instead.
     let mut state = opened("k", hash_value(), 600);
-    state.single_pane_view = SinglePaneView::Value;
+    state.focus = Pane::Value;
     let frame = draw(&state, 60, 24);
     for line in frame.lines() {
         assert!(
@@ -1480,7 +1527,7 @@ fn standalone_value_view_has_no_stray_border_character_at_the_left_edge() {
 #[test]
 fn the_breadcrumb_names_the_key_and_the_effective_back_binding() {
     let mut state = opened("user:8812:session", hash_value(), 2_537);
-    state.single_pane_view = SinglePaneView::Value;
+    state.focus = Pane::Value;
     let frame = draw(&state, 60, 24);
     assert!(frame.contains("back"), "{frame}");
     assert!(frame.contains("user:8812:session"), "{frame}");
@@ -1499,7 +1546,7 @@ fn the_breadcrumb_names_the_key_and_the_effective_back_binding() {
 #[test]
 fn a_key_opened_narrow_shows_its_real_value_not_a_placeholder() {
     let mut state = opened("user:8812:session", hash_value(), 2_537);
-    state.single_pane_view = SinglePaneView::Value;
+    state.focus = Pane::Value;
     let frame = draw(&state, 60, 24);
     assert!(frame.contains("device"), "{frame}");
     assert!(frame.contains("ios/17.2"), "{frame}");

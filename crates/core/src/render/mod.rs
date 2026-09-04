@@ -20,7 +20,7 @@ use crate::theme::{Theme, Token, env_token};
 /// Render the whole frame into a fresh buffer of the given size.
 pub fn frame(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect) -> Buffer {
     let mut buf = Buffer::empty(area);
-    let plan = layout::layout(area, state.single_pane_view);
+    let plan = layout::layout(area, state.focus);
     title_bar(state, theme, clock, area, &mut buf);
 
     keys::render(state, theme, plan.keys, plan.density, &mut buf);
@@ -109,7 +109,17 @@ fn value_pane(
         put(buf, x1, area.y, "  ·  ", theme.style(Token::Border));
         put(buf, x1 + 5, area.y, &open.name, theme.style(Token::Text));
     } else {
-        put(buf, x0, area.y, &open.name, theme.style(Token::Text));
+        // The key name is this pane's header, and like the keys pane's column
+        // header it carries the focus (DESIGN §4): `r` refetches here and
+        // rescans there, so which pane has focus must be readable at a glance.
+        // Standalone below 70 columns there is only one pane on screen, so it
+        // always has focus and there is nothing to distinguish.
+        let name_style = theme.style(if state.keys_pane_focused() {
+            Token::Muted
+        } else {
+            Token::Text
+        });
+        put(buf, x0, area.y, &open.name, name_style);
     }
 
     let viewer = open.value.viewer();

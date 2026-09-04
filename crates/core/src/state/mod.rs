@@ -252,9 +252,9 @@ pub struct State {
     pub tree_mode: bool,
     /// Set while `/` is capturing a filter.
     pub filtering: bool,
-    /// Below 70 columns there is one pane at a time; this says which.
-    /// Ignored at any wider density, where both panes always show.
-    pub single_pane_view: crate::render::layout::SinglePaneView,
+    /// Which pane the reader is in (DESIGN §4). Below 70 columns it also
+    /// decides which pane is drawn at all; see [`crate::render::layout::Pane`].
+    pub focus: crate::render::layout::Pane,
     /// The key in the Viewer, if one is open. There is no cache behind this —
     /// it holds what the server last said and nothing more (ADR-0006).
     pub open: Option<OpenKey>,
@@ -274,18 +274,14 @@ impl State {
     /// Whether a pane-scoped key belongs to the keys pane rather than the
     /// Viewer (R2.7).
     ///
-    /// There is no `Focus` field to keep in sync, because there is nothing to
-    /// store: below the two-pane width `single_pane_view` already says which
-    /// pane is on screen, and above it the Viewer is only reachable when a key
-    /// is open. Movement keys always drive the key list in two-pane mode, so an
-    /// open key is what makes `r` the Viewer's.
+    /// Reads the focus and nothing else. An earlier version inferred it from
+    /// `open.is_some()` at two-pane widths, on the reasoning that the Viewer is
+    /// only reachable once a key is open. That was wrong in use: opening a key
+    /// silently handed `r` to the Viewer while the arrow keys still drove the
+    /// key list, so the pane the cursor was in and the pane `r` acted on were
+    /// different, with nothing on screen saying so.
     pub fn keys_pane_focused(&self) -> bool {
-        use crate::render::layout::{SinglePaneView, TWO_PANE_MIN_COLS};
-        if self.cols < TWO_PANE_MIN_COLS {
-            self.single_pane_view == SinglePaneView::Keys
-        } else {
-            self.open.is_none()
-        }
+        self.focus == crate::render::layout::Pane::Keys
     }
 
     /// What the header may claim about currency.

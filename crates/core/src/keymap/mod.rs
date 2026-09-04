@@ -51,6 +51,12 @@ pub enum Action {
     ViewerBottom,
     /// Begin a copy. The next key chooses what (R3.5).
     Copy,
+    /// Move focus between the keys pane and the Viewer (DESIGN §4).
+    ///
+    /// With two panes this is the only way to say which one a pane-scoped key
+    /// acts on; below 70 columns, where one pane is drawn at a time, it is the
+    /// same movement as `Open`/`Esc` and so changes what is on screen.
+    CyclePane,
 }
 
 impl Action {
@@ -80,6 +86,7 @@ impl Action {
             Action::ViewerTop => "value top",
             Action::ViewerBottom => "value bottom",
             Action::Copy => "copy",
+            Action::CyclePane => "focus",
         }
     }
 
@@ -140,6 +147,10 @@ impl Default for Keymap {
     fn default() -> Self {
         Self {
             bindings: vec![
+                Binding {
+                    key: KeyPress::plain(KeyCode::Tab),
+                    action: Action::CyclePane,
+                },
                 Binding {
                     key: KeyPress::plain(KeyCode::Char('q')),
                     action: Action::Quit,

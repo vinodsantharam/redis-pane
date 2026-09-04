@@ -40,6 +40,17 @@ purpose — what was done, and what was cut and why, are in its own note rather 
     unconditionally and the core never once constructed `Command::StartScan`, leaving its shell
     handler unreachable. `r` now acts on the focused pane, and the hint bar says which
     (`r rescan` vs `r refetch`) rather than naming one half of it at all times.
+- [x] **Pane focus did not exist (DESIGN §4) — found by testing, fixed 2026-09-04.** R2.7 says
+  `r` "acts on the focused pane", and DESIGN §4 has listed `Tab` as *Cycle pane focus* from the
+  start; neither was implemented. The first cut of the rescan above inferred focus from
+  `open.is_some()` at two-pane widths, which failed in the first minute of real use: opening a
+  key silently handed `r` to the Viewer while the arrow keys still drove the key list, so `r`
+  pressed to rescan quietly refetched an unchanged value and the list did not move — no error,
+  no feedback, nothing to explain it. Fixed properly rather than patched: `SinglePaneView`
+  became `Pane` and `single_pane_view` became `focus`, one concept at every width instead of a
+  layout detail that only existed below 70 columns. `Tab` moves focus without closing the key,
+  and the focused pane's header is drawn at full strength against the other's muted — DIM in
+  monochrome, so the one signal that says what `r` will do survives the loss of colour.
 - [x] **The value header passed a window off as the whole value.** The viewer header printed
   `LLEN`/`ZCARD`/`XLEN` — the real length — over a body capped at 500 fetched rows, with nothing
   on screen admitting the gap: a 12,000-item list read "12,000 items" above 500 rows. This is the

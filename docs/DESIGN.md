@@ -89,7 +89,7 @@ terminal is small and the situation is urgent.
 | `?` | Help overlay | global |
 | `Ctrl-K` | Command palette | global |
 | `:` | Redis console | global |
-| `Tab` / `S-Tab` | Cycle pane focus | global |
+| `Tab` | Move focus between the panes | global |
 | `g` + key | Jump to view | global |
 | `Ctrl-C` ×2 | Quit (single press = cancel current op) | global |
 | `/` | Filter / search in pane | pane |
@@ -105,6 +105,16 @@ terminal is small and the situation is urgent.
 
 Every one of these is also listed in the palette with its binding shown, so the keymap teaches
 itself. Bindings are user-overridable in config; the hint bar renders the *effective* binding.
+
+**Focus is one concept at every width.** Below 70 columns it decides which pane is *drawn*
+(§2's stack navigation); at or above it, both panes are drawn and focus decides only which one a
+pane-scoped key acts on. Opening a key moves focus to it, `Esc` moves it back, and `Tab` moves it
+without closing the key. Because `r` rescans in one pane and Refetches in the other, focus is
+information rather than decoration: the focused pane's header is drawn in full-strength text and
+the unfocused one muted (dim, not merely grey, so the distinction survives monochrome), and the
+hint bar names the half in force — `r rescan` or `r refetch`. A pane-scoped key whose target the
+reader cannot see is a key that does the wrong thing silently, which is exactly what happened
+when focus was inferred from "is a key open" instead of tracked.
 
 ## 5. Visual language
 

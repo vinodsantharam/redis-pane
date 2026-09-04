@@ -3,7 +3,7 @@
 use crate::keymap::Action;
 use crate::msg::KeyCode;
 use crate::msg::KeyPress;
-use crate::render::layout::SinglePaneView;
+use crate::render::layout::Pane;
 use crate::state::copy::{CopyWhat, redis_cli_command, value_text};
 use crate::state::{Link, OpenKey, ReadOnlyReason, ScanState, Tracking};
 use crate::{Command, Msg, State};
@@ -278,8 +278,8 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             }
             // The "pop" half of stack navigation: back to the list you were
             // just looking at, before an unrelated background scan.
-            if state.single_pane_view == SinglePaneView::Value {
-                state.single_pane_view = SinglePaneView::Keys;
+            if state.focus == Pane::Value {
+                state.focus = Pane::Keys;
                 return (state, Vec::new());
             }
             // Every in-flight operation is cancellable (PRD R7.3).
@@ -314,6 +314,18 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             }
             (state, vec![Command::RefetchOpenKey])
         }
+        Action::CyclePane => {
+            // Focus only ever moves to a pane there is something to focus.
+            // With no key open the Viewer has nothing in it, and below 70
+            // columns moving focus is what draws the other pane — so focusing
+            // an empty Viewer there would black out the screen.
+            state.focus = match state.focus {
+                Pane::Keys if state.open.is_some() => Pane::Value,
+                Pane::Keys => Pane::Keys,
+                Pane::Value => Pane::Keys,
+            };
+            (state, Vec::new())
+        }
         Action::MoveDown => move_selection(state, 1),
         Action::MoveUp => move_selection(state, -1),
         Action::PageDown => {
@@ -339,11 +351,12 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             let Some(name) = state.keys.name(index).map(|n| n.to_vec()) else {
                 return (state, Vec::new());
             };
-            // Below 70 columns this is the "push" half of stack navigation
-            // (DESIGN §2). Setting it unconditionally is harmless at any wider
-            // density, where layout() never consults it — both panes already
-            // show, so there is nothing this can visibly change.
-            state.single_pane_view = SinglePaneView::Value;
+            // Opening a key moves focus onto it, at every width. Below 70
+            // columns that is the "push" half of stack navigation (DESIGN §2);
+            // above it both panes already show and this decides only which one
+            // a pane-scoped key acts on. `Tab` moves it back without closing
+            // the key, and `Esc` closes the key and moves it back with it.
+            state.focus = Pane::Value;
             (state, vec![Command::OpenKey { index, name }])
         }
         Action::ViewerDown => scroll_viewer(state, ViewerMove::By(1)),
@@ -655,11 +668,13 @@ mod tests {
         assert!(!s.help_open);
     }
 
-    /// `r` on a state with a key open in the Viewer, at a two-pane width.
+    /// A key open in the Viewer *and focused*, at a two-pane width — the state
+    /// that `Action::Open` produces, since opening a key moves focus onto it.
     fn viewing() -> State {
         State {
             cols: 130,
             rows: 40,
+            focus: Pane::Value,
             open: Some(OpenKey::new(
                 0,
                 "k".into(),
@@ -699,26 +714,68 @@ mod tests {
     }
 
     #[test]
-    fn below_two_panes_r_follows_whichever_pane_is_on_screen() {
-        // Stack navigation: only one pane exists, so which one is showing is
-        // the whole of the answer — an open key is not enough on its own.
-        let stacked = State {
+    fn r_follows_focus_at_every_width_not_merely_whether_a_key_is_open() {
+        // The bug this replaced: at a two-pane width, focus was inferred from
+        // `open.is_some()`. Opening a key then silently handed `r` to the
+        // Viewer while the arrow keys still drove the key list, so pressing `r`
+        // to rescan quietly refetched the value instead and the list did not
+        // move. A key can be open and unfocused; that is what `Tab` is for.
+        for cols in [60u16, 130] {
+            let focused_value = State { cols, ..viewing() };
+            assert_eq!(
+                press_r(focused_value.clone()),
+                vec![Command::RefetchOpenKey],
+                "at {cols} columns, a focused Viewer owns `r`"
+            );
+
+            let focused_keys = State {
+                focus: Pane::Keys,
+                ..focused_value
+            };
+            assert_eq!(
+                press_r(focused_keys),
+                vec![Command::StartScan { pattern: None }],
+                "at {cols} columns, an open-but-unfocused key must not own `r`"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_moves_focus_between_the_panes_and_r_follows_it() {
+        // DESIGN §4 has specified `Tab` since the beginning; nothing
+        // implemented it, which left R2.7's "acts on the focused pane" resting
+        // on a focus the user could not move.
+        let tab = |s: State| update(s, Msg::Key(KeyPress::plain(KeyCode::Tab))).0;
+
+        let s = viewing();
+        assert_eq!(s.focus, Pane::Value, "opening a key focuses it");
+
+        let s = tab(s);
+        assert_eq!(s.focus, Pane::Keys);
+        assert_eq!(
+            press_r(s.clone()),
+            vec![Command::StartScan { pattern: None }],
+            "Tab back to the list must make `r` rescan, without closing the key"
+        );
+        assert!(s.open.is_some(), "and without closing the key");
+
+        let s = tab(s);
+        assert_eq!(s.focus, Pane::Value, "Tab cycles back");
+    }
+
+    #[test]
+    fn tab_does_not_focus_a_viewer_with_nothing_in_it() {
+        // Below 70 columns focusing the Viewer is what *draws* it, so focusing
+        // an empty one would blank the screen. Above, it would hand `r` to a
+        // pane that has nothing to refetch.
+        let s = State {
             cols: 60,
             rows: 40,
-            single_pane_view: SinglePaneView::Value,
-            ..viewing()
+            ..State::default()
         };
-        assert_eq!(press_r(stacked.clone()), vec![Command::RefetchOpenKey]);
-
-        let popped = State {
-            single_pane_view: SinglePaneView::Keys,
-            ..stacked
-        };
-        assert_eq!(
-            press_r(popped),
-            vec![Command::StartScan { pattern: None }],
-            "popping back to the list must not leave `r` pointed at the Viewer"
-        );
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Tab)));
+        assert_eq!(s.focus, Pane::Keys);
+        assert_eq!(press_r(s), vec![Command::StartScan { pattern: None }]);
     }
 
     #[test]
@@ -1627,9 +1684,9 @@ mod stack_navigation_tests {
     #[test]
     fn opening_a_key_pushes_into_value_view() {
         let state = browsing();
-        assert_eq!(state.single_pane_view, SinglePaneView::Keys);
+        assert_eq!(state.focus, Pane::Keys);
         let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('l'))));
-        assert_eq!(state.single_pane_view, SinglePaneView::Value);
+        assert_eq!(state.focus, Pane::Value);
         assert!(matches!(cmds.first(), Some(Command::OpenKey { .. })));
     }
 
@@ -1637,10 +1694,10 @@ mod stack_navigation_tests {
     fn esc_pops_back_to_keys_from_value_view() {
         let state = browsing();
         let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('l'))));
-        assert_eq!(state.single_pane_view, SinglePaneView::Value);
+        assert_eq!(state.focus, Pane::Value);
 
         let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Esc)));
-        assert_eq!(state.single_pane_view, SinglePaneView::Keys);
+        assert_eq!(state.focus, Pane::Keys);
         assert!(
             cmds.is_empty(),
             "popping the stack is not itself a scan cancellation"
@@ -1658,8 +1715,8 @@ mod stack_navigation_tests {
         let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Esc)));
         assert!(!state.help_open);
         assert_eq!(
-            state.single_pane_view,
-            SinglePaneView::Value,
+            state.focus,
+            Pane::Value,
             "one Esc closes one thing, not two"
         );
     }
@@ -1677,7 +1734,7 @@ mod stack_navigation_tests {
         assert!(state.scan.is_running());
 
         let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Esc)));
-        assert_eq!(state.single_pane_view, SinglePaneView::Keys);
+        assert_eq!(state.focus, Pane::Keys);
         assert!(
             cmds.is_empty(),
             "the scan must still be running, not cancelled by this Esc"
@@ -1692,9 +1749,9 @@ mod stack_navigation_tests {
         // actual reader can see.
         let state = browsing();
         let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('l'))));
-        assert_eq!(state.single_pane_view, SinglePaneView::Value);
+        assert_eq!(state.focus, Pane::Value);
         // No assertion on rendered output here — render::layout's own test
-        // (`single_pane_view_is_ignored_at_any_wider_density`) is the proof;
+        // (`focus_is_ignored_at_any_wider_density`) is the proof;
         // this just confirms the state transition still happens uniformly.
     }
 }

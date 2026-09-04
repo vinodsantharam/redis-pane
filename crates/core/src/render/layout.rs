@@ -20,11 +20,16 @@ pub enum Density {
     Single,
 }
 
-/// Below 70 columns there is room for one pane at a time. Opening a key
-/// pushes from the list onto the value; `Esc` pops back (DESIGN §2: "single
-/// pane, stack-navigated").
+/// Which pane the reader is in — the focus (DESIGN §4).
+///
+/// One concept doing two jobs, because they are the same question. Below 70
+/// columns there is room for one pane at a time, so this decides what is
+/// *drawn*: opening a key pushes from the list onto the value, `Esc` pops back
+/// (DESIGN §2, "single pane, stack-navigated"). At any wider density both panes
+/// are drawn and this decides only what is *focused* — which is what makes
+/// `r` able to act on one pane and not the other (R2.7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SinglePaneView {
+pub enum Pane {
     #[default]
     Keys,
     Value,
@@ -45,14 +50,9 @@ pub struct Layout {
 const TITLE_ROWS: u16 = 2;
 
 /// The narrowest width that still fits two panes.
-///
-/// Named because it is not only a layout fact: below it, [`SinglePaneView`] is
-/// what says which pane a keystroke belongs to, and above it that field is
-/// meaningless. A second copy of this number elsewhere would put the two
-/// answers out of step at exactly one terminal width.
 pub const TWO_PANE_MIN_COLS: u16 = 70;
 
-pub fn layout(area: Rect, single_pane: SinglePaneView) -> Layout {
+pub fn layout(area: Rect, focus: Pane) -> Layout {
     let density = match area.width {
         w if w >= 120 => Density::Full,
         w if w >= 90 => Density::NoSize,
@@ -66,17 +66,17 @@ pub fn layout(area: Rect, single_pane: SinglePaneView) -> Layout {
 
     if density == Density::Single {
         let full = Rect::new(0, body_top, area.width, body_height);
-        return match single_pane {
+        return match focus {
             // A zero-size keys rect, not an absent one: keys::render already
             // no-ops below its own minimum size, so nothing further needs to
             // know which of the two states produced it.
-            SinglePaneView::Keys => Layout {
+            Pane::Keys => Layout {
                 keys: full,
                 value: None,
                 density,
                 hint_bar,
             },
-            SinglePaneView::Value => Layout {
+            Pane::Value => Layout {
                 keys: Rect::new(0, body_top, 0, 0),
                 value: Some(full),
                 density,
@@ -109,7 +109,7 @@ mod tests {
     use super::*;
 
     fn at(w: u16) -> Layout {
-        layout(Rect::new(0, 0, w, 30), SinglePaneView::Keys)
+        layout(Rect::new(0, 0, w, 30), Pane::Keys)
     }
 
     #[test]
@@ -153,13 +153,13 @@ mod tests {
 
     #[test]
     fn the_hint_bar_collapses_on_a_short_terminal() {
-        assert!(layout(Rect::new(0, 0, 120, 24), SinglePaneView::Keys).hint_bar);
-        assert!(!layout(Rect::new(0, 0, 120, 23), SinglePaneView::Keys).hint_bar);
+        assert!(layout(Rect::new(0, 0, 120, 24), Pane::Keys).hint_bar);
+        assert!(!layout(Rect::new(0, 0, 120, 23), Pane::Keys).hint_bar);
     }
 
     #[test]
     fn below_seventy_columns_value_view_fills_the_whole_pane() {
-        let l = layout(Rect::new(0, 0, 60, 30), SinglePaneView::Value);
+        let l = layout(Rect::new(0, 0, 60, 30), Pane::Value);
         assert!(
             l.keys.width == 0 || l.keys.height == 0,
             "keys should be unused, not visible"
@@ -169,15 +169,14 @@ mod tests {
     }
 
     #[test]
-    fn single_pane_view_is_ignored_at_any_wider_density() {
-        // Both panes always show above 70 columns; the field must not matter.
+    fn focus_does_not_move_a_pane_at_any_wider_density() {
+        // Focus decides what is *drawn* only below 70 columns. Above it both
+        // panes always show, so focus must change nothing about geometry — it
+        // only decides which pane a pane-scoped key acts on.
         for w in [70u16, 90, 120, 200] {
-            let keys_view = layout(Rect::new(0, 0, w, 30), SinglePaneView::Keys);
-            let value_view = layout(Rect::new(0, 0, w, 30), SinglePaneView::Value);
-            assert_eq!(
-                keys_view, value_view,
-                "SinglePaneView leaked into a two-pane width"
-            );
+            let keys_view = layout(Rect::new(0, 0, w, 30), Pane::Keys);
+            let value_view = layout(Rect::new(0, 0, w, 30), Pane::Value);
+            assert_eq!(keys_view, value_view, "focus moved a pane at {w} columns");
         }
     }
 }

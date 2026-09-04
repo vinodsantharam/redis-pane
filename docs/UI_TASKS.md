@@ -4,15 +4,49 @@ Working list of UI/functionality gaps, audited against DESIGN.md and PRD.md on 2
 Ordered by severity. This is a tracking doc, not a spec — see PRD.md/DESIGN.md for the actual
 requirements and ADRs for decisions already made. `[~]` marks an item partially closed on
 purpose — what was done, and what was cut and why, are in its own note rather than a new item.
+`[–]` marks an item cut from scope, with the reasoning kept so the decision survives.
 
 ## Severity 1 — the current UI actively misleads or breaks
 
-- [ ] **Search within a large value is missing (R3.3).** A 500-entry zset or a 12,000-row list
-  is currently a wall of unfilterable, unsortable rows. `Viewer::row_count()`/`row()` exist, but
-  there is no `/`-style filter *inside* the value pane the way there is for the key list.
-- [ ] **Keys-pane liveness is unresolved (DESIGN §9).** A value updates live once opened, but a
-  key being deleted or appearing in the browsed list is invisible until the next manual scan —
-  the same "quietly stale" problem ADR-0006 exists to prevent, one level up.
+- [–] **Search within a large value (R3.3) — cut from scope 2026-09-04.** Not deferred for time;
+  it does not decompose cleanly, and the research is worth keeping:
+  - **Redis offers no uniform mechanism.** `HSCAN`/`SSCAN`/`ZSCAN` take `MATCH` (this is what
+    RedisInsight uses), but there is no `LSCAN`, and streams are ID-ranged rather than
+    content-searchable. Three of eight types can be done server-side; the rest cannot.
+  - **The types are asymmetric in a way that inverts the payoff.** Hash and Set are fetched
+    *whole* today (`HGETALL`/`SMEMBERS`), so a client-side filter there would be completely
+    correct — and they are also the types you can simply scroll. List, ZSet and Stream are
+    windowed at 500, so a filter would search a slice and report a verdict on the whole. The
+    types where search is easiest to get right are the ones that need it least.
+  - **`/` already means "filter the key list".** A second meaning inside the value pane is a
+    keymap ambiguity on top of the above.
+  - What *was* built instead is the honesty half — see the value-window disclosure below, which
+    was the part that actively misled and is not a search feature.
+- [x] **Keys-pane liveness (DESIGN §9) — resolved 2026-09-04.** Decided rather than deferred:
+  the keys pane is **not** push-live, matching RedisInsight, which declines to auto-refresh its
+  key list on purpose to avoid loading production instances. Viewport-scoped `CLIENT TRACKING`
+  was rejected on tracking-table churn during scroll and would need its own ADR — ADR-0006
+  weighed only "one key" against "everything read" and never this middle ground. Two things were
+  built in its place:
+  - **Free deletion detection.** `fetch_metadata` already issued `TYPE` for every visible row and
+    already saw `"none"` for a vanished key — and dropped it on the floor. It now reports those
+    rows, so a key deleted underneath the reader is badged `✕ … gone` at **zero extra round
+    trips and no tracking table**. The tombstone rides in the existing `kinds` byte array, so it
+    costs nothing across a 2M-key set. The row keeps its position (removing it would renumber
+    everything below the cursor) and its last-known size, but drops its TTL to `—`: size is
+    retrospective and stays true, a countdown is a claim about a key that is not there to expire.
+  - **R2.7's rescan, which had never been wired up.** The PRD has always said `r` rescans in the
+    keys pane and Refetches in the Viewer; `Action::Refetch` returned `RefetchOpenKey`
+    unconditionally and the core never once constructed `Command::StartScan`, leaving its shell
+    handler unreachable. `r` now acts on the focused pane, and the hint bar says which
+    (`r rescan` vs `r refetch`) rather than naming one half of it at all times.
+- [x] **The value header passed a window off as the whole value.** The viewer header printed
+  `LLEN`/`ZCARD`/`XLEN` — the real length — over a body capped at 500 fetched rows, with nothing
+  on screen admitting the gap: a 12,000-item list read "12,000 items" above 500 rows. This is the
+  scan-cap defect one level down, and it is why a naive search over those rows would have
+  compounded into "no matches" being indistinguishable from "past the window". The header now
+  reads `12,000 items · 500 shown`, in Warn rather than Muted for the same reason the cap banner
+  is. Types fetched whole say nothing extra.
 
 ## Severity 2 — real functional gaps in what's shipped
 
@@ -29,6 +63,12 @@ purpose — what was done, and what was cut and why, are in its own note rather 
 - [ ] **Mouse support is entirely absent (R7.3).** No click-to-focus, scroll, or drag-to-resize.
 - [ ] **The split ratio is fixed, not resizable** (hardcoded 45/55). Blocks mouse
   drag-to-resize from being useful once built.
+- [ ] **Hash and Set reads are unbounded.** `HGETALL`/`SMEMBERS` pull the entire collection,
+  where List/ZSet/Stream are windowed at 500 (`read.rs`, `WINDOW`). A million-field hash comes
+  down whole, into a 250MB budget (PRD §7), on the same connection the scan is using. Noticed
+  while scoping value search (above), where the same asymmetry is what made the feature not
+  decompose. The fix is `HSCAN`/`SSCAN` with a cursor, which would also be the server-side half
+  of a future search — so these two are worth doing together or not at all.
 
 ## Severity 3 — parked design questions, now answerable from real use
 

@@ -271,6 +271,23 @@ pub struct State {
 }
 
 impl State {
+    /// Whether a pane-scoped key belongs to the keys pane rather than the
+    /// Viewer (R2.7).
+    ///
+    /// There is no `Focus` field to keep in sync, because there is nothing to
+    /// store: below the two-pane width `single_pane_view` already says which
+    /// pane is on screen, and above it the Viewer is only reachable when a key
+    /// is open. Movement keys always drive the key list in two-pane mode, so an
+    /// open key is what makes `r` the Viewer's.
+    pub fn keys_pane_focused(&self) -> bool {
+        use crate::render::layout::{SinglePaneView, TWO_PANE_MIN_COLS};
+        if self.cols < TWO_PANE_MIN_COLS {
+            self.single_pane_view == SinglePaneView::Keys
+        } else {
+            self.open.is_none()
+        }
+    }
+
     /// What the header may claim about currency.
     ///
     /// There is deliberately no setter for this. Liveness is *derived* from the

@@ -588,6 +588,74 @@ fn metadata_arriving_does_not_shift_a_single_column() {
     );
 }
 
+// ── a key that vanished while the list was on screen (DESIGN §9) ────────────
+
+/// `browsing()` with one key deleted underneath the reader.
+fn with_a_gone_key() -> State {
+    let mut state = browsing();
+    // `cart:91af3c9d2e`, in the middle of the list — the position is the point:
+    // the row must stay where it is rather than renumbering its neighbours.
+    state.keys.set_gone(4);
+    state.rebuild_list();
+    state
+}
+
+#[test]
+fn golden_browser_with_a_deleted_key() {
+    assert_golden("browser_gone", &draw(&with_a_gone_key(), 130, 26));
+}
+
+#[test]
+fn a_deleted_key_keeps_its_row_and_says_so() {
+    let frame = draw(&with_a_gone_key(), 130, 26);
+    let row = frame
+        .lines()
+        .find(|l| l.contains("cart:91af3c9d2e"))
+        .expect("the row must survive its key's deletion");
+
+    assert!(row.contains('✕'), "the deletion must be marked: {row}");
+    assert!(
+        row.contains("gone"),
+        "the TYPE column must say what happened rather than fall back to the \
+         pending placeholder, which would claim the fetch had not happened yet"
+    );
+    // The fetch that found it missing is the same fetch that had already
+    // reported its size, and during an incident that figure is the answer to
+    // the only question worth asking about a key that is no longer there.
+    assert!(
+        row.contains("1.1 MB") || row.contains("1.1MB"),
+        "last-known size is kept: {row}"
+    );
+    // But not the TTL: "expires in 12m" is a claim about a key that is not
+    // there to expire, where "it held 1.1 MB" stays true after the deletion.
+    assert!(
+        !row.contains("12m"),
+        "a gone key must not count down toward an expiry that cannot happen: {row}"
+    );
+}
+
+#[test]
+fn a_deleted_row_shifts_nothing_around_it() {
+    let before = draw(&browsing(), 130, 26);
+    let after = draw(&with_a_gone_key(), 130, 26);
+
+    let column_of = |frame: &str, needle: &str| -> Vec<usize> {
+        frame
+            .lines()
+            .filter_map(|l| l.find(needle).map(|byte_idx| l[..byte_idx].chars().count()))
+            .collect::<Vec<_>>()
+    };
+    // `✕` and `●` are both one column wide but different byte lengths, so this
+    // is measured in characters for the same reason the M1.4 proof above is.
+    for anchor in ["feed:global:hot", "stream:orders", "cart:91af3c9d2e"] {
+        assert_eq!(
+            column_of(&before, anchor),
+            column_of(&after, anchor),
+            "{anchor} moved when a key above it was deleted"
+        );
+    }
+}
+
 #[test]
 fn a_pending_cell_is_visibly_waiting_rather_than_blank() {
     // Blank would read as "there is nothing here", which is a different claim.
@@ -876,6 +944,43 @@ fn golden_viewer_stream() {
         "viewer_stream",
         &draw(&opened("stream:orders", v, TTL_NONE), 130, 22),
     );
+}
+
+// ── the header must not pass a window off as the whole value ────────────────
+
+#[test]
+fn a_windowed_value_says_how_much_of_it_is_on_screen() {
+    // `XLEN` says 500; the read brought back 2. Stating only the first turns
+    // "the newest 2 of these" into "this is all of it" — the scan-cap defect
+    // one level down, and the reason a search over these rows was cut rather
+    // than built on top of a header that lies about its own scope.
+    let v = Value::Stream(StreamValue {
+        entries: vec![("72000-0".into(), vec![("order".into(), "1001".into())])],
+        total: 500,
+    });
+    let frame = draw(&opened("stream:orders", v, TTL_NONE), 130, 22);
+    let header = frame
+        .lines()
+        .find(|l| l.contains("stream ·"))
+        .expect("the viewer header names the type");
+    assert!(header.contains("500 entries"), "the real length: {header}");
+    assert!(
+        header.contains("1 shown"),
+        "and what is on screen: {header}"
+    );
+}
+
+#[test]
+fn a_value_fetched_whole_says_nothing_extra() {
+    // A hash comes back complete, so there is no window to disclose and the
+    // header must not grow a phrase that would read as a caveat where none
+    // applies.
+    let frame = draw(&opened("user:8812:session", hash_value(), 2_537), 130, 22);
+    let header = frame
+        .lines()
+        .find(|l| l.contains("hash ·"))
+        .expect("the viewer header names the type");
+    assert!(!header.contains("shown"), "nothing is withheld: {header}");
 }
 
 #[test]

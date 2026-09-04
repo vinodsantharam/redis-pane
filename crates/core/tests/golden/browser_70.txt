@@ -23,4 +23,4 @@
                                    │
                                    │
  scanning 41,203 of ~180,000  Esc cancel
- Esc back   r refetch   ⌃R read-only   ? help   q quit
+ Esc back   r rescan   ⌃R read-only   ? help   q quit

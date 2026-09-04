@@ -54,11 +54,15 @@ pub enum Action {
 }
 
 impl Action {
-    /// The label used in the hint bar and the help overlay.
+    /// The label used in the help overlay, where every binding is listed at
+    /// once and no pane is focused. See [`Action::label_in`] for the hint bar,
+    /// which describes what the key will do right now.
     pub fn label(&self) -> &'static str {
         match self {
             Action::Quit => "quit",
-            Action::Refetch => "refetch",
+            // Both halves, because the help overlay is the one place that has
+            // to explain the whole of R2.7 rather than the half in force.
+            Action::Refetch => "refetch / rescan",
             Action::ToggleReadOnly => "read-only",
             Action::Help => "help",
             Action::Cancel => "back",
@@ -76,6 +80,20 @@ impl Action {
             Action::ViewerTop => "value top",
             Action::ViewerBottom => "value bottom",
             Action::Copy => "copy",
+        }
+    }
+
+    /// The label for the hint bar, which describes what the key does *now*.
+    ///
+    /// Only `Refetch` differs: it acts on the focused pane (R2.7), so a bar
+    /// that always read "refetch" would name the wrong half of it half the
+    /// time. Takes the answer rather than a `&State` so the keymap stays free
+    /// of the rest of the core, and so this is trivially testable both ways.
+    pub fn label_in(&self, keys_pane_focused: bool) -> &'static str {
+        match self {
+            Action::Refetch if keys_pane_focused => "rescan",
+            Action::Refetch => "refetch",
+            other => other.label(),
         }
     }
 }

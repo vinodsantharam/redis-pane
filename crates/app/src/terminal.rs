@@ -246,8 +246,8 @@ pub async fn run(
                     let tx = tx.clone();
                     tokio::spawn(async move {
                         match crate::redis::fetch_metadata(&client, &window).await {
-                            Ok(entries) if !entries.is_empty() => {
-                                let _ = tx.send(Msg::MetadataBatch { entries }).await;
+                            Ok((entries, gone)) if !entries.is_empty() || !gone.is_empty() => {
+                                let _ = tx.send(Msg::MetadataBatch { entries, gone }).await;
                             }
                             Ok(_) => {}
                             Err(e) => {

@@ -1,7 +1,7 @@
 ─ redis-pane ─ ● staging · cache-01:6379/0 · from profile staging ─────────────────────────────────────────────────────── ● live ─
 
  KEY                               TYPE        SIZE   TTL │ stream:orders
- ● user:8812:cart                  zset       412 B   12m │ stream · 500 entries · 2.1 KB
+ ● user:8812:cart                  zset       412 B   12m │ stream · 500 entries · 2 shown · 2.1 KB
  ● user:8812:profile               json       880 B     ∞ │ ttl ∞                                                          ● live
  ● user:8812:session               hash      2.1 KB   42m │
  ● user:8813:session               hash      1.9 KB   56m │ ID                     AGE                    FIELDS

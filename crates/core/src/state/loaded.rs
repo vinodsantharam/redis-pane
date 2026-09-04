@@ -75,6 +75,12 @@ const TTL_UNKNOWN: i32 = i32::MIN;
 /// Redis reports `-1` for a key with no expiry.
 pub const TTL_NONE: i32 = -1;
 const SIZE_UNKNOWN: u32 = u32::MAX;
+/// A key that was scanned but had vanished by the time its metadata was
+/// fetched. It rides in the `kinds` array — `0` already means "not yet known"
+/// and `1..=8` are the types, so a fourth state costs no bytes at all across a
+/// two-million-key set. A parallel `Vec<bool>` would have cost 2MB to say the
+/// same thing about the handful of keys it is ever true for.
+const KIND_GONE: u8 = u8::MAX;
 
 /// The default cap on retained keys.
 ///
@@ -191,6 +197,29 @@ impl LoadedSet {
     pub fn set_kind(&mut self, i: usize, kind: KeyKind) {
         if let Some(slot) = self.kinds.get_mut(i) {
             *slot = kind as u8;
+        }
+    }
+
+    /// Whether key `i` was found to be gone when its metadata was fetched.
+    ///
+    /// `SCAN` walks a keyspace that moves underneath it, so a scanned key may
+    /// already be deleted, expired or evicted by the time the row is drawn. The
+    /// row stays where it is and is badged: silently dropping it would reorder
+    /// everything below the reader's cursor, which is worse than a stale row.
+    pub fn is_gone(&self, i: usize) -> bool {
+        self.kinds.get(i).copied() == Some(KIND_GONE)
+    }
+
+    /// Mark key `i` gone.
+    ///
+    /// TTL and size keep whatever was last known, for the same reason a deleted
+    /// open key keeps its value on screen: during an incident the question is
+    /// usually what was in it. The type byte is what the tombstone displaces,
+    /// and that costs nothing on screen — the type is drawn as a dot in the one
+    /// column the `✕` badge now occupies, so there was never room for both.
+    pub fn set_gone(&mut self, i: usize) {
+        if let Some(slot) = self.kinds.get_mut(i) {
+            *slot = KIND_GONE;
         }
     }
 
@@ -339,6 +368,49 @@ mod tests {
             "and the state must be visible to the status bar"
         );
         assert_eq!(s.len(), 3);
+    }
+
+    #[test]
+    fn a_tombstone_costs_no_memory_and_reports_no_type() {
+        let mut s = LoadedSet::default();
+        s.push(b"a");
+        s.push(b"b");
+        s.set_kind(0, KeyKind::Hash);
+        s.set_ttl(0, 90);
+        s.set_size(0, 4_096);
+        let before = s.heap_bytes();
+
+        s.set_gone(0);
+
+        assert!(s.is_gone(0));
+        assert!(!s.is_gone(1), "its neighbours are untouched");
+        assert_eq!(
+            s.heap_bytes(),
+            before,
+            "the tombstone rides in the kinds array; it must allocate nothing"
+        );
+        assert_eq!(
+            s.kind(0),
+            None,
+            "the type byte is what the tombstone displaces"
+        );
+        // The row keeps what was last known about it, for the same reason a
+        // deleted open key keeps its value on screen (update.rs, ValueGone).
+        assert_eq!(s.ttl(0), Some(90));
+        assert_eq!(s.size(0), Some(4_096));
+    }
+
+    #[test]
+    fn a_rescan_clears_tombstones() {
+        let mut s = LoadedSet::default();
+        s.push(b"a");
+        s.set_gone(0);
+        s.clear();
+        s.push(b"a");
+        assert!(
+            !s.is_gone(0),
+            "a rescan re-reads the keyspace, so nothing carries over"
+        );
     }
 
     #[test]

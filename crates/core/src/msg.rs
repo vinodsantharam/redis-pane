@@ -121,8 +121,14 @@ pub enum Msg {
         error: String,
     },
     /// Lazily-fetched metadata arrived for some rows (R2.4).
+    ///
+    /// `gone` carries the rows whose key had vanished by the time the fetch
+    /// reached it. They are indices rather than `MetadataEntry` values with a
+    /// flag: every field of a `MetadataEntry` describes metadata, and a key that
+    /// is not there has none, so a flagged entry would have to invent a type.
     MetadataBatch {
         entries: Vec<MetadataEntry>,
+        gone: Vec<usize>,
     },
     /// A read of the open key completed, carrying what the server said.
     ///

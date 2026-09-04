@@ -98,11 +98,18 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             (state, Vec::new())
         }
         Msg::ScanBatch { keys } => scan_batch(state, keys),
-        Msg::MetadataBatch { entries } => {
+        Msg::MetadataBatch { entries, gone } => {
             for e in entries {
                 state.keys.set_kind(e.index, e.kind);
                 state.keys.set_ttl(e.index, e.ttl_seconds);
                 state.keys.set_size(e.index, e.size_bytes);
+            }
+            // A deleted key keeps its row and its last-known TTL and size; only
+            // the type byte gives way to the tombstone. Removing the row would
+            // renumber everything below the cursor between one frame and the
+            // next, which is a worse lie than a row that says it is gone.
+            for index in gone {
+                state.keys.set_gone(index);
             }
             (state, Vec::new())
         }
@@ -284,13 +291,26 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
         Action::Refetch => {
             // `r` is a scoped Refetch, not a global refresh. When an update is
             // already waiting, it applies that instead of asking the server for
-            // something it has already been told.
+            // something it has already been told. This branch comes first in
+            // both panes: a held update is the cheapest possible answer, and
+            // re-asking for it would be the one thing `r` must never do.
             if let Some(open) = &mut state.open
                 && open.pending.is_some()
             {
                 open.take_pending();
                 open.at_rest = true;
                 return (state, Vec::new());
+            }
+            // Otherwise `r` acts on the focused pane and nothing else (R2.7).
+            // The keys pane is not push-live — the deletions it can detect for
+            // free arrive with the metadata it was already fetching, and
+            // anything else needs the keyspace walked again (DESIGN §9).
+            if state.keys_pane_focused() {
+                // `None` is the same traversal the session opened with: the
+                // scan has never been server-side filtered, `/` narrows the
+                // Loaded set on this side, and so the active filter survives a
+                // rescan without being mentioned here.
+                return (state, vec![Command::StartScan { pattern: None }]);
             }
             (state, vec![Command::RefetchOpenKey])
         }
@@ -635,13 +655,97 @@ mod tests {
         assert!(!s.help_open);
     }
 
+    /// `r` on a state with a key open in the Viewer, at a two-pane width.
+    fn viewing() -> State {
+        State {
+            cols: 130,
+            rows: 40,
+            open: Some(OpenKey::new(
+                0,
+                "k".into(),
+                crate::state::value::Value::Str(crate::state::value::StringValue::new("v", 40)),
+                -1,
+                10,
+                0,
+            )),
+            ..State::default()
+        }
+    }
+
+    fn press_r(state: State) -> Vec<Command> {
+        update(state, Msg::Key(KeyPress::plain(KeyCode::Char('r')))).1
+    }
+
     #[test]
-    fn r_asks_for_a_refetch_which_is_the_only_read_path() {
-        let (_, cmds) = update(
-            State::default(),
-            Msg::Key(KeyPress::plain(KeyCode::Char('r'))),
+    fn r_in_the_viewer_asks_for_a_refetch_which_is_the_only_read_path() {
+        assert_eq!(press_r(viewing()), vec![Command::RefetchOpenKey]);
+    }
+
+    /// R2.7: `r` acts on the focused pane and nothing else. This half was
+    /// documented from the start and never wired up — the core emitted
+    /// `RefetchOpenKey` unconditionally, so `StartScan` was unreachable.
+    #[test]
+    fn r_in_the_keys_pane_rescans_the_keyspace() {
+        let state = State {
+            cols: 130,
+            rows: 40,
+            ..State::default()
+        };
+        assert_eq!(
+            press_r(state),
+            vec![Command::StartScan { pattern: None }],
+            "with no key open, the keys pane is what `r` acts on"
         );
-        assert_eq!(cmds, vec![Command::RefetchOpenKey]);
+    }
+
+    #[test]
+    fn below_two_panes_r_follows_whichever_pane_is_on_screen() {
+        // Stack navigation: only one pane exists, so which one is showing is
+        // the whole of the answer — an open key is not enough on its own.
+        let stacked = State {
+            cols: 60,
+            rows: 40,
+            single_pane_view: SinglePaneView::Value,
+            ..viewing()
+        };
+        assert_eq!(press_r(stacked.clone()), vec![Command::RefetchOpenKey]);
+
+        let popped = State {
+            single_pane_view: SinglePaneView::Keys,
+            ..stacked
+        };
+        assert_eq!(
+            press_r(popped),
+            vec![Command::StartScan { pattern: None }],
+            "popping back to the list must not leave `r` pointed at the Viewer"
+        );
+    }
+
+    #[test]
+    fn a_held_update_is_applied_before_either_pane_gets_a_say() {
+        // The cheapest possible answer, and re-asking the server for something
+        // it has already sent is the one thing `r` must never do.
+        let mut state = viewing();
+        // An update only waits when the reader is not at rest — otherwise it
+        // lands straight away and there is nothing for `r` to apply.
+        state.open.as_mut().unwrap().at_rest = false;
+        let (state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                index: 0,
+                name: "k".into(),
+                value: crate::state::value::Value::Str(crate::state::value::StringValue::new(
+                    "v2", 40,
+                )),
+                ttl_seconds: -1,
+                size_bytes: 11,
+                at_ms: 1_000,
+            },
+        );
+        assert!(state.open.as_ref().unwrap().pending.is_some(), "held");
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('r'))));
+        assert!(cmds.is_empty(), "no read is asked for");
+        assert!(state.open.as_ref().unwrap().pending.is_none(), "applied");
     }
 
     #[test]
@@ -1139,6 +1243,7 @@ mod metadata_tests {
                     ttl_seconds: 2_537,
                     size_bytes: 2_150,
                 }],
+                gone: Vec::new(),
             },
         );
         assert_eq!(state.keys.kind(2), Some(KeyKind::Hash));
@@ -1158,7 +1263,13 @@ mod metadata_tests {
                 size_bytes: 10,
             })
             .collect();
-        let (state, _) = update(state, Msg::MetadataBatch { entries });
+        let (state, _) = update(
+            state,
+            Msg::MetadataBatch {
+                entries,
+                gone: Vec::new(),
+            },
+        );
         assert!(
             state.rows_needing_metadata().is_empty(),
             "the visible window is fully known, so nothing more is owed"
@@ -1176,7 +1287,13 @@ mod metadata_tests {
                 size_bytes: 10,
             })
             .collect();
-        let (state, _) = update(state, Msg::MetadataBatch { entries });
+        let (state, _) = update(
+            state,
+            Msg::MetadataBatch {
+                entries,
+                gone: Vec::new(),
+            },
+        );
 
         // Page down past the known rows.
         let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::PageDown)));

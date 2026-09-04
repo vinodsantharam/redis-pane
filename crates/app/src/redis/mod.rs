@@ -291,11 +291,14 @@ fn describe(e: &Error) -> String {
 /// with `SCAN` for the connection while the list is still filling.
 ///
 /// A key that vanished between the scan and this fetch is reported as gone
-/// rather than failing the batch — the keyspace moves while we walk it.
+/// rather than failing the batch — the keyspace moves while we walk it. That
+/// second return value is free deletion detection: `TYPE` is already on the
+/// wire for every visible row, so noticing costs no extra round trip and needs
+/// no tracking table (DESIGN §9).
 pub async fn fetch_metadata(
     client: &Client,
     keys: &[(usize, Vec<u8>)],
-) -> Result<Vec<MetadataEntry>, Error> {
+) -> Result<(Vec<MetadataEntry>, Vec<usize>), Error> {
     use redis_pane_core::state::KeyKind;
 
     let pipeline = client.pipeline();
@@ -308,15 +311,21 @@ pub async fn fetch_metadata(
     let replies: Vec<Value> = pipeline.all().await?;
 
     let mut out = Vec::with_capacity(keys.len());
+    let mut gone = Vec::new();
     for (slot, (index, _)) in keys.iter().enumerate() {
         let kind = replies.get(slot * 3).and_then(|v| v.as_str());
         let ttl = replies.get(slot * 3 + 1).and_then(|v| v.as_i64());
         let size = replies.get(slot * 3 + 2).and_then(|v| v.as_i64());
 
-        // TYPE answers "none" for a key that no longer exists.
-        let Some(kind) = kind.filter(|k| k != "none") else {
+        // TYPE answers "none" for a key that no longer exists. A reply that is
+        // absent entirely is a different thing — a short pipeline, not a
+        // deleted key — and must not badge the row: one truncated reply would
+        // otherwise mark every remaining row in the window as deleted.
+        let Some(kind) = kind else { continue };
+        if kind == "none" {
+            gone.push(*index);
             continue;
-        };
+        }
         out.push(MetadataEntry {
             index: *index,
             kind: KeyKind::from_redis(&kind),
@@ -326,7 +335,7 @@ pub async fn fetch_metadata(
             size_bytes: size.unwrap_or(0).clamp(0, u32::MAX as i64 - 1) as u32,
         });
     }
-    Ok(out)
+    Ok((out, gone))
 }
 
 #[cfg(test)]

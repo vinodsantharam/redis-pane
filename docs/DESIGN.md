@@ -317,14 +317,28 @@ the reader's time.
 
 ## 9. Open design questions
 
-- Should the keys pane get liveness too, or does the open key remain the only tracked thing?
-  Tracking the visible rows would show deletions as they happen, at the cost of tracking-table
-  churn on every scroll.
 - Does the dashboard belong in v1 at all, or is the slowlog plus a memory figure in the status
   bar the whole of what triage actually needs? This is now the largest remaining scope risk.
 - With two panes, is the split fixed at a ratio, or does it default to whichever pane has focus?
 - Does the keys pane need a permanent column header row, or can the columns be implied by the
   data and explained once in help?
+
+**Resolved since v0.5** — the keys pane does not get liveness, and the open key remains the only
+tracked thing. Deliberate, not deferred: RedisInsight declines to auto-refresh its key list for
+the same reason, and re-walking a million keys on a timer is what `SCAN`-not-`KEYS` exists to
+avoid. Viewport-scoped `CLIENT TRACKING` — arming only the ~30 visible rows — is the middle
+ground ADR-0006 never considered, and it is rejected here on tracking-table churn during scroll;
+revisiting it needs its own ADR. What the pane gets instead is the half that was already on the
+wire and being discarded: `fetch_metadata` issues `TYPE` for every visible row and sees `"none"`
+for a key that has been deleted, expired or evicted, so those rows are now badged `✕ … gone` at
+no extra round trip. A gone row **keeps its position** — removing it would renumber everything
+below the reader's cursor between one frame and the next — and keeps its last-known size, which
+is usually the only answer left about a key during an incident; its TTL becomes `—`, because a
+countdown is a claim about a key that is no longer there to expire. Anything beyond deletion
+needs the keyspace walked again, which is what `r` in the keys pane now does (R2.7 — documented
+from the start, and unimplemented until now). The value header states its own window the same
+way: `12,000 items · 500 shown`, since `LLEN`/`ZCARD`/`XLEN` and the 500-row read window are
+different numbers and printing only the first turns a slice into the whole.
 
 **Resolved since v0.4** — the scan cap gets a persistent banner row above the key list, not just
 a status-bar line: a copy confirmation or a sort readout could otherwise displace the one signal

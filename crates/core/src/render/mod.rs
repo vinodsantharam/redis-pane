@@ -123,12 +123,36 @@ fn value_pane(
         kind.label(),
         theme.style(crate::theme::type_token(Some(kind))),
     );
-    let rest = format!(
-        " · {} · {}",
-        viewer.measure(),
-        keys::format_size(open.size_bytes)
+    let x2 = put(
+        buf,
+        x1,
+        area.y + 1,
+        &format!(" · {}", viewer.measure()),
+        theme.style(Token::Muted),
     );
-    put(buf, x1, area.y + 1, &rest, theme.style(Token::Muted));
+    // `measure` is the value's real length; the body can only show what the
+    // read brought back. When those differ, saying so is not decoration — it is
+    // the difference between "this is all of it" and "this is the newest 500",
+    // and it carries Warn rather than Muted for the same reason the scan-cap
+    // banner does: a limit nobody notices is one they will mistake for the
+    // whole. Both figures sit together so neither can be read without the other.
+    let x3 = match viewer.window() {
+        Some(shown) => put(
+            buf,
+            x2,
+            area.y + 1,
+            &format!(" · {shown} shown"),
+            theme.style(Token::Warn),
+        ),
+        None => x2,
+    };
+    put(
+        buf,
+        x3,
+        area.y + 1,
+        &format!(" · {}", keys::format_size(open.size_bytes)),
+        theme.style(Token::Muted),
+    );
 
     // TTL is counted down locally: the most time-sensitive figure on screen
     // costs no round trip (R3.9).
@@ -498,7 +522,13 @@ pub fn hint_bar(state: &State) -> String {
     ]
     .into_iter()
     .filter_map(|a| state.keymap.key_for(a).map(|k| (a, k)))
-    .map(|(a, k)| format!("{} {}", key_label(&k), a.label()))
+    .map(|(a, k)| {
+        format!(
+            "{} {}",
+            key_label(&k),
+            a.label_in(state.keys_pane_focused())
+        )
+    })
     .collect::<Vec<_>>()
     .join("   ")
 }

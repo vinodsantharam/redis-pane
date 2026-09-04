@@ -305,23 +305,34 @@ fn key_row(
     }
 
     let kind = keys.kind(i);
+    // A key that vanished between the scan and its metadata fetch. It keeps its
+    // row so nothing below the cursor renumbers, and takes over the dot column
+    // — the same `✕` the Viewer header uses for a deleted open key, so one mark
+    // means one thing at both levels.
+    let gone = keys.is_gone(i);
     // The dot carries the type's hue everywhere a key is listed — DESIGN §5's
     // "consistent everywhere a type appears" — while the TYPE column spells
     // the same fact out in words, which is what keeps it legible with no hue
     // at all. Selection overrides both to the row's single highlight colour,
     // same as every other cell on that row.
-    let dot_style = theme.style(if selected {
-        Token::Selected
-    } else {
-        crate::theme::type_token(kind)
+    let dot_style = theme.style(match (selected, gone) {
+        (true, _) => Token::Selected,
+        (false, true) => Token::Danger,
+        (false, false) => crate::theme::type_token(kind),
     });
-    let dot = if kind.is_some() { "●" } else { PENDING };
+    let dot = match (gone, kind.is_some()) {
+        (true, _) => "✕",
+        (false, true) => "●",
+        (false, false) => PENDING,
+    };
     super::put(buf, area.x + cols.name + indent, y, dot, dot_style);
 
-    let name_style = theme.style(if selected {
-        Token::Selected
-    } else {
-        Token::Text
+    // A gone key's name is history, not something to act on, so it drops to the
+    // same weight as its metadata rather than reading as a live row.
+    let name_style = theme.style(match (selected, gone) {
+        (true, _) => Token::Selected,
+        (false, true) => Token::Muted,
+        (false, false) => Token::Text,
     });
     let meta_style = theme.style(if selected {
         Token::Selected
@@ -355,11 +366,18 @@ fn key_row(
     // Each of these renders a placeholder at the same position when the value
     // has not arrived, so nothing moves when it does.
     if let Some(x) = cols.kind {
-        let text = kind.map_or(PENDING.to_string(), |k| k.label().to_string());
-        let style = theme.style(if selected {
-            Token::Selected
-        } else {
-            crate::theme::type_token(kind)
+        // Without this the TYPE column would fall back to the pending
+        // placeholder, which says "not fetched yet" — the one reading that is
+        // wrong here, because the fetch is exactly what found the key missing.
+        let text = match (gone, kind) {
+            (true, _) => "gone".to_string(),
+            (false, Some(k)) => k.label().to_string(),
+            (false, None) => PENDING.to_string(),
+        };
+        let style = theme.style(match (selected, gone) {
+            (true, _) => Token::Selected,
+            (false, true) => Token::Danger,
+            (false, false) => crate::theme::type_token(kind),
         });
         super::put(buf, area.x + x, y, &text, style);
     }
@@ -368,7 +386,16 @@ fn key_row(
         super::put_right(buf, area.x + x, y, w, &text, meta_style);
     }
     if let Some((x, w)) = cols.ttl {
-        let text = keys.ttl(i).map_or(PENDING.to_string(), format_ttl);
+        // Size is retrospective — "it held 1.1 MB" stays true after a deletion,
+        // and during an incident it is usually the only answer left. A TTL is
+        // future-tense: "expires in 12m" is a claim about a key that is not
+        // there to expire, so it becomes the not-applicable dash instead. Same
+        // glyph the Stream viewer uses for an age it cannot compute.
+        let text = match (gone, keys.ttl(i)) {
+            (true, _) => "—".to_string(),
+            (false, Some(t)) => format_ttl(t),
+            (false, None) => PENDING.to_string(),
+        };
         super::put_right(buf, area.x + x, y, w, &text, meta_style);
     }
 }

@@ -44,11 +44,19 @@ pub struct Layout {
 /// Rows reserved at the top (title) and bottom (hints).
 const TITLE_ROWS: u16 = 2;
 
+/// The narrowest width that still fits two panes.
+///
+/// Named because it is not only a layout fact: below it, [`SinglePaneView`] is
+/// what says which pane a keystroke belongs to, and above it that field is
+/// meaningless. A second copy of this number elsewhere would put the two
+/// answers out of step at exactly one terminal width.
+pub const TWO_PANE_MIN_COLS: u16 = 70;
+
 pub fn layout(area: Rect, single_pane: SinglePaneView) -> Layout {
     let density = match area.width {
         w if w >= 120 => Density::Full,
         w if w >= 90 => Density::NoSize,
-        w if w >= 70 => Density::Tight,
+        w if w >= TWO_PANE_MIN_COLS => Density::Tight,
         _ => Density::Single,
     };
     let hint_bar = area.height >= 24;

@@ -466,10 +466,11 @@ async fn metadata_is_fetched_for_a_window_and_matches_the_server() {
         (2, b"m:list".to_vec()),
         (3, b"m:ttl".to_vec()),
     ];
-    let entries = redis_pane::redis::fetch_metadata(&client, &window)
+    let (entries, gone) = redis_pane::redis::fetch_metadata(&client, &window)
         .await
         .unwrap();
     assert_eq!(entries.len(), 4);
+    assert!(gone.is_empty(), "nothing was deleted: {gone:?}");
 
     use redis_pane_core::state::KeyKind;
     assert_eq!(entries[0].kind, KeyKind::String);
@@ -495,8 +496,10 @@ async fn metadata_is_fetched_for_a_window_and_matches_the_server() {
 
 #[tokio::test]
 #[ignore = "needs docker"]
-async fn a_key_that_vanished_between_scan_and_fetch_is_skipped_not_fatal() {
+async fn a_key_that_vanished_between_scan_and_fetch_is_reported_gone() {
     // The keyspace moves while we walk it, so this is ordinary, not exceptional.
+    // `TYPE` is already on the wire for every visible row, so noticing a
+    // deletion costs no extra round trip and no tracking table (DESIGN §9).
     let (_c, url) = start("redis", "7-alpine").await;
     let writer = Builder::from_config(Config::from_url(&url).unwrap())
         .build()
@@ -506,12 +509,35 @@ async fn a_key_that_vanished_between_scan_and_fetch_is_skipped_not_fatal() {
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
     let window: Vec<(usize, Vec<u8>)> = vec![(0, b"m:here".to_vec()), (1, b"m:gone".to_vec())];
-    let entries = redis_pane::redis::fetch_metadata(&client, &window)
+    let (entries, gone) = redis_pane::redis::fetch_metadata(&client, &window)
         .await
         .unwrap();
 
     assert_eq!(entries.len(), 1, "the surviving key is still reported");
     assert_eq!(entries[0].index, 0);
+    assert_eq!(
+        gone,
+        vec![1],
+        "the missing key is reported by row, not dropped"
+    );
+
+    // And that report has to survive the trip into the core, which is the seam
+    // the unit tests cannot see: they hand `update` a message they wrote
+    // themselves, so a shell that never sends one passes them all. That is
+    // exactly how `Msg::TrackingArmed` went missing for the whole of alpha.2.
+    use redis_pane_core::state::{LoadedSet, State};
+    use redis_pane_core::{Msg, update};
+    let mut keys = LoadedSet::default();
+    keys.push(b"m:here");
+    keys.push(b"m:gone");
+    let mut state = State {
+        keys,
+        ..State::default()
+    };
+    state.rebuild_list();
+    let (state, _) = update(state, Msg::MetadataBatch { entries, gone });
+    assert!(!state.keys.is_gone(0), "the surviving key is untouched");
+    assert!(state.keys.is_gone(1), "the deleted key is tombstoned");
 
     let _ = client.quit().await;
     let _ = writer.quit().await;

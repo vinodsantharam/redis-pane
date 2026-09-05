@@ -162,8 +162,25 @@ pub enum Msg {
         at_ms: u64,
     },
     /// Something was copied. Drives a notice that fades on its own.
+    ///
+    /// The label is owned rather than `&'static str` because a copy that could
+    /// only take part of a value has to say so, and how much it took is not
+    /// known until the copy is built.
     Copied {
-        label: &'static str,
+        label: String,
+        at_ms: u64,
+    },
+    /// The core raised a notice and needs the shell's clock to date it.
+    ///
+    /// `update` is pure and has no clock (ADR-0011), so a notice it raises by
+    /// itself cannot be timestamped where it is written. Two of them were built
+    /// with `at_ms: 0` and were therefore invisible for the life of the
+    /// process: `notice_now` shows a notice for 2.5 seconds, and the shell's
+    /// clock reads epoch milliseconds. The message existed, explained itself,
+    /// and could never appear. Round-tripping through the shell is how every
+    /// other dated fact reaches the core, and it is how these do now.
+    Noticed {
+        text: String,
         at_ms: u64,
     },
     /// Conditions the server reported: replica status, and anything currently

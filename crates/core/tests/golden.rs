@@ -1400,8 +1400,66 @@ fn copying_a_value_with_nothing_open_says_so_instead_of_copying_nothing() {
     state.open = None;
     let (state, _) = press(state, 'y');
     let (state, cmds) = press(state, 'v');
-    assert!(cmds.is_empty());
-    assert_eq!(state.notice_now(0), Some("nothing open to copy"));
+    assert!(
+        !cmds
+            .iter()
+            .any(|c| matches!(c, Command::CopyToClipboard { .. })),
+        "nothing was put on the clipboard"
+    );
+
+    // The notice goes out for the shell to date. This test used to read it at
+    // clock 0 and pass — the one clock reading at which the defect it was
+    // guarding is invisible. The core built the notice with `at_ms: 0`, and
+    // `notice_now` shows a notice for 2.5s against a clock reading epoch
+    // milliseconds, so in the running app the message could never appear:
+    // `y v` with nothing open did nothing at all, forever.
+    let Some(Command::Notify { text }) = cmds.first().cloned() else {
+        panic!("expected a notice, got {cmds:?}");
+    };
+    let (state, _) = update(
+        state,
+        Msg::Noticed {
+            text,
+            at_ms: 73_000,
+        },
+    );
+    assert_eq!(state.notice_now(73_100), Some("nothing open to copy"));
+}
+
+/// The clipboard shows no seams: 500 rows of a 12,000-item list look exactly
+/// like a complete copy once pasted. The Viewer header already states this
+/// about the value; the confirmation has to state it about the copy.
+#[test]
+fn copying_a_windowed_value_says_how_much_it_took() {
+    let windowed = Value::List(IndexedValue {
+        items: (0..500).map(|i| format!("item-{i}")).collect(),
+        total: 12_000,
+    });
+    let state = opened("feed:global:hot", windowed, 600);
+    let (state, _) = press(state, 'y');
+    let (_, cmds) = press(state, 'v');
+
+    let Some(Command::CopyToClipboard { label, text }) = cmds.first() else {
+        panic!("expected a copy, got {cmds:?}");
+    };
+    assert_eq!(
+        label, "value (500 of 12000 items)",
+        "a partial copy that calls itself `value` is a trap"
+    );
+    assert_eq!(text.lines().count(), 500, "and it really is the window");
+}
+
+/// A whole value says nothing extra — the qualifier appears only where there
+/// is something to qualify.
+#[test]
+fn copying_a_complete_value_stays_quiet_about_it() {
+    let state = opened("user:8812:session", hash_value(), 600);
+    let (state, _) = press(state, 'y');
+    let (_, cmds) = press(state, 'v');
+    let Some(Command::CopyToClipboard { label, .. }) = cmds.first() else {
+        panic!("expected a copy");
+    };
+    assert_eq!(label, "value");
 }
 
 #[test]
@@ -1410,7 +1468,7 @@ fn the_confirmation_fades_on_its_own() {
     let (state, _) = update(
         opened("k", hash_value(), 600),
         Msg::Copied {
-            label: "key",
+            label: "key".into(),
             at_ms: 70_000,
         },
     );
@@ -1423,7 +1481,7 @@ fn golden_copy_notice() {
     let (state, _) = update(
         opened("user:8812:session", hash_value(), 2_537),
         Msg::Copied {
-            label: "redis-cli command",
+            label: "redis-cli command".into(),
             at_ms: 73_000,
         },
     );
@@ -1743,7 +1801,7 @@ fn the_banner_is_not_displaced_by_a_copy_confirmation() {
     let (next, _) = update(
         state.clone(),
         Msg::Copied {
-            label: "key",
+            label: "key".into(),
             at_ms: 73_000,
         },
     );

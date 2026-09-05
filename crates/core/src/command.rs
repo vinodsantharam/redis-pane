@@ -65,5 +65,10 @@ pub enum Command {
     ///
     /// The core builds the text; how it reaches a clipboard is the shell's
     /// problem, and over SSH a harder one than it appears.
-    CopyToClipboard { text: String, label: &'static str },
+    CopyToClipboard { text: String, label: String },
+    /// Raise a notice, dated by the shell's clock.
+    ///
+    /// The core has no clock of its own (ADR-0011), so it cannot date a notice
+    /// it raises. This carries the words; the shell supplies the moment.
+    Notify { text: String },
 }

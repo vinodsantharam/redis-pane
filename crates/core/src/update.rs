@@ -262,6 +262,10 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             state.notice = Some((format!("copied {label}"), at_ms));
             (state, Vec::new())
         }
+        Msg::Noticed { text, at_ms } => {
+            state.notice = Some((text, at_ms));
+            (state, Vec::new())
+        }
         Msg::ServerState {
             read_only,
             condition,
@@ -552,7 +556,7 @@ fn group_prefix_at(state: &State, row: usize) -> Option<String> {
 /// `y y` copies the key, `y v` the value, `y c` a `redis-cli` command. Anything
 /// else cancels — an unrecognised second key should do nothing rather than
 /// guess, because the clipboard is somewhere the user cannot see.
-fn copy_key(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
+fn copy_key(state: State, key: KeyPress) -> (State, Vec<Command>) {
     let what = match key.code {
         KeyCode::Char('y') | KeyCode::Char('k') => CopyWhat::Key,
         KeyCode::Char('v') => CopyWhat::Value,
@@ -563,37 +567,44 @@ fn copy_key(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
     // The key name is copyable from the list alone; the other two need an open
     // value, because there is nothing to copy until the server has said what it
     // holds (ADR-0006).
+    let nothing_open = || {
+        vec![Command::Notify {
+            text: "nothing open to copy".into(),
+        }]
+    };
+    let mut label = what.label().to_string();
     let text = match what {
         CopyWhat::Key => match state.open.as_ref().map(|o| o.name.clone()) {
             Some(name) => name,
             None => match state.selected_key().and_then(|i| state.keys.name_str(i)) {
                 Some(name) => name.into_owned(),
-                None => return (state, Vec::new()),
+                None => return (state, nothing_open()),
             },
         },
         CopyWhat::Value => match &state.open {
-            Some(open) => value_text(&open.value, open.read_at_ms),
-            None => {
-                state.notice = Some(("nothing open to copy".into(), 0));
-                return (state, Vec::new());
+            Some(open) => {
+                // A windowed read brought back a slice, and the clipboard shows
+                // no seams: 500 rows of a 12,000-item list look exactly like a
+                // complete copy once pasted. The Viewer header already states
+                // this fact about the same value (`12,000 items · 500 shown`);
+                // the confirmation states it about the copy, in the same words,
+                // rather than saying `copied value` and leaving the paste
+                // buffer to be discovered as a prefix later.
+                let viewer = open.value.viewer();
+                if let Some(shown) = viewer.window() {
+                    label = format!("{label} ({shown} of {})", viewer.measure());
+                }
+                value_text(&open.value, open.read_at_ms)
             }
+            None => return (state, nothing_open()),
         },
         CopyWhat::Command => match &state.open {
             Some(open) => redis_cli_command(&state.connection.target, open),
-            None => {
-                state.notice = Some(("nothing open to copy".into(), 0));
-                return (state, Vec::new());
-            }
+            None => return (state, nothing_open()),
         },
     };
 
-    (
-        state,
-        vec![Command::CopyToClipboard {
-            text,
-            label: what.label(),
-        }],
-    )
+    (state, vec![Command::CopyToClipboard { text, label }])
 }
 
 /// Keys typed while the filter is capturing.

@@ -302,18 +302,41 @@ pub async fn run(
                 }
                 Command::CopyToClipboard { text, label } => {
                     let truncated = crate::clipboard::was_truncated(&text);
-                    if crate::clipboard::copy(&text).is_ok() {
-                        // Redraw from scratch: the escape sequence went to the
-                        // same stdout ratatui is drawing on.
-                        let _ = term.clear();
-                        let at_ms = clock.now_ms();
-                        let label = if truncated {
-                            "value (truncated)"
-                        } else {
-                            label
-                        };
-                        let _ = tx.send(Msg::Copied { label, at_ms }).await;
+                    // Redraw from scratch either way: the escape sequence went
+                    // to the same stdout ratatui is drawing on.
+                    let result = crate::clipboard::copy(&text);
+                    let _ = term.clear();
+                    let at_ms = clock.now_ms();
+                    match result {
+                        Ok(()) => {
+                            let label = if truncated {
+                                format!("{label}, truncated")
+                            } else {
+                                label
+                            };
+                            let _ = tx.send(Msg::Copied { label, at_ms }).await;
+                        }
+                        // A copy that failed used to produce nothing at all —
+                        // no notice, no error — which is indistinguishable from
+                        // one that worked, and leaves the reader pasting
+                        // whatever was on the clipboard before (R7.4). OSC 52
+                        // can still be dropped by the terminal without telling
+                        // anyone; that is a limit of the protocol. This is the
+                        // half we can see.
+                        Err(e) => {
+                            let _ = tx
+                                .send(Msg::Failed {
+                                    command: "copying to the clipboard".into(),
+                                    detail: e.to_string(),
+                                    at_ms,
+                                })
+                                .await;
+                        }
                     }
+                }
+                Command::Notify { text } => {
+                    let at_ms = clock.now_ms();
+                    let _ = tx.send(Msg::Noticed { text, at_ms }).await;
                 }
                 // Reconnection wiring lands with M2.
                 Command::Reconnect { .. } => {}

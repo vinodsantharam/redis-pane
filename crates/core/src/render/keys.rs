@@ -12,6 +12,7 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
+use crate::clock::Clock;
 use crate::state::loaded::TTL_NONE;
 use crate::state::{LoadedSet, State};
 use crate::theme::{Theme, Token};
@@ -134,6 +135,7 @@ pub enum OpenRowMark {
 pub fn render(
     state: &State,
     theme: &Theme,
+    clock: &dyn Clock,
     area: Rect,
     density: Density,
     buf: &mut Buffer,
@@ -141,6 +143,10 @@ pub fn render(
     if area.width < 8 || area.height < 2 {
         return OpenRowMark::None;
     }
+    // Read once per frame, not once per row: `LoadedSet::ttl_now` is what
+    // turns each row's TTL into a countdown (R3.9, extended here from the
+    // Viewer), and every visible row this frame should read the same instant.
+    let now_s = (clock.now_ms() / 1000) as u32;
     let cols = Columns::for_pane(area.width, density);
     let mut y = area.y;
 
@@ -207,6 +213,7 @@ pub fn render(
                 area,
                 cols,
                 at,
+                now_s,
                 buf,
             );
         } else if let Some(i) = state.list.index_at(display_row) {
@@ -220,6 +227,7 @@ pub fn render(
                 cols,
                 at,
                 0,
+                now_s,
                 buf,
             );
         }
@@ -278,6 +286,7 @@ fn tree_row(
     area: Rect,
     cols: Columns,
     y: u16,
+    now_s: u32,
     buf: &mut Buffer,
 ) {
     use crate::state::tree::Row;
@@ -339,6 +348,7 @@ fn tree_row(
             cols,
             y,
             depth * 2,
+            now_s,
             buf,
         ),
         None => {}
@@ -375,6 +385,7 @@ fn key_row(
     cols: Columns,
     y: u16,
     indent: u16,
+    now_s: u32,
     buf: &mut Buffer,
 ) {
     if selected {
@@ -474,7 +485,10 @@ fn key_row(
         // future-tense: "expires in 12m" is a claim about a key that is not
         // there to expire, so it becomes the not-applicable dash instead. Same
         // glyph the Stream viewer uses for an age it cannot compute.
-        let text = match (gone, keys.ttl(i)) {
+        // Counted down from when it was read, the same trick the Viewer's TTL
+        // already does (R3.9) — the column is a countdown now, not a snapshot
+        // that only moves on the next rescan.
+        let text = match (gone, keys.ttl_now(i, now_s)) {
             (true, _) => "—".to_string(),
             (false, Some(t)) => format_ttl(t),
             (false, None) => PENDING.to_string(),

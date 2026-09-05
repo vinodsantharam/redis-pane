@@ -97,7 +97,7 @@ recover on its own.
 Proves: the keyspace is legible, the values keep their shape, and the screen is never lying about
 how current it is.
 
-**Progress: complete.** The Loaded set holds a million keys in 36MB, the keyspace source
+**Progress: complete.** The Loaded set holds a million keys in 40MB, the keyspace source
 streams and cancels against a real server, the browser renders at every breakpoint with metadata
 filling in behind placeholders that hold their column, filter, tree and sort all work by
 permuting an index vector rather than touching the arena, and every Redis type renders behind one

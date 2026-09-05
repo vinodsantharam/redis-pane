@@ -25,6 +25,13 @@ fn issue_read(state: &mut State) -> ReadToken {
     state.read_token
 }
 
+/// The epoch-seconds reading [`crate::state::loaded::LoadedSet::set_ttl`]
+/// stores, from the epoch-milliseconds a `Msg` carries. One place to do this
+/// conversion rather than two, so both cannot quietly disagree about it.
+fn epoch_secs(at_ms: u64) -> u32 {
+    (at_ms / 1000) as u32
+}
+
 pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
     match msg {
         Msg::Key(key) => key_press(state, key),
@@ -135,12 +142,17 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             (state, Vec::new())
         }
         Msg::ScanBatch { keys } => scan_batch(state, keys),
-        Msg::MetadataBatch { entries, gone } => {
+        Msg::MetadataBatch {
+            entries,
+            gone,
+            at_ms,
+        } => {
+            let read_at_s = epoch_secs(at_ms);
             let open_index = state.open.as_ref().and_then(|open| open.index);
             let mut row_says_alive = false;
             for e in entries {
                 state.keys.set_kind(e.index, e.kind);
-                state.keys.set_ttl(e.index, e.ttl_seconds);
+                state.keys.set_ttl(e.index, e.ttl_seconds, read_at_s);
                 state.keys.set_size(e.index, e.size_bytes);
                 row_says_alive |= Some(e.index) == open_index;
             }
@@ -231,7 +243,7 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
                 && state.keys.name(index) == Some(name.as_bytes())
             {
                 state.keys.set_kind(index, value.kind());
-                state.keys.set_ttl(index, ttl_seconds);
+                state.keys.set_ttl(index, ttl_seconds, epoch_secs(at_ms));
                 state.keys.set_size(index, size_bytes);
             }
             match &mut state.open {
@@ -2503,6 +2515,7 @@ mod metadata_tests {
                     size_bytes: 64,
                 }],
                 gone: Vec::new(),
+                at_ms: 1_000,
             },
         );
         assert!(
@@ -2544,6 +2557,7 @@ mod metadata_tests {
             Msg::MetadataBatch {
                 entries: Vec::new(),
                 gone: vec![3],
+                at_ms: 1_000,
             },
         );
         assert!(
@@ -2683,6 +2697,7 @@ mod metadata_tests {
                     size_bytes: 2_150,
                 }],
                 gone: Vec::new(),
+                at_ms: 1_000,
             },
         );
         assert_eq!(state.keys.kind(2), Some(KeyKind::Hash));
@@ -2707,6 +2722,7 @@ mod metadata_tests {
             Msg::MetadataBatch {
                 entries,
                 gone: Vec::new(),
+                at_ms: 1_000,
             },
         );
         assert!(
@@ -2731,6 +2747,7 @@ mod metadata_tests {
             Msg::MetadataBatch {
                 entries,
                 gone: Vec::new(),
+                at_ms: 1_000,
             },
         );
 

@@ -99,6 +99,14 @@ pub struct LoadedSet {
     lens: Vec<u16>,
     kinds: Vec<u8>,
     ttls: Vec<i32>,
+    /// Epoch seconds when this row's TTL was read — what makes it a countdown
+    /// rather than a snapshot (R3.9's rule, extended from the Viewer to here).
+    /// Seconds, not milliseconds: nothing this row ever displays is finer than
+    /// a whole second, and it halves the cost of the array. No sentinel is
+    /// needed for "not yet fetched" — `ttl()` already answers that from
+    /// `ttls`, and `ttl_now()` never consults this array unless `ttl()` first
+    /// returned a real value, so an unused slot's contents are never read.
+    ttl_read_at: Vec<u32>,
     sizes: Vec<u32>,
     cap: usize,
     capped: bool,
@@ -118,6 +126,7 @@ impl LoadedSet {
             lens: Vec::new(),
             kinds: Vec::new(),
             ttls: Vec::new(),
+            ttl_read_at: Vec::new(),
             sizes: Vec::new(),
             cap,
             capped: false,
@@ -160,6 +169,7 @@ impl LoadedSet {
         self.arena.extend_from_slice(name);
         self.kinds.push(0);
         self.ttls.push(TTL_UNKNOWN);
+        self.ttl_read_at.push(0);
         self.sizes.push(SIZE_UNKNOWN);
         true
     }
@@ -223,9 +233,13 @@ impl LoadedSet {
         }
     }
 
-    /// TTL in seconds. `None` means not yet fetched; `Some(TTL_NONE)` means the
-    /// key has no expiry. The distinction matters: one is a gap in what we
-    /// know, the other is a fact about the key.
+    /// TTL as of the moment it was read. `None` means not yet fetched;
+    /// `Some(TTL_NONE)` means the key has no expiry. The distinction matters:
+    /// one is a gap in what we know, the other is a fact about the key.
+    ///
+    /// This is the raw, unmoving number — sorting reads this, never
+    /// [`LoadedSet::ttl_now`], so sort-by-TTL does not re-shuffle rows once a
+    /// second as countdowns cross each other. For display, see `ttl_now`.
     pub fn ttl(&self, i: usize) -> Option<i32> {
         match self.ttls.get(i).copied() {
             Some(TTL_UNKNOWN) | None => None,
@@ -233,9 +247,35 @@ impl LoadedSet {
         }
     }
 
-    pub fn set_ttl(&mut self, i: usize, seconds: i32) {
+    /// TTL counted down locally from when it was read, the same trick
+    /// [`crate::state::open::OpenKey::ttl_now`] already does for the Viewer
+    /// (R3.9), extended here so the keys pane's column is a countdown too
+    /// rather than a snapshot that only moves on a rescan.
+    ///
+    /// `now_s` is epoch seconds, matching how `read_at_s` was stored — one
+    /// clock reading per frame, converted once by the caller rather than
+    /// twice here.
+    pub fn ttl_now(&self, i: usize, now_s: u32) -> Option<i32> {
+        let seconds = self.ttl(i)?;
+        if seconds < 0 {
+            // No expiry: nothing to count down, and TTL_UNKNOWN is already
+            // excluded by `ttl()` above, so this is only ever TTL_NONE.
+            return Some(seconds);
+        }
+        let read_at = *self.ttl_read_at.get(i)?;
+        let elapsed = now_s.saturating_sub(read_at);
+        Some((seconds as i64 - elapsed as i64).max(0) as i32)
+    }
+
+    /// Set a key's TTL and the moment it was read, together. One call rather
+    /// than two, so the countdown this enables cannot start from the wrong
+    /// moment because a caller updated one array and forgot the other.
+    pub fn set_ttl(&mut self, i: usize, seconds: i32, read_at_s: u32) {
         if let Some(slot) = self.ttls.get_mut(i) {
             *slot = seconds;
+        }
+        if let Some(slot) = self.ttl_read_at.get_mut(i) {
+            *slot = read_at_s;
         }
     }
 
@@ -282,6 +322,7 @@ impl LoadedSet {
             + self.lens.capacity() * 2
             + self.kinds.capacity()
             + self.ttls.capacity() * 4
+            + self.ttl_read_at.capacity() * 4
             + self.sizes.capacity() * 4
     }
 }
@@ -336,8 +377,56 @@ mod tests {
         // "there is no TTL" must not render the same way.
         let mut s = set_of(&["k"]);
         assert_eq!(s.ttl(0), None, "not yet fetched");
-        s.set_ttl(0, TTL_NONE);
+        s.set_ttl(0, TTL_NONE, 0);
         assert_eq!(s.ttl(0), Some(TTL_NONE), "fetched, and there is no expiry");
+    }
+
+    // ── ttl_now: the keys pane's countdown (R3.9, extended from the Viewer) ──
+    //
+    // The same four cases `OpenKey::ttl_now`'s own suite already covers,
+    // because this is that function's formula, copied rather than reinvented.
+
+    #[test]
+    fn ttl_now_counts_down_from_when_it_was_read() {
+        let mut s = set_of(&["k"]);
+        s.set_ttl(0, 600, 10_000);
+        assert_eq!(s.ttl_now(0, 10_000), Some(600), "no time has passed yet");
+        assert_eq!(s.ttl_now(0, 10_060), Some(540), "a minute later");
+    }
+
+    #[test]
+    fn ttl_now_clamps_at_zero_rather_than_going_negative() {
+        let mut s = set_of(&["k"]);
+        s.set_ttl(0, 600, 10_000);
+        assert_eq!(s.ttl_now(0, 999_999_999), Some(0));
+    }
+
+    #[test]
+    fn ttl_now_passes_a_no_expiry_key_through_unchanged() {
+        let mut s = set_of(&["k"]);
+        s.set_ttl(0, TTL_NONE, 10_000);
+        assert_eq!(
+            s.ttl_now(0, 999_999_999),
+            Some(TTL_NONE),
+            "∞ does not count down"
+        );
+    }
+
+    #[test]
+    fn ttl_now_is_none_for_a_row_never_fetched() {
+        let s = set_of(&["k"]);
+        assert_eq!(s.ttl_now(0, 10_000), None);
+    }
+
+    #[test]
+    fn a_gone_row_is_unaffected_by_ttl_now() {
+        // `set_gone` keeps the last-known TTL and read time; `render/keys.rs`
+        // never calls `ttl_now` for a gone row (it shows `—` unconditionally),
+        // but the accessor itself must not panic or misbehave if it is.
+        let mut s = set_of(&["k"]);
+        s.set_ttl(0, 600, 10_000);
+        s.set_gone(0);
+        assert_eq!(s.ttl_now(0, 10_060), Some(540));
     }
 
     #[test]
@@ -376,7 +465,7 @@ mod tests {
         s.push(b"a");
         s.push(b"b");
         s.set_kind(0, KeyKind::Hash);
-        s.set_ttl(0, 90);
+        s.set_ttl(0, 90, 0);
         s.set_size(0, 4_096);
         let before = s.heap_bytes();
 

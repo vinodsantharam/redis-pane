@@ -23,7 +23,7 @@ pub fn frame(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect) -> Buf
     let plan = layout::layout(area, state.focus, state.split_adjust);
     title_bar(state, theme, clock, area, &mut buf);
 
-    let open_row = keys::render(state, theme, plan.keys, plan.density, &mut buf);
+    let open_row = keys::render(state, theme, clock, plan.keys, plan.density, &mut buf);
     if let Some(value) = plan.value {
         // Standalone below 70 columns: the value fills the whole pane with no
         // adjacent keys pane to separate from, and the list it came from is

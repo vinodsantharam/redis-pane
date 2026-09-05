@@ -62,9 +62,13 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             (state, commands)
         }
         Msg::ConnectionLost => {
+            // No countdown: nothing has scheduled a retry yet, and the shell
+            // may never schedule one. The header shows the Read age instead,
+            // which is the fact ADR-0009 actually asks for in this state and
+            // the only one that is true.
             state.link = Link::Reconnecting {
                 attempt: 1,
-                retry_in_ms: 0,
+                retry_in_ms: None,
             };
             (state, vec![Command::Reconnect { after_ms: 0 }])
         }
@@ -74,7 +78,7 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
         } => {
             state.link = Link::Reconnecting {
                 attempt,
-                retry_in_ms,
+                retry_in_ms: Some(retry_in_ms),
             };
             (
                 state,
@@ -1082,7 +1086,7 @@ mod liveness_invariants {
             s.link,
             Link::Reconnecting {
                 attempt: 3,
-                retry_in_ms: 4_000
+                retry_in_ms: Some(4_000)
             }
         );
         assert_eq!(cmds, vec![Command::Reconnect { after_ms: 4_000 }]);
@@ -1097,7 +1101,7 @@ mod liveness_invariants {
             (
                 Link::Reconnecting {
                     attempt: 1,
-                    retry_in_ms: 0,
+                    retry_in_ms: None,
                 },
                 Liveness::Disconnected,
             ),

@@ -563,23 +563,30 @@ pub fn status_readout(state: &State, clock: &dyn Clock) -> Vec<(String, Token)> 
         },
     ));
 
-    // Anything short of live owes the reader a fact and a way to act. While
-    // reconnecting, the useful fact is when the next attempt happens: ADR-0009
-    // requires the backoff be visible, because a silent wait is a freeze
-    // wearing a different name.
+    // Anything short of live owes the reader a fact. While a retry is actually
+    // scheduled the useful one is when it lands: ADR-0009 requires the backoff
+    // be visible, because a silent wait is a freeze wearing a different name.
+    // With nothing scheduled the useful one is the Read age — the same fact
+    // every other not-live state shows, and the one ADR-0009 names for a
+    // dropped link. A countdown here would describe a schedule that does not
+    // exist, which is the opposite of what that requirement is for.
     match &state.link {
-        Link::Reconnecting { retry_in_ms, .. } => {
-            out.push((
-                format!(" · retry {}s", retry_in_ms.div_ceil(1000)),
-                Token::Muted,
-            ));
+        Link::Reconnecting {
+            retry_in_ms: Some(ms),
+            ..
+        } => {
+            out.push((format!(" · retry {}s", ms.div_ceil(1000)), Token::Muted));
         }
         _ if liveness != Liveness::Live => {
             out.push((format!(" · {}", read_age(state, clock)), Token::Muted));
         }
         _ => {}
     }
-    if liveness != Liveness::Live
+    // Offer `r` only where it can do something. Disconnected, a Refetch reads a
+    // dead client and returns an error — the same reason a replica reads
+    // `locked` rather than advertising `⌃R`: a key that cannot work is worse
+    // than no key, because the reader spends the incident pressing it.
+    if liveness == Liveness::Manual
         && let Some(hint) = state.keymap.hint(Action::Refetch)
     {
         out.push((format!("  {hint}"), Token::Muted));

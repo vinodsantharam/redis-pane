@@ -234,7 +234,17 @@ fn golden_title_bar_readouts() {
             State {
                 link: Link::Reconnecting {
                     attempt: 2,
-                    retry_in_ms: 4_000,
+                    retry_in_ms: None,
+                },
+                ..base()
+            },
+        ),
+        (
+            "connection lost, a retry scheduled",
+            State {
+                link: Link::Reconnecting {
+                    attempt: 2,
+                    retry_in_ms: Some(4_000),
                 },
                 ..base()
             },
@@ -331,12 +341,36 @@ fn live_states_no_age_manual_states_one_and_reconnecting_states_the_countdown() 
     });
     assert!(manual.contains("read 14s ago"), "{manual}");
 
-    // Reconnecting, the useful fact is when the next attempt lands (ADR-0009):
-    // a backoff nobody can see is a freeze wearing a different name.
+    // A dropped link with nothing scheduled — the state the app actually
+    // reaches today, since `Command::Reconnect` is not wired until M2. It shows
+    // the Read age, which is what ADR-0009 asks for and what is true. This test
+    // used to assert `retry 4s` here, from a state the running app could not
+    // produce: a fixture keeping a promise the code never made.
+    let dropped = readout(&State {
+        link: Link::Reconnecting {
+            attempt: 1,
+            retry_in_ms: None,
+        },
+        ..base()
+    });
+    assert!(dropped.contains("read 14s ago"), "{dropped}");
+    assert!(
+        !dropped.contains("retry"),
+        "no countdown for a retry nobody scheduled: {dropped}"
+    );
+    assert!(
+        dropped.trim_end().ends_with("ago"),
+        "nothing after the age — no Refetch key offered, since it would only \
+         read a dead client: {dropped}"
+    );
+
+    // Once a retry really is scheduled the countdown is the useful fact
+    // (ADR-0009): a backoff nobody can see is a freeze wearing a different
+    // name. Only `Msg::ReconnectScheduled` can reach this.
     let retrying = readout(&State {
         link: Link::Reconnecting {
             attempt: 2,
-            retry_in_ms: 4_000,
+            retry_in_ms: Some(4_000),
         },
         ..base()
     });

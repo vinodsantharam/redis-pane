@@ -136,7 +136,16 @@ pub enum Link {
     /// last read value; it never exits.
     Reconnecting {
         attempt: u32,
-        retry_in_ms: u64,
+        /// When the next attempt lands — `None` when no attempt is scheduled.
+        ///
+        /// An `Option` rather than a `u64`, so a countdown cannot be rendered
+        /// for a retry nobody arranged. It used to be a bare number that
+        /// `ConnectionLost` set to `0`, and the header read
+        /// `✕ disconnected · retry 0s` for the rest of the session while
+        /// nothing was retrying and nothing ever would — a promise of
+        /// self-healing that never arrives, which is worse than saying
+        /// nothing. Only [`crate::Msg::ReconnectScheduled`] can fill this in.
+        retry_in_ms: Option<u64>,
     },
 }
 

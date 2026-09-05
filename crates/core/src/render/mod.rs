@@ -64,6 +64,74 @@ fn value_pane(
     if area.height == 0 || area.width < 6 {
         return;
     }
+
+    let Some(open) = &state.open else {
+        solid_divider(buf, area, standalone, theme);
+        let label = if state.tree_mode && state.row_count() > 0 {
+            "a group is selected"
+        } else if state.row_count() > 0 {
+            "→ to open"
+        } else {
+            "no key selected"
+        };
+        put(buf, area.x + 1, area.y, label, theme.style(Token::Muted));
+        return;
+    };
+
+    // A key confirmed gone before it was ever loaded — arrowed onto directly,
+    // or requested while a different key was open. No value was ever read,
+    // so there is nothing behind a type line, a size, a TTL, or even the
+    // attachment disclosure below (which answers "is this pane about the row
+    // you're on", a question that presupposes there is a pane's worth of
+    // content to be about). One line: the name, and that it does not exist.
+    //
+    // Deliberately distinct from a key that *was* loaded and is deleted while
+    // open — that key keeps its last value and the full header below, because
+    // ADR-0006's "what was in it" question still has an answer for it. This
+    // one never had one.
+    let Some(value) = &open.value else {
+        solid_divider(buf, area, standalone, theme);
+        if standalone {
+            let hint = state
+                .keymap
+                .hint(crate::keymap::Action::Cancel)
+                .unwrap_or_default();
+            let x1 = put(
+                buf,
+                area.x + 1,
+                area.y,
+                &format!("{hint} back"),
+                theme.style(Token::Muted),
+            );
+            let x1 = put(buf, x1, area.y, "  ·  ", theme.style(Token::Border));
+            put(buf, x1, area.y, &open.name, theme.style(Token::Text));
+            put(
+                buf,
+                area.x + 1,
+                area.y + 1,
+                "✕ gone",
+                theme.style(Token::Danger),
+            );
+        } else {
+            put(
+                buf,
+                area.x + 1,
+                area.y,
+                &open.name,
+                theme.style(Token::Text),
+            );
+            put_right(
+                buf,
+                area.x,
+                area.y,
+                area.width.saturating_sub(1),
+                "✕ gone",
+                theme.style(Token::Danger),
+            );
+        }
+        return;
+    };
+
     // Is this pane showing the key the cursor is on?
     let attachment = state.attachment();
     let detached = !matches!(attachment, None | Some(Attachment::Attached));
@@ -115,18 +183,6 @@ fn value_pane(
             _ => 0,
         };
     }
-
-    let Some(open) = &state.open else {
-        let label = if state.tree_mode && state.row_count() > 0 {
-            "a group is selected"
-        } else if state.row_count() > 0 {
-            "→ to open"
-        } else {
-            "no key selected"
-        };
-        put(buf, area.x + 1, area.y, label, sty(Token::Muted));
-        return;
-    };
 
     // ── header: identical for every type (R3.1) ────────────────────────────
     let now = clock.now_ms();
@@ -182,8 +238,8 @@ fn value_pane(
         }
     }
 
-    let viewer = open.value.viewer();
-    let kind = open.value.kind();
+    let viewer = value.viewer();
+    let kind = value.kind();
     // Consistent everywhere a type appears (DESIGN §5): the same hue the keys
     // pane's dot uses, here on the one word that names the type.
     let x1 = put(
@@ -314,6 +370,21 @@ fn value_pane(
                 }),
             );
         }
+    }
+}
+
+/// The plain rule between the panes, with none of the dashing or the tie
+/// glyph the attachment disclosure draws — for the two value-pane states that
+/// precede it and have nothing to disclose: no key open, and a key confirmed
+/// gone before it was ever loaded. Nothing to separate from when this pane is
+/// the whole screen.
+fn solid_divider(buf: &mut Buffer, area: Rect, standalone: bool, theme: &Theme) {
+    if standalone {
+        return;
+    }
+    let x = area.x.saturating_sub(1);
+    for y in 0..area.height {
+        put(buf, x, area.y + y, "│", theme.style(Token::Border));
     }
 }
 

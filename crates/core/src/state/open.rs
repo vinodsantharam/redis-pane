@@ -98,7 +98,12 @@ pub struct OpenKey {
     /// cursor never changes it, so the render path needs no reverse lookup.
     pub row: Option<usize>,
     pub name: String,
-    pub value: Value,
+    /// `None` means exactly one thing: no value has ever been read for this
+    /// key. That is a real, distinct state from "read, then deleted" — a key
+    /// requested and found gone before ever loading has no "what was in it"
+    /// to preserve, so there is nothing here to fake a placeholder for.
+    /// [`OpenKey::gone`] is the only way to construct one.
+    pub value: Option<Value>,
     pub ttl_seconds: i32,
     pub size_bytes: u32,
     /// Clock reading at the last completed read. Drives the TTL countdown and
@@ -134,7 +139,7 @@ impl OpenKey {
             index,
             row: None,
             name,
-            value,
+            value: Some(value),
             ttl_seconds,
             size_bytes,
             read_at_ms: at_ms,
@@ -143,6 +148,33 @@ impl OpenKey {
             editing: false,
             pending: None,
             deleted_at_ms: None,
+            last_read: ReadOutcome::Opened,
+        }
+    }
+
+    /// A key that was requested and confirmed gone before it was ever loaded.
+    ///
+    /// Distinct from a key that *was* loaded and then deleted while open —
+    /// that case keeps its last value (`value: Some(_)`) because ADR-0006's
+    /// "what was in it" question still has an answer. This one never had a
+    /// value to preserve, so it does not get one: `value: None`, and the
+    /// Viewer renders that as a single line — the name, and that it is gone —
+    /// rather than reaching for chrome that describes a value that was never
+    /// read.
+    pub fn gone(index: Option<usize>, name: String, at_ms: u64) -> Self {
+        Self {
+            index,
+            row: None,
+            name,
+            value: None,
+            ttl_seconds: -1,
+            size_bytes: 0,
+            read_at_ms: at_ms,
+            offset: 0,
+            at_rest: true,
+            editing: false,
+            pending: None,
+            deleted_at_ms: Some(at_ms),
             last_read: ReadOutcome::Opened,
         }
     }
@@ -164,17 +196,22 @@ impl OpenKey {
     pub const OUTCOME_MS: u64 = 2_500;
 
     /// Take an update, applying it or holding it.
+    ///
+    /// Works the same way whether or not there was a previous value: a key
+    /// that was gone and has since been recreated has nothing to compare
+    /// against, so `None` is unambiguously `Updated` rather than a special
+    /// case — there is no prior value for the new one to be "unchanged" from.
     pub fn absorb(&mut self, value: Value, ttl_seconds: i32, size_bytes: u32, at_ms: u64) {
         if self.may_apply() {
             // Recorded before the move, and only where the value actually
             // reaches the screen — a held update has not changed anything the
             // reader can see, and `pending` is what speaks for it.
-            self.last_read = if self.value == value {
+            self.last_read = if self.value.as_ref() == Some(&value) {
                 ReadOutcome::Unchanged { at_ms }
             } else {
                 ReadOutcome::Updated { at_ms }
             };
-            self.value = value;
+            self.value = Some(value);
             self.ttl_seconds = ttl_seconds;
             self.size_bytes = size_bytes;
             self.read_at_ms = at_ms;
@@ -193,12 +230,12 @@ impl OpenKey {
     /// Apply a held update, when the reader asks for it.
     pub fn take_pending(&mut self) {
         if let Some(p) = self.pending.take() {
-            self.last_read = if self.value == p.value {
+            self.last_read = if self.value.as_ref() == Some(&p.value) {
                 ReadOutcome::Unchanged { at_ms: p.at_ms }
             } else {
                 ReadOutcome::Updated { at_ms: p.at_ms }
             };
-            self.value = p.value;
+            self.value = Some(p.value);
             self.ttl_seconds = p.ttl_seconds;
             self.size_bytes = p.size_bytes;
             self.read_at_ms = p.at_ms;
@@ -295,7 +332,7 @@ mod tests {
     fn at_rest_an_update_simply_lands_and_the_header_says_it_did() {
         let mut k = open();
         k.absorb(pair("v2"), 500, 120, 12_000);
-        assert_eq!(k.value, pair("v2"));
+        assert_eq!(k.value, Some(pair("v2")));
         assert!(k.pending.is_none());
         // This used to assert a bare `● live`, which is what made a landed
         // update and an hour of silence render identically.
@@ -315,7 +352,7 @@ mod tests {
         let before = k.currency(false, 12_000);
         k.absorb(pair("v1"), 600, 100, 12_000);
 
-        assert_eq!(k.value, pair("v1"), "nothing changed, correctly");
+        assert_eq!(k.value, Some(pair("v1")), "nothing changed, correctly");
         assert_eq!(k.currency(false, 12_000), "○ manual · unchanged");
         assert_ne!(
             k.currency(false, 12_000),
@@ -361,12 +398,12 @@ mod tests {
         k.at_rest = false;
         k.absorb(pair("v2"), 500, 120, 12_000);
 
-        assert_eq!(k.value, pair("v1"), "nothing moved under the reader");
+        assert_eq!(k.value, Some(pair("v1")), "nothing moved under the reader");
         assert!(k.pending.is_some());
         assert_eq!(k.currency(true, 14_000), "● live · changed 2s ago");
 
         k.take_pending();
-        assert_eq!(k.value, pair("v2"), "and it lands when asked for");
+        assert_eq!(k.value, Some(pair("v2")), "and it lands when asked for");
     }
 
     #[test]
@@ -375,7 +412,7 @@ mod tests {
         let mut k = open();
         k.editing = true;
         k.absorb(pair("v2"), 500, 120, 12_000);
-        assert_eq!(k.value, pair("v1"));
+        assert_eq!(k.value, Some(pair("v1")));
         assert_eq!(k.currency(true, 12_000), "✎ editing · changed · held");
     }
 
@@ -384,7 +421,7 @@ mod tests {
         let mut k = open();
         k.deleted_at_ms = Some(12_000);
         assert_eq!(k.currency(true, 15_000), "✕ deleted 3s ago");
-        assert_eq!(k.value, pair("v1"), "the evidence survives");
+        assert_eq!(k.value, Some(pair("v1")), "the evidence survives");
     }
 
     #[test]
@@ -430,7 +467,7 @@ mod tests {
         );
         // One value, replaced wholesale by a read. There is no map from key
         // name to value anywhere in this type (ADR-0006).
-        assert_eq!(k.value.viewer().row_count(), 1);
+        assert_eq!(k.value.unwrap().viewer().row_count(), 1);
     }
 }
 

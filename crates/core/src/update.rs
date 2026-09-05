@@ -134,17 +134,45 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
         }
         Msg::ScanBatch { keys } => scan_batch(state, keys),
         Msg::MetadataBatch { entries, gone } => {
+            let open_index = state.open.as_ref().and_then(|open| open.index);
+            let mut row_says_alive = false;
             for e in entries {
                 state.keys.set_kind(e.index, e.kind);
                 state.keys.set_ttl(e.index, e.ttl_seconds);
                 state.keys.set_size(e.index, e.size_bytes);
+                row_says_alive |= Some(e.index) == open_index;
             }
             // A deleted key keeps its row and its last-known TTL and size; only
             // the type byte gives way to the tombstone. Removing the row would
             // renumber everything below the cursor between one frame and the
             // next, which is a worse lie than a row that says it is gone.
+            let mut row_says_gone = false;
             for index in gone {
                 state.keys.set_gone(index);
+                row_says_gone |= Some(index) == open_index;
+            }
+
+            // 958b311 taught the row what the Viewer knew. This is the other
+            // direction, which it did not cover: a tombstoned row has no type,
+            // so it matches `rows_needing_metadata` forever and the next cursor
+            // move refetches it — and a key that was deleted and then written
+            // again came back to `● string 64 B ∞` in the list while the Viewer
+            // still read `✕ deleted 40s ago`. With tracking off nothing ever
+            // corrected it, and the list is the more believable of the two
+            // because it is the one that looks untouched.
+            //
+            // Both directions of the disagreement are resolved the same way,
+            // and not by copying one pane's opinion onto the other: ask the
+            // server. The read path already dates its own answer and re-arms
+            // tracking (ADR-0006), so whichever pane was wrong is corrected by
+            // evidence rather than by inference.
+            let viewer_says_gone = state
+                .open
+                .as_ref()
+                .is_some_and(|open| open.deleted_at_ms.is_some());
+            if (row_says_alive && viewer_says_gone) || (row_says_gone && !viewer_says_gone) {
+                let token = issue_read(&mut state);
+                return (state, vec![Command::RefetchOpenKey { token }]);
             }
             (state, Vec::new())
         }
@@ -406,28 +434,35 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             (state, Vec::new())
         }
         Action::Refetch => {
-            // `r` is a scoped Refetch, not a global refresh. When an update is
-            // already waiting, it applies that instead of asking the server for
-            // something it has already been told. This branch comes first in
-            // both panes: a held update is the cheapest possible answer, and
-            // re-asking for it would be the one thing `r` must never do.
-            if let Some(open) = &mut state.open
-                && open.pending.is_some()
-            {
-                open.take_pending();
-                open.at_rest = true;
-                return (state, Vec::new());
-            }
-            // Otherwise `r` acts on the focused pane and nothing else (R2.7).
-            // The keys pane is not push-live — the deletions it can detect for
-            // free arrive with the metadata it was already fetching, and
-            // anything else needs the keyspace walked again (DESIGN §9).
+            // `r` acts on the focused pane and nothing else (R2.7), and the
+            // hint bar names which half is in force. The keys pane is not
+            // push-live — the deletions it can detect for free arrive with the
+            // metadata it was already fetching, and anything else needs the
+            // keyspace walked again (DESIGN §9).
+            //
+            // The held-update branch below used to sit *above* this check, so
+            // `r` in the keys pane with an update waiting in the Viewer applied
+            // that update and did not rescan — while the hint bar said
+            // `r rescan`. The list did not move, no scan readout appeared, and
+            // a value in the other pane changed instead: no error, no feedback,
+            // nothing to explain it. That is the same defect 6d665a3 fixed,
+            // surviving in the one branch that ran before the focus check.
             if state.keys_pane_focused() {
                 // `None` is the same traversal the session opened with: the
                 // scan has never been server-side filtered, `/` narrows the
                 // Loaded set on this side, and so the active filter survives a
                 // rescan without being mentioned here.
                 return (state, vec![Command::StartScan { pattern: None }]);
+            }
+            // In the Viewer, a held update is the cheapest possible answer:
+            // applying what the server has already sent is the one thing `r`
+            // must never re-ask for.
+            if let Some(open) = &mut state.open
+                && open.pending.is_some()
+            {
+                open.take_pending();
+                open.at_rest = true;
+                return (state, Vec::new());
             }
             let token = issue_read(&mut state);
             (state, vec![Command::RefetchOpenKey { token }])
@@ -1739,6 +1774,164 @@ mod metadata_tests {
             state.attachment(),
             Some(Attachment::DetachedOffList),
             "filtered away, so there is no row to point at"
+        );
+    }
+
+    /// The hint bar names the action for the focused pane; `r` has to perform
+    /// that one. The held-update branch used to run first, so `r` in the keys
+    /// pane applied a value in the *other* pane and did not rescan — while the
+    /// hint said `r rescan`, the list did not move, and no scan readout
+    /// appeared to explain it.
+    #[test]
+    fn r_in_the_keys_pane_rescans_even_with_an_update_waiting_in_the_viewer() {
+        use crate::state::value::{StringValue, Value};
+
+        let mut state = browsing(10);
+        state.view.selected = 3;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+            panic!("expected an open");
+        };
+        let (mut state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token,
+                index: Some(3),
+                name: "k:3".into(),
+                value: Value::Str(StringValue::new("v1", 40)),
+                ttl_seconds: -1,
+                size_bytes: 2,
+                at_ms: 1_000,
+            },
+        );
+        // Scrolled, so the next value is held rather than applied.
+        {
+            let open = state.open.as_mut().unwrap();
+            open.offset = 3;
+            open.at_rest = false;
+        }
+        let token = state.read_token;
+        let (mut state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token,
+                index: Some(3),
+                name: "k:3".into(),
+                value: Value::Str(StringValue::new("v2", 40)),
+                ttl_seconds: -1,
+                size_bytes: 2,
+                at_ms: 2_000,
+            },
+        );
+        assert!(state.open.as_ref().unwrap().pending.is_some(), "held");
+
+        state.focus = Pane::Keys;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('r'))));
+        assert!(
+            matches!(cmds.as_slice(), [Command::StartScan { .. }]),
+            "the hint says `r rescan`, so `r` rescans: {cmds:?}"
+        );
+        assert!(
+            state.open.as_ref().unwrap().pending.is_some(),
+            "and the held update is still held, untouched by a keys-pane key"
+        );
+    }
+
+    /// 958b311 taught the row what the Viewer knew. The other direction was
+    /// open: a tombstoned row has no type, so it is refetched on the next
+    /// cursor move, and a key deleted and then written again came back to
+    /// `● string 64 B ∞` in the list while the Viewer still read `✕ deleted`.
+    #[test]
+    fn a_key_that_comes_back_makes_the_viewer_go_and_ask() {
+        use crate::msg::MetadataEntry;
+        use crate::state::value::{StringValue, Value};
+
+        let mut state = browsing(10);
+        state.view.selected = 3;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+            panic!("expected an open");
+        };
+        let (state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token,
+                index: Some(3),
+                name: "k:3".into(),
+                value: Value::Str(StringValue::new("v", 40)),
+                ttl_seconds: -1,
+                size_bytes: 1,
+                at_ms: 1_000,
+            },
+        );
+        let token = state.read_token;
+        let (state, _) = update(
+            state,
+            Msg::ValueGone {
+                token,
+                at_ms: 2_000,
+            },
+        );
+        assert!(state.keys.is_gone(3), "both panes agree it is gone");
+
+        // The row is refetched, because a tombstone has no type, and the server
+        // says the key is there again.
+        let (state, cmds) = update(
+            state,
+            Msg::MetadataBatch {
+                entries: vec![MetadataEntry {
+                    index: 3,
+                    kind: crate::state::KeyKind::String,
+                    ttl_seconds: -1,
+                    size_bytes: 64,
+                }],
+                gone: Vec::new(),
+            },
+        );
+        assert!(
+            matches!(cmds.as_slice(), [Command::RefetchOpenKey { .. }]),
+            "the panes disagree, so ask the server rather than guess: {cmds:?}"
+        );
+        assert!(
+            state.open.as_ref().unwrap().deleted_at_ms.is_some(),
+            "and the badge stays until the answer arrives — no guessing either way"
+        );
+    }
+
+    /// The same rule in the other direction: metadata noticed the deletion
+    /// first, and the Viewer is still showing a live-looking value.
+    #[test]
+    fn a_row_that_goes_makes_the_viewer_go_and_ask_too() {
+        use crate::state::value::{StringValue, Value};
+
+        let mut state = browsing(10);
+        state.view.selected = 3;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+            panic!("expected an open");
+        };
+        let (state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token,
+                index: Some(3),
+                name: "k:3".into(),
+                value: Value::Str(StringValue::new("v", 40)),
+                ttl_seconds: -1,
+                size_bytes: 1,
+                at_ms: 1_000,
+            },
+        );
+        let (_, cmds) = update(
+            state,
+            Msg::MetadataBatch {
+                entries: Vec::new(),
+                gone: vec![3],
+            },
+        );
+        assert!(
+            matches!(cmds.as_slice(), [Command::RefetchOpenKey { .. }]),
+            "{cmds:?}"
         );
     }
 

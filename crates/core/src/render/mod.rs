@@ -134,14 +134,14 @@ fn value_pane(
     // Standalone (below 70 columns), the list this key came from is off
     // screen entirely — DESIGN §2's "breadcrumb replaces columns". The
     // effective binding, not a hard-coded key, per R7.5.
-    if standalone {
+    let name_end = if standalone {
         let hint = state
             .keymap
             .hint(crate::keymap::Action::Cancel)
             .unwrap_or_default();
         let x1 = put(buf, x0, area.y, &format!("{hint} back"), sty(Token::Muted));
         put(buf, x1, area.y, "  ·  ", sty(Token::Border));
-        put(buf, x1 + 5, area.y, &open.name, sty(Token::Text));
+        put(buf, x1 + 5, area.y, &open.name, sty(Token::Text))
     } else {
         // The key name is this pane's header, and like the keys pane's column
         // header it carries the focus (DESIGN §4): `r` refetches here and
@@ -153,24 +153,31 @@ fn value_pane(
         } else {
             Token::Text
         });
-        let name_end = put(buf, x0, area.y, &open.name, name_style);
+        put(buf, x0, area.y, &open.name, name_style)
+    };
 
-        // The chip. The wash says *that* the Viewer is off the cursor; this
-        // says it in words, which is what makes the state survive monochrome
-        // and what makes it mean something the first time it is seen.
-        //
-        // Dropped before the key name is, following the title bar's rule: the
-        // name is the pane's identity and is never sacrificed to a qualifier.
-        if let Some(chips) = detached_chip(attachment) {
-            let right = area.width.saturating_sub(1);
-            for chip in chips {
-                let width = chip.chars().count() as u16;
-                // One space of daylight, so a long name and the chip can never
-                // read as one string.
-                if area.x + right.saturating_sub(width) > name_end {
-                    put_right(buf, area.x, area.y, right, chip, sty(Token::Warn));
-                    break;
-                }
+    // The chip. The wash says *that* the Viewer is off the cursor; this says it
+    // in words, which is what makes the state survive monochrome and what makes
+    // it mean something the first time it is seen.
+    //
+    // Drawn in both layouts. It used to sit inside the two-pane branch, which
+    // left the one place it matters most with no signal at all: below 70
+    // columns the divider, the tie glyph and the row underline are all gone by
+    // construction — there is no second pane to carry them — so the wash was
+    // the only thing left, and the wash is nothing in monochrome. Every fixture
+    // written for this feature was 130 or 80 columns wide, so nothing caught it.
+    //
+    // Dropped before the key name is, following the title bar's rule: the name
+    // is the pane's identity and is never sacrificed to a qualifier.
+    if let Some(chips) = detached_chip(attachment) {
+        let right = area.width.saturating_sub(1);
+        for chip in chips {
+            let width = chip.chars().count() as u16;
+            // One space of daylight, so a long name and the chip can never read
+            // as one string.
+            if area.x + right.saturating_sub(width) > name_end {
+                put_right(buf, area.x, area.y, right, chip, sty(Token::Warn));
+                break;
             }
         }
     }

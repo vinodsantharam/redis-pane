@@ -1890,6 +1890,30 @@ fn golden_viewer_detached_scrolled_out_of_view() {
     assert_golden("viewer_detached_scrolled_out", &frame);
 }
 
+/// Below 70 columns there is no second pane, so the divider, the tie glyph and
+/// the row underline are all gone by construction — and the wash is nothing in
+/// monochrome. The chip is the only signal left, and it used to be drawn only
+/// in the two-pane branch: every fixture written for this feature was 130 or 80
+/// columns wide, so nothing caught it.
+#[test]
+fn golden_viewer_detached_single_pane() {
+    let mut state = opened("user:8812:session", hash_value(), 2_537);
+    state.cols = 60;
+    state.focus = redis_pane_core::render::layout::Pane::Value;
+    state.view.selected = 0;
+
+    let frame = draw(&state, 60, 22);
+    assert!(
+        frame.contains('⊘'),
+        "the one signal a single pane can carry:\n{frame}"
+    );
+    assert!(
+        frame.contains("user:8812:session"),
+        "and the breadcrumb still names the key:\n{frame}"
+    );
+    assert_golden("viewer_detached_single", &frame);
+}
+
 /// The chip gives way before the key name does, following the title bar's rule:
 /// the name is the pane's identity, the chip is a qualifier on it.
 #[test]

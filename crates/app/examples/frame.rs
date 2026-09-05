@@ -113,7 +113,14 @@ async fn main() {
         .collect();
     let t2 = Instant::now();
     if let Ok((entries, gone)) = redis_pane::redis::fetch_metadata(&client, &window).await {
-        (state, _) = update(state, Msg::MetadataBatch { entries, gone });
+        (state, _) = update(
+            state,
+            Msg::MetadataBatch {
+                entries,
+                gone,
+                at_ms: clock.now_ms(),
+            },
+        );
     }
     let meta_ms = t2.elapsed();
     show(

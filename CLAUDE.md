@@ -141,7 +141,7 @@ they are expensive to retrofit:
   cursor behind it, but Cluster will have N (ADR-0008) and the browser above must not know. It
   lives in `crates/app/src/redis/scan.rs`; the core sees only `Msg::ScanBatch`.
 - **The cap is enforced in exactly one place** — `scan_batch` in `update.rs` — so no path can grow
-  the Loaded set past it. Measured: 1M keys of average length occupy 36MB (`cargo run --release
+  the Loaded set past it. Measured: 1M keys of average length occupy 40MB (`cargo run --release
   -p redis-pane-core --example memreport`).
 - **Lists are virtualized.** Render cost is a function of viewport size, not keyspace size.
   Metadata (type, memory, TTL — four columns, no element count; PRD R2.4) is fetched lazily

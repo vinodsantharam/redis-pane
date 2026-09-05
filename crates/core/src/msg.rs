@@ -155,6 +155,11 @@ pub enum Msg {
     MetadataBatch {
         entries: Vec<MetadataEntry>,
         gone: Vec<usize>,
+        /// When this batch was read, so the keys pane's TTL column can count
+        /// down locally afterward (R3.9's rule, extended from the Viewer to
+        /// here) instead of freezing at whatever it read until the next
+        /// rescan.
+        at_ms: u64,
     },
     /// A read of the open key completed, carrying what the server said.
     ///

@@ -254,7 +254,19 @@ pub async fn run(
             *f.buffer_mut() = buf;
         })?;
 
-        let Some(msg) = rx.recv().await else {
+        // A tick with no message of its own: `update` is never called on it,
+        // only the redraw above runs again with a fresher clock reading. This
+        // is the whole of what makes a TTL countdown actually move on an
+        // otherwise idle screen — the number was already computed correctly
+        // per frame (R3.9), it just had nothing asking for a new frame once a
+        // second. Ratatui diffs the buffer before writing to the terminal, so
+        // a tick where only a few digits changed writes only those cells.
+        let msg = tokio::select! {
+            biased;
+            msg = rx.recv() => msg,
+            () = tokio::time::sleep(std::time::Duration::from_secs(1)) => continue,
+        };
+        let Some(msg) = msg else {
             return Ok(());
         };
         let commands;
@@ -284,9 +296,19 @@ pub async fn run(
                     let client = client.clone();
                     let tx = tx.clone();
                     tokio::spawn(async move {
+                        let at_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
                         match crate::redis::fetch_metadata(&client, &window).await {
                             Ok((entries, gone)) if !entries.is_empty() || !gone.is_empty() => {
-                                let _ = tx.send(Msg::MetadataBatch { entries, gone }).await;
+                                let _ = tx
+                                    .send(Msg::MetadataBatch {
+                                        entries,
+                                        gone,
+                                        at_ms,
+                                    })
+                                    .await;
                             }
                             Ok(_) => {}
                             Err(e) => {

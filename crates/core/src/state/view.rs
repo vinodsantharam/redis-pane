@@ -413,9 +413,9 @@ mod tests {
     fn a_key_with_no_expiry_sorts_after_every_key_that_has_one() {
         // ∞ is the largest TTL there is, not a missing value.
         let mut keys = store(&["forever", "soon", "later"]);
-        keys.set_ttl(0, super::super::loaded::TTL_NONE);
-        keys.set_ttl(1, 30);
-        keys.set_ttl(2, 3_600);
+        keys.set_ttl(0, super::super::loaded::TTL_NONE, 0);
+        keys.set_ttl(1, 30, 0);
+        keys.set_ttl(2, 3_600, 0);
         let mut v = KeyView {
             sort: SortBy::Ttl,
             ..KeyView::default()
@@ -423,6 +423,36 @@ mod tests {
         v.rebuild(&keys);
         assert_eq!(viewed(&keys, &v), ["soon", "later", "forever"]);
         assert_eq!(v.known(), 3, "no expiry is a known fact, not a gap");
+    }
+
+    /// Sort-by-TTL must not reshuffle rows once a second as their countdowns
+    /// cross each other — that would look broken, not live. `sort_by_lazy`
+    /// reads the raw, unmoving `ttl()`, never `ttl_now()`; this pins that as a
+    /// property of the sort rather than an accident of which function nobody
+    /// happened to call.
+    #[test]
+    fn sort_by_ttl_does_not_reshuffle_as_the_clock_advances() {
+        let mut keys = store(&["soon", "later"]);
+        keys.set_ttl(0, 10, 0);
+        keys.set_ttl(1, 20, 0);
+        let mut v = KeyView {
+            sort: SortBy::Ttl,
+            ..KeyView::default()
+        };
+        v.rebuild(&keys);
+        let order = viewed(&keys, &v);
+        assert_eq!(order, ["soon", "later"]);
+
+        // 15 seconds on: "soon"'s displayed countdown would now read behind
+        // "later"'s original number, but nothing here has been re-sorted —
+        // rebuild wasn't even called again.
+        assert_eq!(keys.ttl_now(0, 15), Some(0));
+        assert_eq!(keys.ttl_now(1, 15), Some(5));
+        assert_eq!(
+            viewed(&keys, &v),
+            order,
+            "the clock alone must not change sort order"
+        );
     }
 
     #[test]

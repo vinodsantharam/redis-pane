@@ -536,7 +536,14 @@ async fn a_key_that_vanished_between_scan_and_fetch_is_reported_gone() {
         ..State::default()
     };
     state.rebuild_list();
-    let (state, _) = update(state, Msg::MetadataBatch { entries, gone });
+    let (state, _) = update(
+        state,
+        Msg::MetadataBatch {
+            entries,
+            gone,
+            at_ms: 0,
+        },
+    );
     assert!(!state.keys.is_gone(0), "the surviving key is untouched");
     assert!(state.keys.is_gone(1), "the deleted key is tombstoned");
 

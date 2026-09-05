@@ -468,7 +468,7 @@ fn browsing() -> State {
     for (i, (name, kind, ttl, size)) in rows.iter().enumerate() {
         keys.push(name.as_bytes());
         keys.set_kind(i, *kind);
-        keys.set_ttl(i, *ttl);
+        keys.set_ttl(i, *ttl, 74); // matches CLOCK below
         keys.set_size(i, *size);
     }
     let mut state = State {
@@ -526,6 +526,32 @@ fn golden_browser_split_widened() {
 #[test]
 fn golden_browser_119_cols_sheds_size() {
     assert_golden("browser_119", &draw(&browsing(), 119, 26));
+}
+
+#[test]
+fn a_keys_pane_ttl_counts_down_as_the_clock_advances_with_no_new_data() {
+    // "lock:checkout:8812" was read at t=74s with a 12s TTL. Advancing the
+    // clock alone — no refetch, no new Msg — must shrink the number on
+    // screen, the same liveness the value pane already has (R3.9).
+    let at_read_time = draw(&browsing(), 130, 26);
+    let five_seconds_later = draw(&browsing(), 130, 26);
+    assert_eq!(
+        at_read_time, five_seconds_later,
+        "same clock, same frame — this pins the baseline before the next assertion"
+    );
+
+    let buf = render::frame(
+        &browsing(),
+        &Theme::new(ColorDepth::Monochrome),
+        &FixedClock(79_000),
+        Rect::new(0, 0, 130, 26),
+    );
+    let ticked = render::to_text(&buf);
+    assert_ne!(
+        at_read_time, ticked,
+        "a row with a known, positive TTL must show a smaller number once the \
+         clock has moved on — the keys pane never costs a round trip for this (R3.9)"
+    );
 }
 
 #[test]
@@ -784,7 +810,7 @@ fn many_keys() -> State {
     for (i, (name, kind, ttl, size)) in rows.iter().enumerate() {
         keys.push(name.as_bytes());
         keys.set_kind(i, *kind);
-        keys.set_ttl(i, *ttl);
+        keys.set_ttl(i, *ttl, 74); // matches CLOCK below
         keys.set_size(i, *size);
     }
     let mut state = State {
@@ -832,7 +858,7 @@ fn golden_sorted_by_size_partially_known() {
         if i < 2 {
             keys.set_kind(i, KeyKind::ZSet);
             keys.set_size(i, [412u32, 880][i]);
-            keys.set_ttl(i, 720);
+            keys.set_ttl(i, 720, 74); // matches CLOCK below
         }
     }
     state.keys = keys;

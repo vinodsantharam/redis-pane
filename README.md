@@ -67,9 +67,11 @@ from these documents, the documents change in the same commit.
   it changes and the Viewer refetches. Nothing is ever memoized, so a value cannot go stale
   behind a control claiming to update it. ([ADR-0006](docs/adr/0006-liveness-without-a-refresh-button.md))
 - **It never claims to be current when it isn't.** A dropped connection keeps your data on
-  screen and says it is disconnected; a reconnect re-arms tracking before the header calls itself
-  live again; Read-only Mode names the reason it is on, and says `locked` rather than offering a
-  toggle that a replica would refuse.
+  screen, says it is disconnected, and tells you how old what you are looking at is — it does not
+  promise a retry it has not scheduled. (Reconnecting on its own is M2; today a dropped link stays
+  dropped, and says so.) When reconnection lands it will re-arm tracking before the header calls
+  itself live again. Read-only Mode names the reason it is on, and says `locked` rather than
+  offering a toggle that a replica would refuse.
   ([ADR-0009](docs/adr/0009-connection-lifecycle.md))
 - **One Connection per process, one database, fixed at launch.** No switcher, no `SELECT`, no
   tabs, no sidebar — a second target is a second terminal. Everything else stays small because

@@ -8,6 +8,61 @@ purpose — what was done, and what was cut and why, are in its own note rather 
 
 ## Severity 1 — the current UI actively misleads or breaks
 
+*Re-audited 2026-09-05 by reading the code against the docs, after the tracker showed severity 1
+clear and the app still had seven of them. The original audit was written on 2026-09-03; **every
+severity-1 item since has been found by using the app or auditing it afresh, never by the
+checkboxes**. Treat this section's emptiness as a prompt to look again, not as a result.*
+
+- [x] **The disconnect header promised a retry that would never come — 2026-09-05.** With the
+  server taken away the title bar read `✕ disconnected · retry 0s   r refetch`, permanently.
+  `Command::Reconnect` is a no-op until M2 and fred is built with no retry policy, so nothing was
+  retrying and nothing ever would; `r` read a dead client and produced an error. Worse, the
+  countdown *displaced* the Read age, so the one moment the age matters most was the one state
+  not showing it (ADR-0009 specifies `✕ disconnected · last read …`). `retry_in_ms` is now
+  `Option<u64>` so the countdown cannot be rendered for a retry nobody arranged, and the Refetch
+  key is offered only where it can work. The golden fixture had been asserting `retry 4s` from a
+  state the running app cannot reach — a test holding a promise the code never made.
+- [x] **Keys acted on panes that were not on screen — 2026-09-05.** Below 70 columns one pane is
+  drawn at a time, and nothing stopped a key scoped to the other one from running anyway. `/` in
+  the Viewer there started a filter capture inside a zero-width pane: every keypress after it
+  vanished, `q` typed a `q`, and the app was indistinguishable from hung — two keypresses from
+  launch. Quieter versions: `↓` moved the key cursor invisibly, so `Esc` returned to a list that
+  had wandered; and on the list screen `⌃↓` scrolled a value nobody could see. Actions now declare
+  their pane and are dropped when it is not drawn. **Not** a change to what focus means — the
+  two-pane keymap is modeless on purpose and is untouched.
+- [x] **A Refetch that found nothing rendered a byte-identical frame — 2026-09-05.** ADR-0006's
+  founding complaint, reproduced: the reader could not tell "the refresh did nothing" from "the
+  value did not change" — nor from the reply being dropped as superseded, nor from a failure whose
+  notice was missed. DESIGN §6.4 had specified `● live · updated now` and `○ manual · unchanged`
+  from the start; neither existed, and `absorb()` discarded the comparison needed to choose. Now
+  recorded and stated, in all four liveness/outcome corners, fading after a couple of seconds
+  because it is an account of an event rather than a description of the key.
+- [x] **The clipboard reported success it had not had — 2026-09-05.** Three holes: `y v` copied
+  the ≤500-row window and said `copied value` (the Viewer header two lines above was truthfully
+  saying `500 shown`); a failed clipboard write produced nothing at all, so failure looked like
+  success (R7.4); and `nothing open to copy` was built with `at_ms: 0` against a wall clock, so it
+  could never appear — its test passed by reading the notice at clock 0, the one reading where the
+  defect is invisible. Copying the whole value would need an unbounded re-read (see severity 2),
+  so the confirmation states its window instead: `copied value (500 of 12000 items)`.
+- [x] **`r` in the keys pane did not rescan with an update waiting — 2026-09-05.** The held-update
+  branch returned before the focus check, so `r` applied a value in the *other* pane while the
+  hint bar said `r rescan` and the list did not move. The same defect 6d665a3 fixed, surviving in
+  the one branch above the check it added.
+- [x] **The Open key disclosure did not exist below 70 columns — 2026-09-05.** A gap in 48a1102,
+  three commits old. The chip was drawn only in the two-pane branch, and at single-pane width the
+  divider, tie glyph and row underline are absent by construction — leaving the wash, which is
+  nothing in monochrome. Every fixture written for that feature was 130 or 80 columns, so the
+  monochrome tests that looked like proof only ever covered the two-pane case.
+- [x] **A key deleted and then recreated left the panes disagreeing — 2026-09-05.** The direction
+  958b311 did not cover: a tombstoned row has no type, so the next cursor move refetches it and
+  the row returns to `● string 64 B ∞` while the Viewer still reads `✕ deleted 40s ago`; with
+  tracking unavailable nothing corrected it. Both directions now resolve by asking the server
+  rather than copying one pane's opinion onto the other.
+- [x] **A password could reach stderr — 2026-09-05.** `redis/mod.rs` interpolated the dial URL
+  into the URL-parse failure message. Reachable only on a malformed URL, which is exactly when
+  someone has pasted one by hand with a real secret in it and is about to paste the error into a
+  bug report. Redacted, like every other path.
+
 - [x] **The value pane could be showing a key the cursor is not on, with nothing saying so —
   reported from use, fixed 2026-09-05.** Diagnosed rather than patched: the value on screen was
   never wrong. It was a correct, live, tracked read of a *different* key, and `● live` was telling

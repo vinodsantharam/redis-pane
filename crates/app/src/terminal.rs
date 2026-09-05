@@ -6,7 +6,6 @@
 //! doing, because nothing here waits on the network.
 
 use std::io::{Stdout, stdout};
-use std::sync::Arc;
 
 use crossterm::event::{self, Event, KeyCode as XKeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::{execute, terminal};
@@ -135,16 +134,10 @@ pub async fn run(
     };
 
     let mut scan_cancel: Option<CancellationToken> = None;
-    // Reads take turns. `CLIENT CACHING YES` arms the *next* read-only command
-    // on the connection, so two reads running at once can interleave and leave
-    // the server tracking a key the Viewer is not showing — the header would
-    // then read `● live` over a value nothing will ever push an update for,
-    // which is exactly the failure ADR-0006 exists to make unreachable. Holding
-    // this across the arm-and-read pair is what keeps them one indivisible step.
-    let read_lock = Arc::new(tokio::sync::Mutex::new(()));
-    // Superseded reads are cancelled rather than merely ignored: a read that
-    // never runs cannot arm anything, which keeps the queue above short.
-    let mut read_cancel: Option<CancellationToken> = None;
+    // Reads take turns, and superseded ones never reach the wire. See
+    // `redis::read::ReadGate` for why that is a liveness invariant and not a
+    // tidiness preference.
+    let mut read_gate = crate::redis::read::ReadGate::default();
     start_scan(&client, None, &tx, &mut scan_cancel);
 
     // fred reconnects underneath us, and the server on the other side remembers
@@ -282,8 +275,7 @@ pub async fn run(
                     &tx,
                     area_width(&term),
                     arming,
-                    &read_lock,
-                    &mut read_cancel,
+                    &mut read_gate,
                 ),
                 Command::RefetchOpenKey { token } => {
                     if let Some(open) = &state.open {
@@ -295,8 +287,7 @@ pub async fn run(
                             &tx,
                             area_width(&term),
                             arming,
-                            &read_lock,
-                            &mut read_cancel,
+                            &mut read_gate,
                         );
                     }
                 }
@@ -369,38 +360,28 @@ fn open_key(
     tx: &mpsc::Sender<Msg>,
     pane_width: usize,
     arming: crate::redis::read::Arming,
-    read_lock: &Arc<tokio::sync::Mutex<()>>,
-    read_cancel: &mut Option<CancellationToken>,
+    gate: &mut crate::redis::read::ReadGate,
 ) {
     // Supersede whatever was in flight. The core would ignore its reply anyway
     // — every reply carries the token of the read it answers — but ignoring a
     // reply does not un-send the `CLIENT CACHING YES` that came with it, and
     // that is the half which decides what the server tracks.
-    if let Some(previous) = read_cancel.replace(CancellationToken::new()) {
-        previous.cancel();
-    }
-    let cancel = read_cancel.clone().expect("just set");
+    let permit = gate.begin();
     let client = client.clone();
     let tx = tx.clone();
-    let read_lock = read_lock.clone();
     tokio::spawn(async move {
-        // Two chances to drop out before touching the wire: while queueing for
-        // the lock, and on acquiring it. Past that point the arm-and-read pair
-        // runs to completion — interrupting it is what would leave the
-        // connection armed for a key nobody is looking at.
-        let _guard = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return,
-            guard = read_lock.lock() => guard,
-        };
-        if cancel.is_cancelled() {
-            return;
-        }
         let at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let result = crate::redis::read::read_value(&client, &name, pane_width, arming).await;
+        let Some(result) = permit
+            .run(crate::redis::read::read_value(
+                &client, &name, pane_width, arming,
+            ))
+            .await
+        else {
+            return;
+        };
 
         // `read_value` awaits `CLIENT CACHING YES` with `?` before doing
         // anything else, so any Ok(_) here means arming already succeeded on

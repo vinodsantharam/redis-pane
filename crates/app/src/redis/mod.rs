@@ -105,8 +105,14 @@ pub async fn connect_with(
     url: &str,
     credentials: &Credentials,
 ) -> Result<(Client, Established), ConnectError> {
-    let mut config =
-        Config::from_url(url).map_err(|e| ConnectError::Unreachable(format!("{url}: {e}")))?;
+    // Redacted, because this string is printed. A URL that fails to parse is
+    // exactly the one someone pasted by hand with a real password in it, and
+    // the next thing they do with a startup diagnostic is paste it into a bug
+    // report. Everywhere else the dial URL and the displayable target are kept
+    // deliberately apart; this was the one place they met.
+    let mut config = Config::from_url(url).map_err(|e| {
+        ConnectError::Unreachable(format!("{}: {e}", redis_pane_core::resolve::redact(url)))
+    })?;
 
     // A Profile's credentials are the more specific statement of intent, so
     // they win over anything embedded in the URL.

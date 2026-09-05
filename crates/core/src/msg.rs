@@ -68,6 +68,30 @@ impl KeyPress {
     }
 }
 
+/// A mouse action, described without reference to any terminal library — the
+/// same boundary `KeyCode`/`KeyPress` draw for the keyboard (R7.3).
+///
+/// Deliberately not "everything a mouse can do": only the left button is
+/// modelled, because nothing here is specified for the others, and a
+/// right-click doing something the reader did not ask for is worse than a
+/// right-click doing nothing. `col`/`row` are cell coordinates in the whole
+/// terminal, the same space [`crate::render::layout::layout`] lays panes out
+/// in — the core, not the shell, decides what a coordinate means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MouseAction {
+    /// The left button went down at this cell.
+    Down { col: u16, row: u16 },
+    /// The left button was released, wherever it happened to be.
+    Up,
+    /// The cursor moved to this cell while the left button was held.
+    Drag { col: u16, row: u16 },
+    /// The wheel scrolled one notch toward the top, over this cell.
+    ScrollUp { col: u16, row: u16 },
+    /// The wheel scrolled one notch toward the bottom, over this cell.
+    ScrollDown { col: u16, row: u16 },
+}
+
 /// Every input to the core: keystrokes, resizes, and replies from the shells.
 ///
 /// The core has no other way in. A shell that wants to tell the core something
@@ -77,6 +101,8 @@ impl KeyPress {
 pub enum Msg {
     /// A key was pressed.
     Key(KeyPress),
+    /// The mouse did something (R7.3).
+    Mouse(MouseAction),
     /// The terminal was resized. Drives the layout breakpoints in DESIGN §2.
     Resized {
         cols: u16,

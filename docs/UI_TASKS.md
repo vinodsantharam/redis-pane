@@ -193,10 +193,29 @@ checkboxes**. Treat this section's emptiness as a prompt to look again, not as a
   TTL countdown (R3.9). **Not done, cut deliberately rather than half-built:** expandable fields
   (an interactive drill-down, its own feature) and the consumer-group panel (`XINFO GROUPS`/
   `XPENDING` — a separate fetch and a separate view, not a per-entry field).
-- [ ] **Mouse support is entirely absent (R7.3).** No click-to-focus, scroll, or drag-to-resize.
-  The drag-to-resize mechanism exists now (`State.split_adjust`, `⌃←`/`⌃→`, below) — what is
-  missing here is turning `crossterm` mouse events into the same state changes, plus click and
-  scroll, which that mechanism does not touch.
+- [x] **Mouse support was entirely absent (R7.3) — closed 2026-09-05.** All three: click to
+  focus, scroll, drag to resize. `crossterm::event::{Enable,Disable}MouseCapture` bracket the
+  session in `terminal.rs`; a new boundary function, `translate_mouse`, turns a `MouseEvent` into
+  the same terminal-free `Msg` shape `translate` already does for the keyboard — the core still
+  never sees `crossterm` (ADR-0011's boundary check is unaffected).
+  - **Click to focus** — a mouse-down inside a pane's rect focuses it, computed with the exact
+    same `layout()` the renderer used for the frame the reader clicked on, rather than a second,
+    possibly-drifting notion of where the panes are.
+  - **Scroll** acts on whichever pane is under the cursor and focuses it, deliberately without
+    requiring a prior click — the ordinary window-manager convention, and the reason it *also*
+    moves focus: leaving it unmoved would mean a keyboard action right after a scroll silently
+    lands on the other pane, the exact class of bug the R2.7 focus work spent a whole day closing.
+  - **Drag to resize** turns out to be the same gesture as click-to-focus at the mouse-down
+    level — grabbing the exact divider column arms `State.resizing_split` instead of changing
+    focus, and `Drag` events then move `split_adjust` to follow the cursor until `Up`. Reuses the
+    mechanism built for `⌃←`/`⌃→` (below) rather than a second one: the same field, the same
+    clamp, so a drag and a keypress can hand off to each other mid-session with no special case.
+  - Below 70 columns there is no divider to grab and nothing changes underfoot — the geometry
+    itself (a zero-width pane) already keeps every one of these gated to a pane that is actually
+    drawn, the same property the keyboard-focus fix relies on, for free, with no separate check.
+  - Not built: multi-select via drag, and a right/middle-click doing anything at all — neither is
+    named in R7.3, and a click that does something nobody asked for is worse than one that does
+    nothing (`MouseAction` models the left button only).
 - [x] **The split ratio is fixed, not resizable — closed 2026-09-05.** Was hardcoded per
   density (45% keys at Full, 50% at Tight/NoSize) with no way to change it. `State.split_adjust`
   is now a session-held column offset, applied and clamped in `layout()` — a pure function, so a
@@ -233,6 +252,11 @@ checkboxes**. Treat this section's emptiness as a prompt to look again, not as a
     path otherwise goes out of its way not to have (`ReadGate`, three commits ago). A capped
     manual loop (`SCAN_ROUNDS`) has no such edge to remember, and bounds the read even against a
     pathological table where `COUNT` badly undershoots.
+
+**Severity 2 fully closed (2026-09-05)**, in the tracker's own sense of the word: the one `[~]`
+item (streams) was already a deliberate, documented partial close, not an open TODO, and nothing
+in this section now has an empty checkbox. Re-audit before trusting that the way severity 1's own
+header warns to — this file's history is that emptiness is a prompt to look again, not a result.
 
 ## Severity 3 — parked design questions, now answerable from real use
 

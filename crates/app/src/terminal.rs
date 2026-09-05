@@ -7,7 +7,10 @@
 
 use std::io::{Stdout, stdout};
 
-use crossterm::event::{self, Event, KeyCode as XKeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode as XKeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton,
+    MouseEvent, MouseEventKind,
+};
 use crossterm::{execute, terminal};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -16,7 +19,7 @@ use fred::interfaces::EventInterface;
 use fred::prelude::Client;
 use redis_pane_core::clock::Clock;
 use redis_pane_core::command::ReadToken;
-use redis_pane_core::msg::{KeyCode, KeyPress};
+use redis_pane_core::msg::{KeyCode, KeyPress, MouseAction};
 use redis_pane_core::theme::{ColorDepth, Theme};
 use redis_pane_core::{Command, Msg, State, render, update};
 use tokio::sync::mpsc;
@@ -30,7 +33,11 @@ struct Guard;
 impl Drop for Guard {
     fn drop(&mut self) {
         let _ = terminal::disable_raw_mode();
-        let _ = execute!(stdout(), terminal::LeaveAlternateScreen);
+        let _ = execute!(
+            stdout(),
+            event::DisableMouseCapture,
+            terminal::LeaveAlternateScreen
+        );
     }
 }
 
@@ -65,6 +72,22 @@ pub fn translate(key: KeyEvent) -> Option<Msg> {
     }))
 }
 
+/// Translate a crossterm mouse event the same way [`translate`] does for the
+/// keyboard (R7.3). Only the left button is modelled — see
+/// [`redis_pane_core::msg::MouseAction`] for why.
+pub fn translate_mouse(mouse: MouseEvent) -> Option<Msg> {
+    let (col, row) = (mouse.column, mouse.row);
+    let action = match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => MouseAction::Down { col, row },
+        MouseEventKind::Up(MouseButton::Left) => MouseAction::Up,
+        MouseEventKind::Drag(MouseButton::Left) => MouseAction::Drag { col, row },
+        MouseEventKind::ScrollUp => MouseAction::ScrollUp { col, row },
+        MouseEventKind::ScrollDown => MouseAction::ScrollDown { col, row },
+        _ => return None,
+    };
+    Some(Msg::Mouse(action))
+}
+
 /// Run the event loop until the core says to quit.
 ///
 /// The render loop never does I/O. Redis work happens on tokio tasks that send
@@ -78,7 +101,11 @@ pub async fn run(
     tracking: bool,
 ) -> std::io::Result<()> {
     terminal::enable_raw_mode()?;
-    execute!(stdout(), terminal::EnterAlternateScreen)?;
+    execute!(
+        stdout(),
+        terminal::EnterAlternateScreen,
+        event::EnableMouseCapture
+    )?;
     let _guard = Guard;
 
     let mut term: Terminal<CrosstermBackend<Stdout>> =
@@ -94,6 +121,13 @@ pub async fn run(
             match event::read() {
                 Ok(Event::Key(k)) => {
                     if let Some(msg) = translate(k)
+                        && input_tx.blocking_send(msg).is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(Event::Mouse(m)) => {
+                    if let Some(msg) = translate_mouse(m)
                         && input_tx.blocking_send(msg).is_err()
                     {
                         return;

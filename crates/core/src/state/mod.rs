@@ -274,6 +274,11 @@ pub struct State {
     /// Session-only for now — restoring it across a relaunch needs the
     /// session-state file `state_file.rs` does not implement yet (ADR-0003).
     pub split_adjust: i16,
+    /// Set between a mouse-down that grabbed the divider and the matching
+    /// mouse-up (R7.3, drag-to-resize). While true, `Drag` events move
+    /// [`State::split_adjust`] to follow the cursor; a chord-armed flag in
+    /// the same family as `copy_pending` and `filtering`.
+    pub resizing_split: bool,
     /// The Open key, if one is open. There is no cache behind this — it holds
     /// what the server last said and nothing more (ADR-0006).
     pub open: Option<OpenKey>,

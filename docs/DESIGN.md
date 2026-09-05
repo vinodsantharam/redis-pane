@@ -362,6 +362,12 @@ the reader's time.
   `$XDG_STATE_HOME/redis-pane/`, never in the user's config file.
 - **Copy that fits the terminal.** `y` offers key / value / `redis-cli` command / permalink-style
   reference — because the next step is usually pasting into a ticket or a shell.
+- **Mouse support (R7.3), never required.** Click focuses a pane; the wheel scrolls whichever
+  pane is under it, focusing that pane the same way a click would, so a keyboard action right
+  after does not silently land on the other one; dragging the divider itself resizes the split.
+  Every one of those is also reachable from the keyboard (`Tab`, `↑↓`/`⌃↑↓`, `⌃←→`) — this is a
+  keyboard-first tool used over SSH as often as at a desk, so the mouse is a shortcut for the
+  motions above, never a second way to reach something the keyboard cannot.
 
 ## 8. Accessibility
 

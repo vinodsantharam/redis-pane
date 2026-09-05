@@ -34,6 +34,35 @@ pub enum Attachment {
     DetachedOffList,
 }
 
+/// What the last completed read of this key found.
+///
+/// ADR-0006 opens by naming the ambiguity the product exists to remove: the
+/// user *"cannot distinguish 'the refresh did nothing' from 'the value
+/// genuinely did not change'"*. Without this the app reproduced it. A Refetch
+/// that found nothing left every cell of the frame identical, which is also
+/// exactly what a reply dropped as a superseded read looks like, and what a
+/// read that failed and had its notice missed looks like. The value was right
+/// either way; the reader had no way to know a read had happened at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadOutcome {
+    /// The key was just opened — there was nothing on screen to compare to.
+    Opened,
+    /// The value that arrived differed from the one on screen.
+    Updated { at_ms: u64 },
+    /// The value that arrived was identical, byte for byte.
+    Unchanged { at_ms: u64 },
+}
+
+impl ReadOutcome {
+    /// When this was learned, if it was learned from a read.
+    fn at_ms(&self) -> Option<u64> {
+        match self {
+            ReadOutcome::Opened => None,
+            ReadOutcome::Updated { at_ms } | ReadOutcome::Unchanged { at_ms } => Some(*at_ms),
+        }
+    }
+}
+
 /// A value that arrived while the reader was not at rest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pending {
@@ -88,6 +117,8 @@ pub struct OpenKey {
     /// value stays on screen: during an incident the question is almost always
     /// *what was in it*, and that is the moment it becomes unrecoverable.
     pub deleted_at_ms: Option<u64>,
+    /// What the last completed read found, so the header can say so.
+    pub last_read: ReadOutcome,
 }
 
 impl OpenKey {
@@ -112,6 +143,7 @@ impl OpenKey {
             editing: false,
             pending: None,
             deleted_at_ms: None,
+            last_read: ReadOutcome::Opened,
         }
     }
 
@@ -124,9 +156,24 @@ impl OpenKey {
         self.at_rest && !self.editing && self.offset == 0
     }
 
+    /// How long the header states what the last read found before falling back
+    /// to its resting phrase.
+    ///
+    /// Long enough to be read, short enough that it cannot be mistaken for a
+    /// standing description of the key.
+    pub const OUTCOME_MS: u64 = 2_500;
+
     /// Take an update, applying it or holding it.
     pub fn absorb(&mut self, value: Value, ttl_seconds: i32, size_bytes: u32, at_ms: u64) {
         if self.may_apply() {
+            // Recorded before the move, and only where the value actually
+            // reaches the screen — a held update has not changed anything the
+            // reader can see, and `pending` is what speaks for it.
+            self.last_read = if self.value == value {
+                ReadOutcome::Unchanged { at_ms }
+            } else {
+                ReadOutcome::Updated { at_ms }
+            };
             self.value = value;
             self.ttl_seconds = ttl_seconds;
             self.size_bytes = size_bytes;
@@ -146,6 +193,11 @@ impl OpenKey {
     /// Apply a held update, when the reader asks for it.
     pub fn take_pending(&mut self) {
         if let Some(p) = self.pending.take() {
+            self.last_read = if self.value == p.value {
+                ReadOutcome::Unchanged { at_ms: p.at_ms }
+            } else {
+                ReadOutcome::Updated { at_ms: p.at_ms }
+            };
             self.value = p.value;
             self.ttl_seconds = p.ttl_seconds;
             self.size_bytes = p.size_bytes;
@@ -186,6 +238,27 @@ impl OpenKey {
         if self.editing {
             return "✎ editing".into();
         }
+        // What the last read found, while it is still news. This is the half
+        // ADR-0006 named and the app did not have: without it, a Refetch that
+        // found nothing renders a frame identical in every cell to one where
+        // the reply was dropped as superseded, or failed, or was never sent.
+        // The reader is left doing exactly what the ADR describes — unable to
+        // tell "the refresh did nothing" from "nothing changed".
+        //
+        // It fades, because it is an account of an event and not a description
+        // of the key. After it does, the resting phrases below take over.
+        if let Some(at) = self.last_read.at_ms()
+            && now_ms.saturating_sub(at) < Self::OUTCOME_MS
+        {
+            return match (live, self.last_read) {
+                (true, ReadOutcome::Updated { .. }) => "● live · updated now".into(),
+                (true, ReadOutcome::Unchanged { .. }) => "● live · unchanged".into(),
+                (false, ReadOutcome::Updated { .. }) => "○ manual · updated now".into(),
+                (false, ReadOutcome::Unchanged { .. }) => "○ manual · unchanged".into(),
+                // Unreachable: `at_ms()` is `None` for `Opened`.
+                (_, ReadOutcome::Opened) => unreachable!(),
+            };
+        }
         if live {
             "● live".into()
         } else {
@@ -219,12 +292,66 @@ mod tests {
     }
 
     #[test]
-    fn at_rest_an_update_simply_lands() {
+    fn at_rest_an_update_simply_lands_and_the_header_says_it_did() {
         let mut k = open();
         k.absorb(pair("v2"), 500, 120, 12_000);
         assert_eq!(k.value, pair("v2"));
         assert!(k.pending.is_none());
-        assert_eq!(k.currency(true, 12_000), "● live");
+        // This used to assert a bare `● live`, which is what made a landed
+        // update and an hour of silence render identically.
+        assert_eq!(k.currency(true, 12_000), "● live · updated now");
+        assert_eq!(
+            k.currency(true, 12_000 + OpenKey::OUTCOME_MS),
+            "● live",
+            "it is an account of an event, so it fades back"
+        );
+    }
+
+    /// ADR-0006's founding complaint, at the level of one string: pressing `r`
+    /// and learning nothing is the defect, not the absence of a change.
+    #[test]
+    fn a_read_that_found_nothing_says_so_rather_than_looking_like_no_read() {
+        let mut k = open();
+        let before = k.currency(false, 12_000);
+        k.absorb(pair("v1"), 600, 100, 12_000);
+
+        assert_eq!(k.value, pair("v1"), "nothing changed, correctly");
+        assert_eq!(k.currency(false, 12_000), "○ manual · unchanged");
+        assert_ne!(
+            k.currency(false, 12_000),
+            before,
+            "and the frame is not identical to one where no read happened"
+        );
+        assert_eq!(
+            k.currency(true, 12_000),
+            "● live · unchanged",
+            "the same question exists when live and `r` is pressed by hand"
+        );
+    }
+
+    #[test]
+    fn applying_a_held_update_reports_what_it_turned_out_to_be() {
+        let mut k = open();
+        k.offset = 40;
+        k.at_rest = false;
+        k.absorb(pair("v2"), 500, 120, 12_000);
+        assert!(k.pending.is_some(), "held while scrolled");
+
+        k.offset = 0;
+        k.at_rest = true;
+        k.take_pending();
+        assert_eq!(k.currency(true, 12_000), "● live · updated now");
+    }
+
+    /// A held update speaks for itself through `pending`; the outcome line must
+    /// not pre-empt it, because nothing has reached the screen yet.
+    #[test]
+    fn a_held_update_does_not_report_an_outcome_it_has_not_had() {
+        let mut k = open();
+        k.offset = 40;
+        k.at_rest = false;
+        k.absorb(pair("v2"), 500, 120, 12_000);
+        assert_eq!(k.currency(true, 12_000), "● live · changed just now");
     }
 
     #[test]

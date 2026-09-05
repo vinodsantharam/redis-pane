@@ -1204,6 +1204,52 @@ fn an_update_at_rest_lands_with_no_keypress() {
     );
 }
 
+/// ADR-0006's founding complaint, at the frame level: a Refetch that finds
+/// nothing must not render a frame identical to one where no read happened.
+#[test]
+fn a_refetch_that_found_nothing_still_changes_the_frame() {
+    let mut state = opened("k", hash_value(), 600);
+    let before = draw(&state, 130, 22);
+
+    // The same value comes back — the ordinary case for a key nobody is
+    // writing to, and the case that used to be indistinguishable from the
+    // reply being dropped as superseded, or failing, or never being sent.
+    state
+        .open
+        .as_mut()
+        .unwrap()
+        .absorb(hash_value(), 600, 2_150, 73_000);
+
+    let after = draw(&state, 130, 22);
+    assert_ne!(
+        before, after,
+        "the reader has to be able to tell that a read happened"
+    );
+    assert!(after.contains("unchanged"), "{after}");
+}
+
+#[test]
+fn golden_viewer_read_outcomes() {
+    let mut state = opened("user:8812:session", hash_value(), 2_537);
+    state
+        .open
+        .as_mut()
+        .unwrap()
+        .absorb(hash_value(), 2_537, 2_150, 73_000);
+    assert_golden("viewer_unchanged", &draw(&state, 130, 22));
+
+    let mut state = opened("user:8812:session", hash_value(), 2_537);
+    let changed = Value::Hash(PairValue {
+        pairs: vec![("plan".into(), "enterprise".into())],
+    });
+    state
+        .open
+        .as_mut()
+        .unwrap()
+        .absorb(changed, 2_537, 2_150, 73_000);
+    assert_golden("viewer_updated", &draw(&state, 130, 22));
+}
+
 #[test]
 fn an_update_while_scrolled_is_announced_and_offers_the_effective_key() {
     let mut state = opened("k", hash_value(), 600);

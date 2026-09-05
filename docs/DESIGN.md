@@ -221,14 +221,25 @@ against: the failure users learn to distrust is not a wrong value, it is being u
 │                                                          │
 │ live and current                                  ● live │
 │ an update just landed               ● live · updated now │
+│ a read found no change                ● live · unchanged │
 │ changed, you are scrolled    ● live · changed 2s ago   r │
 │ mid-edit, held back              ● live · changed · held │
 │ key deleted on the server               ✕ deleted 3s ago │
 │ tracking unavailable         ○ manual · read 14s ago   r │
+│ refetch found a change            ○ manual · updated now │
 │ refetch found no change             ○ manual · unchanged │
 │                                                          │
 └──────────────────────────────────────────────────────────┘
 ```
+
+The four `updated now` / `unchanged` rows are one rule, not four cases: **the header states what
+the last read found, and then stops.** They fade after a couple of seconds, because they are an
+account of an event rather than a description of the key — after that the resting phrase takes
+over. The two `● live` variants were not in the original inventory and are here because the
+question they answer does not depend on liveness: `r` pressed by hand on a live key deserves the
+same answer as `r` pressed on a manual one. Without them a Refetch that found nothing rendered a
+frame identical in every cell to one where the reply was dropped as superseded, or failed, or was
+never sent — which is the ADR-0006 ambiguity reproduced by the screen built to remove it.
 
 TTL is a special case worth stating: it counts down locally from the value read at fetch time,
 so the most time-sensitive figure on screen is live at no network cost.

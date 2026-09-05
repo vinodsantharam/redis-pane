@@ -15,7 +15,7 @@ pub mod view;
 
 pub use copy::CopyWhat;
 pub use loaded::{KeyKind, LoadedSet};
-pub use open::{Attachment, OpenKey};
+pub use open::{Attachment, OpenKey, ReadOutcome};
 pub use scan::ScanState;
 pub use tree::Tree;
 pub use value::{Value, Viewer};

@@ -8,6 +8,35 @@ purpose — what was done, and what was cut and why, are in its own note rather 
 
 ## Severity 1 — the current UI actively misleads or breaks
 
+- [x] **The value pane could be showing a key the cursor is not on, with nothing saying so —
+  reported from use, fixed 2026-09-05.** Diagnosed rather than patched: the value on screen was
+  never wrong. It was a correct, live, tracked read of a *different* key, and `● live` was telling
+  the truth — the problem is identity, not freshness. Three separate causes, two of them races
+  that would have made any new indicator report a lie:
+  - **A late read hijacked the pane.** `Msg::ValueLoaded`'s fallback arm installed a new `OpenKey`
+    unconditionally, and `open_key` spawned a detached task per read with no token and no
+    ordering. Open a 1.1 MB zset, change your mind, open something small: the small one arrives,
+    then the big one lands and takes the pane back. Every read now carries a `ReadToken` minted by
+    the core, and a reply that answers a superseded question is dropped.
+  - **`ValueGone` carried no identity at all** — `{ at_ms }`, while its sibling carried index and
+    name, both of which the shell had in scope and threw away. A stale gone-reply badged whichever
+    key was open *and*, since 958b311 keeps the panes in step, tombstoned its row: a healthy key
+    marked `✕ deleted` in both panes, with nothing afterwards to correct it. The sharpest seam in
+    the area, and invisible until something went looking.
+  - **`CLIENT CACHING YES` arms the next command on the connection**, so two concurrent reads
+    could interleave and leave the server tracking a key the Viewer was not showing — `● live`
+    over a value nothing would ever push an update for, which is ADR-0006's own defect by a third
+    route. Reads now take turns; the arm-and-read pair is indivisible.
+  - **And then the disclosure**, which is what was actually asked for: the Viewer is washed with a
+    dashed divider and `⊘ not the selected key`, the keys pane underlines the Open key's row and
+    ties it to the pane with `├`, and `▲`/`▼` point at it when it has scrolled out of view. Nothing
+    is drawn when the panes agree. See [ADR-0012](adr/0012-the-viewer-may-hold-a-key-you-are-not-on.md)
+    for the rejected alternatives — follow-the-cursor and a pin mode, both turned down — and
+    CONTEXT.md for **Selected key** / **Open key**, which had no names until now.
+  - Two fixtures were quietly self-contradicting and are now coherent: `opened()` opened index 0
+    whatever name it was given, and `viewer_deleted` badged the Viewer while leaving its row
+    untouched — the exact disagreement 958b311 removed, pictured in a golden frame.
+
 - [–] **Search within a large value (R3.3) — cut from scope 2026-09-04.** Not deferred for time;
   it does not decompose cleanly, and the research is worth keeping:
   - **Redis offers no uniform mechanism.** `HSCAN`/`SSCAN`/`ZSCAN` take `MATCH` (this is what

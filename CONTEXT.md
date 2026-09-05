@@ -48,6 +48,18 @@ all operate on the Loaded set, never on the whole keyspace — so the UI must be
 large it is and whether scanning is still adding to it.
 _Avoid_: Result set, cache, buffer, page
 
+**Selected key**:
+The key on the row under the cursor in the keys pane. It is what `→` would open and what a
+key-list action operates on — it is *not*, by itself, the key on screen in the Viewer.
+_Avoid_: Highlighted key, current key, cursor key
+
+**Open key**:
+The key the Viewer is showing. Opening is explicit, so the Open key is frequently **not** the
+Selected key — the user moves the cursor without opening, and the Viewer goes on holding what it
+was given. That divergence is legal and useful, and it is the app's job to say when it applies:
+both panes state the relationship rather than leaving the two names to be compared by eye.
+_Avoid_: Current key, active key, focused key, previewed key
+
 **Palette**:
 The fuzzy launcher for actions belonging to *the application* — navigation, settings, view
 switching. Every action is reachable here.
@@ -59,12 +71,12 @@ Palette: the Palette drives the app, the Console drives the server.
 _Avoid_: REPL, terminal, prompt, command bar
 
 **Refetch**:
-A single re-read of the open key from the server — type, memory usage, TTL, and the value
+A single re-read of the Open key from the server — type, memory usage, TTL, and the value
 itself. It always issues real commands; there is no value cache to serve from.
 _Avoid_: Refresh, reload, re-query
 
 **Liveness**:
-The property that the open key updates itself when it actually changes, driven by server
+The property that the Open key updates itself when it actually changes, driven by server
 invalidation rather than by a timer or a button. When the server cannot provide it, the app says
 so rather than falling back quietly.
 _Avoid_: Auto-refresh, polling, watch, live mode

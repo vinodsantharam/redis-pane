@@ -56,6 +56,22 @@ pub enum Token {
     Warn,
     /// Destructive, or refused.
     Danger,
+    /// The background of a Viewer holding a key that is not the Selected key —
+    /// DESIGN §5's `surface-alt`, and its first real use.
+    ///
+    /// A *background only*: it never sets a foreground, so every token drawn
+    /// over it keeps its own hue and the body stays as readable as it was. In
+    /// monochrome it is nothing at all, deliberately — the dashed divider, the
+    /// header chip and the underlined row are what carry the state where there
+    /// is no colour, which is why the wash is never shipped as the only signal.
+    SurfaceDetached,
+    /// The Open key's row in the keys pane, when it is not the Selected key.
+    ///
+    /// Ranked deliberately below [`Token::Selected`]: the cursor is a full bar,
+    /// this is an underline. Two emphases in one list only work if one of them
+    /// is obviously the junior, and underline is the one modifier still free in
+    /// monochrome once the selection has taken reverse video.
+    OpenRow,
 }
 
 /// Resolves tokens to styles at a given colour depth.
@@ -109,6 +125,12 @@ impl Theme {
             Token::Ok => fg(Color::Rgb(0x7A, 0xC7, 0x8E)),
             Token::Warn => fg(Color::Rgb(0xE0, 0xAF, 0x68)),
             Token::Danger => fg(Color::Rgb(0xF7, 0x76, 0x8E)),
+            // Dark enough to sit under body text without touching contrast,
+            // and blue enough to read as a state rather than as a highlight —
+            // the amber of `Selected` is spoken for, and the two must never be
+            // mistaken for each other.
+            Token::SurfaceDetached => Style::default().bg(Color::Rgb(0x1E, 0x24, 0x33)),
+            Token::OpenRow => Style::default().add_modifier(Modifier::UNDERLINED),
         }
     }
 
@@ -136,6 +158,8 @@ impl Theme {
             Token::Ok => fg(114),
             Token::Warn => fg(179),
             Token::Danger => fg(210),
+            Token::SurfaceDetached => Style::default().bg(Color::Indexed(236)),
+            Token::OpenRow => Style::default().add_modifier(Modifier::UNDERLINED),
         }
     }
 
@@ -146,6 +170,13 @@ impl Theme {
             // all — the standard way a terminal marks "this is the row you
             // are on" when it cannot colour it.
             Token::Selected => s.add_modifier(Modifier::REVERSED),
+            // Underline, so the Open key's row stays distinguishable from the
+            // cursor's reverse video with no hue at all.
+            Token::OpenRow => s.add_modifier(Modifier::UNDERLINED),
+            // The wash is hue and nothing else, so here it is nothing. Making
+            // it DIM instead would collide with the focus signal, which already
+            // owns intensity on the Viewer's header row.
+            Token::SurfaceDetached => s,
             Token::Muted | Token::Border | Token::EnvUnknown => s.add_modifier(Modifier::DIM),
             Token::BorderFocus | Token::EnvProd | Token::Danger => s.add_modifier(Modifier::BOLD),
             // Every type token: no modifier. The TYPE column's word is what

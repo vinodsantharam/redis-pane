@@ -150,10 +150,14 @@ async fn main() {
         (state, _) = update(state, Msg::TrackingArmed);
     }
     if let Ok(Some(read)) = read_result {
+        let token = state.read_token;
         (state, _) = update(
             state,
             Msg::ValueLoaded {
-                index: target,
+                // This example drives `update` by hand rather than through the
+                // command loop, so it stamps the token the core is holding.
+                token,
+                index: Some(target),
                 name: String::from_utf8_lossy(&name).into_owned(),
                 value: read.value,
                 ttl_seconds: read.ttl_seconds,

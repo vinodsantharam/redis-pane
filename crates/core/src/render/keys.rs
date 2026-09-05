@@ -111,11 +111,35 @@ impl Viewport {
     }
 }
 
+/// Where the Open key's row ended up, so the divider between the panes can
+/// point at it.
+///
+/// Returned rather than recomputed on the value pane's side: the viewport maths
+/// that decides which rows are on screen lives here, and duplicating it is how
+/// the two panes would come to disagree about where one key is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenRowMark {
+    /// Nothing open, or the Open key has no row at all — filtered out, folded
+    /// away, or waiting to be re-resolved after a rescan.
+    None,
+    /// On screen, at this buffer row.
+    At(u16),
+    /// Scrolled past, above or below the visible window.
+    Above,
+    Below,
+}
+
 /// Render the keys pane. Draws at most `area.height` rows regardless of how
 /// many keys are loaded.
-pub fn render(state: &State, theme: &Theme, area: Rect, density: Density, buf: &mut Buffer) {
+pub fn render(
+    state: &State,
+    theme: &Theme,
+    area: Rect,
+    density: Density,
+    buf: &mut Buffer,
+) -> OpenRowMark {
     if area.width < 8 || area.height < 2 {
-        return;
+        return OpenRowMark::None;
     }
     let cols = Columns::for_pane(area.width, density);
     let mut y = area.y;
@@ -149,6 +173,14 @@ pub fn render(state: &State, theme: &Theme, area: Rect, density: Density, buf: &
     let body_height = (area.y + area.height).saturating_sub(y) as usize;
     let view = state.view.scrolled_to_selection(body_height);
 
+    // The Open key's row, if it has one. Read once rather than per row.
+    let open_row = state.open.as_ref().and_then(|open| open.row);
+    let mut mark = match open_row {
+        None => OpenRowMark::None,
+        Some(row) if row < view.offset => OpenRowMark::Above,
+        Some(_) => OpenRowMark::Below,
+    };
+
     for row in 0..body_height {
         let display_row = view.offset + row;
         if display_row >= state.row_count() {
@@ -156,12 +188,43 @@ pub fn render(state: &State, theme: &Theme, area: Rect, density: Density, buf: &
         }
         let at = y + row as u16;
         let selected = display_row == view.selected;
+        // The Open key's row carries a mark of its own, ranked below the
+        // cursor's: the reader has to be able to see, without looking away from
+        // the list, which row the Viewer is actually showing (CONTEXT.md's
+        // Selected key vs Open key). When they are the same row the two marks
+        // coincide, which is what makes the moment they separate legible.
+        let is_open = open_row == Some(display_row);
+        if is_open {
+            mark = OpenRowMark::At(at);
+        }
         if state.tree_mode {
-            tree_row(state, display_row, selected, theme, area, cols, at, buf);
+            tree_row(
+                state,
+                display_row,
+                selected,
+                is_open,
+                theme,
+                area,
+                cols,
+                at,
+                buf,
+            );
         } else if let Some(i) = state.list.index_at(display_row) {
-            key_row(&state.keys, i, selected, theme, area, cols, at, 0, buf);
+            key_row(
+                &state.keys,
+                i,
+                selected,
+                is_open,
+                theme,
+                area,
+                cols,
+                at,
+                0,
+                buf,
+            );
         }
     }
+    mark
 }
 
 /// `/ user:*:session          3,410 of 41,203`
@@ -210,6 +273,7 @@ fn tree_row(
     state: &State,
     display_row: usize,
     selected: bool,
+    is_open: bool,
     theme: &Theme,
     area: Rect,
     cols: Columns,
@@ -269,6 +333,7 @@ fn tree_row(
             &state.keys,
             index as usize,
             selected,
+            is_open,
             theme,
             area,
             cols,
@@ -304,6 +369,7 @@ fn key_row(
     keys: &LoadedSet,
     i: usize,
     selected: bool,
+    is_open: bool,
     theme: &Theme,
     area: Rect,
     cols: Columns,
@@ -340,11 +406,17 @@ fn key_row(
 
     // A gone key's name is history, not something to act on, so it drops to the
     // same weight as its metadata rather than reading as a live row.
-    let name_style = theme.style(match (selected, gone) {
+    let mut name_style = theme.style(match (selected, gone) {
         (true, _) => Token::Selected,
         (false, true) => Token::Muted,
         (false, false) => Token::Text,
     });
+    // Underline rather than a glyph or a hue: it costs no column, it composes
+    // with the selection bar when the two coincide, and it is the one modifier
+    // still free in monochrome once `Selected` has taken reverse video.
+    if is_open {
+        name_style = name_style.patch(theme.style(Token::OpenRow));
+    }
     let meta_style = theme.style(if selected {
         Token::Selected
     } else {

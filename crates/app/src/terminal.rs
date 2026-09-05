@@ -6,6 +6,7 @@
 //! doing, because nothing here waits on the network.
 
 use std::io::{Stdout, stdout};
+use std::sync::Arc;
 
 use crossterm::event::{self, Event, KeyCode as XKeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::{execute, terminal};
@@ -15,6 +16,7 @@ use ratatui::backend::CrosstermBackend;
 use fred::interfaces::EventInterface;
 use fred::prelude::Client;
 use redis_pane_core::clock::Clock;
+use redis_pane_core::command::ReadToken;
 use redis_pane_core::msg::{KeyCode, KeyPress};
 use redis_pane_core::theme::{ColorDepth, Theme};
 use redis_pane_core::{Command, Msg, State, render, update};
@@ -133,6 +135,16 @@ pub async fn run(
     };
 
     let mut scan_cancel: Option<CancellationToken> = None;
+    // Reads take turns. `CLIENT CACHING YES` arms the *next* read-only command
+    // on the connection, so two reads running at once can interleave and leave
+    // the server tracking a key the Viewer is not showing — the header would
+    // then read `● live` over a value nothing will ever push an update for,
+    // which is exactly the failure ADR-0006 exists to make unreachable. Holding
+    // this across the arm-and-read pair is what keeps them one indivisible step.
+    let read_lock = Arc::new(tokio::sync::Mutex::new(()));
+    // Superseded reads are cancelled rather than merely ignored: a read that
+    // never runs cannot arm anything, which keeps the queue above short.
+    let mut read_cancel: Option<CancellationToken> = None;
     start_scan(&client, None, &tx, &mut scan_cancel);
 
     // fred reconnects underneath us, and the server on the other side remembers
@@ -262,18 +274,29 @@ pub async fn run(
                         }
                     });
                 }
-                Command::OpenKey { index, name } => {
-                    open_key(&client, index, name, &tx, area_width(&term), arming)
-                }
-                Command::RefetchOpenKey => {
+                Command::OpenKey { index, name, token } => open_key(
+                    &client,
+                    Some(index),
+                    name,
+                    token,
+                    &tx,
+                    area_width(&term),
+                    arming,
+                    &read_lock,
+                    &mut read_cancel,
+                ),
+                Command::RefetchOpenKey { token } => {
                     if let Some(open) = &state.open {
                         open_key(
                             &client,
                             open.index,
                             open.name.as_bytes().to_vec(),
+                            token,
                             &tx,
                             area_width(&term),
                             arming,
+                            &read_lock,
+                            &mut read_cancel,
                         );
                     }
                 }
@@ -314,17 +337,42 @@ pub async fn run(
 /// read `○ manual` forever, on every server, including local Redis with
 /// tracking fully working. The core's invariant was airtight; the shell simply
 /// never told it the truth.
+#[allow(clippy::too_many_arguments)]
 fn open_key(
     client: &Client,
-    index: usize,
+    index: Option<usize>,
     name: Vec<u8>,
+    token: ReadToken,
     tx: &mpsc::Sender<Msg>,
     pane_width: usize,
     arming: crate::redis::read::Arming,
+    read_lock: &Arc<tokio::sync::Mutex<()>>,
+    read_cancel: &mut Option<CancellationToken>,
 ) {
+    // Supersede whatever was in flight. The core would ignore its reply anyway
+    // — every reply carries the token of the read it answers — but ignoring a
+    // reply does not un-send the `CLIENT CACHING YES` that came with it, and
+    // that is the half which decides what the server tracks.
+    if let Some(previous) = read_cancel.replace(CancellationToken::new()) {
+        previous.cancel();
+    }
+    let cancel = read_cancel.clone().expect("just set");
     let client = client.clone();
     let tx = tx.clone();
+    let read_lock = read_lock.clone();
     tokio::spawn(async move {
+        // Two chances to drop out before touching the wire: while queueing for
+        // the lock, and on acquiring it. Past that point the arm-and-read pair
+        // runs to completion — interrupting it is what would leave the
+        // connection armed for a key nobody is looking at.
+        let _guard = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            guard = read_lock.lock() => guard,
+        };
+        if cancel.is_cancelled() {
+            return;
+        }
         let at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -340,6 +388,7 @@ fn open_key(
 
         let msg = match result {
             Ok(Some(read)) => Msg::ValueLoaded {
+                token,
                 index,
                 name: String::from_utf8_lossy(&name).into_owned(),
                 value: read.value,
@@ -347,9 +396,14 @@ fn open_key(
                 size_bytes: read.size_bytes,
                 at_ms,
             },
-            Ok(None) => Msg::ValueGone { at_ms },
+            Ok(None) => Msg::ValueGone { token, at_ms },
             // Never swallowed: a Redis error that produces no visible effect is
             // indistinguishable from the app deciding to do nothing (R7.4).
+            //
+            // Deliberately carries no token, so it is never dropped as stale. A
+            // read that failed, failed — the key it names is in the message, and
+            // suppressing it because the reader has moved on would be swallowing
+            // an error on a technicality (R7.4).
             Err(e) => Msg::Failed {
                 command: format!("reading {}", String::from_utf8_lossy(&name)),
                 detail: e.details().to_string(),

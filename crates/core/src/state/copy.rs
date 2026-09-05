@@ -94,7 +94,7 @@ mod tests {
     use crate::state::value::{PairValue, ScoredValue, StringValue};
 
     fn open_with(name: &str, value: Value) -> OpenKey {
-        OpenKey::new(0, name.into(), value, -1, 10, 0)
+        OpenKey::new(Some(0), name.into(), value, -1, 10, 0)
     }
 
     fn hash() -> Value {

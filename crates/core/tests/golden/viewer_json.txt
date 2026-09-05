@@ -7,7 +7,7 @@
  ● user:8813:session               hash      1.9 KB   56m │ {
  ● cart:91af3c9d2e                 zset      1.1 MB   12m │   "ab_checkout": "B",
  ● feed:global:hot                 list     63.0 KB     ∞ │   "newnav": true,
-                                                          │   "rollout": 0.25
+ · config:feature-flags            ·              ·     · ├   "rollout": 0.25
                                                           │ }
                                                           │
                                                           │

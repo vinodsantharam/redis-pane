@@ -135,15 +135,30 @@ pub enum Msg {
     /// The only way a value enters the Viewer. There is no other path, which is
     /// what makes a stale value unrepresentable (ADR-0006).
     ValueLoaded {
-        index: usize,
+        /// Which read this answers. A reply from a superseded read is dropped
+        /// rather than applied — see [`crate::command::ReadToken`].
+        token: crate::command::ReadToken,
+        /// The Loaded set row this key was read from, if one was known. `None`
+        /// after a rescan took it away — the value is still the value, but
+        /// there is no row it may be written back to.
+        index: Option<usize>,
         name: String,
         value: crate::state::Value,
         ttl_seconds: i32,
         size_bytes: u32,
         at_ms: u64,
     },
-    /// The open key is gone: deleted, expired, or evicted.
+    /// The key that was read is gone: deleted, expired, or evicted.
+    ///
+    /// Carries a token for the same reason [`Msg::ValueLoaded`] does, and with
+    /// more at stake: this message tombstones the Open key *and* its row in the
+    /// keys pane, so an unidentified one badges whichever key happens to be
+    /// open now. A healthy key marked `✕ deleted` in both panes is worse than
+    /// the wrong value, because nothing afterwards corrects it — metadata is
+    /// refetched only for rows whose type is unknown, and this row's would be
+    /// known and wrong.
     ValueGone {
+        token: crate::command::ReadToken,
         at_ms: u64,
     },
     /// Something was copied. Drives a notice that fades on its own.

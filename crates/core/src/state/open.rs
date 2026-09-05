@@ -11,6 +11,29 @@
 
 use super::value::Value;
 
+/// Whether the Viewer is showing the Selected key.
+///
+/// The Open key and the Selected key are allowed to differ, and routinely do:
+/// opening is explicit, so moving the cursor leaves the Viewer where it was.
+/// That is useful — it is how you read one key while looking for another — but
+/// it is only usable if the app says when it applies. Left unsaid it produces
+/// the complaint this type exists to answer: the value pane appearing to show
+/// the wrong key, when in fact it is showing the right value for a key the
+/// reader is no longer on. Nothing here is about freshness; the value is a live
+/// tracked read either way (ADR-0006). It is about *whose* value it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attachment {
+    /// The Open key is the Selected key. The quiet case, and the common one.
+    Attached,
+    /// The Open key is elsewhere in the list, this many rows from the cursor —
+    /// negative above, positive below.
+    Detached { rows: isize },
+    /// The Open key is open but has no row to point at: filtered out, inside a
+    /// collapsed group, or not yet re-resolved after a rescan. The keys pane
+    /// has nothing to mark, so the Viewer has to carry the whole signal.
+    DetachedOffList,
+}
+
 /// A value that arrived while the reader was not at rest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pending {
@@ -21,11 +44,30 @@ pub struct Pending {
     pub at_ms: u64,
 }
 
-/// The key currently in the Viewer.
+/// The Open key: the key currently in the Viewer.
+///
+/// It is frequently *not* the Selected key — opening is explicit, and moving
+/// the cursor does not move the Viewer. Both panes state that relationship
+/// rather than leaving two key names to be compared by eye; the state behind
+/// that is [`crate::state::State::attachment`], computed from [`OpenKey::row`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenKey {
-    /// Index into the Loaded set.
-    pub index: usize,
+    /// Index into the Loaded set, while one is known to address this key.
+    ///
+    /// `None` after a rescan. `SCAN` order is not stable, so the Loaded set is
+    /// renumbered and the old index may address a *different key* — writing
+    /// this key's type or tombstone through it would corrupt an unrelated row,
+    /// and marking that row as the Open key would point the user confidently at
+    /// the wrong line. It is re-resolved by name when the key is scanned again.
+    /// [`OpenKey::name`] is the identity that never goes stale.
+    pub index: Option<usize>,
+    /// Display row of this key, while it has one.
+    ///
+    /// `None` when the key has no row to be on: filtered out, inside a
+    /// collapsed group, or not yet re-resolved after a rescan. Recomputed when
+    /// the row list is rebuilt rather than searched for per frame — moving the
+    /// cursor never changes it, so the render path needs no reverse lookup.
+    pub row: Option<usize>,
     pub name: String,
     pub value: Value,
     pub ttl_seconds: i32,
@@ -50,7 +92,7 @@ pub struct OpenKey {
 
 impl OpenKey {
     pub fn new(
-        index: usize,
+        index: Option<usize>,
         name: String,
         value: Value,
         ttl_seconds: i32,
@@ -59,6 +101,7 @@ impl OpenKey {
     ) -> Self {
         Self {
             index,
+            row: None,
             name,
             value,
             ttl_seconds,
@@ -172,7 +215,7 @@ mod tests {
     }
 
     fn open() -> OpenKey {
-        OpenKey::new(0, "k".into(), pair("v1"), 600, 100, 10_000)
+        OpenKey::new(Some(0), "k".into(), pair("v1"), 600, 100, 10_000)
     }
 
     #[test]
@@ -227,7 +270,7 @@ mod tests {
 
     #[test]
     fn a_key_with_no_expiry_stays_that_way_however_long_you_watch() {
-        let k = OpenKey::new(0, "k".into(), pair("v"), -1, 10, 0);
+        let k = OpenKey::new(Some(0), "k".into(), pair("v"), -1, 10, 0);
         assert_eq!(k.ttl_now(999_999_999), -1);
     }
 
@@ -251,7 +294,7 @@ mod tests {
     #[test]
     fn the_viewer_holds_no_second_copy_of_anything() {
         let k = OpenKey::new(
-            0,
+            Some(0),
             "k".into(),
             Value::Str(StringValue::new("x", 40)),
             -1,
@@ -283,7 +326,7 @@ mod editing_indicator_tests {
 
     #[test]
     fn editing_with_nothing_pending_says_so_rather_than_reading_as_plain_live() {
-        let mut k = OpenKey::new(0, "k".into(), pair(), -1, 10, 0);
+        let mut k = OpenKey::new(Some(0), "k".into(), pair(), -1, 10, 0);
         k.editing = true;
         assert_eq!(k.currency(true, 0), "✎ editing");
         assert_ne!(
@@ -295,7 +338,7 @@ mod editing_indicator_tests {
 
     #[test]
     fn editing_with_a_pending_update_still_says_held() {
-        let mut k = OpenKey::new(0, "k".into(), pair(), -1, 10, 0);
+        let mut k = OpenKey::new(Some(0), "k".into(), pair(), -1, 10, 0);
         k.editing = true;
         k.absorb(pair(), -1, 10, 1_000);
         assert_eq!(k.currency(true, 1_000), "✎ editing · changed · held");
@@ -303,7 +346,7 @@ mod editing_indicator_tests {
 
     #[test]
     fn not_editing_is_unaffected() {
-        let k = OpenKey::new(0, "k".into(), pair(), -1, 10, 0);
+        let k = OpenKey::new(Some(0), "k".into(), pair(), -1, 10, 0);
         assert_eq!(k.currency(true, 0), "● live");
     }
 }

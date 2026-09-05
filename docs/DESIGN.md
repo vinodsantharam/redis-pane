@@ -122,7 +122,7 @@ when focus was inferred from "is a key open" instead of tracked.
 
 | Token | Use |
 |---|---|
-| `surface` / `surface-alt` | Pane background, zebra striping |
+| `surface` / `surface-alt` | Pane background; `surface-alt` washes the Viewer while it holds a key that is not the Selected key (§6.4) |
 | `border` / `border-focus` | Pane edges; focused pane gets `border-focus` + bold title |
 | `text` / `text-muted` | Primary content vs. metadata (TTL, sizes, counts) |
 | `accent` | Selection, cursor row, active tab |
@@ -241,6 +241,41 @@ Where the server cannot support tracking — Redis before 6, or no RESP3 — the
 `○ manual`, Read age replaces it, and `r` does the work. This is the same rule as the Source
 readout in the title bar: the app may choose for you, but it never lets you assume wrongly.
 Silent degradation here would recreate the exact frustration this screen exists to remove.
+
+**Whose value is this?** The Viewer holds the **Open key**, and the cursor sits on the
+**Selected key**; they are frequently not the same, because opening is explicit and arrowing the
+list deliberately does not fire a read and a `CLIENT TRACKING` re-arm per keystroke. Nothing
+about that is a freshness problem — the value is live and tracked either way — but left unsaid it
+reads as the value pane showing the wrong key, which is the complaint this whole section exists
+to answer, one level up.
+
+So the state is stated on both sides of the divider, and the division of labour is: **the Viewer
+says what, the divider says where.**
+
+```
+│ KEY                    TYPE   TTL ┊ user:8812:session   ⊘ not the selected key │
+│ ██user:8812:cart███████zset███12m ┊ hash · 5 fields · 2.1 KB                   │
+│ ● user:8812:profile    json    ∞  ┊ ttl 42m                            ● live  │
+│ ● user:8812:session    hash   42m ├   ← the Open key's row, underlined         │
+│ ● user:8813:session    hash   56m ┊ FIELD        VALUE                         │
+```
+
+- The Viewer is **washed** (`surface-alt`), the divider goes **dashed**, and the header carries
+  `⊘ not the selected key` — or `⊘ not in the list` when the Open key has no row at all, because
+  it is filtered out, folded inside a collapsed group, or waiting to be re-resolved after a
+  rescan. The chip is dropped before the key name is: the name is the pane's identity.
+- The keys pane **underlines** the Open key's name, and the divider cell on that row becomes `├`.
+  Underline is ranked deliberately below the cursor's full-bar highlight — two marks in one list
+  only work if one is obviously the junior — and it is the one modifier still free in monochrome
+  once the selection has taken reverse video. When the Open key has scrolled out of the window the
+  divider carries `▲`/`▼` at its edge instead.
+- **When the two agree, none of this is on screen** and the tie glyph is the only trace. That
+  coincidence is the point rather than redundancy: it teaches the relationship in the ordinary
+  case, so the moment the panes separate reads as a change and not as a puzzle.
+
+The wash is hue and nothing else, so monochrome loses it entirely — the dashed divider, the chip
+and the underline are what carry the state there. That is why the wash is never the only signal,
+and it is the same rule as everywhere else: losing colour must lose emphasis, never information.
 
 ### 6.5 Editing and confirmation
 Editing opens an inline editor in the value pane, not a modal. Committing shows a **command

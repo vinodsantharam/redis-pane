@@ -873,9 +873,33 @@ use redis_pane_core::state::value::{
     StringValue, Value,
 };
 
+/// A key open, with the cursor on its row — the Attached case, which is what
+/// these viewer fixtures are about.
+///
+/// It opens *the row that actually holds this name*, adding it to the Loaded
+/// set if it is not already there. The earlier version opened index 0 whatever
+/// the name was, which was invisible while nothing tied the panes together and
+/// is a self-contradicting frame now that something does: a header naming one
+/// key over a mark pointing at another is precisely the confusion these fixtures
+/// exist to catch.
 fn opened(name: &str, value: Value, ttl: i32) -> State {
     let mut state = many_keys();
-    state.open = Some(OpenKey::new(0, name.into(), value, ttl, 2_150, 60_000));
+    let index = (0..state.keys.len())
+        .find(|&i| state.keys.name_str(i).as_deref() == Some(name))
+        .unwrap_or_else(|| {
+            state.keys.push(name.as_bytes());
+            state.keys.len() - 1
+        });
+    state.open = Some(OpenKey::new(
+        Some(index),
+        name.into(),
+        value,
+        ttl,
+        2_150,
+        60_000,
+    ));
+    state.rebuild_list();
+    state.view.selected = state.open.as_ref().and_then(|open| open.row).unwrap_or(0);
     state
 }
 
@@ -1114,6 +1138,11 @@ fn golden_viewer_update_held_while_scrolled() {
 fn golden_viewer_deleted() {
     let mut state = opened("lock:checkout:8812", hash_value(), 12);
     state.open.as_mut().unwrap().deleted_at_ms = Some(71_000);
+    // The row learns it too. `Msg::ValueGone` does both together (958b311); a
+    // fixture that badged only the Viewer would picture the two panes
+    // disagreeing about one key, which is the state that commit removed.
+    let index = state.open.as_ref().unwrap().index.unwrap();
+    state.keys.set_gone(index);
     assert_golden("viewer_deleted", &draw(&state, 130, 22));
 }
 
@@ -1662,5 +1691,183 @@ fn the_banner_coexists_with_the_filter_line_in_the_documented_order() {
     assert!(
         banner_row < filter_row,
         "the cap banner should sit above the filter line"
+    );
+}
+
+// ── The Open key vs the Selected key (CONTEXT.md; UI task severity 1) ───────
+//
+// The reported defect: the cursor on one key, the value pane showing another,
+// with nothing on screen relating the two. The value was never wrong — it was a
+// live tracked read of a different key — so these fixtures are about identity,
+// not freshness.
+
+/// The Attached case is the quiet one: no wash, a solid divider, no chip. It is
+/// pinned here so that "nothing happens when the panes agree" is a tested
+/// property rather than an assumption.
+#[test]
+fn golden_viewer_attached_says_nothing_extra() {
+    let state = opened("user:8812:session", hash_value(), 2_537);
+    let frame = draw(&state, 130, 22);
+    assert!(!frame.contains('┊'), "no dashed divider while attached");
+    assert!(!frame.contains('⊘'), "no chip while attached");
+    assert!(frame.contains('├'), "but the row is still tied to the pane");
+}
+
+/// The cursor moves off the Open key. This is the frame the bug report was
+/// about, and it is the one that has to be unmistakable.
+#[test]
+fn golden_viewer_detached() {
+    let mut state = opened("user:8812:session", hash_value(), 2_537);
+    state.view.selected = 0; // `user:8812:cart`, two rows above the Open key
+    assert_golden("viewer_detached", &draw(&state, 130, 22));
+}
+
+/// Filtered out: the Open key has no row, so the keys pane has nothing to mark
+/// and the Viewer has to carry the whole signal on its own.
+#[test]
+fn golden_viewer_detached_off_list() {
+    let mut state = opened("user:8812:session", hash_value(), 2_537);
+    state.list.filter = "cart".into();
+    state.rebuild_list();
+    assert_golden("viewer_detached_off_list", &draw(&state, 130, 22));
+}
+
+/// Scrolled past: the Open key is real and has a row, but not one on screen.
+/// The divider points the way rather than leaving it to be hunted for.
+#[test]
+fn golden_viewer_detached_scrolled_out_of_view() {
+    let mut state = opened("user:8812:cart", hash_value(), 2_537);
+    // Enough rows that the window cannot hold them all, which is the only way
+    // the Open key can have a row and still not be on screen.
+    for i in 0..40 {
+        state.keys.push(format!("filler:{i:03}").as_bytes());
+    }
+    state.rebuild_list();
+    state.view.selected = state.row_count() - 1;
+    let frame = draw(&state, 130, 22);
+    assert!(
+        frame.contains('▲'),
+        "the Open key is above the window:\n{frame}"
+    );
+    assert_golden("viewer_detached_scrolled_out", &frame);
+}
+
+/// The chip gives way before the key name does, following the title bar's rule:
+/// the name is the pane's identity, the chip is a qualifier on it.
+#[test]
+fn the_chip_shortens_and_then_goes_rather_than_crowding_the_key_name() {
+    let mut state = opened("user:8812:session", hash_value(), 2_537);
+    state.view.selected = 0;
+    let wide = draw(&state, 130, 22);
+    assert!(wide.contains("⊘ not the selected key"), "{wide}");
+
+    let narrow = draw(&state, 80, 22);
+    assert!(
+        narrow.contains("user:8812:session"),
+        "the key name always survives:\n{narrow}"
+    );
+    assert!(
+        narrow.contains('⊘'),
+        "and the chip is still stated:\n{narrow}"
+    );
+    assert!(
+        !narrow.contains("⊘ not the selected key"),
+        "but not at full length in a pane this narrow:\n{narrow}"
+    );
+}
+
+/// The wash is hue and nothing else, so monochrome must lose it — and must
+/// still say the same thing. This is the test that stops the loud treatment
+/// from becoming the *only* treatment.
+#[test]
+fn detachment_survives_the_loss_of_colour() {
+    let mut state = opened("user:8812:session", hash_value(), 2_537);
+    state.view.selected = 0;
+    let area = Rect::new(0, 0, 130, 22);
+
+    // `put` writes `Style::reset()`, which leaves `bg` as `Some(Color::Reset)`.
+    // That is the *absence* of a background, so testing `is_some()` would pass
+    // on every cell in the frame and prove nothing.
+    let washed_at = |buf: &ratatui::buffer::Buffer, x: u16, y: u16| {
+        !matches!(
+            buf.cell((x, y)).map(|c| c.style().bg),
+            None | Some(None) | Some(Some(ratatui::style::Color::Reset))
+        )
+    };
+
+    let color = render::frame(&state, &Theme::new(ColorDepth::TrueColor), &CLOCK, area);
+    // The pane's own rows are exactly the ones the dashed divider runs down, so
+    // the two signals are checked against each other rather than against a
+    // hand-counted range of chrome rows.
+    let pane_rows: Vec<u16> = render::to_text(&color)
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.contains('┊'))
+        .map(|(y, _)| y as u16)
+        .collect();
+    assert!(pane_rows.len() > 10, "sanity: {pane_rows:?}");
+    assert!(
+        pane_rows.iter().all(|y| washed_at(&color, 100, *y)),
+        "in colour the whole value pane is washed, empty rows included"
+    );
+    assert!(
+        !washed_at(&color, 20, 4),
+        "and the keys pane is not — the wash is a statement about one pane"
+    );
+
+    let mono = render::frame(&state, &Theme::new(ColorDepth::Monochrome), &CLOCK, area);
+    assert!(
+        (0..area.height).all(|y| !washed_at(&mono, 100, y)),
+        "in monochrome there is no wash at all"
+    );
+    let text = render::to_text(&mono);
+    assert!(text.contains('┊'), "the dashed divider carries it instead");
+    assert!(
+        text.contains("⊘ not the selected key"),
+        "and so does the chip"
+    );
+}
+
+/// Two marks in one list only work if one is obviously the junior partner. The
+/// cursor keeps reverse video; the Open key's row gets underline, which is the
+/// one modifier still free once the selection has taken the other.
+#[test]
+fn the_open_row_is_underlined_and_the_cursor_row_is_not_merely_that() {
+    use ratatui::style::Modifier;
+
+    let mut state = opened("user:8812:session", hash_value(), 2_537);
+    state.view.selected = 0;
+    let area = Rect::new(0, 0, 130, 22);
+    let mono = render::frame(&state, &Theme::new(ColorDepth::Monochrome), &CLOCK, area);
+
+    // The bare name also appears in the value pane's header, which is above the
+    // list; the dot is what makes this a key *row*.
+    let open_y = row_of(&mono, "● user:8812:session");
+    let cursor_y = row_of(&mono, "● user:8812:cart");
+    assert_ne!(open_y, cursor_y, "this fixture is only meaningful detached");
+
+    let style_at = |x: u16, y: u16| {
+        mono.cell((x, y))
+            .map(|c| c.style())
+            .expect("cell in bounds")
+    };
+    // Column 3 is inside the key name, past the leading space and the dot.
+    assert!(
+        style_at(3, open_y)
+            .add_modifier
+            .contains(Modifier::UNDERLINED),
+        "the Open key's name is underlined"
+    );
+    assert!(
+        style_at(3, cursor_y)
+            .add_modifier
+            .contains(Modifier::REVERSED),
+        "the cursor's row keeps the full-bar highlight"
+    );
+    assert!(
+        !style_at(3, cursor_y)
+            .add_modifier
+            .contains(Modifier::UNDERLINED),
+        "and the two marks are not the same mark"
     );
 }

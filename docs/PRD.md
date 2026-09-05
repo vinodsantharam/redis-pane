@@ -253,7 +253,9 @@ config file; a **Connection** is a live session, which may be **ad-hoc** (no Pro
 - **M2 — Mutate.** Editing, TTL management, delete/rename/copy, read-only mode, safety rails.
 - **M3 — Power.** Command palette + console, monitor, pub/sub, server dashboard, slowlog.
 - **M4 — Scale & polish.** Cluster support, million-key performance work, themes, packaging
-  and distribution.
+  and distribution. *Raw binary distribution (GitHub Release archives for macOS, Linux, and
+  Windows, via `cargo-dist`) shipped ahead of M4 as a low-risk alpha-testing convenience — no
+  code signing, no package manager. M4 still owns everything else in this bullet.*
 
 ## 10. Open questions
 

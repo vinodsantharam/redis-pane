@@ -36,6 +36,18 @@ struct Cli {
     /// Database index. Fixed at launch; there is no in-app switcher (ADR-0005).
     #[arg(long, value_name = "N")]
     db: Option<u8>,
+    /// ACL username. Always wins over a Profile's or the environment's.
+    #[arg(long, value_name = "NAME")]
+    user: Option<String>,
+    /// Password, given directly. Visible in shell history and to other users
+    /// via `ps` — prefer a Profile's `passwordEnv`/`passwordCommand` for
+    /// anything long-lived. Always wins over a Profile's or the environment's.
+    #[arg(long, value_name = "SECRET")]
+    password: Option<String>,
+    /// Use TLS. Additive only — there is no --no-tls to downgrade a Profile or
+    /// a `rediss://` URL that already wants it.
+    #[arg(long)]
+    tls: bool,
     /// Resolve and print the target, then exit without connecting.
     #[arg(long)]
     print_target: bool,
@@ -121,6 +133,13 @@ fn probe(connection: &Connection, credentials: &Credentials, dial: &str) -> i32 
 fn main() {
     let cli = Cli::parse();
 
+    if cli.password.is_some() {
+        eprintln!(
+            "redis-pane: warning: --password is visible in shell history and to other users \
+             via `ps`; prefer passwordEnv/passwordCommand in a Profile for anything long-lived."
+        );
+    }
+
     let config = match config_io::default_path() {
         Some(path) => match config_io::load(&path) {
             Ok(config) => config,
@@ -139,6 +158,9 @@ fn main() {
         port: cli.port,
         db: cli.db,
         profile: cli.profile.or(cli.positional_profile),
+        user: cli.user,
+        password: cli.password,
+        tls: cli.tls,
     };
     let resolution = resolve(&flags, config.as_ref(), &env_vars());
     let connection = resolution.connection.clone();

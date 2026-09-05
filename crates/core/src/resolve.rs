@@ -69,6 +69,12 @@ pub struct Flags {
     pub port: Option<u16>,
     pub db: Option<u8>,
     pub profile: Option<String>,
+    /// `--user`, `--password`, `--tls` — a credential source that always wins,
+    /// on top of whatever target and credentials the other flags, a Profile,
+    /// or the environment produced. See `resolve()`'s override pass below.
+    pub user: Option<String>,
+    pub password: Option<String>,
+    pub tls: bool,
 }
 
 impl Flags {
@@ -101,6 +107,24 @@ const DEFAULT_PORT: u16 = 6379;
 ///
 /// Never fails and never prompts: the fallback is always `127.0.0.1:6379`.
 pub fn resolve(flags: &Flags, config: Option<&Config>, env: &EnvVars) -> Resolution {
+    let mut resolution = resolve_target(flags, config, env);
+    // `--user`/`--password`/`--tls` always win, on top of whatever the target
+    // resolution above produced — a Profile's stored password included. This
+    // is the same "explicit flags beat everything" precedence ADR-0001 already
+    // states for the target itself, extended to credentials.
+    if let Some(user) = &flags.user {
+        resolution.credentials.username = Some(user.clone());
+    }
+    if let Some(password) = &flags.password {
+        resolution.credentials.password = PasswordSource::Literal(password.clone());
+    }
+    if flags.tls {
+        resolution.credentials.tls = true;
+    }
+    resolution
+}
+
+fn resolve_target(flags: &Flags, config: Option<&Config>, env: &EnvVars) -> Resolution {
     // 1. An explicit --profile names a Profile, and outranks everything but a
     //    target given directly on the command line.
     if let Some(name) = &flags.profile
@@ -612,6 +636,64 @@ mod credential_tests {
         let c = resolve(&flags, Some(&cfg), &env).credentials;
         assert_eq!(c.password, PasswordSource::Env("PROFILE_PW".into()));
         assert!(c.username.is_none(), "the stale username must not leak in");
+    }
+
+    #[test]
+    fn a_password_flag_overrides_a_profiles_stored_password() {
+        // `redis-pane --profile prod --password "$(vault read ...)"` has to
+        // actually reach the connection, the same way an explicit --host beats
+        // a Profile's target (ADR-0001) — the flag is the most explicit thing
+        // on the command line, so it wins here too.
+        let cfg = config(r#"{"profiles":{"p":{"host":"h","passwordEnv":"PROFILE_PW"}}}"#);
+        let flags = Flags {
+            profile: Some("p".into()),
+            password: Some("override-me".into()),
+            ..Flags::default()
+        };
+        let c = resolve(&flags, Some(&cfg), &EnvVars::default()).credentials;
+        assert_eq!(c.password, PasswordSource::Literal("override-me".into()));
+    }
+
+    #[test]
+    fn a_password_flag_applies_even_when_the_target_came_from_host_and_port() {
+        // Before this flag existed, --host/--port had no way to carry a
+        // password at all except REDIS_PASSWORD — this is the missing case.
+        let flags = Flags {
+            host: Some("cache-01".into()),
+            password: Some("hunter2".into()),
+            ..Flags::default()
+        };
+        let c = resolve(&flags, None, &EnvVars::default()).credentials;
+        assert_eq!(c.password, PasswordSource::Literal("hunter2".into()));
+    }
+
+    #[test]
+    fn a_user_flag_and_tls_flag_are_applied_the_same_way() {
+        let flags = Flags {
+            host: Some("cache-01".into()),
+            user: Some("app".into()),
+            tls: true,
+            ..Flags::default()
+        };
+        let c = resolve(&flags, None, &EnvVars::default()).credentials;
+        assert_eq!(c.username.as_deref(), Some("app"));
+        assert!(c.tls);
+    }
+
+    #[test]
+    fn no_flag_credentials_leaves_the_existing_source_untouched() {
+        // Regression guard: today's REDIS_PASSWORD-with-host/port behavior
+        // must survive unchanged when none of the new flags are set.
+        let env = EnvVars {
+            redis_password: Some("from-env".into()),
+            ..EnvVars::default()
+        };
+        let flags = Flags {
+            host: Some("cache-01".into()),
+            ..Flags::default()
+        };
+        let c = resolve(&flags, None, &env).credentials;
+        assert_eq!(c.password, PasswordSource::Literal("from-env".into()));
     }
 }
 

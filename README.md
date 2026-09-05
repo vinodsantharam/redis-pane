@@ -84,7 +84,10 @@ from these documents, the documents change in the same commit.
   `~/.config/redis-pane/config.json`; anything the app persists goes to a separate state file.
   ([ADR-0002](docs/adr/0002-json-config-file.md), [ADR-0003](docs/adr/0003-app-never-writes-config.md))
 - **Secrets are references** — `passwordEnv` or `passwordCommand`. Literal passwords work, but
-  the file is refused when group- or world-readable.
+  the file is refused when group- or world-readable. `--user`/`--password`/`--tls` are the
+  documented exception: a password given directly on the command line, always winning over a
+  Profile's or the environment's, with a printed warning about shell history and `ps`
+  ([ADR-0001](docs/adr/0001-connection-resolution-order.md)).
 - **There are four Environments, not three.** `unknown` is a real one: anything that is not
   loopback or a unix socket and was not tagged gets it, and starts in Read-only Mode.
   ([ADR-0004](docs/adr/0004-untagged-connections-are-read-only.md))

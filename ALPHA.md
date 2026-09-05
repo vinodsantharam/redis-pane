@@ -47,8 +47,15 @@ Simplest — a URL directly:
 redis-pane --url redis://localhost:6379
 ```
 
-For anything with a password, use a Profile instead so the secret never touches your shell
-history. Write `~/.config/redis-pane/config.json`:
+For anything with a password, quickest is `--user`/`--password`/`--tls` directly:
+
+```bash
+redis-pane --host your-host --port 6379 --user default --password your-actual-password --tls
+```
+
+`redis-pane` warns on stderr when you do this, because the password is then visible in your shell
+history and to other users on the box via `ps`. For anything long-lived, use a Profile instead so
+the secret never touches either. Write `~/.config/redis-pane/config.json`:
 
 ```json
 {

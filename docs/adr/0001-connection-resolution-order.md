@@ -33,3 +33,12 @@ Making the Source visible at all times is not decoration — it is the entire mi
 resolving silently. It cannot be dropped for visual tidiness without reopening this decision.
 
 The first-run picker survives, but only for the case where nothing at all is configured.
+
+**`--user`, `--password`, and `--tls` are a credential source of their own, and always win.**
+They apply on top of whatever target and credentials the resolution above produced — a Profile's
+stored password included — the same "explicit flags beat everything" precedence this ADR already
+states for the target itself. `redis-cli`, `psql`, and `mongosh` all take a password directly on
+the command line and print a warning rather than refusing it; `redis-pane` does the same
+(`crates/app/src/main.rs` warns on stderr whenever `--password` is set), because the risk —
+shell history, `ps` — is real but not the config file's risk, so ADR-0002's group/world-readable
+refusal does not apply here and would not help if it did.

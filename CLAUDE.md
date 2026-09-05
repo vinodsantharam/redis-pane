@@ -82,6 +82,27 @@ the functional core plus golden-frame snapshots and needs no Docker; the integra
 reconnect, capability probing where `CLIENT TRACKING` is refused, and error mapping for
 `-LOADING`, `-OOM`, `-MISCONF` and `-READONLY`. The integration suite does not exist yet.
 
+### Driving the app by hand
+
+Anything about liveness, TTL countdowns or `SCAN` behaviour has to be *watched*, not reasoned
+about, so `scripts/` carries a disposable Redis and something to put in it. Python 3 only — no
+virtualenv and no pip; `scripts/resp.py` is a small RESP2 client the tools share. See
+[scripts/README.md](scripts/README.md) for the full flags.
+
+```bash
+./scripts/redis-up.sh                   # redis:8.4-alpine on :6379 (down|restart|cli|logs|status)
+python3 scripts/fixtures.py --flush     # 5000 keys, every type, 40% with a 10s-2m TTL
+cargo run -p redis-pane                 # browse it
+python3 scripts/churn.py                # second terminal: delete/mutate/expire/create at 5 op/s
+./scripts/redis-up.sh down              # throw it away
+```
+
+`python3 scripts/churn.py --focus <key>` aims most of its writes at one key: that is the direct
+check that the Viewer re-arms tracking after every invalidation, and it will not be caught by a
+`cargo test` run. `fixtures.py -n 200000` is the one to reach for when the question is whether
+`SCAN` still streams and the list still virtualizes. These are dev tools, not tests — the
+integration suite uses `testcontainers` and owns its own containers.
+
 ## Architecture guidance
 
 The following constraints come out of the PRD and should shape the code from the first commit —

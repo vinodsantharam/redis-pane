@@ -20,7 +20,8 @@
 
 ## 2. Layout
 
-Two columns, one status bar, one hint bar. The split is resizable; nothing else is permanent.
+Two columns, one status bar, one hint bar. The split is resizable (`⌃←`/`⌃→`, or a drag once
+R7.3's mouse support lands); nothing else is permanent.
 
 ```
 ┌─ redis-pane ─ ● staging · cache-01:6379/0 · from profile ──────────────────┐
@@ -375,9 +376,20 @@ the reader's time.
 
 - Does the dashboard belong in v1 at all, or is the slowlog plus a memory figure in the status
   bar the whole of what triage actually needs? This is now the largest remaining scope risk.
-- With two panes, is the split fixed at a ratio, or does it default to whichever pane has focus?
 - Does the keys pane need a permanent column header row, or can the columns be implied by the
   data and explained once in help?
+
+**Resolved since v0.6** — the split defaults to each density's documented ratio (45% keys at
+Full, 50% at Tight/NoSize) and is independent of focus, not a function of it: focus already
+answers a different question — which pane a pane-scoped key acts on (§4) — and overloading it to
+also mean "which pane is bigger" would make moving focus resize the screen out from under the
+reader. `⌃←`/`⌃→` nudge the divider from that default in either direction, clamped so neither
+pane can be squeezed below a usable width; the offset is one number, held for the session and
+applied identically whichever density the terminal is currently at, so widening the terminal past
+a breakpoint reshuffles columns the documented way without discarding a reader's adjustment.
+Mouse drag-to-resize (R7.3) is unbuilt and will drive the same offset. Not yet persisted across a
+relaunch — §7's "pane split, filter, and scroll position restore on relaunch" needs the
+session-state file ADR-0003 describes, which does not exist yet either.
 
 **Resolved since v0.5** — the keys pane does not get liveness, and the open key remains the only
 tracked thing. Deliberate, not deferred: RedisInsight declines to auto-refresh its key list for

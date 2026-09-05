@@ -504,6 +504,26 @@ fn golden_browser_130_cols_full_density() {
 }
 
 #[test]
+fn golden_browser_split_widened() {
+    // DESIGN §2: "the split is resizable" — a reader who has nudged the
+    // divider toward the Viewer sees a wider keys pane in every subsequent
+    // frame, not just a one-off recalculation.
+    let mut state = browsing();
+    state.split_adjust = 20;
+    let frame = draw(&state, 130, 26);
+    assert_ne!(
+        frame,
+        draw(&browsing(), 130, 26),
+        "the frame actually changed"
+    );
+    assert!(
+        frame.contains("user:8812:session"),
+        "still the same keyspace, just redrawn wider"
+    );
+    assert_golden("browser_130_widened", &frame);
+}
+
+#[test]
 fn golden_browser_119_cols_sheds_size() {
     assert_golden("browser_119", &draw(&browsing(), 119, 26));
 }
@@ -1614,6 +1634,7 @@ fn the_selected_row_carries_a_background_all_the_way_across_not_just_on_the_name
     let keys_pane_width = redis_pane_core::render::layout::layout(
         Rect::new(0, 0, 130, 12),
         redis_pane_core::render::layout::Pane::Keys,
+        0,
     )
     .keys
     .width;
@@ -1639,6 +1660,7 @@ fn an_unselected_row_carries_no_background_at_all() {
     let keys_pane_width = redis_pane_core::render::layout::layout(
         Rect::new(0, 0, 130, 12),
         redis_pane_core::render::layout::Pane::Keys,
+        0,
     )
     .keys
     .width;

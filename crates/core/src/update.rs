@@ -499,6 +499,26 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             };
             (state, Vec::new())
         }
+        Action::WidenKeysPane => {
+            // The clamp lives in `layout()`, which is the only place that
+            // knows the terminal's actual width; here the offset is a plain
+            // number, so a session that never touches this key costs nothing
+            // and the core stays geometry-free (ADR-0011).
+            if state.split_is_adjustable() {
+                state.split_adjust = state
+                    .split_adjust
+                    .saturating_add(crate::render::layout::SPLIT_STEP as i16);
+            }
+            (state, Vec::new())
+        }
+        Action::NarrowKeysPane => {
+            if state.split_is_adjustable() {
+                state.split_adjust = state
+                    .split_adjust
+                    .saturating_sub(crate::render::layout::SPLIT_STEP as i16);
+            }
+            (state, Vec::new())
+        }
         Action::MoveDown => move_selection(state, 1),
         Action::MoveUp => move_selection(state, -1),
         Action::PageDown => {
@@ -978,6 +998,53 @@ mod tests {
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Tab)));
         assert_eq!(s.focus, Pane::Keys);
         assert_eq!(press_r(s), vec![Command::StartScan { pattern: None }]);
+    }
+
+    // ── the split is resizable (DESIGN §2, UI_TASKS severity 2) ────────────
+
+    #[test]
+    fn widen_and_narrow_move_the_split_by_one_step() {
+        let state = viewing(); // 130 columns: two panes exist to resize
+        let (state, cmds) = update(state, Msg::Key(KeyPress::ctrl(KeyCode::Right)));
+        assert!(cmds.is_empty(), "a plain state mutation, no command needed");
+        assert_eq!(state.split_adjust, crate::render::layout::SPLIT_STEP as i16);
+
+        let (state, _) = update(state, Msg::Key(KeyPress::ctrl(KeyCode::Left)));
+        assert_eq!(state.split_adjust, 0, "back where it started");
+
+        let (state, _) = update(state, Msg::Key(KeyPress::ctrl(KeyCode::Left)));
+        assert_eq!(
+            state.split_adjust,
+            -(crate::render::layout::SPLIT_STEP as i16)
+        );
+    }
+
+    #[test]
+    fn resizing_below_seventy_columns_does_nothing() {
+        // There is no divider to move with one pane on screen (DESIGN §2) —
+        // changing the number would be exactly the invisible action the
+        // pane-visibility gate above exists to rule out for every other key.
+        let state = State {
+            cols: 60,
+            rows: 40,
+            ..State::default()
+        };
+        let (state, _) = update(state, Msg::Key(KeyPress::ctrl(KeyCode::Right)));
+        assert_eq!(state.split_adjust, 0);
+    }
+
+    #[test]
+    fn the_adjustment_survives_moving_around_the_app() {
+        // Not reset by anything else the reader does in the same session —
+        // opening a key, moving the cursor, changing focus.
+        let mut state = viewing();
+        (state, _) = update(state, Msg::Key(KeyPress::ctrl(KeyCode::Right)));
+        let widened = state.split_adjust;
+        assert_ne!(widened, 0);
+
+        (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Tab)));
+        (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Down)));
+        assert_eq!(state.split_adjust, widened, "untouched by ordinary use");
     }
 
     #[test]

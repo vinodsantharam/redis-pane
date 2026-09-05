@@ -194,8 +194,21 @@ checkboxes**. Treat this section's emptiness as a prompt to look again, not as a
   (an interactive drill-down, its own feature) and the consumer-group panel (`XINFO GROUPS`/
   `XPENDING` — a separate fetch and a separate view, not a per-entry field).
 - [ ] **Mouse support is entirely absent (R7.3).** No click-to-focus, scroll, or drag-to-resize.
-- [ ] **The split ratio is fixed, not resizable** (hardcoded 45/55). Blocks mouse
-  drag-to-resize from being useful once built.
+  The drag-to-resize mechanism exists now (`State.split_adjust`, `⌃←`/`⌃→`, below) — what is
+  missing here is turning `crossterm` mouse events into the same state changes, plus click and
+  scroll, which that mechanism does not touch.
+- [x] **The split ratio is fixed, not resizable — closed 2026-09-05.** Was hardcoded per
+  density (45% keys at Full, 50% at Tight/NoSize) with no way to change it. `State.split_adjust`
+  is now a session-held column offset, applied and clamped in `layout()` — a pure function, so a
+  session that never touches it renders exactly as before (every existing golden fixture is
+  unmodified). `⌃←`/`⌃→` (unused chords, alongside the existing `⌃↑`/`⌃↓` that scroll the Viewer)
+  nudge it now; **mouse drag-to-resize (above) will drive the same offset once built, not a
+  second mechanism.** DESIGN §9's open question about the split — fixed ratio vs. following focus
+  — is resolved: neither. It is one persisted-for-the-session number, deliberately independent of
+  focus, which already answers a different question (which pane a pane-scoped key acts on).
+  **Not yet persisted across a relaunch** — DESIGN §7 promises pane split restores on relaunch,
+  and that needs the session-state file ADR-0003 describes, which is an empty stub
+  (`crates/app/src/state_file.rs`) — a separate, unbuilt feature, not a gap in this fix.
 - [x] **Hash and Set reads are unbounded — closed 2026-09-05.** `HGETALL`/`SMEMBERS` pulled
   the entire collection regardless of size, where List/ZSet/Stream were windowed at 500
   (`read.rs`, `WINDOW`) — a million-field hash came down whole, into a 250MB budget (PRD §7), on

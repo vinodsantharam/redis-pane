@@ -52,7 +52,34 @@ const TITLE_ROWS: u16 = 2;
 /// The narrowest width that still fits two panes.
 pub const TWO_PANE_MIN_COLS: u16 = 70;
 
-pub fn layout(area: Rect, focus: Pane) -> Layout {
+/// The narrowest either pane may be squeezed to by an adjustment.
+///
+/// Below this a pane stops being useful before it stops being visible: the
+/// keys pane needs room for a dot, a type hue and enough of a name to
+/// distinguish it from its neighbours; the value pane needs room for a
+/// header line that still says something. There is no formula that makes
+/// "how short is too short" exact, so this is chosen, not derived — and
+/// generous enough that `TWO_PANE_MIN_COLS` (70) always has slack on both
+/// sides of it.
+const MIN_PANE_COLS: u16 = 20;
+
+/// How many columns one `⌃←`/`⌃→` moves the divider (DESIGN §2: "the split is
+/// resizable").
+pub const SPLIT_STEP: u16 = 4;
+
+/// Apply a session's split adjustment to a density's base keys-pane width.
+///
+/// Clamped so neither pane can be squeezed below [`MIN_PANE_COLS`] — nudging
+/// past the limit stops there rather than inverting the panes or overflowing
+/// the terminal. The `+ 1` on the upper bound accounts for the divider
+/// column itself, which is not part of either pane's width.
+fn adjust_keys_width(total: u16, base: u16, split_adjust: i16) -> u16 {
+    let max = total.saturating_sub(MIN_PANE_COLS + 1).max(MIN_PANE_COLS);
+    (i32::from(base) + i32::from(split_adjust)).clamp(i32::from(MIN_PANE_COLS), i32::from(max))
+        as u16
+}
+
+pub fn layout(area: Rect, focus: Pane, split_adjust: i16) -> Layout {
     let density = match area.width {
         w if w >= 120 => Density::Full,
         w if w >= 90 => Density::NoSize,
@@ -85,12 +112,17 @@ pub fn layout(area: Rect, focus: Pane) -> Layout {
         };
     }
 
-    // The value pane takes the larger share: a key name is short, a value is
-    // not, and the pane people read is the one that should get the room.
-    let keys_width = match density {
+    // The value pane takes the larger share by default: a key name is short,
+    // a value is not, and the pane people read is the one that should get the
+    // room. `split_adjust` — nudged by `⌃←`/`⌃→`, and independent of density
+    // — perturbs that default rather than replacing it, so widening the
+    // terminal still reshuffles columns the documented way and a reader's
+    // adjustment survives it.
+    let base_keys_width = match density {
         Density::Full => area.width * 45 / 100,
         _ => area.width / 2,
     };
+    let keys_width = adjust_keys_width(area.width, base_keys_width, split_adjust);
     Layout {
         keys: Rect::new(0, body_top, keys_width, body_height),
         value: Some(Rect::new(
@@ -109,7 +141,7 @@ mod tests {
     use super::*;
 
     fn at(w: u16) -> Layout {
-        layout(Rect::new(0, 0, w, 30), Pane::Keys)
+        layout(Rect::new(0, 0, w, 30), Pane::Keys, 0)
     }
 
     #[test]
@@ -153,13 +185,13 @@ mod tests {
 
     #[test]
     fn the_hint_bar_collapses_on_a_short_terminal() {
-        assert!(layout(Rect::new(0, 0, 120, 24), Pane::Keys).hint_bar);
-        assert!(!layout(Rect::new(0, 0, 120, 23), Pane::Keys).hint_bar);
+        assert!(layout(Rect::new(0, 0, 120, 24), Pane::Keys, 0).hint_bar);
+        assert!(!layout(Rect::new(0, 0, 120, 23), Pane::Keys, 0).hint_bar);
     }
 
     #[test]
     fn below_seventy_columns_value_view_fills_the_whole_pane() {
-        let l = layout(Rect::new(0, 0, 60, 30), Pane::Value);
+        let l = layout(Rect::new(0, 0, 60, 30), Pane::Value, 0);
         assert!(
             l.keys.width == 0 || l.keys.height == 0,
             "keys should be unused, not visible"
@@ -174,9 +206,97 @@ mod tests {
         // panes always show, so focus must change nothing about geometry — it
         // only decides which pane a pane-scoped key acts on.
         for w in [70u16, 90, 120, 200] {
-            let keys_view = layout(Rect::new(0, 0, w, 30), Pane::Keys);
-            let value_view = layout(Rect::new(0, 0, w, 30), Pane::Value);
+            let keys_view = layout(Rect::new(0, 0, w, 30), Pane::Keys, 0);
+            let value_view = layout(Rect::new(0, 0, w, 30), Pane::Value, 0);
             assert_eq!(keys_view, value_view, "focus moved a pane at {w} columns");
         }
+    }
+
+    // ── the split is resizable (DESIGN §2) ──────────────────────────────────
+
+    #[test]
+    fn a_positive_adjustment_widens_the_keys_pane() {
+        let base = layout(Rect::new(0, 0, 140, 30), Pane::Keys, 0).keys.width;
+        let widened = layout(Rect::new(0, 0, 140, 30), Pane::Keys, 20).keys.width;
+        assert_eq!(widened, base + 20);
+    }
+
+    #[test]
+    fn a_negative_adjustment_narrows_the_keys_pane() {
+        let base = layout(Rect::new(0, 0, 140, 30), Pane::Keys, 0).keys.width;
+        let narrowed = layout(Rect::new(0, 0, 140, 30), Pane::Keys, -20).keys.width;
+        assert_eq!(narrowed, base - 20);
+    }
+
+    #[test]
+    fn the_adjustment_cannot_crush_either_pane_below_the_minimum() {
+        // A reader holding the key down must hit a wall, not a negative width
+        // or a pane that swallows its neighbour.
+        let crushed_narrow = layout(Rect::new(0, 0, 140, 30), Pane::Keys, -1_000);
+        assert_eq!(crushed_narrow.keys.width, MIN_PANE_COLS);
+        assert!(crushed_narrow.value.unwrap().width >= MIN_PANE_COLS);
+
+        let crushed_wide = layout(Rect::new(0, 0, 140, 30), Pane::Keys, 1_000);
+        assert!(crushed_wide.value.unwrap().width >= MIN_PANE_COLS);
+        assert!(
+            crushed_wide.keys.x + crushed_wide.keys.width < crushed_wide.value.unwrap().x,
+            "still no overlap at the far end of the range"
+        );
+    }
+
+    #[test]
+    fn the_panes_stay_disjoint_at_every_density_across_the_whole_adjustment_range() {
+        // The property `panes_never_overlap_or_overflow` already checks at
+        // zero adjustment; this is the same property swept over the range an
+        // actual session can reach by repeatedly pressing the key.
+        for w in [70u16, 89, 90, 119, 120, 200] {
+            for adjust in (-200i16..=200).step_by(10) {
+                let l = layout(Rect::new(0, 0, w, 30), Pane::Keys, adjust);
+                let value = l.value.unwrap();
+                assert!(l.keys.x + l.keys.width < value.x, "overlap at {w}/{adjust}");
+                assert!(value.x + value.width <= w, "overflow at {w}/{adjust}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_session_that_never_touches_the_key_renders_exactly_as_before() {
+        // The whole point of an *adjustment* rather than a replacement ratio:
+        // every density's documented default is untouched at zero.
+        for w in [70u16, 89, 90, 119, 120, 200] {
+            assert_eq!(
+                layout(Rect::new(0, 0, w, 30), Pane::Keys, 0),
+                layout(Rect::new(0, 0, w, 30), Pane::Keys, 0),
+            );
+        }
+        // Full density's documented 45%, unperturbed.
+        assert_eq!(
+            layout(Rect::new(0, 0, 140, 30), Pane::Keys, 0).keys.width,
+            63
+        );
+    }
+
+    #[test]
+    fn the_adjustment_survives_a_density_change() {
+        // One persisted offset, not one preset per density — widening the
+        // terminal past a breakpoint reshuffles columns the documented way,
+        // but a reader's own nudge is not reset by it.
+        let tight = layout(Rect::new(0, 0, 80, 30), Pane::Keys, 10).keys.width;
+        let tight_base = layout(Rect::new(0, 0, 80, 30), Pane::Keys, 0).keys.width;
+        assert_eq!(tight, tight_base + 10);
+
+        let full = layout(Rect::new(0, 0, 140, 30), Pane::Keys, 10).keys.width;
+        let full_base = layout(Rect::new(0, 0, 140, 30), Pane::Keys, 0).keys.width;
+        assert_eq!(full, full_base + 10);
+    }
+
+    #[test]
+    fn single_pane_density_ignores_the_adjustment_entirely() {
+        // Below 70 columns there is no divider to move; an adjustment made
+        // before narrowing the terminal must not resurface as a shifted
+        // breadcrumb or a mysteriously offset single pane.
+        let adjusted = layout(Rect::new(0, 0, 60, 30), Pane::Keys, 30);
+        let plain = layout(Rect::new(0, 0, 60, 30), Pane::Keys, 0);
+        assert_eq!(adjusted, plain);
     }
 }

@@ -143,17 +143,29 @@ impl Viewer for StringValue {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PairValue {
     pub pairs: Vec<(String, String)>,
+    /// The hash's real field count, which may exceed what was fetched.
+    ///
+    /// `HGETALL` used to bring back the whole hash regardless of size, into a
+    /// 250MB budget on the same connection the scan is using — the one type,
+    /// with Set, that stayed unbounded after List/ZSet/Stream were windowed.
+    /// A million-field hash now reads like every other large collection: the
+    /// newest `WINDOW` fields via `HSCAN`, with `total` from `HLEN` so the
+    /// header can say what fraction that is.
+    pub total: usize,
 }
 
 impl Viewer for PairValue {
     fn measure(&self) -> String {
-        plural(self.pairs.len(), "field")
+        plural(self.total, "field")
     }
     fn columns(&self) -> &'static [&'static str] {
         &["FIELD", "VALUE"]
     }
     fn row_count(&self) -> usize {
         self.pairs.len()
+    }
+    fn window(&self) -> Option<usize> {
+        (self.pairs.len() < self.total).then_some(self.pairs.len())
     }
     fn row(&self, i: usize, _now_ms: u64) -> Vec<String> {
         self.pairs
@@ -431,6 +443,7 @@ mod tests {
             Value::Str(StringValue::new("hello", 40)),
             Value::Hash(PairValue {
                 pairs: vec![("a".into(), "1".into())],
+                total: 1,
             }),
             Value::List(IndexedValue {
                 items: vec!["x".into()],
@@ -468,15 +481,37 @@ mod tests {
     fn the_element_count_lives_in_the_header_where_it_costs_no_column() {
         let hash = PairValue {
             pairs: (0..14).map(|i| (format!("f{i}"), "v".into())).collect(),
+            total: 14,
         };
         assert_eq!(hash.measure(), "14 fields");
         assert_eq!(
             PairValue {
-                pairs: vec![("a".into(), "1".into())]
+                pairs: vec![("a".into(), "1".into())],
+                total: 1,
             }
             .measure(),
             "1 field"
         );
+    }
+
+    #[test]
+    fn a_hash_windows_the_same_way_list_zset_and_stream_do() {
+        // Hash — with Set — was the last type where `measure` (the real
+        // length) and `row_count` (what was fetched) were always the same
+        // number, because the read pulled the whole collection regardless of
+        // size. `window()` now answers the same question for it the other
+        // windowed types already did.
+        let partial = PairValue {
+            pairs: vec![("f".into(), "v".into())],
+            total: 1_500,
+        };
+        assert_eq!(partial.window(), Some(1), "fetched fewer than the total");
+
+        let whole = PairValue {
+            pairs: vec![("a".into(), "1".into())],
+            total: 1,
+        };
+        assert_eq!(whole.window(), None, "fetched the whole thing");
     }
 
     #[test]

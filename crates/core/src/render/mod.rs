@@ -20,7 +20,7 @@ use crate::theme::{Theme, Token, env_token};
 /// Render the whole frame into a fresh buffer of the given size.
 pub fn frame(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect) -> Buffer {
     let mut buf = Buffer::empty(area);
-    let plan = layout::layout(area, state.focus);
+    let plan = layout::layout(area, state.focus, state.split_adjust);
     title_bar(state, theme, clock, area, &mut buf);
 
     let open_row = keys::render(state, theme, plan.keys, plan.density, &mut buf);

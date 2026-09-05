@@ -264,6 +264,21 @@ pub struct State {
     /// Which pane the reader is in (DESIGN §4). Below 70 columns it also
     /// decides which pane is drawn at all; see [`crate::render::layout::Pane`].
     pub focus: crate::render::layout::Pane,
+    /// How far the reader has nudged the divider from its density's default,
+    /// in columns — positive widens the keys pane, negative widens the
+    /// Viewer (DESIGN §2: "the split is resizable"). Applied and clamped in
+    /// [`crate::render::layout::layout`], not here: this is a plain offset,
+    /// geometry-free, so a session that never touches `⌃←`/`⌃→` renders
+    /// exactly as it always did.
+    ///
+    /// Session-only for now — restoring it across a relaunch needs the
+    /// session-state file `state_file.rs` does not implement yet (ADR-0003).
+    pub split_adjust: i16,
+    /// Set between a mouse-down that grabbed the divider and the matching
+    /// mouse-up (R7.3, drag-to-resize). While true, `Drag` events move
+    /// [`State::split_adjust`] to follow the cursor; a chord-armed flag in
+    /// the same family as `copy_pending` and `filtering`.
+    pub resizing_split: bool,
     /// The Open key, if one is open. There is no cache behind this — it holds
     /// what the server last said and nothing more (ADR-0006).
     pub open: Option<OpenKey>,
@@ -325,6 +340,16 @@ impl State {
     /// Whether the Viewer can be seen right now.
     pub fn value_pane_visible(&self) -> bool {
         self.pane_visible(crate::render::layout::Pane::Value)
+    }
+
+    /// Whether there are two panes on screen for `⌃←`/`⌃→` to divide.
+    ///
+    /// Below 70 columns exactly one pane is drawn (DESIGN §2, stack
+    /// navigation), so there is no divider to move — nudging it there would
+    /// change a number with nothing on screen to show for it, the same class
+    /// of silent action `pane_visible` exists to rule out for other keys.
+    pub fn split_is_adjustable(&self) -> bool {
+        self.cols >= crate::render::layout::TWO_PANE_MIN_COLS
     }
 
     /// What the header may claim about currency.

@@ -504,6 +504,26 @@ fn golden_browser_130_cols_full_density() {
 }
 
 #[test]
+fn golden_browser_split_widened() {
+    // DESIGN §2: "the split is resizable" — a reader who has nudged the
+    // divider toward the Viewer sees a wider keys pane in every subsequent
+    // frame, not just a one-off recalculation.
+    let mut state = browsing();
+    state.split_adjust = 20;
+    let frame = draw(&state, 130, 26);
+    assert_ne!(
+        frame,
+        draw(&browsing(), 130, 26),
+        "the frame actually changed"
+    );
+    assert!(
+        frame.contains("user:8812:session"),
+        "still the same keyspace, just redrawn wider"
+    );
+    assert_golden("browser_130_widened", &frame);
+}
+
+#[test]
 fn golden_browser_119_cols_sheds_size() {
     assert_golden("browser_119", &draw(&browsing(), 119, 26));
 }
@@ -946,6 +966,7 @@ fn hash_value() -> Value {
             ("plan".into(), "pro".into()),
             ("locale".into(), "fr-FR".into()),
         ],
+        total: 5,
     })
 }
 
@@ -1076,6 +1097,28 @@ fn a_windowed_value_says_how_much_of_it_is_on_screen() {
 }
 
 #[test]
+fn a_windowed_hash_says_how_much_of_it_is_on_screen() {
+    // `HLEN` says 1500; `HSCAN` brought back 1 field for this fixture. Hash
+    // was, with Set, the last type that stayed unbounded (`HGETALL` pulling
+    // the whole thing) after List/ZSet/Stream were windowed — same defect,
+    // same fix, same header rule.
+    let v = Value::Hash(PairValue {
+        pairs: vec![("f1".into(), "v1".into())],
+        total: 1_500,
+    });
+    let frame = draw(&opened("bighash", v, TTL_NONE), 130, 22);
+    let header = frame
+        .lines()
+        .find(|l| l.contains("hash ·"))
+        .expect("the viewer header names the type");
+    assert!(header.contains("1500 fields"), "the real length: {header}");
+    assert!(
+        header.contains("1 shown"),
+        "and what is on screen: {header}"
+    );
+}
+
+#[test]
 fn a_value_fetched_whole_says_nothing_extra() {
     // A hash comes back complete, so there is no window to disclose and the
     // header must not grow a phrase that would read as a caveat where none
@@ -1188,6 +1231,7 @@ fn an_update_at_rest_lands_with_no_keypress() {
 
     let changed = Value::Hash(PairValue {
         pairs: vec![("plan".into(), "enterprise".into())],
+        total: 1,
     });
     state
         .open
@@ -1241,6 +1285,7 @@ fn golden_viewer_read_outcomes() {
     let mut state = opened("user:8812:session", hash_value(), 2_537);
     let changed = Value::Hash(PairValue {
         pairs: vec![("plan".into(), "enterprise".into())],
+        total: 1,
     });
     state
         .open
@@ -1259,6 +1304,7 @@ fn an_update_while_scrolled_is_announced_and_offers_the_effective_key() {
     open.absorb(
         Value::Hash(PairValue {
             pairs: vec![("plan".into(), "enterprise".into())],
+            total: 1,
         }),
         600,
         2_150,
@@ -1588,6 +1634,7 @@ fn the_selected_row_carries_a_background_all_the_way_across_not_just_on_the_name
     let keys_pane_width = redis_pane_core::render::layout::layout(
         Rect::new(0, 0, 130, 12),
         redis_pane_core::render::layout::Pane::Keys,
+        0,
     )
     .keys
     .width;
@@ -1613,6 +1660,7 @@ fn an_unselected_row_carries_no_background_at_all() {
     let keys_pane_width = redis_pane_core::render::layout::layout(
         Rect::new(0, 0, 130, 12),
         redis_pane_core::render::layout::Pane::Keys,
+        0,
     )
     .keys
     .width;

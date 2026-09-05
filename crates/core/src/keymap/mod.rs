@@ -57,6 +57,11 @@ pub enum Action {
     /// acts on; below 70 columns, where one pane is drawn at a time, it is the
     /// same movement as `Open`/`Esc` and so changes what is on screen.
     CyclePane,
+    /// Nudge the divider toward the Viewer, widening the keys pane
+    /// (DESIGN §2: "the split is resizable").
+    WidenKeysPane,
+    /// Nudge the divider toward the keys pane, widening the Viewer.
+    NarrowKeysPane,
 }
 
 impl Action {
@@ -123,6 +128,8 @@ impl Action {
             Action::ViewerBottom => "value bottom",
             Action::Copy => "copy",
             Action::CyclePane => "focus",
+            Action::WidenKeysPane => "widen keys",
+            Action::NarrowKeysPane => "narrow keys",
         }
     }
 
@@ -295,6 +302,18 @@ impl Default for Keymap {
                 Binding {
                     key: KeyPress::plain(KeyCode::Char('y')),
                     action: Action::Copy,
+                },
+                // Horizontal chords for a horizontal action, alongside the
+                // vertical `⌃↑`/`⌃↓` pair that already scrolls the Viewer.
+                // Plain `Left`/`Right` are unbound and `⌃←`/`⌃→` otherwise
+                // idle, so this adds no ambiguity to the existing scheme.
+                Binding {
+                    key: KeyPress::ctrl(KeyCode::Right),
+                    action: Action::WidenKeysPane,
+                },
+                Binding {
+                    key: KeyPress::ctrl(KeyCode::Left),
+                    action: Action::NarrowKeysPane,
                 },
             ],
         }

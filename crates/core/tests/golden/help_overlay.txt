@@ -26,3 +26,5 @@ l       open
 ⌃HOME   value top
 ⌃END    value bottom
 y       copy
+⌃→      widen keys
+⌃←      narrow keys

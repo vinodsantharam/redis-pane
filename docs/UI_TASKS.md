@@ -128,7 +128,10 @@ checkboxes**. Treat this section's emptiness as a prompt to look again, not as a
     *whole* today (`HGETALL`/`SMEMBERS`), so a client-side filter there would be completely
     correct — and they are also the types you can simply scroll. List, ZSet and Stream are
     windowed at 500, so a filter would search a slice and report a verdict on the whole. The
-    types where search is easiest to get right are the ones that need it least.
+    types where search is easiest to get right are the ones that need it least. **No longer true
+    as of 2026-09-05** — see the Hash/Set windowing item below; Hash and Set are windowed now
+    too, so this specific asymmetry is gone. The rest of the reasoning here (no `LSCAN`, streams
+    are ID-ranged, `/`'s keymap ambiguity) is untouched by that and still holds.
   - **`/` already means "filter the key list".** A second meaning inside the value pane is a
     keymap ambiguity on top of the above.
   - What *was* built instead is the honesty half — see the value-window disclosure below, which
@@ -190,15 +193,70 @@ checkboxes**. Treat this section's emptiness as a prompt to look again, not as a
   TTL countdown (R3.9). **Not done, cut deliberately rather than half-built:** expandable fields
   (an interactive drill-down, its own feature) and the consumer-group panel (`XINFO GROUPS`/
   `XPENDING` — a separate fetch and a separate view, not a per-entry field).
-- [ ] **Mouse support is entirely absent (R7.3).** No click-to-focus, scroll, or drag-to-resize.
-- [ ] **The split ratio is fixed, not resizable** (hardcoded 45/55). Blocks mouse
-  drag-to-resize from being useful once built.
-- [ ] **Hash and Set reads are unbounded.** `HGETALL`/`SMEMBERS` pull the entire collection,
-  where List/ZSet/Stream are windowed at 500 (`read.rs`, `WINDOW`). A million-field hash comes
-  down whole, into a 250MB budget (PRD §7), on the same connection the scan is using. Noticed
-  while scoping value search (above), where the same asymmetry is what made the feature not
-  decompose. The fix is `HSCAN`/`SSCAN` with a cursor, which would also be the server-side half
-  of a future search — so these two are worth doing together or not at all.
+- [x] **Mouse support was entirely absent (R7.3) — closed 2026-09-05.** All three: click to
+  focus, scroll, drag to resize. `crossterm::event::{Enable,Disable}MouseCapture` bracket the
+  session in `terminal.rs`; a new boundary function, `translate_mouse`, turns a `MouseEvent` into
+  the same terminal-free `Msg` shape `translate` already does for the keyboard — the core still
+  never sees `crossterm` (ADR-0011's boundary check is unaffected).
+  - **Click to focus** — a mouse-down inside a pane's rect focuses it, computed with the exact
+    same `layout()` the renderer used for the frame the reader clicked on, rather than a second,
+    possibly-drifting notion of where the panes are.
+  - **Scroll** acts on whichever pane is under the cursor and focuses it, deliberately without
+    requiring a prior click — the ordinary window-manager convention, and the reason it *also*
+    moves focus: leaving it unmoved would mean a keyboard action right after a scroll silently
+    lands on the other pane, the exact class of bug the R2.7 focus work spent a whole day closing.
+  - **Drag to resize** turns out to be the same gesture as click-to-focus at the mouse-down
+    level — grabbing the exact divider column arms `State.resizing_split` instead of changing
+    focus, and `Drag` events then move `split_adjust` to follow the cursor until `Up`. Reuses the
+    mechanism built for `⌃←`/`⌃→` (below) rather than a second one: the same field, the same
+    clamp, so a drag and a keypress can hand off to each other mid-session with no special case.
+  - Below 70 columns there is no divider to grab and nothing changes underfoot — the geometry
+    itself (a zero-width pane) already keeps every one of these gated to a pane that is actually
+    drawn, the same property the keyboard-focus fix relies on, for free, with no separate check.
+  - Not built: multi-select via drag, and a right/middle-click doing anything at all — neither is
+    named in R7.3, and a click that does something nobody asked for is worse than one that does
+    nothing (`MouseAction` models the left button only).
+- [x] **The split ratio is fixed, not resizable — closed 2026-09-05.** Was hardcoded per
+  density (45% keys at Full, 50% at Tight/NoSize) with no way to change it. `State.split_adjust`
+  is now a session-held column offset, applied and clamped in `layout()` — a pure function, so a
+  session that never touches it renders exactly as before (every existing golden fixture is
+  unmodified). `⌃←`/`⌃→` (unused chords, alongside the existing `⌃↑`/`⌃↓` that scroll the Viewer)
+  nudge it now; **mouse drag-to-resize (above) will drive the same offset once built, not a
+  second mechanism.** DESIGN §9's open question about the split — fixed ratio vs. following focus
+  — is resolved: neither. It is one persisted-for-the-session number, deliberately independent of
+  focus, which already answers a different question (which pane a pane-scoped key acts on).
+  **Not yet persisted across a relaunch** — DESIGN §7 promises pane split restores on relaunch,
+  and that needs the session-state file ADR-0003 describes, which is an empty stub
+  (`crates/app/src/state_file.rs`) — a separate, unbuilt feature, not a gap in this fix.
+- [x] **Hash and Set reads are unbounded — closed 2026-09-05.** `HGETALL`/`SMEMBERS` pulled
+  the entire collection regardless of size, where List/ZSet/Stream were windowed at 500
+  (`read.rs`, `WINDOW`) — a million-field hash came down whole, into a 250MB budget (PRD §7), on
+  the same connection the scan is using. Fixed with `HSCAN`/`SSCAN`, matching the existing
+  windowed types exactly: `HLEN`/`SCARD` for the real count, up to `WINDOW` elements fetched, and
+  the header's own honesty (`window()`) now applies to Hash the same way it already did to
+  List/ZSet/Stream — `1500 fields · 500 shown`. Verified against a real 1,500-field hash and a
+  1,500-member set (`crates/app/tests/integration.rs`).
+  - **Done alone rather than "together or not at all" with search**, which the note above this
+    one called for. That coupling held only for the *client-side-filter-is-completely-correct*
+    argument the search write-up made about Hash/Set being fetched whole — this closes exactly
+    that argument, since a client-side filter over a 500-element window of a 1,500-field hash is
+    now no more "completely correct" than it already wasn't for List/ZSet/Stream. Search's other
+    blockers are unrelated to windowing and remain: no `LSCAN` for List, streams are ID-ranged not
+    content-searchable, and `/` already means "filter the key list". So the coupling did not
+    actually gate this fix; it only meant the asymmetry search's write-up leaned on has been
+    quietly removed. **The search write-up's "Hash and Set are fetched whole" premise is now
+    false**, noted there rather than rewritten, since it was true when the decision was made.
+  - `HSCAN`/`SSCAN` are driven by hand through `custom()` rather than `Client::hscan`/`sscan`'s
+    auto-continuing stream, whose page type requests another round trip *in its `Drop` impl* if
+    not explicitly told to stop — the kind of implicit background command this project's read
+    path otherwise goes out of its way not to have (`ReadGate`, three commits ago). A capped
+    manual loop (`SCAN_ROUNDS`) has no such edge to remember, and bounds the read even against a
+    pathological table where `COUNT` badly undershoots.
+
+**Severity 2 fully closed (2026-09-05)**, in the tracker's own sense of the word: the one `[~]`
+item (streams) was already a deliberate, documented partial close, not an open TODO, and nothing
+in this section now has an empty checkbox. Re-audit before trusting that the way severity 1's own
+header warns to — this file's history is that emptiness is a prompt to look again, not a result.
 
 ## Severity 3 — parked design questions, now answerable from real use
 

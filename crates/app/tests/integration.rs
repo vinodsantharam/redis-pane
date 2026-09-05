@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use fred::interfaces::ClientLike;
 use fred::prelude::*;
+use redis_pane_core::state::value::Viewer;
 use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
@@ -959,6 +960,143 @@ async fn back_to_back_opens_leave_the_second_key_armed_not_the_first() {
             .is_err(),
         "a key nobody is looking at must not be tracked"
     );
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+// ── Hash and Set reads are windowed, matching List/ZSet/Stream ──────────────
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn a_large_hash_is_windowed_not_pulled_whole() {
+    // HGETALL used to bring the whole hash back regardless of size — the last
+    // type, with Set, that stayed unbounded after List/ZSet/Stream were
+    // windowed. A million-field hash arrived whole into a 250MB budget (PRD
+    // §7), on the same connection the scan is using.
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+
+    let fields: Vec<(String, String)> = (0..1_500)
+        .map(|i| (format!("f{i}"), format!("v{i}")))
+        .collect();
+    let _: () = writer.hset("bighash", fields).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let read = redis_pane::redis::read::read_value(
+        &client,
+        b"bighash",
+        40,
+        redis_pane::redis::read::Arming::Enabled,
+    )
+    .await
+    .unwrap()
+    .expect("the key exists");
+
+    let redis_pane_core::state::value::Value::Hash(hash) = read.value else {
+        panic!("expected a hash");
+    };
+    assert_eq!(hash.total, 1_500, "HLEN, not the window, is the real count");
+    assert_eq!(
+        hash.pairs.len(),
+        500,
+        "HSCAN stopped at the window, not the whole hash"
+    );
+    // Every pair that did come back must actually be from the hash — no
+    // duplicates or garbage from a mishandled cursor.
+    let names: std::collections::HashSet<_> = hash.pairs.iter().map(|(k, _)| k.clone()).collect();
+    assert_eq!(names.len(), 500, "no duplicate fields from re-scanning");
+    for (k, v) in &hash.pairs {
+        let n: usize = k.strip_prefix('f').unwrap().parse().unwrap();
+        assert_eq!(*v, format!("v{n}"), "field and value must still agree");
+    }
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn a_large_set_is_windowed_not_pulled_whole() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+
+    let members: Vec<String> = (0..1_500).map(|i| format!("m{i}")).collect();
+    let _: () = writer.sadd("bigset", members).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let read = redis_pane::redis::read::read_value(
+        &client,
+        b"bigset",
+        40,
+        redis_pane::redis::read::Arming::Enabled,
+    )
+    .await
+    .unwrap()
+    .expect("the key exists");
+
+    let redis_pane_core::state::value::Value::Set(set) = read.value else {
+        panic!("expected a set");
+    };
+    assert_eq!(set.total, 1_500, "SCARD, not the window, is the real count");
+    assert_eq!(
+        set.members.len(),
+        500,
+        "SSCAN stopped at the window, not the whole set"
+    );
+    let unique: std::collections::HashSet<_> = set.members.iter().collect();
+    assert_eq!(unique.len(), 500, "no duplicate members from re-scanning");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn a_small_hash_and_set_still_come_back_whole() {
+    // The common case: HLEN/SCARD equal what was fetched, so the header has
+    // nothing extra to disclose (window() must return None).
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer
+        .hset("smallhash", [("a", "1"), ("b", "2"), ("c", "3")])
+        .await
+        .unwrap();
+    let _: () = writer.sadd("smallset", ["x", "y", "z"]).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let arming = redis_pane::redis::read::Arming::Enabled;
+
+    let hash = redis_pane::redis::read::read_value(&client, b"smallhash", 40, arming)
+        .await
+        .unwrap()
+        .unwrap();
+    let redis_pane_core::state::value::Value::Hash(h) = hash.value else {
+        panic!("expected a hash");
+    };
+    assert_eq!(h.pairs.len(), 3);
+    assert_eq!(h.total, 3);
+    assert_eq!(h.window(), None, "nothing was withheld");
+
+    let set = redis_pane::redis::read::read_value(&client, b"smallset", 40, arming)
+        .await
+        .unwrap()
+        .unwrap();
+    let redis_pane_core::state::value::Value::Set(s) = set.value else {
+        panic!("expected a set");
+    };
+    assert_eq!(s.members.len(), 3);
+    assert_eq!(s.total, 3);
+    assert_eq!(s.window(), None, "nothing was withheld");
 
     let _ = client.quit().await;
     let _ = writer.quit().await;

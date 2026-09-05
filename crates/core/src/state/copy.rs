@@ -99,6 +99,7 @@ mod tests {
     fn hash() -> Value {
         Value::Hash(PairValue {
             pairs: vec![("id".into(), "8812".into()), ("plan".into(), "pro".into())],
+            total: 2,
         })
     }
 

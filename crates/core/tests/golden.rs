@@ -946,6 +946,7 @@ fn hash_value() -> Value {
             ("plan".into(), "pro".into()),
             ("locale".into(), "fr-FR".into()),
         ],
+        total: 5,
     })
 }
 
@@ -1076,6 +1077,28 @@ fn a_windowed_value_says_how_much_of_it_is_on_screen() {
 }
 
 #[test]
+fn a_windowed_hash_says_how_much_of_it_is_on_screen() {
+    // `HLEN` says 1500; `HSCAN` brought back 1 field for this fixture. Hash
+    // was, with Set, the last type that stayed unbounded (`HGETALL` pulling
+    // the whole thing) after List/ZSet/Stream were windowed — same defect,
+    // same fix, same header rule.
+    let v = Value::Hash(PairValue {
+        pairs: vec![("f1".into(), "v1".into())],
+        total: 1_500,
+    });
+    let frame = draw(&opened("bighash", v, TTL_NONE), 130, 22);
+    let header = frame
+        .lines()
+        .find(|l| l.contains("hash ·"))
+        .expect("the viewer header names the type");
+    assert!(header.contains("1500 fields"), "the real length: {header}");
+    assert!(
+        header.contains("1 shown"),
+        "and what is on screen: {header}"
+    );
+}
+
+#[test]
 fn a_value_fetched_whole_says_nothing_extra() {
     // A hash comes back complete, so there is no window to disclose and the
     // header must not grow a phrase that would read as a caveat where none
@@ -1188,6 +1211,7 @@ fn an_update_at_rest_lands_with_no_keypress() {
 
     let changed = Value::Hash(PairValue {
         pairs: vec![("plan".into(), "enterprise".into())],
+        total: 1,
     });
     state
         .open
@@ -1241,6 +1265,7 @@ fn golden_viewer_read_outcomes() {
     let mut state = opened("user:8812:session", hash_value(), 2_537);
     let changed = Value::Hash(PairValue {
         pairs: vec![("plan".into(), "enterprise".into())],
+        total: 1,
     });
     state
         .open
@@ -1259,6 +1284,7 @@ fn an_update_while_scrolled_is_announced_and_offers_the_effective_key() {
     open.absorb(
         Value::Hash(PairValue {
             pairs: vec![("plan".into(), "enterprise".into())],
+            total: 1,
         }),
         600,
         2_150,

@@ -14,6 +14,8 @@
 //! to pass `false` for convenience, and that caller would silently go dark.
 
 use fred::prelude::*;
+use fred::types::CustomCommand;
+use fred::types::Value as RedisValue;
 use redis_pane_core::state::value::{
     BinaryValue, IndexedValue, JsonValue, MemberValue, PairValue, ScoredValue, StreamValue,
     StringValue, Value,
@@ -22,6 +24,19 @@ use redis_pane_core::state::value::{
 /// How much of a large collection to fetch. The Viewer is for reading, not for
 /// exporting; a bounded window keeps a 4MB list from arriving as one reply.
 const WINDOW: i64 = 500;
+
+/// A ceiling on `HSCAN`/`SSCAN` round trips per read, independent of
+/// `WINDOW`.
+///
+/// `COUNT` is a hint the server is free to undershoot — a table with a lot of
+/// recently-expired or rehashing buckets can return far fewer live entries per
+/// page than asked for. Without a ceiling, a pathological table would keep
+/// this read looping (and the Viewer waiting) until it either filled the
+/// window or walked the whole thing. `SCAN_ROUNDS * WINDOW` candidate slots is
+/// generous headroom over the common case (one or two rounds), while keeping
+/// a worst case bounded — the same discipline ADR-0010 applies to the
+/// keyspace scan's cap.
+const SCAN_ROUNDS: u32 = 40;
 
 /// Whether this connection can arm tracking at all.
 ///
@@ -137,8 +152,12 @@ pub async fn read_value(
     let value = match kind.as_str() {
         "string" => string_value(client, key, pane_width).await?,
         "hash" => {
-            let map: Vec<(String, String)> = client.hgetall(key).await?;
-            Value::Hash(PairValue { pairs: map })
+            let total: i64 = client.hlen(key.clone()).await.unwrap_or(0);
+            let pairs = hscan_window(client, &key).await?;
+            Value::Hash(PairValue {
+                pairs,
+                total: total.max(0) as usize,
+            })
         }
         "list" => {
             let total: i64 = client.llen(key.clone()).await.unwrap_or(0);
@@ -150,7 +169,7 @@ pub async fn read_value(
         }
         "set" => {
             let total: i64 = client.scard(key.clone()).await.unwrap_or(0);
-            let members: Vec<String> = client.smembers(key).await?;
+            let members = sscan_window(client, &key).await?;
             Value::Set(MemberValue {
                 members,
                 total: total.max(0) as usize,
@@ -183,6 +202,83 @@ pub async fn read_value(
         ttl_seconds: ttl.clamp(-1, i32::MAX as i64) as i32,
         size_bytes: size.clamp(0, u32::MAX as i64 - 1) as u32,
     }))
+}
+
+/// Fetch up to [`WINDOW`] fields via `HSCAN`, the windowing discipline
+/// List/ZSet/Stream already had. `HGETALL` — with `SMEMBERS` for Set — was
+/// the last type still pulling its whole collection into memory regardless of
+/// size, on the same connection the keyspace scan is using, into a 250MB
+/// budget (PRD §7).
+///
+/// This drives `HSCAN` by hand with [`fred::interfaces::ClientLike::custom`]
+/// rather than through `Client::hscan`'s auto-continuing stream: that
+/// stream's page type requests another round trip *in its `Drop` impl* if it
+/// is not explicitly told to stop, which is exactly the kind of implicit
+/// background command this project's read path does not otherwise have (see
+/// `ReadGate` above). A hand-rolled loop with an explicit stopping condition
+/// has no such edge to remember.
+async fn hscan_window(client: &Client, key: &Key) -> Result<Vec<(String, String)>, Error> {
+    let mut pairs = Vec::new();
+    let mut cursor = "0".to_string();
+    for _ in 0..SCAN_ROUNDS {
+        let (next, flat): (String, Vec<String>) = client
+            .custom(
+                CustomCommand::new("HSCAN", key.as_bytes(), false),
+                vec![
+                    RedisValue::from(key.clone()),
+                    RedisValue::from(cursor),
+                    RedisValue::from("COUNT".to_string()),
+                    RedisValue::from(WINDOW),
+                ],
+            )
+            .await?;
+        // HSCAN's reply is a flat [field, value, field, value, ...] array —
+        // paired up here rather than asked of the caller.
+        pairs.extend(
+            flat.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|[k, v]| (k.clone(), v.clone())),
+        );
+        cursor = next;
+        // Stop as soon as the window is full, or the table is exhausted —
+        // whichever comes first. A cursor of "0" means one full pass
+        // completed: a sparse or heavily-tombstoned hash can reach that
+        // before WINDOW fields ever accumulate, and that is the whole hash,
+        // correctly, not a truncated window of it.
+        if pairs.len() >= WINDOW as usize || cursor == "0" {
+            break;
+        }
+    }
+    pairs.truncate(WINDOW as usize);
+    Ok(pairs)
+}
+
+/// `SSCAN`'s half of [`hscan_window`] — see its comment for why this is a
+/// hand-rolled loop rather than `Client::sscan`'s stream.
+async fn sscan_window(client: &Client, key: &Key) -> Result<Vec<String>, Error> {
+    let mut members = Vec::new();
+    let mut cursor = "0".to_string();
+    for _ in 0..SCAN_ROUNDS {
+        let (next, page): (String, Vec<String>) = client
+            .custom(
+                CustomCommand::new("SSCAN", key.as_bytes(), false),
+                vec![
+                    RedisValue::from(key.clone()),
+                    RedisValue::from(cursor),
+                    RedisValue::from("COUNT".to_string()),
+                    RedisValue::from(WINDOW),
+                ],
+            )
+            .await?;
+        members.extend(page);
+        cursor = next;
+        if members.len() >= WINDOW as usize || cursor == "0" {
+            break;
+        }
+    }
+    members.truncate(WINDOW as usize);
+    Ok(members)
 }
 
 /// Strings are the one type whose *shape* is not given by its Redis type: it

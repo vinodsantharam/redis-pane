@@ -321,6 +321,7 @@ mod tests {
     fn pair(v: &str) -> Value {
         Value::Hash(PairValue {
             pairs: vec![("f".into(), v.into())],
+            total: 1,
         })
     }
 
@@ -485,6 +486,7 @@ mod editing_indicator_tests {
     fn pair() -> Value {
         Value::Hash(PairValue {
             pairs: vec![("f".into(), "v".into())],
+            total: 1,
         })
     }
 

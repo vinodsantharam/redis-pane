@@ -42,7 +42,10 @@ by an arriving update.
 
 **TTL counts down locally**, with no round trip.
 
-**A key deleted while open keeps its last value**, badged, with mutations disabled.
+**A key that was loaded and is then deleted while open keeps its last value**, badged, with
+mutations disabled — because "what was in it" still has an answer for a key that was actually
+read. A key confirmed gone *before* it was ever loaded has no such answer and gets no such badge
+over a value: see Consequences for the distinction this decision did not originally draw.
 
 **Degradation is announced.** Without RESP3 tracking the header reads `○ manual`, Read age is
 shown, and `r` performs the Refetch.
@@ -139,3 +142,14 @@ one: after every invalidation, and after every reconnect.
 - Reversing this means reintroducing a cache, which is where the original bug lives. Treat the
   no-cache rule (R3.6) as the load-bearing half; the transport can change, the absence of a
   cache should not.
+- **"A key deleted while open keeps its last value" assumed a value had been read.** `ValueGone`
+  originally carried only a token, not the key's index or name — unlike `ValueLoaded`, which
+  carries both — so the handler could not tell *which* key had come back gone and simply mutated
+  whatever `OpenKey` happened to be in `state.open`. Reported from use: arrow onto an already-
+  deleted key while a different, healthy key is open, and the healthy key gets badged `✕ deleted`
+  and its row tombstoned in the keys pane — a token check passes (it genuinely is the latest
+  read), so nothing here violated the letter of the invariant above, only its spirit. Fixed by
+  giving `ValueGone` the same identity `ValueLoaded` has, and by drawing the distinction this ADR
+  had not: a key that *was* loaded and is deleted while open keeps its value, badged, exactly as
+  decided; a key confirmed gone *before* it was ever loaded has no value to keep, and `OpenKey`
+  can now say so (`value: Option<Value>`) instead of being forced to badge someone else's.

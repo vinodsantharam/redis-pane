@@ -1503,7 +1503,12 @@ fn the_command_uses_the_target_the_title_bar_is_showing() {
     // A copied command that points at a different server than the one on
     // screen would be actively dangerous.
     let state = opened("k", hash_value(), 600);
-    let cmd = redis_cli_command(&state.connection.target, state.open.as_ref().unwrap());
+    let open = state.open.as_ref().unwrap();
+    let cmd = redis_cli_command(
+        &state.connection.target,
+        &open.name,
+        open.value.as_ref().unwrap(),
+    );
     assert!(cmd.contains("cache-01"), "{cmd}");
     assert_eq!(state.connection.target, "cache-01:6379/0");
 }
@@ -1512,7 +1517,7 @@ fn the_command_uses_the_target_the_title_bar_is_showing() {
 fn copying_a_value_is_not_affected_by_where_the_viewer_is_scrolled() {
     let mut state = opened("k", hash_value(), 600);
     state.open.as_mut().unwrap().offset = 3;
-    let full = value_text(&state.open.as_ref().unwrap().value, 0);
+    let full = value_text(state.open.as_ref().unwrap().value.as_ref().unwrap(), 0);
     assert_eq!(full.lines().count(), 5);
 }
 
@@ -1913,6 +1918,84 @@ fn golden_viewer_detached_single_pane() {
     );
     assert_golden("viewer_detached_single", &frame);
 }
+
+// ── a key confirmed gone before it was ever loaded (severity 1) ─────────────
+//
+// Reported from use: arrowing onto an already-deleted key while a different
+// one was open left the Viewer showing the *previous* key's value, badged
+// `✕ deleted` — which was actually a separate bug (the badge was attributed
+// to the wrong key; see `update.rs`'s `opening_a_gone_key_never_...` tests)
+// layered under a real design question: even correctly attributed, a value
+// that was never read has no type, size, or TTL to show, and no question of
+// attachment to answer. These fixtures pin the minimal render: the name, and
+// that it is gone — nothing else.
+
+/// A key requested and confirmed gone, on the row the cursor is on.
+fn gone_key(name: &str) -> State {
+    let mut state = many_keys();
+    let index = (0..state.keys.len())
+        .find(|&i| state.keys.name_str(i).as_deref() == Some(name))
+        .unwrap_or_else(|| {
+            state.keys.push(name.as_bytes());
+            state.keys.len() - 1
+        });
+    state.open = Some(OpenKey::gone(Some(index), name.into(), 60_000));
+    state.rebuild_list();
+    state.view.selected = state.open.as_ref().and_then(|open| open.row).unwrap_or(0);
+    state
+}
+
+#[test]
+fn golden_viewer_gone_before_load() {
+    let frame = draw(&gone_key("bighash"), 130, 22);
+    assert!(frame.contains("bighash"), "{frame}");
+    assert!(frame.contains("✕ gone"), "{frame}");
+    assert!(
+        !frame.contains("ttl"),
+        "no ttl line for a value never read:\n{frame}"
+    );
+    assert!(!frame.contains('⊘'), "no attachment chip either:\n{frame}");
+    assert_golden("viewer_gone_before_load", &frame);
+}
+
+/// The same state, but the cursor has since moved off the gone key's row.
+/// Per the explicit design choice, this state skips the attachment
+/// disclosure entirely — no wash, no dashed divider, no chip — even though
+/// the key genuinely is not the one selected. The two fixtures must be
+/// byte-identical in the value pane itself; only the keys pane's cursor row
+/// differs.
+#[test]
+fn golden_viewer_gone_before_load_while_detached() {
+    let mut state = gone_key("bighash");
+    state.view.selected = 0;
+    let frame = draw(&state, 130, 22);
+    assert!(frame.contains("bighash"), "{frame}");
+    assert!(frame.contains("✕ gone"), "{frame}");
+    assert!(
+        !frame.contains('⊘'),
+        "detachment is not disclosed for a key with nothing to disclose:\n{frame}"
+    );
+    assert_golden("viewer_gone_before_load_detached", &frame);
+}
+
+#[test]
+fn golden_viewer_gone_before_load_single_pane() {
+    let mut state = gone_key("bighash");
+    state.cols = 60;
+    state.focus = redis_pane_core::render::layout::Pane::Value;
+    let frame = draw(&state, 60, 22);
+    assert!(frame.contains("bighash"), "{frame}");
+    assert!(frame.contains("✕ gone"), "{frame}");
+    assert_golden("viewer_gone_before_load_single", &frame);
+}
+
+// The preserved case — a key that *was* loaded, then deleted while open,
+// keeps its full value and header exactly as before, because ADR-0006's
+// "what was in it" question still has an answer for it — is already pinned
+// by `golden_viewer_deleted` above, unmodified by this change: it passed
+// byte-for-byte with everything else in this file once `OpenKey.value`
+// became optional, which is the regression guarantee this comment is here to
+// point at rather than duplicate.
 
 /// The chip gives way before the key name does, following the title bar's rule:
 /// the name is the pane's identity, the chip is a qualifier on it.

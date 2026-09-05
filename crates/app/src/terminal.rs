@@ -400,7 +400,12 @@ fn open_key(
                 size_bytes: read.size_bytes,
                 at_ms,
             },
-            Ok(None) => Msg::ValueGone { token, at_ms },
+            Ok(None) => Msg::ValueGone {
+                token,
+                index,
+                name: String::from_utf8_lossy(&name).into_owned(),
+                at_ms,
+            },
             // Never swallowed: a Redis error that produces no visible effect is
             // indistinguishable from the app deciding to do nothing (R7.4).
             //

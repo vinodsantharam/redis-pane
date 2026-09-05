@@ -13,6 +13,33 @@ clear and the app still had seven of them. The original audit was written on 202
 severity-1 item since has been found by using the app or auditing it afresh, never by the
 checkboxes**. Treat this section's emptiness as a prompt to look again, not as a result.*
 
+- [x] **Opening a gone key could badge a healthy one as deleted — reported from use, fixed
+  2026-09-05.** Arrow onto an already-deleted key while a different one is open, and the Viewer
+  kept showing the *previous* key's value, badged `✕ deleted just now` — the badge was lying about
+  which key it described. `Msg::ValueGone` carried only a token and a timestamp, unlike its
+  sibling `ValueLoaded`, which carries the key's index and name — so the handler had no way to
+  know which key a "gone" reply was actually about, and simply mutated whatever `OpenKey` happened
+  to be open. Concretely: token matches (it *is* the latest read), so the guard passes, and the
+  handler badges the previous, perfectly alive key `✕ deleted` and **tombstones its row in the
+  keys pane too**, with nothing afterward to correct it. A quieter form of the same gap: with
+  nothing open yet, the handler's `if let Some(open) = ...` guard made the whole message a no-op —
+  the keypress produced no visible change at all.
+  - `ValueGone` now carries `index`/`name`, mirroring `ValueLoaded` exactly, and the handler
+    branches on name the same way: the key already open (by name) keeps ADR-0006's behaviour
+    exactly as before — last value on screen, badged. A *different* key (including nothing open)
+    replaces `state.open` wholesale with a fresh, minimal placeholder for the key actually named
+    in the reply, the same way `ValueLoaded`'s own `_` branch already replaces the Viewer when a
+    different key succeeds. The row tombstone is guarded by name against the arena, matching
+    `ValueLoaded`'s existing metadata-writeback guard — never `open.index`, which is what let a
+    reply about one key mark a different key's row gone.
+  - This also surfaced a real design question underneath the bug: even correctly attributed, a key
+    confirmed gone *before it was ever loaded* has no type, size, or TTL to disclose — there was
+    never a value for any of that chrome to describe. `OpenKey.value` is now `Option<Value>`, and
+    a `None` renders as one line: the name, and `✕ gone` — no attachment chip either, since that
+    disclosure answers "is this pane about the row you're on", a question a value that was never
+    read has no stake in. A key that *was* loaded and is deleted while open is unaffected and keeps
+    its full badged-value treatment — that is ADR-0006's actual case, and "what was in it" still
+    has an answer for it.
 - [x] **The disconnect header promised a retry that would never come — 2026-09-05.** With the
   server taken away the title bar read `✕ disconnected · retry 0s   r refetch`, permanently.
   `Command::Reconnect` is a no-op until M2 and fred is built with no retry policy, so nothing was

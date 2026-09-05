@@ -254,34 +254,54 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             }
             (state, Vec::new())
         }
-        Msg::ValueGone { token, at_ms } => {
-            // Identity matters more here than anywhere else. This message
-            // tombstones the Open key *and* its row, so an unidentified one
-            // badges whichever key happens to be open when it lands — marking a
-            // healthy key deleted in both panes, with nothing afterwards to
-            // correct it.
+        Msg::ValueGone {
+            token,
+            index,
+            name,
+            at_ms,
+        } => {
             if token != state.read_token {
                 return (state, Vec::new());
             }
-            // The value stays on screen, badged. During an incident the
-            // question is almost always what was in it, and this is the moment
-            // that answer becomes unrecoverable.
-            if let Some(open) = &mut state.open {
-                open.deleted_at_ms = Some(at_ms);
-                open.pending = None;
-                // The row this key came from learns it too. Without this the
-                // two panes state different things about one key at the same
-                // moment — the Viewer badged `✕ deleted` while the list still
-                // showed `● string 64 B` — and the list is the more believable
-                // of the two, because it is the one that looks untouched.
-                // Nothing else would correct it: metadata is only refetched for
-                // rows whose type is unknown, and this row's is known and wrong.
-                //
-                // Skipped while the index is `None`: after a rescan there is no
-                // row this key is known to be on, and tombstoning a guess would
-                // put a `✕ gone` badge on a key that is perfectly alive.
-                if let Some(index) = open.index {
-                    state.keys.set_gone(index);
+            // The row this reply is actually about — never `open.index`. A
+            // token-only version of this message shipped once and used
+            // `open.index` here, which meant a gone reply for a *different*
+            // key than the one already open tombstoned the wrong row: a
+            // perfectly healthy key marked `✕ … gone`, with nothing
+            // afterwards to correct it (metadata is refetched only for rows
+            // of unknown type, and this one's was known and wrong).
+            //
+            // Guarded by name, the same way `ValueLoaded`'s metadata
+            // writeback is: a rescan between the read and its reply
+            // renumbers the Loaded set, and this index would then describe
+            // an unrelated key in confident detail.
+            if let Some(index) = index
+                && state.keys.name(index) == Some(name.as_bytes())
+            {
+                state.keys.set_gone(index);
+            }
+            match &mut state.open {
+                // The key already open is the one that came back gone —
+                // whether it had a value or was already this same
+                // placeholder. This is ADR-0006's actual case: a value was
+                // read, and the reader is watching it get deleted. The last
+                // value stays on screen, badged. During an incident the
+                // question is almost always what was in it, and this is the
+                // moment that answer becomes unrecoverable.
+                Some(open) if open.name == name => {
+                    open.deleted_at_ms = Some(at_ms);
+                    open.pending = None;
+                }
+                // A different key than whatever is open — including nothing
+                // open at all. There is no "what was in it" to preserve here;
+                // nothing was ever read. A fresh, minimal placeholder replaces
+                // whatever was open, the same way `ValueLoaded`'s `_` arm
+                // replaces the Viewer wholesale when a different key
+                // succeeds — the two messages now agree on how a key changes
+                // identity, not just on how it changes value.
+                _ => {
+                    state.open = Some(OpenKey::gone(index, name, at_ms));
+                    state.relocate_open_key();
                 }
             }
             (state, Vec::new())
@@ -607,6 +627,14 @@ fn copy_key(state: State, key: KeyPress) -> (State, Vec<Command>) {
             text: "nothing open to copy".into(),
         }]
     };
+    // A key confirmed gone before it was ever loaded has a name but no value —
+    // there was never anything for the server to say. Distinct wording from
+    // `nothing_open()`: something *is* open, it simply has nothing behind it.
+    let gone = || {
+        vec![Command::Notify {
+            text: "gone — nothing to copy".into(),
+        }]
+    };
     let mut label = what.label().to_string();
     let text = match what {
         CopyWhat::Key => match state.open.as_ref().map(|o| o.name.clone()) {
@@ -616,8 +644,8 @@ fn copy_key(state: State, key: KeyPress) -> (State, Vec<Command>) {
                 None => return (state, nothing_open()),
             },
         },
-        CopyWhat::Value => match &state.open {
-            Some(open) => {
+        CopyWhat::Value => match state.open.as_ref().map(|open| (open, open.value.as_ref())) {
+            Some((open, Some(value))) => {
                 // A windowed read brought back a slice, and the clipboard shows
                 // no seams: 500 rows of a 12,000-item list look exactly like a
                 // complete copy once pasted. The Viewer header already states
@@ -625,16 +653,20 @@ fn copy_key(state: State, key: KeyPress) -> (State, Vec<Command>) {
                 // the confirmation states it about the copy, in the same words,
                 // rather than saying `copied value` and leaving the paste
                 // buffer to be discovered as a prefix later.
-                let viewer = open.value.viewer();
+                let viewer = value.viewer();
                 if let Some(shown) = viewer.window() {
                     label = format!("{label} ({shown} of {})", viewer.measure());
                 }
-                value_text(&open.value, open.read_at_ms)
+                value_text(value, open.read_at_ms)
             }
+            Some((_, None)) => return (state, gone()),
             None => return (state, nothing_open()),
         },
-        CopyWhat::Command => match &state.open {
-            Some(open) => redis_cli_command(&state.connection.target, open),
+        CopyWhat::Command => match state.open.as_ref().map(|open| (open, open.value.as_ref())) {
+            Some((open, Some(value))) => {
+                redis_cli_command(&state.connection.target, &open.name, value)
+            }
+            Some((_, None)) => return (state, gone()),
             None => return (state, nothing_open()),
         },
     };
@@ -715,8 +747,12 @@ enum ViewerMove {
 /// value is one abstraction (R3.1) — a hex dump and a hash pane both scroll
 /// this way.
 fn scroll_viewer(mut state: State, mv: ViewerMove) -> (State, Vec<Command>) {
-    if let Some(open) = &mut state.open {
-        let last = open.value.viewer().row_count().saturating_sub(1);
+    // Nothing to scroll in a key confirmed gone before it was ever loaded —
+    // there is no body, only a name and a badge.
+    if let Some(open) = &mut state.open
+        && let Some(value) = &open.value
+    {
+        let last = value.viewer().row_count().saturating_sub(1);
         open.offset = match mv {
             ViewerMove::By(by) => (open.offset as isize + by).clamp(0, last as isize) as usize,
             ViewerMove::Absolute(n) => n.min(last),
@@ -1460,6 +1496,8 @@ mod metadata_tests {
             state,
             Msg::ValueGone {
                 token: ReadToken::default(),
+                index: Some(3),
+                name: "k:3".into(),
                 at_ms: 2_000,
             },
         );
@@ -1622,6 +1660,8 @@ mod metadata_tests {
             state,
             Msg::ValueGone {
                 token: doomed,
+                index: Some(3),
+                name: "k:3".into(),
                 at_ms: 2_000,
             },
         );
@@ -1630,6 +1670,155 @@ mod metadata_tests {
             "the open key is alive and must not be badged as deleted"
         );
         assert!(!state.keys.is_gone(5), "nor may its row be tombstoned");
+    }
+
+    /// The bug reported from use, reproduced exactly: key A is open, the
+    /// reader arrows onto a *different*, already-deleted key B — not a
+    /// superseded read of A, a fresh, current, correctly-answered read of B.
+    /// The old token-only `ValueGone` had no way to tell this apart from a
+    /// reply about A, and badged A — alive, unrelated — as deleted, tombstoning
+    /// its row too.
+    #[test]
+    fn opening_a_gone_key_never_misattributes_it_to_the_key_that_was_already_open() {
+        use crate::state::value::{StringValue, Value};
+
+        let mut state = browsing(10);
+        state.view.selected = 3;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+            panic!("expected an open");
+        };
+        let (mut state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token,
+                index: Some(3),
+                name: "k:3".into(),
+                value: Value::Str(StringValue::new("v", 40)),
+                ttl_seconds: -1,
+                size_bytes: 1,
+                at_ms: 1_000,
+            },
+        );
+        // k:3 (A) is open and alive. Now arrow onto k:5 (B) — a different key
+        // — and B turns out to be gone.
+        state.view.selected = 5;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+            panic!("expected an open");
+        };
+        let (state, _) = update(
+            state,
+            Msg::ValueGone {
+                token,
+                index: Some(5),
+                name: "k:5".into(),
+                at_ms: 2_000,
+            },
+        );
+
+        let open = state.open.as_ref().unwrap();
+        assert_eq!(
+            open.name, "k:5",
+            "the pane must name the key just asked for"
+        );
+        assert!(open.value.is_none(), "nothing was ever read for it");
+        assert!(open.deleted_at_ms.is_some());
+        assert!(state.keys.is_gone(5), "B's own row is correctly tombstoned");
+        assert!(
+            !state.keys.is_gone(3),
+            "A is alive and must not be falsely marked gone in the keys pane"
+        );
+    }
+
+    /// The quieter half of the same bug: nothing was open at all, so the old
+    /// handler's `if let Some(open) = &mut state.open` guard made a fresh gone
+    /// key a complete no-op — the keypress produced no visible change
+    /// whatsoever, indistinguishable from the app having done nothing.
+    #[test]
+    fn opening_a_gone_key_from_a_cold_start_is_not_a_silent_no_op() {
+        let mut state = browsing(10);
+        assert!(state.open.is_none());
+
+        state.view.selected = 2;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+            panic!("expected an open");
+        };
+        let (state, _) = update(
+            state,
+            Msg::ValueGone {
+                token,
+                index: Some(2),
+                name: "k:2".into(),
+                at_ms: 1_000,
+            },
+        );
+
+        let open = state
+            .open
+            .as_ref()
+            .expect("the keypress must produce something");
+        assert_eq!(open.name, "k:2");
+        assert!(open.value.is_none());
+        assert!(state.keys.is_gone(2));
+    }
+
+    /// Refetching a key that is *already* the gone placeholder — `r` pressed
+    /// again, and the server still says it does not exist — must not panic or
+    /// disturb anything; it is Case A (the name matches what is already open)
+    /// landing on a key with no value rather than one with a stale value.
+    #[test]
+    fn refetching_an_already_gone_key_that_is_still_gone_is_idempotent() {
+        let mut state = browsing(10);
+        state.view.selected = 4;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+            panic!("expected an open");
+        };
+        let (state, _) = update(
+            state,
+            Msg::ValueGone {
+                token,
+                index: Some(4),
+                name: "k:4".into(),
+                at_ms: 1_000,
+            },
+        );
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('r'))));
+        let Some(&Command::RefetchOpenKey { token }) = cmds.first() else {
+            panic!("expected a refetch, got {cmds:?}");
+        };
+        let (state, _) = update(
+            state,
+            Msg::ValueGone {
+                token,
+                index: Some(4),
+                name: "k:4".into(),
+                at_ms: 2_000,
+            },
+        );
+        let open = state.open.unwrap();
+        assert_eq!(open.name, "k:4");
+        assert!(open.value.is_none());
+        assert!(open.deleted_at_ms.is_some());
+    }
+
+    /// A key that was gone and has since been recreated: `absorb` must treat
+    /// `None → Some` as unambiguously `Updated`, not a special case and not
+    /// `Unchanged` — there was nothing before for the new value to match.
+    #[test]
+    fn a_gone_key_that_comes_back_is_reported_as_updated_not_unchanged() {
+        use crate::state::open::{OpenKey, ReadOutcome};
+        use crate::state::value::{StringValue, Value};
+
+        let mut open = OpenKey::gone(Some(0), "k".into(), 0);
+        assert!(open.value.is_none());
+        open.absorb(Value::Str(StringValue::new("v", 40)), -1, 4, 1_000);
+
+        assert_eq!(open.value, Some(Value::Str(StringValue::new("v", 40))));
+        assert!(open.deleted_at_ms.is_none(), "no longer gone");
+        assert!(matches!(open.last_read, ReadOutcome::Updated { .. }));
     }
 
     /// `SCAN` has no stable order, so an index outlives its meaning. Keeping it
@@ -1869,6 +2058,8 @@ mod metadata_tests {
             state,
             Msg::ValueGone {
                 token,
+                index: Some(3),
+                name: "k:3".into(),
                 at_ms: 2_000,
             },
         );

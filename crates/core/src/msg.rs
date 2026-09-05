@@ -148,17 +148,25 @@ pub enum Msg {
         size_bytes: u32,
         at_ms: u64,
     },
-    /// The key that was read is gone: deleted, expired, or evicted.
+    /// The key that was read is gone: deleted, expired, or evicted — or was
+    /// never there to begin with.
     ///
-    /// Carries a token for the same reason [`Msg::ValueLoaded`] does, and with
-    /// more at stake: this message tombstones the Open key *and* its row in the
-    /// keys pane, so an unidentified one badges whichever key happens to be
-    /// open now. A healthy key marked `✕ deleted` in both panes is worse than
-    /// the wrong value, because nothing afterwards corrects it — metadata is
-    /// refetched only for rows whose type is unknown, and this row's would be
-    /// known and wrong.
+    /// Carries the same identity `ValueLoaded` does, and for the same reason:
+    /// the token alone only says *this is the most recent read*, not *which
+    /// key it was a read of*. A token-only version of this message shipped
+    /// once and had exactly the bug that identity exists to prevent —
+    /// opening a gone key while a different one was already open badged the
+    /// *previous*, perfectly alive key `✕ deleted` and tombstoned its row,
+    /// because the handler had no way to tell the two apart and simply
+    /// mutated whatever was open. `index`/`name` are what let the core ask
+    /// "is this the key I already have open, or a different one" instead of
+    /// assuming.
     ValueGone {
         token: crate::command::ReadToken,
+        /// The Loaded set row this key was read from, if one was known —
+        /// same meaning as [`Msg::ValueLoaded::index`].
+        index: Option<usize>,
+        name: String,
         at_ms: u64,
     },
     /// Something was copied. Drives a notice that fades on its own.

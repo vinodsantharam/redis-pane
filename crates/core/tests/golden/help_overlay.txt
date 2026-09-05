@@ -1,6 +1,7 @@
+Tab     focus
 q       quit
 ⌃C      quit
-r       refetch
+r       refetch / rescan
 ⌃R      read-only
 ?       help
 Esc     back

@@ -15,7 +15,7 @@ pub mod view;
 
 pub use copy::CopyWhat;
 pub use loaded::{KeyKind, LoadedSet};
-pub use open::OpenKey;
+pub use open::{Attachment, OpenKey, ReadOutcome};
 pub use scan::ScanState;
 pub use tree::Tree;
 pub use value::{Value, Viewer};
@@ -136,7 +136,16 @@ pub enum Link {
     /// last read value; it never exits.
     Reconnecting {
         attempt: u32,
-        retry_in_ms: u64,
+        /// When the next attempt lands — `None` when no attempt is scheduled.
+        ///
+        /// An `Option` rather than a `u64`, so a countdown cannot be rendered
+        /// for a retry nobody arranged. It used to be a bare number that
+        /// `ConnectionLost` set to `0`, and the header read
+        /// `✕ disconnected · retry 0s` for the rest of the session while
+        /// nothing was retrying and nothing ever would — a promise of
+        /// self-healing that never arrives, which is worse than saying
+        /// nothing. Only [`crate::Msg::ReconnectScheduled`] can fill this in.
+        retry_in_ms: Option<u64>,
     },
 }
 
@@ -252,12 +261,19 @@ pub struct State {
     pub tree_mode: bool,
     /// Set while `/` is capturing a filter.
     pub filtering: bool,
-    /// Below 70 columns there is one pane at a time; this says which.
-    /// Ignored at any wider density, where both panes always show.
-    pub single_pane_view: crate::render::layout::SinglePaneView,
-    /// The key in the Viewer, if one is open. There is no cache behind this —
-    /// it holds what the server last said and nothing more (ADR-0006).
+    /// Which pane the reader is in (DESIGN §4). Below 70 columns it also
+    /// decides which pane is drawn at all; see [`crate::render::layout::Pane`].
+    pub focus: crate::render::layout::Pane,
+    /// The Open key, if one is open. There is no cache behind this — it holds
+    /// what the server last said and nothing more (ADR-0006).
     pub open: Option<OpenKey>,
+    /// Identifies the most recently issued read. Replies carrying anything else
+    /// answer a question the reader has already moved on from, and are dropped.
+    ///
+    /// Bumped by [`crate::update::update`] whenever it issues a read, so the
+    /// core is the only thing that mints one — a shell that could invent a
+    /// token could resurrect a superseded read.
+    pub read_token: crate::command::ReadToken,
     /// Set between `y` and the key that says what to copy.
     pub copy_pending: bool,
     /// A transient confirmation and when it was raised. It fades on its own
@@ -271,6 +287,46 @@ pub struct State {
 }
 
 impl State {
+    /// Whether a pane-scoped key belongs to the keys pane rather than the
+    /// Viewer (R2.7).
+    ///
+    /// Reads the focus and nothing else. An earlier version inferred it from
+    /// `open.is_some()` at two-pane widths, on the reasoning that the Viewer is
+    /// only reachable once a key is open. That was wrong in use: opening a key
+    /// silently handed `r` to the Viewer while the arrow keys still drove the
+    /// key list, so the pane the cursor was in and the pane `r` acted on were
+    /// different, with nothing on screen saying so.
+    pub fn keys_pane_focused(&self) -> bool {
+        self.focus == crate::render::layout::Pane::Keys
+    }
+
+    /// Whether a pane is actually on screen.
+    ///
+    /// Below 70 columns only one pane is drawn and focus chooses which
+    /// (DESIGN §2, stack navigation), so an action scoped to the other one has
+    /// no visible effect at all — arrow keys moving a cursor nobody can see,
+    /// or `/` opening a filter line inside a pane of zero width while every
+    /// subsequent keypress disappears into it. An action whose result is off
+    /// screen is indistinguishable from an application that has stopped
+    /// responding, which is the worst thing a TUI can look like.
+    ///
+    /// At any wider density both panes are drawn and this is always true, so
+    /// the two-pane keymap is unchanged: plain arrows drive the list and
+    /// `⌃`-arrows drive the value, in both panes, as DESIGN §4 specifies.
+    pub fn pane_visible(&self, pane: crate::render::layout::Pane) -> bool {
+        self.cols >= crate::render::layout::TWO_PANE_MIN_COLS || self.focus == pane
+    }
+
+    /// Whether the keys pane can be seen right now.
+    pub fn keys_pane_visible(&self) -> bool {
+        self.pane_visible(crate::render::layout::Pane::Keys)
+    }
+
+    /// Whether the Viewer can be seen right now.
+    pub fn value_pane_visible(&self) -> bool {
+        self.pane_visible(crate::render::layout::Pane::Value)
+    }
+
     /// What the header may claim about currency.
     ///
     /// There is deliberately no setter for this. Liveness is *derived* from the
@@ -330,6 +386,33 @@ impl State {
         self.key_at(self.view.selected)
     }
 
+    /// The display row a Loaded set index is currently shown at, if any.
+    ///
+    /// Linear in the row count, which is why it is called when the row list is
+    /// rebuilt and never per frame. `key_at` is the only mapping that exists,
+    /// and it runs the other way.
+    fn row_of(&self, index: usize) -> Option<usize> {
+        (0..self.row_count()).find(|&row| self.key_at(row) == Some(index))
+    }
+
+    /// Whether the Viewer is showing the Selected key, and if not, where the
+    /// Open key went.
+    ///
+    /// `None` when no key is open, because the question does not arise. This is
+    /// the whole of the model behind the detached treatment in both panes: one
+    /// pure function of state, so a golden frame pins it and a unit test can
+    /// reach every branch without rendering anything.
+    pub fn attachment(&self) -> Option<Attachment> {
+        let open = self.open.as_ref()?;
+        Some(match open.row {
+            Some(row) if row == self.view.selected => Attachment::Attached,
+            Some(row) => Attachment::Detached {
+                rows: row as isize - self.view.selected as isize,
+            },
+            None => Attachment::DetachedOffList,
+        })
+    }
+
     /// Recompute the list after the keys, the filter, the sort or the mode
     /// changed. Tree mode needs name order to fold in one pass.
     pub fn rebuild_list(&mut self) {
@@ -343,6 +426,24 @@ impl State {
         let last = self.row_count().saturating_sub(1);
         if self.view.selected > last {
             self.view.selected = last;
+        }
+        self.relocate_open_key();
+    }
+
+    /// Find the Open key's row again after the rows changed.
+    ///
+    /// Filtering, sorting and folding all move it, and a rescan removes its
+    /// index entirely. Doing this here rather than in the renderer is what keeps
+    /// the per-frame cost at zero: moving the cursor cannot change which row the
+    /// Open key is on, so the answer only goes stale when the rows do.
+    pub(crate) fn relocate_open_key(&mut self) {
+        let row = self
+            .open
+            .as_ref()
+            .and_then(|open| open.index)
+            .and_then(|index| self.row_of(index));
+        if let Some(open) = self.open.as_mut() {
+            open.row = row;
         }
     }
 

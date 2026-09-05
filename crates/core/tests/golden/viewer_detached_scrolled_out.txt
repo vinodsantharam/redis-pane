@@ -1,0 +1,21 @@
+─ redis-pane ─ ● staging · cache-01:6379/0 · from profile staging ─────────────────────────────────────────────────────── ● live ─
+
+ KEY                               TYPE        SIZE   TTL ▲ user:8812:cart                                 ⊘ not the selected key
+ · filler:022                      ·              ·     · ┊ hash · 5 fields · 2.1 KB
+ · filler:023                      ·              ·     · ┊ ttl 42m                                                        ● live
+ · filler:024                      ·              ·     · ┊
+ · filler:025                      ·              ·     · ┊ FIELD                             VALUE
+ · filler:026                      ·              ·     · ┊ id                                8812
+ · filler:027                      ·              ·     · ┊ device                            ios/17.2
+ · filler:028                      ·              ·     · ┊ region                            eu-west-1
+ · filler:029                      ·              ·     · ┊ plan                              pro
+ · filler:030                      ·              ·     · ┊ locale                            fr-FR
+ · filler:031                      ·              ·     · ┊
+ · filler:032                      ·              ·     · ┊
+ · filler:033                      ·              ·     · ┊
+ · filler:034                      ·              ·     · ┊
+ · filler:035                      ·              ·     · ┊
+ · filler:036                      ·              ·     · ┊
+ · filler:037                      ·              ·     · ┊
+ · filler:038                      ·              ·     · ┊
+ · filler:039                      ·              ·     · ┊

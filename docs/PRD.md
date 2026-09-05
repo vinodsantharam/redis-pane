@@ -170,6 +170,12 @@ config file; a **Connection** is a live session, which may be **ad-hoc** (no Pro
 - **R3.11** Liveness state is always visible in the Viewer header. Where the server cannot
   support it — Redis < 6, or no RESP3 — the app degrades to Read age plus explicit Refetch and
   **says so**. It never silently behaves differently from what the user would assume.
+- **R3.12** **Which key the Viewer holds is always legible.** The Open key and the Selected key
+  are allowed to differ — opening is explicit, so moving the cursor does not move the Viewer —
+  and whenever they do, *both* panes say so: the Viewer states it in words and the keys pane
+  marks the Open key's row. This is a question of identity, not freshness: the value on screen is
+  a live tracked read either way (R3.6, R3.7), and the failure being designed against is the user
+  reading a correct value as though it belonged to the key under their cursor.
 
 ### 6.4 Mutation
 - **R4.1** In-place edit for scalar values and collection members, with a diff-style confirm.

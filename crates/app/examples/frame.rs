@@ -112,8 +112,8 @@ async fn main() {
         .filter_map(|i| state.keys.name(*i).map(|n| (*i, n.to_vec())))
         .collect();
     let t2 = Instant::now();
-    if let Ok(entries) = redis_pane::redis::fetch_metadata(&client, &window).await {
-        (state, _) = update(state, Msg::MetadataBatch { entries });
+    if let Ok((entries, gone)) = redis_pane::redis::fetch_metadata(&client, &window).await {
+        (state, _) = update(state, Msg::MetadataBatch { entries, gone });
     }
     let meta_ms = t2.elapsed();
     show(
@@ -122,13 +122,17 @@ async fn main() {
         &clock,
     );
 
-    // ── open the first hash we can find ────────────────────────────────────
+    // ── open a key: `REDIS_PANE_OPEN` if it names one, else the first hash ──
+    // The override is what makes this useful for checking a *particular* key's
+    // frame — a windowed list or a long stream, say, where the header has
+    // something to disclose that a 5-byte string does not.
+    let wanted = std::env::var("REDIS_PANE_OPEN").ok();
     let target = (0..state.keys.len())
         .find(|i| {
-            state
-                .keys
-                .name_str(*i)
-                .is_some_and(|n| n.ends_with(":session"))
+            state.keys.name_str(*i).is_some_and(|n| match &wanted {
+                Some(w) => n == w.as_str(),
+                None => n.ends_with(":session"),
+            })
         })
         .unwrap_or(0);
     let name = state.keys.name(target).unwrap().to_vec();
@@ -146,10 +150,14 @@ async fn main() {
         (state, _) = update(state, Msg::TrackingArmed);
     }
     if let Ok(Some(read)) = read_result {
+        let token = state.read_token;
         (state, _) = update(
             state,
             Msg::ValueLoaded {
-                index: target,
+                // This example drives `update` by hand rather than through the
+                // command loop, so it stamps the token the core is holding.
+                token,
+                index: Some(target),
                 name: String::from_utf8_lossy(&name).into_owned(),
                 value: read.value,
                 ttl_seconds: read.ttl_seconds,

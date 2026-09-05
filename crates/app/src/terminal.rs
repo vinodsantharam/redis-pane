@@ -15,6 +15,7 @@ use ratatui::backend::CrosstermBackend;
 use fred::interfaces::EventInterface;
 use fred::prelude::Client;
 use redis_pane_core::clock::Clock;
+use redis_pane_core::command::ReadToken;
 use redis_pane_core::msg::{KeyCode, KeyPress};
 use redis_pane_core::theme::{ColorDepth, Theme};
 use redis_pane_core::{Command, Msg, State, render, update};
@@ -133,6 +134,10 @@ pub async fn run(
     };
 
     let mut scan_cancel: Option<CancellationToken> = None;
+    // Reads take turns, and superseded ones never reach the wire. See
+    // `redis::read::ReadGate` for why that is a liveness invariant and not a
+    // tidiness preference.
+    let mut read_gate = crate::redis::read::ReadGate::default();
     start_scan(&client, None, &tx, &mut scan_cancel);
 
     // fred reconnects underneath us, and the server on the other side remembers
@@ -246,8 +251,8 @@ pub async fn run(
                     let tx = tx.clone();
                     tokio::spawn(async move {
                         match crate::redis::fetch_metadata(&client, &window).await {
-                            Ok(entries) if !entries.is_empty() => {
-                                let _ = tx.send(Msg::MetadataBatch { entries }).await;
+                            Ok((entries, gone)) if !entries.is_empty() || !gone.is_empty() => {
+                                let _ = tx.send(Msg::MetadataBatch { entries, gone }).await;
                             }
                             Ok(_) => {}
                             Err(e) => {
@@ -262,35 +267,67 @@ pub async fn run(
                         }
                     });
                 }
-                Command::OpenKey { index, name } => {
-                    open_key(&client, index, name, &tx, area_width(&term), arming)
-                }
-                Command::RefetchOpenKey => {
+                Command::OpenKey { index, name, token } => open_key(
+                    &client,
+                    Some(index),
+                    name,
+                    token,
+                    &tx,
+                    area_width(&term),
+                    arming,
+                    &mut read_gate,
+                ),
+                Command::RefetchOpenKey { token } => {
                     if let Some(open) = &state.open {
                         open_key(
                             &client,
                             open.index,
                             open.name.as_bytes().to_vec(),
+                            token,
                             &tx,
                             area_width(&term),
                             arming,
+                            &mut read_gate,
                         );
                     }
                 }
                 Command::CopyToClipboard { text, label } => {
                     let truncated = crate::clipboard::was_truncated(&text);
-                    if crate::clipboard::copy(&text).is_ok() {
-                        // Redraw from scratch: the escape sequence went to the
-                        // same stdout ratatui is drawing on.
-                        let _ = term.clear();
-                        let at_ms = clock.now_ms();
-                        let label = if truncated {
-                            "value (truncated)"
-                        } else {
-                            label
-                        };
-                        let _ = tx.send(Msg::Copied { label, at_ms }).await;
+                    // Redraw from scratch either way: the escape sequence went
+                    // to the same stdout ratatui is drawing on.
+                    let result = crate::clipboard::copy(&text);
+                    let _ = term.clear();
+                    let at_ms = clock.now_ms();
+                    match result {
+                        Ok(()) => {
+                            let label = if truncated {
+                                format!("{label}, truncated")
+                            } else {
+                                label
+                            };
+                            let _ = tx.send(Msg::Copied { label, at_ms }).await;
+                        }
+                        // A copy that failed used to produce nothing at all —
+                        // no notice, no error — which is indistinguishable from
+                        // one that worked, and leaves the reader pasting
+                        // whatever was on the clipboard before (R7.4). OSC 52
+                        // can still be dropped by the terminal without telling
+                        // anyone; that is a limit of the protocol. This is the
+                        // half we can see.
+                        Err(e) => {
+                            let _ = tx
+                                .send(Msg::Failed {
+                                    command: "copying to the clipboard".into(),
+                                    detail: e.to_string(),
+                                    at_ms,
+                                })
+                                .await;
+                        }
                     }
+                }
+                Command::Notify { text } => {
+                    let at_ms = clock.now_ms();
+                    let _ = tx.send(Msg::Noticed { text, at_ms }).await;
                 }
                 // Reconnection wiring lands with M2.
                 Command::Reconnect { .. } => {}
@@ -314,14 +351,22 @@ pub async fn run(
 /// read `○ manual` forever, on every server, including local Redis with
 /// tracking fully working. The core's invariant was airtight; the shell simply
 /// never told it the truth.
+#[allow(clippy::too_many_arguments)]
 fn open_key(
     client: &Client,
-    index: usize,
+    index: Option<usize>,
     name: Vec<u8>,
+    token: ReadToken,
     tx: &mpsc::Sender<Msg>,
     pane_width: usize,
     arming: crate::redis::read::Arming,
+    gate: &mut crate::redis::read::ReadGate,
 ) {
+    // Supersede whatever was in flight. The core would ignore its reply anyway
+    // — every reply carries the token of the read it answers — but ignoring a
+    // reply does not un-send the `CLIENT CACHING YES` that came with it, and
+    // that is the half which decides what the server tracks.
+    let permit = gate.begin();
     let client = client.clone();
     let tx = tx.clone();
     tokio::spawn(async move {
@@ -329,7 +374,14 @@ fn open_key(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let result = crate::redis::read::read_value(&client, &name, pane_width, arming).await;
+        let Some(result) = permit
+            .run(crate::redis::read::read_value(
+                &client, &name, pane_width, arming,
+            ))
+            .await
+        else {
+            return;
+        };
 
         // `read_value` awaits `CLIENT CACHING YES` with `?` before doing
         // anything else, so any Ok(_) here means arming already succeeded on
@@ -340,6 +392,7 @@ fn open_key(
 
         let msg = match result {
             Ok(Some(read)) => Msg::ValueLoaded {
+                token,
                 index,
                 name: String::from_utf8_lossy(&name).into_owned(),
                 value: read.value,
@@ -347,9 +400,14 @@ fn open_key(
                 size_bytes: read.size_bytes,
                 at_ms,
             },
-            Ok(None) => Msg::ValueGone { at_ms },
+            Ok(None) => Msg::ValueGone { token, at_ms },
             // Never swallowed: a Redis error that produces no visible effect is
             // indistinguishable from the app deciding to do nothing (R7.4).
+            //
+            // Deliberately carries no token, so it is never dropped as stale. A
+            // read that failed, failed — the key it names is in the message, and
+            // suppressing it because the reader has moved on would be swallowing
+            // an error on a technicality (R7.4).
             Err(e) => Msg::Failed {
                 command: format!("reading {}", String::from_utf8_lossy(&name)),
                 detail: e.details().to_string(),

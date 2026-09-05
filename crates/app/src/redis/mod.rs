@@ -105,8 +105,14 @@ pub async fn connect_with(
     url: &str,
     credentials: &Credentials,
 ) -> Result<(Client, Established), ConnectError> {
-    let mut config =
-        Config::from_url(url).map_err(|e| ConnectError::Unreachable(format!("{url}: {e}")))?;
+    // Redacted, because this string is printed. A URL that fails to parse is
+    // exactly the one someone pasted by hand with a real password in it, and
+    // the next thing they do with a startup diagnostic is paste it into a bug
+    // report. Everywhere else the dial URL and the displayable target are kept
+    // deliberately apart; this was the one place they met.
+    let mut config = Config::from_url(url).map_err(|e| {
+        ConnectError::Unreachable(format!("{}: {e}", redis_pane_core::resolve::redact(url)))
+    })?;
 
     // A Profile's credentials are the more specific statement of intent, so
     // they win over anything embedded in the URL.
@@ -291,11 +297,14 @@ fn describe(e: &Error) -> String {
 /// with `SCAN` for the connection while the list is still filling.
 ///
 /// A key that vanished between the scan and this fetch is reported as gone
-/// rather than failing the batch — the keyspace moves while we walk it.
+/// rather than failing the batch — the keyspace moves while we walk it. That
+/// second return value is free deletion detection: `TYPE` is already on the
+/// wire for every visible row, so noticing costs no extra round trip and needs
+/// no tracking table (DESIGN §9).
 pub async fn fetch_metadata(
     client: &Client,
     keys: &[(usize, Vec<u8>)],
-) -> Result<Vec<MetadataEntry>, Error> {
+) -> Result<(Vec<MetadataEntry>, Vec<usize>), Error> {
     use redis_pane_core::state::KeyKind;
 
     let pipeline = client.pipeline();
@@ -308,15 +317,21 @@ pub async fn fetch_metadata(
     let replies: Vec<Value> = pipeline.all().await?;
 
     let mut out = Vec::with_capacity(keys.len());
+    let mut gone = Vec::new();
     for (slot, (index, _)) in keys.iter().enumerate() {
         let kind = replies.get(slot * 3).and_then(|v| v.as_str());
         let ttl = replies.get(slot * 3 + 1).and_then(|v| v.as_i64());
         let size = replies.get(slot * 3 + 2).and_then(|v| v.as_i64());
 
-        // TYPE answers "none" for a key that no longer exists.
-        let Some(kind) = kind.filter(|k| k != "none") else {
+        // TYPE answers "none" for a key that no longer exists. A reply that is
+        // absent entirely is a different thing — a short pipeline, not a
+        // deleted key — and must not badge the row: one truncated reply would
+        // otherwise mark every remaining row in the window as deleted.
+        let Some(kind) = kind else { continue };
+        if kind == "none" {
+            gone.push(*index);
             continue;
-        };
+        }
         out.push(MetadataEntry {
             index: *index,
             kind: KeyKind::from_redis(&kind),
@@ -326,7 +341,7 @@ pub async fn fetch_metadata(
             size_bytes: size.unwrap_or(0).clamp(0, u32::MAX as i64 - 1) as u32,
         });
     }
-    Ok(out)
+    Ok((out, gone))
 }
 
 #[cfg(test)]

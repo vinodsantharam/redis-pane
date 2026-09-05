@@ -234,7 +234,17 @@ fn golden_title_bar_readouts() {
             State {
                 link: Link::Reconnecting {
                     attempt: 2,
-                    retry_in_ms: 4_000,
+                    retry_in_ms: None,
+                },
+                ..base()
+            },
+        ),
+        (
+            "connection lost, a retry scheduled",
+            State {
+                link: Link::Reconnecting {
+                    attempt: 2,
+                    retry_in_ms: Some(4_000),
                 },
                 ..base()
             },
@@ -331,12 +341,36 @@ fn live_states_no_age_manual_states_one_and_reconnecting_states_the_countdown() 
     });
     assert!(manual.contains("read 14s ago"), "{manual}");
 
-    // Reconnecting, the useful fact is when the next attempt lands (ADR-0009):
-    // a backoff nobody can see is a freeze wearing a different name.
+    // A dropped link with nothing scheduled — the state the app actually
+    // reaches today, since `Command::Reconnect` is not wired until M2. It shows
+    // the Read age, which is what ADR-0009 asks for and what is true. This test
+    // used to assert `retry 4s` here, from a state the running app could not
+    // produce: a fixture keeping a promise the code never made.
+    let dropped = readout(&State {
+        link: Link::Reconnecting {
+            attempt: 1,
+            retry_in_ms: None,
+        },
+        ..base()
+    });
+    assert!(dropped.contains("read 14s ago"), "{dropped}");
+    assert!(
+        !dropped.contains("retry"),
+        "no countdown for a retry nobody scheduled: {dropped}"
+    );
+    assert!(
+        dropped.trim_end().ends_with("ago"),
+        "nothing after the age — no Refetch key offered, since it would only \
+         read a dead client: {dropped}"
+    );
+
+    // Once a retry really is scheduled the countdown is the useful fact
+    // (ADR-0009): a backoff nobody can see is a freeze wearing a different
+    // name. Only `Msg::ReconnectScheduled` can reach this.
     let retrying = readout(&State {
         link: Link::Reconnecting {
             attempt: 2,
-            retry_in_ms: 4_000,
+            retry_in_ms: Some(4_000),
         },
         ..base()
     });
@@ -588,6 +622,74 @@ fn metadata_arriving_does_not_shift_a_single_column() {
     );
 }
 
+// ── a key that vanished while the list was on screen (DESIGN §9) ────────────
+
+/// `browsing()` with one key deleted underneath the reader.
+fn with_a_gone_key() -> State {
+    let mut state = browsing();
+    // `cart:91af3c9d2e`, in the middle of the list — the position is the point:
+    // the row must stay where it is rather than renumbering its neighbours.
+    state.keys.set_gone(4);
+    state.rebuild_list();
+    state
+}
+
+#[test]
+fn golden_browser_with_a_deleted_key() {
+    assert_golden("browser_gone", &draw(&with_a_gone_key(), 130, 26));
+}
+
+#[test]
+fn a_deleted_key_keeps_its_row_and_says_so() {
+    let frame = draw(&with_a_gone_key(), 130, 26);
+    let row = frame
+        .lines()
+        .find(|l| l.contains("cart:91af3c9d2e"))
+        .expect("the row must survive its key's deletion");
+
+    assert!(row.contains('✕'), "the deletion must be marked: {row}");
+    assert!(
+        row.contains("gone"),
+        "the TYPE column must say what happened rather than fall back to the \
+         pending placeholder, which would claim the fetch had not happened yet"
+    );
+    // The fetch that found it missing is the same fetch that had already
+    // reported its size, and during an incident that figure is the answer to
+    // the only question worth asking about a key that is no longer there.
+    assert!(
+        row.contains("1.1 MB") || row.contains("1.1MB"),
+        "last-known size is kept: {row}"
+    );
+    // But not the TTL: "expires in 12m" is a claim about a key that is not
+    // there to expire, where "it held 1.1 MB" stays true after the deletion.
+    assert!(
+        !row.contains("12m"),
+        "a gone key must not count down toward an expiry that cannot happen: {row}"
+    );
+}
+
+#[test]
+fn a_deleted_row_shifts_nothing_around_it() {
+    let before = draw(&browsing(), 130, 26);
+    let after = draw(&with_a_gone_key(), 130, 26);
+
+    let column_of = |frame: &str, needle: &str| -> Vec<usize> {
+        frame
+            .lines()
+            .filter_map(|l| l.find(needle).map(|byte_idx| l[..byte_idx].chars().count()))
+            .collect::<Vec<_>>()
+    };
+    // `✕` and `●` are both one column wide but different byte lengths, so this
+    // is measured in characters for the same reason the M1.4 proof above is.
+    for anchor in ["feed:global:hot", "stream:orders", "cart:91af3c9d2e"] {
+        assert_eq!(
+            column_of(&before, anchor),
+            column_of(&after, anchor),
+            "{anchor} moved when a key above it was deleted"
+        );
+    }
+}
+
 #[test]
 fn a_pending_cell_is_visibly_waiting_rather_than_blank() {
     // Blank would read as "there is nothing here", which is a different claim.
@@ -805,9 +907,33 @@ use redis_pane_core::state::value::{
     StringValue, Value,
 };
 
+/// A key open, with the cursor on its row — the Attached case, which is what
+/// these viewer fixtures are about.
+///
+/// It opens *the row that actually holds this name*, adding it to the Loaded
+/// set if it is not already there. The earlier version opened index 0 whatever
+/// the name was, which was invisible while nothing tied the panes together and
+/// is a self-contradicting frame now that something does: a header naming one
+/// key over a mark pointing at another is precisely the confusion these fixtures
+/// exist to catch.
 fn opened(name: &str, value: Value, ttl: i32) -> State {
     let mut state = many_keys();
-    state.open = Some(OpenKey::new(0, name.into(), value, ttl, 2_150, 60_000));
+    let index = (0..state.keys.len())
+        .find(|&i| state.keys.name_str(i).as_deref() == Some(name))
+        .unwrap_or_else(|| {
+            state.keys.push(name.as_bytes());
+            state.keys.len() - 1
+        });
+    state.open = Some(OpenKey::new(
+        Some(index),
+        name.into(),
+        value,
+        ttl,
+        2_150,
+        60_000,
+    ));
+    state.rebuild_list();
+    state.view.selected = state.open.as_ref().and_then(|open| open.row).unwrap_or(0);
     state
 }
 
@@ -876,6 +1002,90 @@ fn golden_viewer_stream() {
         "viewer_stream",
         &draw(&opened("stream:orders", v, TTL_NONE), 130, 22),
     );
+}
+
+// ── focus is visible, because `r` means different things per pane ───────────
+
+#[test]
+fn which_pane_has_focus_is_visible_without_pressing_anything() {
+    use redis_pane_core::render::layout::Pane;
+    let keys_focused = State {
+        focus: Pane::Keys,
+        ..opened("user:8812:session", hash_value(), 2_537)
+    };
+    let value_focused = State {
+        focus: Pane::Value,
+        ..opened("user:8812:session", hash_value(), 2_537)
+    };
+    let a = render::to_golden(&render::frame(
+        &keys_focused,
+        &Theme::new(ColorDepth::TrueColor),
+        &CLOCK,
+        Rect::new(0, 0, 130, 22),
+    ));
+    let b = render::to_golden(&render::frame(
+        &value_focused,
+        &Theme::new(ColorDepth::TrueColor),
+        &CLOCK,
+        Rect::new(0, 0, 130, 22),
+    ));
+    let text_of = |g: &str| g.split("--- styles ---").next().unwrap().to_string();
+    assert_eq!(
+        text_of(&a),
+        text_of(&b),
+        "focus is emphasis, not content — no glyph, no reflow, no width change"
+    );
+    assert_ne!(a, b, "but it must be visible in the styles");
+}
+
+#[test]
+fn focus_survives_the_loss_of_colour() {
+    // It says which pane `r` will act on, so it is information rather than
+    // decoration, and this module's rule is that losing colour loses emphasis
+    // and never information. Muted is DIM in monochrome where Text is plain.
+    let theme = Theme::new(ColorDepth::Monochrome);
+    assert_ne!(
+        theme.style(redis_pane_core::theme::Token::Text),
+        theme.style(redis_pane_core::theme::Token::Muted),
+        "the focused and unfocused pane headers would be indistinguishable"
+    );
+}
+
+// ── the header must not pass a window off as the whole value ────────────────
+
+#[test]
+fn a_windowed_value_says_how_much_of_it_is_on_screen() {
+    // `XLEN` says 500; the read brought back 2. Stating only the first turns
+    // "the newest 2 of these" into "this is all of it" — the scan-cap defect
+    // one level down, and the reason a search over these rows was cut rather
+    // than built on top of a header that lies about its own scope.
+    let v = Value::Stream(StreamValue {
+        entries: vec![("72000-0".into(), vec![("order".into(), "1001".into())])],
+        total: 500,
+    });
+    let frame = draw(&opened("stream:orders", v, TTL_NONE), 130, 22);
+    let header = frame
+        .lines()
+        .find(|l| l.contains("stream ·"))
+        .expect("the viewer header names the type");
+    assert!(header.contains("500 entries"), "the real length: {header}");
+    assert!(
+        header.contains("1 shown"),
+        "and what is on screen: {header}"
+    );
+}
+
+#[test]
+fn a_value_fetched_whole_says_nothing_extra() {
+    // A hash comes back complete, so there is no window to disclose and the
+    // header must not grow a phrase that would read as a caveat where none
+    // applies.
+    let frame = draw(&opened("user:8812:session", hash_value(), 2_537), 130, 22);
+    let header = frame
+        .lines()
+        .find(|l| l.contains("hash ·"))
+        .expect("the viewer header names the type");
+    assert!(!header.contains("shown"), "nothing is withheld: {header}");
 }
 
 #[test]
@@ -962,6 +1172,11 @@ fn golden_viewer_update_held_while_scrolled() {
 fn golden_viewer_deleted() {
     let mut state = opened("lock:checkout:8812", hash_value(), 12);
     state.open.as_mut().unwrap().deleted_at_ms = Some(71_000);
+    // The row learns it too. `Msg::ValueGone` does both together (958b311); a
+    // fixture that badged only the Viewer would picture the two panes
+    // disagreeing about one key, which is the state that commit removed.
+    let index = state.open.as_ref().unwrap().index.unwrap();
+    state.keys.set_gone(index);
     assert_golden("viewer_deleted", &draw(&state, 130, 22));
 }
 
@@ -987,6 +1202,52 @@ fn an_update_at_rest_lands_with_no_keypress() {
         !after.contains("r to load"),
         "nothing was asked of the reader"
     );
+}
+
+/// ADR-0006's founding complaint, at the frame level: a Refetch that finds
+/// nothing must not render a frame identical to one where no read happened.
+#[test]
+fn a_refetch_that_found_nothing_still_changes_the_frame() {
+    let mut state = opened("k", hash_value(), 600);
+    let before = draw(&state, 130, 22);
+
+    // The same value comes back — the ordinary case for a key nobody is
+    // writing to, and the case that used to be indistinguishable from the
+    // reply being dropped as superseded, or failing, or never being sent.
+    state
+        .open
+        .as_mut()
+        .unwrap()
+        .absorb(hash_value(), 600, 2_150, 73_000);
+
+    let after = draw(&state, 130, 22);
+    assert_ne!(
+        before, after,
+        "the reader has to be able to tell that a read happened"
+    );
+    assert!(after.contains("unchanged"), "{after}");
+}
+
+#[test]
+fn golden_viewer_read_outcomes() {
+    let mut state = opened("user:8812:session", hash_value(), 2_537);
+    state
+        .open
+        .as_mut()
+        .unwrap()
+        .absorb(hash_value(), 2_537, 2_150, 73_000);
+    assert_golden("viewer_unchanged", &draw(&state, 130, 22));
+
+    let mut state = opened("user:8812:session", hash_value(), 2_537);
+    let changed = Value::Hash(PairValue {
+        pairs: vec![("plan".into(), "enterprise".into())],
+    });
+    state
+        .open
+        .as_mut()
+        .unwrap()
+        .absorb(changed, 2_537, 2_150, 73_000);
+    assert_golden("viewer_updated", &draw(&state, 130, 22));
 }
 
 #[test]
@@ -1139,8 +1400,66 @@ fn copying_a_value_with_nothing_open_says_so_instead_of_copying_nothing() {
     state.open = None;
     let (state, _) = press(state, 'y');
     let (state, cmds) = press(state, 'v');
-    assert!(cmds.is_empty());
-    assert_eq!(state.notice_now(0), Some("nothing open to copy"));
+    assert!(
+        !cmds
+            .iter()
+            .any(|c| matches!(c, Command::CopyToClipboard { .. })),
+        "nothing was put on the clipboard"
+    );
+
+    // The notice goes out for the shell to date. This test used to read it at
+    // clock 0 and pass — the one clock reading at which the defect it was
+    // guarding is invisible. The core built the notice with `at_ms: 0`, and
+    // `notice_now` shows a notice for 2.5s against a clock reading epoch
+    // milliseconds, so in the running app the message could never appear:
+    // `y v` with nothing open did nothing at all, forever.
+    let Some(Command::Notify { text }) = cmds.first().cloned() else {
+        panic!("expected a notice, got {cmds:?}");
+    };
+    let (state, _) = update(
+        state,
+        Msg::Noticed {
+            text,
+            at_ms: 73_000,
+        },
+    );
+    assert_eq!(state.notice_now(73_100), Some("nothing open to copy"));
+}
+
+/// The clipboard shows no seams: 500 rows of a 12,000-item list look exactly
+/// like a complete copy once pasted. The Viewer header already states this
+/// about the value; the confirmation has to state it about the copy.
+#[test]
+fn copying_a_windowed_value_says_how_much_it_took() {
+    let windowed = Value::List(IndexedValue {
+        items: (0..500).map(|i| format!("item-{i}")).collect(),
+        total: 12_000,
+    });
+    let state = opened("feed:global:hot", windowed, 600);
+    let (state, _) = press(state, 'y');
+    let (_, cmds) = press(state, 'v');
+
+    let Some(Command::CopyToClipboard { label, text }) = cmds.first() else {
+        panic!("expected a copy, got {cmds:?}");
+    };
+    assert_eq!(
+        label, "value (500 of 12000 items)",
+        "a partial copy that calls itself `value` is a trap"
+    );
+    assert_eq!(text.lines().count(), 500, "and it really is the window");
+}
+
+/// A whole value says nothing extra — the qualifier appears only where there
+/// is something to qualify.
+#[test]
+fn copying_a_complete_value_stays_quiet_about_it() {
+    let state = opened("user:8812:session", hash_value(), 600);
+    let (state, _) = press(state, 'y');
+    let (_, cmds) = press(state, 'v');
+    let Some(Command::CopyToClipboard { label, .. }) = cmds.first() else {
+        panic!("expected a copy");
+    };
+    assert_eq!(label, "value");
 }
 
 #[test]
@@ -1149,7 +1468,7 @@ fn the_confirmation_fades_on_its_own() {
     let (state, _) = update(
         opened("k", hash_value(), 600),
         Msg::Copied {
-            label: "key",
+            label: "key".into(),
             at_ms: 70_000,
         },
     );
@@ -1162,7 +1481,7 @@ fn golden_copy_notice() {
     let (state, _) = update(
         opened("user:8812:session", hash_value(), 2_537),
         Msg::Copied {
-            label: "redis-cli command",
+            label: "redis-cli command".into(),
             at_ms: 73_000,
         },
     );
@@ -1263,7 +1582,7 @@ fn the_selected_row_carries_a_background_all_the_way_across_not_just_on_the_name
     // there is a value pane to the right of it, correctly unpainted.
     let keys_pane_width = redis_pane_core::render::layout::layout(
         Rect::new(0, 0, 130, 12),
-        redis_pane_core::render::layout::SinglePaneView::Keys,
+        redis_pane_core::render::layout::Pane::Keys,
     )
     .keys
     .width;
@@ -1288,7 +1607,7 @@ fn an_unselected_row_carries_no_background_at_all() {
 
     let keys_pane_width = redis_pane_core::render::layout::layout(
         Rect::new(0, 0, 130, 12),
-        redis_pane_core::render::layout::SinglePaneView::Keys,
+        redis_pane_core::render::layout::Pane::Keys,
     )
     .keys
     .width;
@@ -1334,12 +1653,12 @@ fn distinct_types_render_with_distinct_dot_colours_in_a_real_frame() {
 
 // ── severity-3 #8: stack navigation below 70 columns ────────────────────────
 
-use redis_pane_core::render::layout::SinglePaneView;
+use redis_pane_core::render::layout::Pane;
 
 #[test]
 fn golden_single_pane_value_view_60_cols() {
     let mut state = opened("user:8812:session", hash_value(), 2_537);
-    state.single_pane_view = SinglePaneView::Value;
+    state.focus = Pane::Value;
     assert_golden("single_pane_value_60", &draw(&state, 60, 24));
 }
 
@@ -1348,7 +1667,7 @@ fn the_default_single_pane_state_still_renders_the_key_list_unchanged() {
     // Regression guard: adding Value mode must not disturb the existing,
     // already-shipped Keys mode at the same width.
     let state = many_keys();
-    assert_eq!(state.single_pane_view, SinglePaneView::Keys);
+    assert_eq!(state.focus, Pane::Keys);
     let frame = draw(&state, 60, 24);
     assert!(
         frame.contains("KEY"),
@@ -1362,7 +1681,7 @@ fn standalone_value_view_has_no_stray_border_character_at_the_left_edge() {
     // full width there is no adjacent pane to separate from, and that
     // character must not appear over the content instead.
     let mut state = opened("k", hash_value(), 600);
-    state.single_pane_view = SinglePaneView::Value;
+    state.focus = Pane::Value;
     let frame = draw(&state, 60, 24);
     for line in frame.lines() {
         assert!(
@@ -1375,7 +1694,7 @@ fn standalone_value_view_has_no_stray_border_character_at_the_left_edge() {
 #[test]
 fn the_breadcrumb_names_the_key_and_the_effective_back_binding() {
     let mut state = opened("user:8812:session", hash_value(), 2_537);
-    state.single_pane_view = SinglePaneView::Value;
+    state.focus = Pane::Value;
     let frame = draw(&state, 60, 24);
     assert!(frame.contains("back"), "{frame}");
     assert!(frame.contains("user:8812:session"), "{frame}");
@@ -1394,7 +1713,7 @@ fn the_breadcrumb_names_the_key_and_the_effective_back_binding() {
 #[test]
 fn a_key_opened_narrow_shows_its_real_value_not_a_placeholder() {
     let mut state = opened("user:8812:session", hash_value(), 2_537);
-    state.single_pane_view = SinglePaneView::Value;
+    state.focus = Pane::Value;
     let frame = draw(&state, 60, 24);
     assert!(frame.contains("device"), "{frame}");
     assert!(frame.contains("ios/17.2"), "{frame}");
@@ -1482,7 +1801,7 @@ fn the_banner_is_not_displaced_by_a_copy_confirmation() {
     let (next, _) = update(
         state.clone(),
         Msg::Copied {
-            label: "key",
+            label: "key".into(),
             at_ms: 73_000,
         },
     );
@@ -1510,5 +1829,207 @@ fn the_banner_coexists_with_the_filter_line_in_the_documented_order() {
     assert!(
         banner_row < filter_row,
         "the cap banner should sit above the filter line"
+    );
+}
+
+// ── The Open key vs the Selected key (CONTEXT.md; UI task severity 1) ───────
+//
+// The reported defect: the cursor on one key, the value pane showing another,
+// with nothing on screen relating the two. The value was never wrong — it was a
+// live tracked read of a different key — so these fixtures are about identity,
+// not freshness.
+
+/// The Attached case is the quiet one: no wash, a solid divider, no chip. It is
+/// pinned here so that "nothing happens when the panes agree" is a tested
+/// property rather than an assumption.
+#[test]
+fn golden_viewer_attached_says_nothing_extra() {
+    let state = opened("user:8812:session", hash_value(), 2_537);
+    let frame = draw(&state, 130, 22);
+    assert!(!frame.contains('┊'), "no dashed divider while attached");
+    assert!(!frame.contains('⊘'), "no chip while attached");
+    assert!(frame.contains('├'), "but the row is still tied to the pane");
+}
+
+/// The cursor moves off the Open key. This is the frame the bug report was
+/// about, and it is the one that has to be unmistakable.
+#[test]
+fn golden_viewer_detached() {
+    let mut state = opened("user:8812:session", hash_value(), 2_537);
+    state.view.selected = 0; // `user:8812:cart`, two rows above the Open key
+    assert_golden("viewer_detached", &draw(&state, 130, 22));
+}
+
+/// Filtered out: the Open key has no row, so the keys pane has nothing to mark
+/// and the Viewer has to carry the whole signal on its own.
+#[test]
+fn golden_viewer_detached_off_list() {
+    let mut state = opened("user:8812:session", hash_value(), 2_537);
+    state.list.filter = "cart".into();
+    state.rebuild_list();
+    assert_golden("viewer_detached_off_list", &draw(&state, 130, 22));
+}
+
+/// Scrolled past: the Open key is real and has a row, but not one on screen.
+/// The divider points the way rather than leaving it to be hunted for.
+#[test]
+fn golden_viewer_detached_scrolled_out_of_view() {
+    let mut state = opened("user:8812:cart", hash_value(), 2_537);
+    // Enough rows that the window cannot hold them all, which is the only way
+    // the Open key can have a row and still not be on screen.
+    for i in 0..40 {
+        state.keys.push(format!("filler:{i:03}").as_bytes());
+    }
+    state.rebuild_list();
+    state.view.selected = state.row_count() - 1;
+    let frame = draw(&state, 130, 22);
+    assert!(
+        frame.contains('▲'),
+        "the Open key is above the window:\n{frame}"
+    );
+    assert_golden("viewer_detached_scrolled_out", &frame);
+}
+
+/// Below 70 columns there is no second pane, so the divider, the tie glyph and
+/// the row underline are all gone by construction — and the wash is nothing in
+/// monochrome. The chip is the only signal left, and it used to be drawn only
+/// in the two-pane branch: every fixture written for this feature was 130 or 80
+/// columns wide, so nothing caught it.
+#[test]
+fn golden_viewer_detached_single_pane() {
+    let mut state = opened("user:8812:session", hash_value(), 2_537);
+    state.cols = 60;
+    state.focus = redis_pane_core::render::layout::Pane::Value;
+    state.view.selected = 0;
+
+    let frame = draw(&state, 60, 22);
+    assert!(
+        frame.contains('⊘'),
+        "the one signal a single pane can carry:\n{frame}"
+    );
+    assert!(
+        frame.contains("user:8812:session"),
+        "and the breadcrumb still names the key:\n{frame}"
+    );
+    assert_golden("viewer_detached_single", &frame);
+}
+
+/// The chip gives way before the key name does, following the title bar's rule:
+/// the name is the pane's identity, the chip is a qualifier on it.
+#[test]
+fn the_chip_shortens_and_then_goes_rather_than_crowding_the_key_name() {
+    let mut state = opened("user:8812:session", hash_value(), 2_537);
+    state.view.selected = 0;
+    let wide = draw(&state, 130, 22);
+    assert!(wide.contains("⊘ not the selected key"), "{wide}");
+
+    let narrow = draw(&state, 80, 22);
+    assert!(
+        narrow.contains("user:8812:session"),
+        "the key name always survives:\n{narrow}"
+    );
+    assert!(
+        narrow.contains('⊘'),
+        "and the chip is still stated:\n{narrow}"
+    );
+    assert!(
+        !narrow.contains("⊘ not the selected key"),
+        "but not at full length in a pane this narrow:\n{narrow}"
+    );
+}
+
+/// The wash is hue and nothing else, so monochrome must lose it — and must
+/// still say the same thing. This is the test that stops the loud treatment
+/// from becoming the *only* treatment.
+#[test]
+fn detachment_survives_the_loss_of_colour() {
+    let mut state = opened("user:8812:session", hash_value(), 2_537);
+    state.view.selected = 0;
+    let area = Rect::new(0, 0, 130, 22);
+
+    // `put` writes `Style::reset()`, which leaves `bg` as `Some(Color::Reset)`.
+    // That is the *absence* of a background, so testing `is_some()` would pass
+    // on every cell in the frame and prove nothing.
+    let washed_at = |buf: &ratatui::buffer::Buffer, x: u16, y: u16| {
+        !matches!(
+            buf.cell((x, y)).map(|c| c.style().bg),
+            None | Some(None) | Some(Some(ratatui::style::Color::Reset))
+        )
+    };
+
+    let color = render::frame(&state, &Theme::new(ColorDepth::TrueColor), &CLOCK, area);
+    // The pane's own rows are exactly the ones the dashed divider runs down, so
+    // the two signals are checked against each other rather than against a
+    // hand-counted range of chrome rows.
+    let pane_rows: Vec<u16> = render::to_text(&color)
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.contains('┊'))
+        .map(|(y, _)| y as u16)
+        .collect();
+    assert!(pane_rows.len() > 10, "sanity: {pane_rows:?}");
+    assert!(
+        pane_rows.iter().all(|y| washed_at(&color, 100, *y)),
+        "in colour the whole value pane is washed, empty rows included"
+    );
+    assert!(
+        !washed_at(&color, 20, 4),
+        "and the keys pane is not — the wash is a statement about one pane"
+    );
+
+    let mono = render::frame(&state, &Theme::new(ColorDepth::Monochrome), &CLOCK, area);
+    assert!(
+        (0..area.height).all(|y| !washed_at(&mono, 100, y)),
+        "in monochrome there is no wash at all"
+    );
+    let text = render::to_text(&mono);
+    assert!(text.contains('┊'), "the dashed divider carries it instead");
+    assert!(
+        text.contains("⊘ not the selected key"),
+        "and so does the chip"
+    );
+}
+
+/// Two marks in one list only work if one is obviously the junior partner. The
+/// cursor keeps reverse video; the Open key's row gets underline, which is the
+/// one modifier still free once the selection has taken the other.
+#[test]
+fn the_open_row_is_underlined_and_the_cursor_row_is_not_merely_that() {
+    use ratatui::style::Modifier;
+
+    let mut state = opened("user:8812:session", hash_value(), 2_537);
+    state.view.selected = 0;
+    let area = Rect::new(0, 0, 130, 22);
+    let mono = render::frame(&state, &Theme::new(ColorDepth::Monochrome), &CLOCK, area);
+
+    // The bare name also appears in the value pane's header, which is above the
+    // list; the dot is what makes this a key *row*.
+    let open_y = row_of(&mono, "● user:8812:session");
+    let cursor_y = row_of(&mono, "● user:8812:cart");
+    assert_ne!(open_y, cursor_y, "this fixture is only meaningful detached");
+
+    let style_at = |x: u16, y: u16| {
+        mono.cell((x, y))
+            .map(|c| c.style())
+            .expect("cell in bounds")
+    };
+    // Column 3 is inside the key name, past the leading space and the dot.
+    assert!(
+        style_at(3, open_y)
+            .add_modifier
+            .contains(Modifier::UNDERLINED),
+        "the Open key's name is underlined"
+    );
+    assert!(
+        style_at(3, cursor_y)
+            .add_modifier
+            .contains(Modifier::REVERSED),
+        "the cursor's row keeps the full-bar highlight"
+    );
+    assert!(
+        !style_at(3, cursor_y)
+            .add_modifier
+            .contains(Modifier::UNDERLINED),
+        "and the two marks are not the same mark"
     );
 }

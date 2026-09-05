@@ -51,14 +51,60 @@ pub enum Action {
     ViewerBottom,
     /// Begin a copy. The next key chooses what (R3.5).
     Copy,
+    /// Move focus between the keys pane and the Viewer (DESIGN §4).
+    ///
+    /// With two panes this is the only way to say which one a pane-scoped key
+    /// acts on; below 70 columns, where one pane is drawn at a time, it is the
+    /// same movement as `Open`/`Esc` and so changes what is on screen.
+    CyclePane,
 }
 
 impl Action {
-    /// The label used in the hint bar and the help overlay.
+    /// Whether the pane this action operates on is currently drawn.
+    ///
+    /// Actions divide cleanly: some move or reshape the key list, some scroll
+    /// the value, and the rest belong to the app rather than to either pane.
+    /// Only the first two can be aimed at something the reader cannot see —
+    /// and only below 70 columns, where one pane is on screen at a time.
+    pub fn pane_is_on_screen(&self, state: &crate::State) -> bool {
+        use crate::render::layout::Pane;
+        match self {
+            // The key list: moving in it, reshaping it, or opening from it.
+            Action::MoveUp
+            | Action::MoveDown
+            | Action::PageUp
+            | Action::PageDown
+            | Action::Top
+            | Action::Bottom
+            | Action::Filter
+            | Action::Sort
+            | Action::ToggleTree
+            | Action::ToggleGroup
+            | Action::Open => state.pane_visible(Pane::Keys),
+            // The value body.
+            Action::ViewerUp
+            | Action::ViewerDown
+            | Action::ViewerPageUp
+            | Action::ViewerPageDown
+            | Action::ViewerTop
+            | Action::ViewerBottom => state.pane_visible(Pane::Value),
+            // Everything else is the app's, not a pane's: quitting, help, Esc,
+            // `Tab` (which is what *changes* which pane is on screen), `r`
+            // (already pane-scoped by R2.7 on its own terms), copying, and the
+            // read-only toggle.
+            _ => true,
+        }
+    }
+
+    /// The label used in the help overlay, where every binding is listed at
+    /// once and no pane is focused. See [`Action::label_in`] for the hint bar,
+    /// which describes what the key will do right now.
     pub fn label(&self) -> &'static str {
         match self {
             Action::Quit => "quit",
-            Action::Refetch => "refetch",
+            // Both halves, because the help overlay is the one place that has
+            // to explain the whole of R2.7 rather than the half in force.
+            Action::Refetch => "refetch / rescan",
             Action::ToggleReadOnly => "read-only",
             Action::Help => "help",
             Action::Cancel => "back",
@@ -76,6 +122,21 @@ impl Action {
             Action::ViewerTop => "value top",
             Action::ViewerBottom => "value bottom",
             Action::Copy => "copy",
+            Action::CyclePane => "focus",
+        }
+    }
+
+    /// The label for the hint bar, which describes what the key does *now*.
+    ///
+    /// Only `Refetch` differs: it acts on the focused pane (R2.7), so a bar
+    /// that always read "refetch" would name the wrong half of it half the
+    /// time. Takes the answer rather than a `&State` so the keymap stays free
+    /// of the rest of the core, and so this is trivially testable both ways.
+    pub fn label_in(&self, keys_pane_focused: bool) -> &'static str {
+        match self {
+            Action::Refetch if keys_pane_focused => "rescan",
+            Action::Refetch => "refetch",
+            other => other.label(),
         }
     }
 }
@@ -122,6 +183,10 @@ impl Default for Keymap {
     fn default() -> Self {
         Self {
             bindings: vec![
+                Binding {
+                    key: KeyPress::plain(KeyCode::Tab),
+                    action: Action::CyclePane,
+                },
                 Binding {
                     key: KeyPress::plain(KeyCode::Char('q')),
                     action: Action::Quit,

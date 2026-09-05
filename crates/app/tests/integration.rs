@@ -466,10 +466,11 @@ async fn metadata_is_fetched_for_a_window_and_matches_the_server() {
         (2, b"m:list".to_vec()),
         (3, b"m:ttl".to_vec()),
     ];
-    let entries = redis_pane::redis::fetch_metadata(&client, &window)
+    let (entries, gone) = redis_pane::redis::fetch_metadata(&client, &window)
         .await
         .unwrap();
     assert_eq!(entries.len(), 4);
+    assert!(gone.is_empty(), "nothing was deleted: {gone:?}");
 
     use redis_pane_core::state::KeyKind;
     assert_eq!(entries[0].kind, KeyKind::String);
@@ -495,8 +496,10 @@ async fn metadata_is_fetched_for_a_window_and_matches_the_server() {
 
 #[tokio::test]
 #[ignore = "needs docker"]
-async fn a_key_that_vanished_between_scan_and_fetch_is_skipped_not_fatal() {
+async fn a_key_that_vanished_between_scan_and_fetch_is_reported_gone() {
     // The keyspace moves while we walk it, so this is ordinary, not exceptional.
+    // `TYPE` is already on the wire for every visible row, so noticing a
+    // deletion costs no extra round trip and no tracking table (DESIGN §9).
     let (_c, url) = start("redis", "7-alpine").await;
     let writer = Builder::from_config(Config::from_url(&url).unwrap())
         .build()
@@ -506,12 +509,35 @@ async fn a_key_that_vanished_between_scan_and_fetch_is_skipped_not_fatal() {
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
     let window: Vec<(usize, Vec<u8>)> = vec![(0, b"m:here".to_vec()), (1, b"m:gone".to_vec())];
-    let entries = redis_pane::redis::fetch_metadata(&client, &window)
+    let (entries, gone) = redis_pane::redis::fetch_metadata(&client, &window)
         .await
         .unwrap();
 
     assert_eq!(entries.len(), 1, "the surviving key is still reported");
     assert_eq!(entries[0].index, 0);
+    assert_eq!(
+        gone,
+        vec![1],
+        "the missing key is reported by row, not dropped"
+    );
+
+    // And that report has to survive the trip into the core, which is the seam
+    // the unit tests cannot see: they hand `update` a message they wrote
+    // themselves, so a shell that never sends one passes them all. That is
+    // exactly how `Msg::TrackingArmed` went missing for the whole of alpha.2.
+    use redis_pane_core::state::{LoadedSet, State};
+    use redis_pane_core::{Msg, update};
+    let mut keys = LoadedSet::default();
+    keys.push(b"m:here");
+    keys.push(b"m:gone");
+    let mut state = State {
+        keys,
+        ..State::default()
+    };
+    state.rebuild_list();
+    let (state, _) = update(state, Msg::MetadataBatch { entries, gone });
+    assert!(!state.keys.is_gone(0), "the surviving key is untouched");
+    assert!(state.keys.is_gone(1), "the deleted key is tombstoned");
 
     let _ = client.quit().await;
     let _ = writer.quit().await;
@@ -852,6 +878,87 @@ async fn a_freshly_added_entry_reads_as_just_added() {
     // real wall-clock epoch millis, not a guess about Redis's ID format.
     let age = redis_pane_core::state::value::stream_entry_age(&stream.entries[0].0, now_ms);
     assert_eq!(age, "just now", "id was {}", stream.entries[0].0);
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+// ── The arm-and-read pair is indivisible (ReadGate) ─────────────────────────
+
+/// Opening one key and then another, back to back, must leave the server
+/// tracking the **second** — the one the Viewer is showing.
+///
+/// `CLIENT CACHING YES` arms the *next* read-only command on the connection,
+/// not a command it is bundled with. Two reads in flight at once can therefore
+/// interleave on the wire — A arms, B arms, A reads, B reads — and the arming
+/// lands on the wrong key. Nothing in the app is wrong at that point except the
+/// one thing that matters: the header goes on saying `● live` over a value
+/// nothing will ever push an update for, which is ADR-0006's defect reached by
+/// a route the core cannot see. The read token added alongside this rejects the
+/// stale *reply*, but dropping a reply does not un-send the `CLIENT CACHING`
+/// that went with it.
+///
+/// This drives `ReadGate` itself, which is what `terminal.rs` uses, rather than
+/// reproducing the sequence by hand — the shape of test that let the original
+/// `TrackingArmed` bug ship.
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn back_to_back_opens_leave_the_second_key_armed_not_the_first() {
+    use redis_pane::redis::read::{Arming, ReadGate, read_value};
+
+    let (_c, url) = start("redis", "7-alpine").await;
+    let (client, est) = redis_pane::redis::connect(&url).await.unwrap();
+    assert!(est.tracking_supported, "or this test proves nothing");
+
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer.set("first", "a", None, None, false).await.unwrap();
+    let _: () = writer.set("second", "b", None, None, false).await.unwrap();
+
+    let mut invalidations = fred::interfaces::TrackingInterface::invalidation_rx(&client);
+
+    // Open `first`, then change your mind and open `second` before the first
+    // has come back — the exact sequence a reader produces by pressing `→`
+    // twice, and the one that used to race.
+    let mut gate = ReadGate::default();
+    let a = gate.begin();
+    let b = gate.begin();
+    let (ca, cb) = (client.clone(), client.clone());
+    let ha =
+        tokio::spawn(async move { a.run(read_value(&ca, b"first", 40, Arming::Enabled)).await });
+    let hb =
+        tokio::spawn(async move { b.run(read_value(&cb, b"second", 40, Arming::Enabled)).await });
+    let (ra, rb) = (ha.await.unwrap(), hb.await.unwrap());
+
+    assert!(
+        ra.is_none(),
+        "the superseded read must never reach the wire, or it arms `first`"
+    );
+    assert!(rb.is_some_and(|r| r.is_ok()), "the wanted read still ran");
+
+    // The server must be tracking `second`.
+    let _: () = writer.set("second", "b2", None, None, false).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), invalidations.recv())
+            .await
+            .is_ok(),
+        "the key the Viewer is showing must be the key that pushes"
+    );
+
+    // And not `first`. Re-arm on `second` so the consumed arming cannot be
+    // mistaken for the absence of one, then write to `first`.
+    let _ = read_value(&client, b"second", 40, Arming::Enabled)
+        .await
+        .unwrap();
+    let _: () = writer.set("first", "a2", None, None, false).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(800), invalidations.recv())
+            .await
+            .is_err(),
+        "a key nobody is looking at must not be tracked"
+    );
 
     let _ = client.quit().await;
     let _ = writer.quit().await;

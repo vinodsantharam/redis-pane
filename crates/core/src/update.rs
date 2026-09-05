@@ -1,9 +1,10 @@
 //! The single entry point into the core (PLAN M0.4).
 
+use crate::command::ReadToken;
 use crate::keymap::Action;
 use crate::msg::KeyCode;
 use crate::msg::KeyPress;
-use crate::render::layout::SinglePaneView;
+use crate::render::layout::Pane;
 use crate::state::copy::{CopyWhat, redis_cli_command, value_text};
 use crate::state::{Link, OpenKey, ReadOnlyReason, ScanState, Tracking};
 use crate::{Command, Msg, State};
@@ -13,12 +14,30 @@ use crate::{Command, Msg, State};
 /// Pure: no I/O, no clock, no randomness. Time arrives inside the message
 /// (see [`Msg::ReadCompleted`]) rather than being read here, which is what
 /// keeps a frame a function of state alone (ADR-0011).
+/// Mint the token for a read about to be issued, superseding any in flight.
+///
+/// Every read goes through here, for the same reason every read goes through
+/// one `Command`: a read issued without bumping the token would be answered by
+/// a reply the core could not tell apart from a stale one.
+fn issue_read(state: &mut State) -> ReadToken {
+    state.read_token = ReadToken(state.read_token.0.wrapping_add(1));
+    state.read_token
+}
+
 pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
     match msg {
         Msg::Key(key) => key_press(state, key),
         Msg::Resized { cols, rows } => {
             state.cols = cols;
             state.rows = rows;
+            // A filter being typed must stay where it can be seen. Narrowing
+            // the terminal past two panes with the Viewer focused would
+            // otherwise leave the capture running inside a pane that is no
+            // longer drawn — the same invisible keystroke sink `/` used to open
+            // directly, arrived at by dragging a window edge instead.
+            if state.filtering && !state.keys_pane_visible() {
+                state.focus = Pane::Keys;
+            }
             (state, Vec::new())
         }
         Msg::ReadCompleted { at_ms } => {
@@ -42,16 +61,22 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
                 },
             };
             let commands = if tracking_supported {
-                vec![Command::RefetchOpenKey]
+                vec![Command::RefetchOpenKey {
+                    token: issue_read(&mut state),
+                }]
             } else {
                 Vec::new()
             };
             (state, commands)
         }
         Msg::ConnectionLost => {
+            // No countdown: nothing has scheduled a retry yet, and the shell
+            // may never schedule one. The header shows the Read age instead,
+            // which is the fact ADR-0009 actually asks for in this state and
+            // the only one that is true.
             state.link = Link::Reconnecting {
                 attempt: 1,
-                retry_in_ms: 0,
+                retry_in_ms: None,
             };
             (state, vec![Command::Reconnect { after_ms: 0 }])
         }
@@ -61,7 +86,7 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
         } => {
             state.link = Link::Reconnecting {
                 attempt,
-                retry_in_ms,
+                retry_in_ms: Some(retry_in_ms),
             };
             (
                 state,
@@ -86,10 +111,20 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             {
                 *tracking = Tracking::Consumed;
             }
-            (state, vec![Command::RefetchOpenKey])
+            let token = issue_read(&mut state);
+            (state, vec![Command::RefetchOpenKey { token }])
         }
         Msg::ScanStarted { estimated_total } => {
             state.keys.clear();
+            // The Open key survives a rescan; its *index* must not. `SCAN` has
+            // no stable order, so the same number will address a different key
+            // once the set refills, and every use of it — the tombstone
+            // writeback, the row marker in the keys pane — would then be
+            // confidently wrong rather than merely absent. It is re-resolved by
+            // name in `scan_batch` when the key comes back.
+            if let Some(open) = &mut state.open {
+                open.index = None;
+            }
             state.rebuild_list();
             state.scan = ScanState::Running {
                 scanned: 0,
@@ -98,11 +133,46 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             (state, Vec::new())
         }
         Msg::ScanBatch { keys } => scan_batch(state, keys),
-        Msg::MetadataBatch { entries } => {
+        Msg::MetadataBatch { entries, gone } => {
+            let open_index = state.open.as_ref().and_then(|open| open.index);
+            let mut row_says_alive = false;
             for e in entries {
                 state.keys.set_kind(e.index, e.kind);
                 state.keys.set_ttl(e.index, e.ttl_seconds);
                 state.keys.set_size(e.index, e.size_bytes);
+                row_says_alive |= Some(e.index) == open_index;
+            }
+            // A deleted key keeps its row and its last-known TTL and size; only
+            // the type byte gives way to the tombstone. Removing the row would
+            // renumber everything below the cursor between one frame and the
+            // next, which is a worse lie than a row that says it is gone.
+            let mut row_says_gone = false;
+            for index in gone {
+                state.keys.set_gone(index);
+                row_says_gone |= Some(index) == open_index;
+            }
+
+            // 958b311 taught the row what the Viewer knew. This is the other
+            // direction, which it did not cover: a tombstoned row has no type,
+            // so it matches `rows_needing_metadata` forever and the next cursor
+            // move refetches it — and a key that was deleted and then written
+            // again came back to `● string 64 B ∞` in the list while the Viewer
+            // still read `✕ deleted 40s ago`. With tracking off nothing ever
+            // corrected it, and the list is the more believable of the two
+            // because it is the one that looks untouched.
+            //
+            // Both directions of the disagreement are resolved the same way,
+            // and not by copying one pane's opinion onto the other: ask the
+            // server. The read path already dates its own answer and re-arms
+            // tracking (ADR-0006), so whichever pane was wrong is corrected by
+            // evidence rather than by inference.
+            let viewer_says_gone = state
+                .open
+                .as_ref()
+                .is_some_and(|open| open.deleted_at_ms.is_some());
+            if (row_says_alive && viewer_says_gone) || (row_says_gone && !viewer_says_gone) {
+                let token = issue_read(&mut state);
+                return (state, vec![Command::RefetchOpenKey { token }]);
             }
             (state, Vec::new())
         }
@@ -129,6 +199,7 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             (state, Vec::new())
         }
         Msg::ValueLoaded {
+            token,
             index,
             name,
             value,
@@ -136,10 +207,35 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             size_bytes,
             at_ms,
         } => {
+            // Only the answer to the question actually being asked may change
+            // what is open. Without this, opening a slow key and then a fast one
+            // put the slow one's reply in the Viewer when it finally landed —
+            // the value pane showing a key the reader had left. The value in
+            // that reply was correct; it simply answered an older question.
+            if token != state.read_token {
+                return (state, Vec::new());
+            }
+            // A value came back, so the key is there. Says so on the row too —
+            // the same two-pane agreement `ValueGone` keeps in the other
+            // direction, and what un-badges a key that was deleted and then
+            // written again. Setting the kind rather than merely clearing the
+            // tombstone means the row is right immediately instead of showing
+            // a pending placeholder until the next scroll refetches it.
+            //
+            // Guarded by the name, not just by the token: a rescan between the
+            // read and its reply renumbers the Loaded set, and this index would
+            // then describe an unrelated key in confident detail.
+            if let Some(index) = index
+                && state.keys.name(index) == Some(name.as_bytes())
+            {
+                state.keys.set_kind(index, value.kind());
+                state.keys.set_ttl(index, ttl_seconds);
+                state.keys.set_size(index, size_bytes);
+            }
             match &mut state.open {
                 // A read of the key already open is an update, and where it
                 // lands depends on where the reader is (ADR-0006).
-                Some(open) if open.index == index => {
+                Some(open) if open.name == name => {
                     open.absorb(value, ttl_seconds, size_bytes, at_ms)
                 }
                 _ => {
@@ -150,23 +246,52 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
                         ttl_seconds,
                         size_bytes,
                         at_ms,
-                    ))
+                    ));
+                    // A newly opened key has to find its row before either pane
+                    // can point at it.
+                    state.relocate_open_key();
                 }
             }
             (state, Vec::new())
         }
-        Msg::ValueGone { at_ms } => {
+        Msg::ValueGone { token, at_ms } => {
+            // Identity matters more here than anywhere else. This message
+            // tombstones the Open key *and* its row, so an unidentified one
+            // badges whichever key happens to be open when it lands — marking a
+            // healthy key deleted in both panes, with nothing afterwards to
+            // correct it.
+            if token != state.read_token {
+                return (state, Vec::new());
+            }
             // The value stays on screen, badged. During an incident the
             // question is almost always what was in it, and this is the moment
             // that answer becomes unrecoverable.
             if let Some(open) = &mut state.open {
                 open.deleted_at_ms = Some(at_ms);
                 open.pending = None;
+                // The row this key came from learns it too. Without this the
+                // two panes state different things about one key at the same
+                // moment — the Viewer badged `✕ deleted` while the list still
+                // showed `● string 64 B` — and the list is the more believable
+                // of the two, because it is the one that looks untouched.
+                // Nothing else would correct it: metadata is only refetched for
+                // rows whose type is unknown, and this row's is known and wrong.
+                //
+                // Skipped while the index is `None`: after a rescan there is no
+                // row this key is known to be on, and tombstoning a guess would
+                // put a `✕ gone` badge on a key that is perfectly alive.
+                if let Some(index) = open.index {
+                    state.keys.set_gone(index);
+                }
             }
             (state, Vec::new())
         }
         Msg::Copied { label, at_ms } => {
             state.notice = Some((format!("copied {label}"), at_ms));
+            (state, Vec::new())
+        }
+        Msg::Noticed { text, at_ms } => {
+            state.notice = Some((text, at_ms));
             (state, Vec::new())
         }
         Msg::ServerState {
@@ -206,12 +331,28 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
 /// This is the single place the cap is enforced, so there is no path that grows
 /// the Loaded set past it (ADR-0010).
 fn scan_batch(mut state: State, keys: Vec<Vec<u8>>) -> (State, Vec<Command>) {
+    // A rescan took the Open key's index away (`ScanStarted`). Watch for the
+    // name coming back so it can be restored — here rather than by searching
+    // the arena afterwards, because the index is simply the length before the
+    // push, and this is the one place that knows it.
+    let looking_for = match &state.open {
+        Some(open) if open.index.is_none() => Some(open.name.clone()),
+        _ => None,
+    };
     for key in keys {
+        let index = state.keys.len();
         if !state.keys.push(&key) {
             state.scan = ScanState::Capped {
                 at: state.keys.len(),
             };
             return (state, vec![Command::CancelScan]);
+        }
+        // Only after the push succeeded: a key the cap refused has no index,
+        // and claiming one would point the Open key at a row that is not there.
+        if looking_for.as_deref().map(str::as_bytes) == Some(key.as_slice())
+            && let Some(open) = &mut state.open
+        {
+            open.index = Some(index);
         }
     }
     if let ScanState::Running {
@@ -252,6 +393,17 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
     let Some(action) = state.keymap.action_for(&key) else {
         return (state, Vec::new());
     };
+    // An action whose pane is off screen does nothing. Below 70 columns only
+    // one pane is drawn, so without this `↓` moves a cursor nobody can see and
+    // `/` starts capturing into a filter line of zero width — every keypress
+    // after it vanishing, `q` typing a `q`, the app indistinguishable from
+    // hung. Stack navigation says the other pane is simply not there right now
+    // (DESIGN §2), and the honest reading of "not there" is "does nothing",
+    // not "does something invisible". `Esc` is the way back and it is in the
+    // hint bar. Above 70 columns both panes are drawn and nothing changes.
+    if !action.pane_is_on_screen(&state) {
+        return (state, Vec::new());
+    }
     match action {
         Action::Quit => quit(state),
         Action::Help => {
@@ -271,8 +423,8 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             }
             // The "pop" half of stack navigation: back to the list you were
             // just looking at, before an unrelated background scan.
-            if state.single_pane_view == SinglePaneView::Value {
-                state.single_pane_view = SinglePaneView::Keys;
+            if state.focus == Pane::Value {
+                state.focus = Pane::Keys;
                 return (state, Vec::new());
             }
             // Every in-flight operation is cancellable (PRD R7.3).
@@ -282,9 +434,29 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             (state, Vec::new())
         }
         Action::Refetch => {
-            // `r` is a scoped Refetch, not a global refresh. When an update is
-            // already waiting, it applies that instead of asking the server for
-            // something it has already been told.
+            // `r` acts on the focused pane and nothing else (R2.7), and the
+            // hint bar names which half is in force. The keys pane is not
+            // push-live — the deletions it can detect for free arrive with the
+            // metadata it was already fetching, and anything else needs the
+            // keyspace walked again (DESIGN §9).
+            //
+            // The held-update branch below used to sit *above* this check, so
+            // `r` in the keys pane with an update waiting in the Viewer applied
+            // that update and did not rescan — while the hint bar said
+            // `r rescan`. The list did not move, no scan readout appeared, and
+            // a value in the other pane changed instead: no error, no feedback,
+            // nothing to explain it. That is the same defect 6d665a3 fixed,
+            // surviving in the one branch that ran before the focus check.
+            if state.keys_pane_focused() {
+                // `None` is the same traversal the session opened with: the
+                // scan has never been server-side filtered, `/` narrows the
+                // Loaded set on this side, and so the active filter survives a
+                // rescan without being mentioned here.
+                return (state, vec![Command::StartScan { pattern: None }]);
+            }
+            // In the Viewer, a held update is the cheapest possible answer:
+            // applying what the server has already sent is the one thing `r`
+            // must never re-ask for.
             if let Some(open) = &mut state.open
                 && open.pending.is_some()
             {
@@ -292,7 +464,20 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
                 open.at_rest = true;
                 return (state, Vec::new());
             }
-            (state, vec![Command::RefetchOpenKey])
+            let token = issue_read(&mut state);
+            (state, vec![Command::RefetchOpenKey { token }])
+        }
+        Action::CyclePane => {
+            // Focus only ever moves to a pane there is something to focus.
+            // With no key open the Viewer has nothing in it, and below 70
+            // columns moving focus is what draws the other pane — so focusing
+            // an empty Viewer there would black out the screen.
+            state.focus = match state.focus {
+                Pane::Keys if state.open.is_some() => Pane::Value,
+                Pane::Keys => Pane::Keys,
+                Pane::Value => Pane::Keys,
+            };
+            (state, Vec::new())
         }
         Action::MoveDown => move_selection(state, 1),
         Action::MoveUp => move_selection(state, -1),
@@ -319,12 +504,14 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             let Some(name) = state.keys.name(index).map(|n| n.to_vec()) else {
                 return (state, Vec::new());
             };
-            // Below 70 columns this is the "push" half of stack navigation
-            // (DESIGN §2). Setting it unconditionally is harmless at any wider
-            // density, where layout() never consults it — both panes already
-            // show, so there is nothing this can visibly change.
-            state.single_pane_view = SinglePaneView::Value;
-            (state, vec![Command::OpenKey { index, name }])
+            // Opening a key moves focus onto it, at every width. Below 70
+            // columns that is the "push" half of stack navigation (DESIGN §2);
+            // above it both panes already show and this decides only which one
+            // a pane-scoped key acts on. `Tab` moves it back without closing
+            // the key, and `Esc` closes the key and moves it back with it.
+            state.focus = Pane::Value;
+            let token = issue_read(&mut state);
+            (state, vec![Command::OpenKey { index, name, token }])
         }
         Action::ViewerDown => scroll_viewer(state, ViewerMove::By(1)),
         Action::ViewerUp => scroll_viewer(state, ViewerMove::By(-1)),
@@ -404,7 +591,7 @@ fn group_prefix_at(state: &State, row: usize) -> Option<String> {
 /// `y y` copies the key, `y v` the value, `y c` a `redis-cli` command. Anything
 /// else cancels — an unrecognised second key should do nothing rather than
 /// guess, because the clipboard is somewhere the user cannot see.
-fn copy_key(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
+fn copy_key(state: State, key: KeyPress) -> (State, Vec<Command>) {
     let what = match key.code {
         KeyCode::Char('y') | KeyCode::Char('k') => CopyWhat::Key,
         KeyCode::Char('v') => CopyWhat::Value,
@@ -415,37 +602,44 @@ fn copy_key(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
     // The key name is copyable from the list alone; the other two need an open
     // value, because there is nothing to copy until the server has said what it
     // holds (ADR-0006).
+    let nothing_open = || {
+        vec![Command::Notify {
+            text: "nothing open to copy".into(),
+        }]
+    };
+    let mut label = what.label().to_string();
     let text = match what {
         CopyWhat::Key => match state.open.as_ref().map(|o| o.name.clone()) {
             Some(name) => name,
             None => match state.selected_key().and_then(|i| state.keys.name_str(i)) {
                 Some(name) => name.into_owned(),
-                None => return (state, Vec::new()),
+                None => return (state, nothing_open()),
             },
         },
         CopyWhat::Value => match &state.open {
-            Some(open) => value_text(&open.value, open.read_at_ms),
-            None => {
-                state.notice = Some(("nothing open to copy".into(), 0));
-                return (state, Vec::new());
+            Some(open) => {
+                // A windowed read brought back a slice, and the clipboard shows
+                // no seams: 500 rows of a 12,000-item list look exactly like a
+                // complete copy once pasted. The Viewer header already states
+                // this fact about the same value (`12,000 items · 500 shown`);
+                // the confirmation states it about the copy, in the same words,
+                // rather than saying `copied value` and leaving the paste
+                // buffer to be discovered as a prefix later.
+                let viewer = open.value.viewer();
+                if let Some(shown) = viewer.window() {
+                    label = format!("{label} ({shown} of {})", viewer.measure());
+                }
+                value_text(&open.value, open.read_at_ms)
             }
+            None => return (state, nothing_open()),
         },
         CopyWhat::Command => match &state.open {
             Some(open) => redis_cli_command(&state.connection.target, open),
-            None => {
-                state.notice = Some(("nothing open to copy".into(), 0));
-                return (state, Vec::new());
-            }
+            None => return (state, nothing_open()),
         },
     };
 
-    (
-        state,
-        vec![Command::CopyToClipboard {
-            text,
-            label: what.label(),
-        }],
-    )
+    (state, vec![Command::CopyToClipboard { text, label }])
 }
 
 /// Keys typed while the filter is capturing.
@@ -635,13 +829,147 @@ mod tests {
         assert!(!s.help_open);
     }
 
+    /// A key open in the Viewer *and focused*, at a two-pane width — the state
+    /// that `Action::Open` produces, since opening a key moves focus onto it.
+    fn viewing() -> State {
+        State {
+            cols: 130,
+            rows: 40,
+            focus: Pane::Value,
+            open: Some(OpenKey::new(
+                Some(0),
+                "k".into(),
+                crate::state::value::Value::Str(crate::state::value::StringValue::new("v", 40)),
+                -1,
+                10,
+                0,
+            )),
+            ..State::default()
+        }
+    }
+
+    fn press_r(state: State) -> Vec<Command> {
+        update(state, Msg::Key(KeyPress::plain(KeyCode::Char('r')))).1
+    }
+
     #[test]
-    fn r_asks_for_a_refetch_which_is_the_only_read_path() {
-        let (_, cmds) = update(
-            State::default(),
-            Msg::Key(KeyPress::plain(KeyCode::Char('r'))),
+    fn r_in_the_viewer_asks_for_a_refetch_which_is_the_only_read_path() {
+        assert!(matches!(
+            press_r(viewing()).as_slice(),
+            [Command::RefetchOpenKey { .. }]
+        ));
+    }
+
+    /// R2.7: `r` acts on the focused pane and nothing else. This half was
+    /// documented from the start and never wired up — the core emitted
+    /// `RefetchOpenKey` unconditionally, so `StartScan` was unreachable.
+    #[test]
+    fn r_in_the_keys_pane_rescans_the_keyspace() {
+        let state = State {
+            cols: 130,
+            rows: 40,
+            ..State::default()
+        };
+        assert_eq!(
+            press_r(state),
+            vec![Command::StartScan { pattern: None }],
+            "with no key open, the keys pane is what `r` acts on"
         );
-        assert_eq!(cmds, vec![Command::RefetchOpenKey]);
+    }
+
+    #[test]
+    fn r_follows_focus_at_every_width_not_merely_whether_a_key_is_open() {
+        // The bug this replaced: at a two-pane width, focus was inferred from
+        // `open.is_some()`. Opening a key then silently handed `r` to the
+        // Viewer while the arrow keys still drove the key list, so pressing `r`
+        // to rescan quietly refetched the value instead and the list did not
+        // move. A key can be open and unfocused; that is what `Tab` is for.
+        for cols in [60u16, 130] {
+            let focused_value = State { cols, ..viewing() };
+            assert!(
+                matches!(
+                    press_r(focused_value.clone()).as_slice(),
+                    [Command::RefetchOpenKey { .. }]
+                ),
+                "at {cols} columns, a focused Viewer owns `r`"
+            );
+
+            let focused_keys = State {
+                focus: Pane::Keys,
+                ..focused_value
+            };
+            assert_eq!(
+                press_r(focused_keys),
+                vec![Command::StartScan { pattern: None }],
+                "at {cols} columns, an open-but-unfocused key must not own `r`"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_moves_focus_between_the_panes_and_r_follows_it() {
+        // DESIGN §4 has specified `Tab` since the beginning; nothing
+        // implemented it, which left R2.7's "acts on the focused pane" resting
+        // on a focus the user could not move.
+        let tab = |s: State| update(s, Msg::Key(KeyPress::plain(KeyCode::Tab))).0;
+
+        let s = viewing();
+        assert_eq!(s.focus, Pane::Value, "opening a key focuses it");
+
+        let s = tab(s);
+        assert_eq!(s.focus, Pane::Keys);
+        assert_eq!(
+            press_r(s.clone()),
+            vec![Command::StartScan { pattern: None }],
+            "Tab back to the list must make `r` rescan, without closing the key"
+        );
+        assert!(s.open.is_some(), "and without closing the key");
+
+        let s = tab(s);
+        assert_eq!(s.focus, Pane::Value, "Tab cycles back");
+    }
+
+    #[test]
+    fn tab_does_not_focus_a_viewer_with_nothing_in_it() {
+        // Below 70 columns focusing the Viewer is what *draws* it, so focusing
+        // an empty one would blank the screen. Above, it would hand `r` to a
+        // pane that has nothing to refetch.
+        let s = State {
+            cols: 60,
+            rows: 40,
+            ..State::default()
+        };
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Tab)));
+        assert_eq!(s.focus, Pane::Keys);
+        assert_eq!(press_r(s), vec![Command::StartScan { pattern: None }]);
+    }
+
+    #[test]
+    fn a_held_update_is_applied_before_either_pane_gets_a_say() {
+        // The cheapest possible answer, and re-asking the server for something
+        // it has already sent is the one thing `r` must never do.
+        let mut state = viewing();
+        // An update only waits when the reader is not at rest — otherwise it
+        // lands straight away and there is nothing for `r` to apply.
+        state.open.as_mut().unwrap().at_rest = false;
+        let (state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token: ReadToken::default(),
+                index: Some(0),
+                name: "k".into(),
+                value: crate::state::value::Value::Str(crate::state::value::StringValue::new(
+                    "v2", 40,
+                )),
+                ttl_seconds: -1,
+                size_bytes: 11,
+                at_ms: 1_000,
+            },
+        );
+        assert!(state.open.as_ref().unwrap().pending.is_some(), "held");
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('r'))));
+        assert!(cmds.is_empty(), "no read is asked for");
+        assert!(state.open.as_ref().unwrap().pending.is_none(), "applied");
     }
 
     #[test]
@@ -743,7 +1071,7 @@ mod liveness_invariants {
                 tracking_supported: true,
             },
         );
-        assert_eq!(cmds, vec![Command::RefetchOpenKey]);
+        assert!(matches!(cmds.as_slice(), [Command::RefetchOpenKey { .. }]));
     }
 
     /// ADR-0009: a reconnect that does not re-arm must not present as live.
@@ -769,7 +1097,7 @@ mod liveness_invariants {
             Liveness::Live,
             "reconnected but not re-armed"
         );
-        assert_eq!(cmds, vec![Command::RefetchOpenKey]);
+        assert!(matches!(cmds.as_slice(), [Command::RefetchOpenKey { .. }]));
 
         let (rearmed, _) = update(back, Msg::TrackingArmed);
         assert_eq!(rearmed.liveness(), Liveness::Live);
@@ -781,7 +1109,7 @@ mod liveness_invariants {
     #[test]
     fn an_invalidation_consumes_the_arming_and_forces_a_refetch() {
         let (after, cmds) = update(armed(), Msg::Invalidated);
-        assert_eq!(cmds, vec![Command::RefetchOpenKey]);
+        assert!(matches!(cmds.as_slice(), [Command::RefetchOpenKey { .. }]));
 
         let (rearmed, _) = update(after, Msg::TrackingArmed);
         assert_eq!(rearmed.liveness(), Liveness::Live);
@@ -823,7 +1151,7 @@ mod liveness_invariants {
             s.link,
             Link::Reconnecting {
                 attempt: 3,
-                retry_in_ms: 4_000
+                retry_in_ms: Some(4_000)
             }
         );
         assert_eq!(cmds, vec![Command::Reconnect { after_ms: 4_000 }]);
@@ -838,7 +1166,7 @@ mod liveness_invariants {
             (
                 Link::Reconnecting {
                     attempt: 1,
-                    retry_in_ms: 0,
+                    retry_in_ms: None,
                 },
                 Liveness::Disconnected,
             ),
@@ -1100,8 +1428,85 @@ mod metadata_tests {
     use crate::state::KeyKind;
     use crate::state::loaded::TTL_NONE;
 
+    /// The two panes must never state different things about one key.
+    ///
+    /// Found in use: with a key open and then deleted, the Viewer badged
+    /// `✕ deleted just now` while that key's row in the list still read
+    /// `● string 64 B ∞`. Nothing would have corrected it — metadata is only
+    /// refetched for rows whose type is *unknown*, and this row's was known
+    /// and stale — so the list quietly kept the more believable of two
+    /// contradictory claims.
+    #[test]
+    fn a_deleted_open_key_is_badged_in_the_list_as_well_as_the_viewer() {
+        use crate::state::value::{StringValue, Value};
+
+        let state = browsing(10);
+        let (state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token: ReadToken::default(),
+                index: Some(3),
+                name: "k:3".into(),
+                value: Value::Str(StringValue::new("v", 40)),
+                ttl_seconds: -1,
+                size_bytes: 64,
+                at_ms: 1_000,
+            },
+        );
+        assert_eq!(state.keys.kind(3), Some(KeyKind::String));
+        assert!(!state.keys.is_gone(3));
+
+        let (state, _) = update(
+            state,
+            Msg::ValueGone {
+                token: ReadToken::default(),
+                at_ms: 2_000,
+            },
+        );
+        assert!(
+            state.open.as_ref().unwrap().deleted_at_ms.is_some(),
+            "the Viewer knows"
+        );
+        assert!(state.keys.is_gone(3), "and so must the row it came from");
+        assert!(!state.keys.is_gone(2), "its neighbours are untouched");
+    }
+
+    #[test]
+    fn a_key_that_comes_back_stops_saying_gone() {
+        use crate::state::value::{PairValue, Value};
+
+        let mut state = browsing(10);
+        state.keys.set_gone(3);
+        let (state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token: ReadToken::default(),
+                index: Some(3),
+                name: "k:3".into(),
+                value: Value::Hash(PairValue::default()),
+                ttl_seconds: 90,
+                size_bytes: 128,
+                at_ms: 3_000,
+            },
+        );
+        assert!(
+            !state.keys.is_gone(3),
+            "a value came back, so the key is there"
+        );
+        assert_eq!(
+            state.keys.kind(3),
+            Some(KeyKind::Hash),
+            "and the row is right at once, not a placeholder until the next scroll"
+        );
+        assert_eq!(state.keys.ttl(3), Some(90));
+        assert_eq!(state.keys.size(3), Some(128));
+    }
+
     fn browsing(n: usize) -> State {
         let mut state = State {
+            // Wide enough for two panes, so both are on screen and a
+            // pane-scoped key is not silently gated out from under the test.
+            cols: 130,
             rows: 30,
             ..State::default()
         };
@@ -1114,6 +1519,527 @@ mod metadata_tests {
         let keys = (0..n).map(|i| format!("k:{i}").into_bytes()).collect();
         let (state, _) = update(state, Msg::ScanBatch { keys });
         state
+    }
+
+    use crate::state::Attachment;
+
+    // ── Which key is the Viewer showing? (CONTEXT.md: Open key) ────────────
+    //
+    // The reported defect was the cursor on one key and the value pane showing
+    // another. Three separate causes, two of them races, and a race that is
+    // only *usually* won is a bug that gets reported once a quarter forever.
+
+    /// Open a slow key, then a fast one. The slow reply lands last and must not
+    /// win: it is a correct value answering a question the reader has left.
+    #[test]
+    fn a_reply_from_a_superseded_read_never_reaches_the_viewer() {
+        use crate::state::value::{StringValue, Value};
+
+        let mut state = browsing(10);
+        // Open row 3 …
+        state.view.selected = 3;
+        let (mut state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::OpenKey { token: slow, .. }) = cmds.first() else {
+            panic!("expected an open, got {cmds:?}");
+        };
+        // … then change your mind and open row 5 before the first came back.
+        state.view.selected = 5;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::OpenKey { token: fast, .. }) = cmds.first() else {
+            panic!("expected an open, got {cmds:?}");
+        };
+        assert_ne!(slow, fast, "two reads, two identities");
+
+        let (state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token: fast,
+                index: Some(5),
+                name: "k:5".into(),
+                value: Value::Str(StringValue::new("five", 40)),
+                ttl_seconds: -1,
+                size_bytes: 4,
+                at_ms: 1_000,
+            },
+        );
+        let (state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token: slow,
+                index: Some(3),
+                name: "k:3".into(),
+                value: Value::Str(StringValue::new("three", 40)),
+                ttl_seconds: -1,
+                size_bytes: 5,
+                at_ms: 2_000,
+            },
+        );
+
+        assert_eq!(
+            state.open.as_ref().unwrap().name,
+            "k:5",
+            "the last key asked for is the key on screen"
+        );
+        assert!(
+            state.keys.kind(3).is_none(),
+            "and the superseded reply wrote nothing anywhere"
+        );
+    }
+
+    /// The sharper half: `ValueGone` tombstones the Open key *and* its row, so
+    /// a stale one marks a perfectly healthy key deleted in both panes — and
+    /// nothing afterwards corrects it.
+    #[test]
+    fn a_superseded_gone_reply_does_not_bury_the_key_that_is_open_now() {
+        use crate::state::value::{StringValue, Value};
+
+        let mut state = browsing(10);
+        state.view.selected = 3;
+        let (mut state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::OpenKey { token: doomed, .. }) = cmds.first() else {
+            panic!("expected an open");
+        };
+        state.view.selected = 5;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::OpenKey { token: current, .. }) = cmds.first() else {
+            panic!("expected an open");
+        };
+        let (state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token: current,
+                index: Some(5),
+                name: "k:5".into(),
+                value: Value::Str(StringValue::new("five", 40)),
+                ttl_seconds: -1,
+                size_bytes: 4,
+                at_ms: 1_000,
+            },
+        );
+
+        // k:3 really was deleted — but that is news about k:3, not about k:5.
+        let (state, _) = update(
+            state,
+            Msg::ValueGone {
+                token: doomed,
+                at_ms: 2_000,
+            },
+        );
+        assert!(
+            state.open.as_ref().unwrap().deleted_at_ms.is_none(),
+            "the open key is alive and must not be badged as deleted"
+        );
+        assert!(!state.keys.is_gone(5), "nor may its row be tombstoned");
+    }
+
+    /// `SCAN` has no stable order, so an index outlives its meaning. Keeping it
+    /// would put the row marker and the tombstone on whatever key inherited the
+    /// number — confidently wrong, which is worse than absent.
+    #[test]
+    fn a_rescan_takes_the_open_keys_index_and_a_later_batch_gives_it_back() {
+        use crate::state::value::{StringValue, Value};
+
+        let mut state = browsing(10);
+        state.view.selected = 3;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+            panic!("expected an open");
+        };
+        let (state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token,
+                index: Some(3),
+                name: "k:3".into(),
+                value: Value::Str(StringValue::new("v", 40)),
+                ttl_seconds: -1,
+                size_bytes: 1,
+                at_ms: 1_000,
+            },
+        );
+        assert_eq!(state.open.as_ref().unwrap().index, Some(3));
+        assert_eq!(state.open.as_ref().unwrap().row, Some(3));
+
+        let (state, _) = update(
+            state,
+            Msg::ScanStarted {
+                estimated_total: 10,
+            },
+        );
+        assert_eq!(
+            state.open.as_ref().unwrap().index,
+            None,
+            "the number means nothing until the key is seen again"
+        );
+        assert_eq!(state.open.as_ref().unwrap().row, None);
+        assert_eq!(
+            state.attachment(),
+            Some(Attachment::DetachedOffList),
+            "and the Viewer says so rather than pointing at a row"
+        );
+
+        // The keyspace comes back in a different order, as it may.
+        let keys = ["k:7", "k:3", "k:1"]
+            .iter()
+            .map(|k| k.as_bytes().to_vec())
+            .collect();
+        let (state, _) = update(state, Msg::ScanBatch { keys });
+        assert_eq!(
+            state.open.as_ref().unwrap().index,
+            Some(1),
+            "re-resolved by name, at wherever it landed this time"
+        );
+    }
+
+    /// The metadata writeback is guarded by the name, not only by the token: a
+    /// rescan can land between a read and its reply without either being stale.
+    #[test]
+    fn a_value_reply_never_writes_metadata_onto_a_renumbered_row() {
+        use crate::state::value::{PairValue, Value};
+
+        let mut state = browsing(10);
+        state.view.selected = 3;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+            panic!("expected an open");
+        };
+        // The rescan refills row 3 with a different key.
+        let (state, _) = update(state, Msg::ScanStarted { estimated_total: 4 });
+        let keys = ["a", "b", "c", "somebody-else"]
+            .iter()
+            .map(|k| k.as_bytes().to_vec())
+            .collect();
+        let (state, _) = update(state, Msg::ScanBatch { keys });
+
+        let (state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token,
+                index: Some(3),
+                name: "k:3".into(),
+                value: Value::Hash(PairValue::default()),
+                ttl_seconds: 90,
+                size_bytes: 128,
+                at_ms: 1_000,
+            },
+        );
+        assert!(
+            state.keys.kind(3).is_none(),
+            "row 3 is `somebody-else` now and knows nothing about k:3"
+        );
+        assert_eq!(
+            state.open.as_ref().unwrap().name,
+            "k:3",
+            "the Viewer still took the value, which was never in doubt"
+        );
+    }
+
+    /// The three answers the panes are drawn from.
+    #[test]
+    fn attachment_distinguishes_on_the_cursor_from_elsewhere_from_nowhere() {
+        use crate::state::value::{StringValue, Value};
+
+        let mut state = browsing(10);
+        assert_eq!(state.attachment(), None, "nothing open, no question to ask");
+
+        state.view.selected = 3;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+            panic!("expected an open");
+        };
+        let (mut state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token,
+                index: Some(3),
+                name: "k:3".into(),
+                value: Value::Str(StringValue::new("v", 40)),
+                ttl_seconds: -1,
+                size_bytes: 1,
+                at_ms: 1_000,
+            },
+        );
+        assert_eq!(state.attachment(), Some(Attachment::Attached));
+
+        state.view.selected = 1;
+        assert_eq!(
+            state.attachment(),
+            Some(Attachment::Detached { rows: 2 }),
+            "two rows below the cursor"
+        );
+
+        state.list.filter = "k:9".into();
+        state.rebuild_list();
+        assert_eq!(
+            state.attachment(),
+            Some(Attachment::DetachedOffList),
+            "filtered away, so there is no row to point at"
+        );
+    }
+
+    /// The hint bar names the action for the focused pane; `r` has to perform
+    /// that one. The held-update branch used to run first, so `r` in the keys
+    /// pane applied a value in the *other* pane and did not rescan — while the
+    /// hint said `r rescan`, the list did not move, and no scan readout
+    /// appeared to explain it.
+    #[test]
+    fn r_in_the_keys_pane_rescans_even_with_an_update_waiting_in_the_viewer() {
+        use crate::state::value::{StringValue, Value};
+
+        let mut state = browsing(10);
+        state.view.selected = 3;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+            panic!("expected an open");
+        };
+        let (mut state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token,
+                index: Some(3),
+                name: "k:3".into(),
+                value: Value::Str(StringValue::new("v1", 40)),
+                ttl_seconds: -1,
+                size_bytes: 2,
+                at_ms: 1_000,
+            },
+        );
+        // Scrolled, so the next value is held rather than applied.
+        {
+            let open = state.open.as_mut().unwrap();
+            open.offset = 3;
+            open.at_rest = false;
+        }
+        let token = state.read_token;
+        let (mut state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token,
+                index: Some(3),
+                name: "k:3".into(),
+                value: Value::Str(StringValue::new("v2", 40)),
+                ttl_seconds: -1,
+                size_bytes: 2,
+                at_ms: 2_000,
+            },
+        );
+        assert!(state.open.as_ref().unwrap().pending.is_some(), "held");
+
+        state.focus = Pane::Keys;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('r'))));
+        assert!(
+            matches!(cmds.as_slice(), [Command::StartScan { .. }]),
+            "the hint says `r rescan`, so `r` rescans: {cmds:?}"
+        );
+        assert!(
+            state.open.as_ref().unwrap().pending.is_some(),
+            "and the held update is still held, untouched by a keys-pane key"
+        );
+    }
+
+    /// 958b311 taught the row what the Viewer knew. The other direction was
+    /// open: a tombstoned row has no type, so it is refetched on the next
+    /// cursor move, and a key deleted and then written again came back to
+    /// `● string 64 B ∞` in the list while the Viewer still read `✕ deleted`.
+    #[test]
+    fn a_key_that_comes_back_makes_the_viewer_go_and_ask() {
+        use crate::msg::MetadataEntry;
+        use crate::state::value::{StringValue, Value};
+
+        let mut state = browsing(10);
+        state.view.selected = 3;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+            panic!("expected an open");
+        };
+        let (state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token,
+                index: Some(3),
+                name: "k:3".into(),
+                value: Value::Str(StringValue::new("v", 40)),
+                ttl_seconds: -1,
+                size_bytes: 1,
+                at_ms: 1_000,
+            },
+        );
+        let token = state.read_token;
+        let (state, _) = update(
+            state,
+            Msg::ValueGone {
+                token,
+                at_ms: 2_000,
+            },
+        );
+        assert!(state.keys.is_gone(3), "both panes agree it is gone");
+
+        // The row is refetched, because a tombstone has no type, and the server
+        // says the key is there again.
+        let (state, cmds) = update(
+            state,
+            Msg::MetadataBatch {
+                entries: vec![MetadataEntry {
+                    index: 3,
+                    kind: crate::state::KeyKind::String,
+                    ttl_seconds: -1,
+                    size_bytes: 64,
+                }],
+                gone: Vec::new(),
+            },
+        );
+        assert!(
+            matches!(cmds.as_slice(), [Command::RefetchOpenKey { .. }]),
+            "the panes disagree, so ask the server rather than guess: {cmds:?}"
+        );
+        assert!(
+            state.open.as_ref().unwrap().deleted_at_ms.is_some(),
+            "and the badge stays until the answer arrives — no guessing either way"
+        );
+    }
+
+    /// The same rule in the other direction: metadata noticed the deletion
+    /// first, and the Viewer is still showing a live-looking value.
+    #[test]
+    fn a_row_that_goes_makes_the_viewer_go_and_ask_too() {
+        use crate::state::value::{StringValue, Value};
+
+        let mut state = browsing(10);
+        state.view.selected = 3;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+            panic!("expected an open");
+        };
+        let (state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token,
+                index: Some(3),
+                name: "k:3".into(),
+                value: Value::Str(StringValue::new("v", 40)),
+                ttl_seconds: -1,
+                size_bytes: 1,
+                at_ms: 1_000,
+            },
+        );
+        let (_, cmds) = update(
+            state,
+            Msg::MetadataBatch {
+                entries: Vec::new(),
+                gone: vec![3],
+            },
+        );
+        assert!(
+            matches!(cmds.as_slice(), [Command::RefetchOpenKey { .. }]),
+            "{cmds:?}"
+        );
+    }
+
+    // ── An action must not act on a pane that is not on screen ─────────────
+    //
+    // Below 70 columns one pane is drawn at a time (DESIGN §2). Aiming a
+    // pane-scoped key at the other one produced no visible change whatsoever,
+    // which is the single worst thing a TUI can look like: indistinguishable
+    // from having stopped responding.
+
+    fn narrow_viewing() -> State {
+        let mut state = browsing(10);
+        state.cols = 60;
+        let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        assert_eq!(state.focus, Pane::Value, "→ pushes onto the value");
+        assert!(
+            !state.keys_pane_visible(),
+            "and the list is off screen there"
+        );
+        state
+    }
+
+    /// The sharpest case. `/` began capturing into a filter line rendered
+    /// inside a pane of zero width: every keypress after it disappeared, `q`
+    /// typed a `q` instead of quitting, and only `Esc` escaped.
+    #[test]
+    fn slash_cannot_open_an_invisible_keystroke_sink() {
+        let state = narrow_viewing();
+        let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('/'))));
+        assert!(
+            !state.filtering,
+            "no capture may start while the pane that would show it is not drawn"
+        );
+
+        // And `q` still means quit, which is the part that mattered.
+        let (_, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('q'))));
+        assert_eq!(cmds, vec![Command::Quit]);
+    }
+
+    /// The cursor moved an arbitrary distance with nothing on screen changing,
+    /// and `Esc` then returned to a list that had silently wandered.
+    #[test]
+    fn the_key_list_does_not_move_while_it_is_off_screen() {
+        let state = narrow_viewing();
+        let before = state.view.selected;
+        let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Down)));
+        let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::End)));
+        assert_eq!(state.view.selected, before, "the cursor stayed put");
+    }
+
+    /// The same defect mirrored: on the list screen the value is not drawn, so
+    /// its scroll keys were moving an offset nobody could see.
+    #[test]
+    fn the_value_does_not_scroll_while_it_is_off_screen() {
+        let mut state = browsing(10);
+        state.cols = 60;
+        state.open = Some(OpenKey::new(
+            Some(0),
+            "k".into(),
+            crate::state::value::Value::Str(crate::state::value::StringValue::new("v", 40)),
+            -1,
+            10,
+            0,
+        ));
+        assert!(
+            !state.value_pane_visible(),
+            "the list is what is drawn here"
+        );
+        let (state, _) = update(state, Msg::Key(KeyPress::ctrl(KeyCode::Down)));
+        assert_eq!(state.open.as_ref().unwrap().offset, 0);
+    }
+
+    /// Both panes are drawn above 70 columns, so the two-pane keymap is
+    /// untouched: plain arrows drive the list from either pane and `⌃`-arrows
+    /// drive the value, exactly as DESIGN §4 specifies.
+    #[test]
+    fn nothing_is_gated_while_both_panes_are_on_screen() {
+        let state = browsing(10);
+        let (mut state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        assert_eq!(state.focus, Pane::Value);
+        assert!(state.keys_pane_visible() && state.value_pane_visible());
+
+        let before = state.view.selected;
+        (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Down)));
+        assert_ne!(
+            state.view.selected, before,
+            "the list still moves from the Viewer at two-pane widths"
+        );
+        let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('/'))));
+        assert!(state.filtering, "and `/` still filters");
+    }
+
+    /// Reached by dragging a window edge rather than by pressing a key: a
+    /// filter being typed at two-pane width, then narrowed past the breakpoint
+    /// with the Viewer focused, would leave the capture running off screen.
+    #[test]
+    fn narrowing_the_terminal_keeps_an_open_filter_where_it_can_be_seen() {
+        let state = browsing(10);
+        let (mut state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('/'))));
+        assert!(state.filtering);
+
+        let (state, _) = update(state, Msg::Resized { cols: 60, rows: 30 });
+        assert!(state.filtering, "the filter is still being typed");
+        assert!(
+            state.keys_pane_visible(),
+            "so the pane showing it must be the one on screen"
+        );
     }
 
     #[test]
@@ -1139,6 +2065,7 @@ mod metadata_tests {
                     ttl_seconds: 2_537,
                     size_bytes: 2_150,
                 }],
+                gone: Vec::new(),
             },
         );
         assert_eq!(state.keys.kind(2), Some(KeyKind::Hash));
@@ -1158,7 +2085,13 @@ mod metadata_tests {
                 size_bytes: 10,
             })
             .collect();
-        let (state, _) = update(state, Msg::MetadataBatch { entries });
+        let (state, _) = update(
+            state,
+            Msg::MetadataBatch {
+                entries,
+                gone: Vec::new(),
+            },
+        );
         assert!(
             state.rows_needing_metadata().is_empty(),
             "the visible window is fully known, so nothing more is owed"
@@ -1176,7 +2109,13 @@ mod metadata_tests {
                 size_bytes: 10,
             })
             .collect();
-        let (state, _) = update(state, Msg::MetadataBatch { entries });
+        let (state, _) = update(
+            state,
+            Msg::MetadataBatch {
+                entries,
+                gone: Vec::new(),
+            },
+        );
 
         // Page down past the known rows.
         let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::PageDown)));
@@ -1297,7 +2236,10 @@ mod honesty_tests {
             },
         );
         assert_ne!(state.liveness(), Liveness::Live);
-        assert!(cmds.contains(&Command::RefetchOpenKey));
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Command::RefetchOpenKey { .. }))
+        );
     }
 
     /// R1.15: a replica outranks an Environment guard, and cannot be lifted.
@@ -1390,7 +2332,12 @@ mod viewer_scroll_tests {
             total: n,
         });
         State {
-            open: Some(OpenKey::new(0, "k".into(), value, -1, 10, 0)),
+            // A real width: at `State::default()`'s zero columns the layout is
+            // single-pane and the Viewer is not on screen, so its own scroll
+            // keys would correctly do nothing.
+            cols: 130,
+            rows: 40,
+            open: Some(OpenKey::new(Some(0), "k".into(), value, -1, 10, 0)),
             ..State::default()
         }
     }
@@ -1510,9 +2457,9 @@ mod stack_navigation_tests {
     #[test]
     fn opening_a_key_pushes_into_value_view() {
         let state = browsing();
-        assert_eq!(state.single_pane_view, SinglePaneView::Keys);
+        assert_eq!(state.focus, Pane::Keys);
         let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('l'))));
-        assert_eq!(state.single_pane_view, SinglePaneView::Value);
+        assert_eq!(state.focus, Pane::Value);
         assert!(matches!(cmds.first(), Some(Command::OpenKey { .. })));
     }
 
@@ -1520,10 +2467,10 @@ mod stack_navigation_tests {
     fn esc_pops_back_to_keys_from_value_view() {
         let state = browsing();
         let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('l'))));
-        assert_eq!(state.single_pane_view, SinglePaneView::Value);
+        assert_eq!(state.focus, Pane::Value);
 
         let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Esc)));
-        assert_eq!(state.single_pane_view, SinglePaneView::Keys);
+        assert_eq!(state.focus, Pane::Keys);
         assert!(
             cmds.is_empty(),
             "popping the stack is not itself a scan cancellation"
@@ -1541,8 +2488,8 @@ mod stack_navigation_tests {
         let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Esc)));
         assert!(!state.help_open);
         assert_eq!(
-            state.single_pane_view,
-            SinglePaneView::Value,
+            state.focus,
+            Pane::Value,
             "one Esc closes one thing, not two"
         );
     }
@@ -1560,7 +2507,7 @@ mod stack_navigation_tests {
         assert!(state.scan.is_running());
 
         let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Esc)));
-        assert_eq!(state.single_pane_view, SinglePaneView::Keys);
+        assert_eq!(state.focus, Pane::Keys);
         assert!(
             cmds.is_empty(),
             "the scan must still be running, not cancelled by this Esc"
@@ -1575,9 +2522,9 @@ mod stack_navigation_tests {
         // actual reader can see.
         let state = browsing();
         let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('l'))));
-        assert_eq!(state.single_pane_view, SinglePaneView::Value);
+        assert_eq!(state.focus, Pane::Value);
         // No assertion on rendered output here — render::layout's own test
-        // (`single_pane_view_is_ignored_at_any_wider_density`) is the proof;
+        // (`focus_is_ignored_at_any_wider_density`) is the proof;
         // this just confirms the state transition still happens uniformly.
     }
 }

@@ -111,11 +111,35 @@ impl Viewport {
     }
 }
 
+/// Where the Open key's row ended up, so the divider between the panes can
+/// point at it.
+///
+/// Returned rather than recomputed on the value pane's side: the viewport maths
+/// that decides which rows are on screen lives here, and duplicating it is how
+/// the two panes would come to disagree about where one key is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenRowMark {
+    /// Nothing open, or the Open key has no row at all — filtered out, folded
+    /// away, or waiting to be re-resolved after a rescan.
+    None,
+    /// On screen, at this buffer row.
+    At(u16),
+    /// Scrolled past, above or below the visible window.
+    Above,
+    Below,
+}
+
 /// Render the keys pane. Draws at most `area.height` rows regardless of how
 /// many keys are loaded.
-pub fn render(state: &State, theme: &Theme, area: Rect, density: Density, buf: &mut Buffer) {
+pub fn render(
+    state: &State,
+    theme: &Theme,
+    area: Rect,
+    density: Density,
+    buf: &mut Buffer,
+) -> OpenRowMark {
     if area.width < 8 || area.height < 2 {
-        return;
+        return OpenRowMark::None;
     }
     let cols = Columns::for_pane(area.width, density);
     let mut y = area.y;
@@ -137,11 +161,25 @@ pub fn render(state: &State, theme: &Theme, area: Rect, density: Density, buf: &
         filter_line(state, theme, area, y, buf);
         y += 1;
     }
-    header(theme, Rect { y, ..area }, cols, buf);
+    header(
+        theme,
+        Rect { y, ..area },
+        cols,
+        state.keys_pane_focused(),
+        buf,
+    );
     y += 1;
 
     let body_height = (area.y + area.height).saturating_sub(y) as usize;
     let view = state.view.scrolled_to_selection(body_height);
+
+    // The Open key's row, if it has one. Read once rather than per row.
+    let open_row = state.open.as_ref().and_then(|open| open.row);
+    let mut mark = match open_row {
+        None => OpenRowMark::None,
+        Some(row) if row < view.offset => OpenRowMark::Above,
+        Some(_) => OpenRowMark::Below,
+    };
 
     for row in 0..body_height {
         let display_row = view.offset + row;
@@ -150,12 +188,43 @@ pub fn render(state: &State, theme: &Theme, area: Rect, density: Density, buf: &
         }
         let at = y + row as u16;
         let selected = display_row == view.selected;
+        // The Open key's row carries a mark of its own, ranked below the
+        // cursor's: the reader has to be able to see, without looking away from
+        // the list, which row the Viewer is actually showing (CONTEXT.md's
+        // Selected key vs Open key). When they are the same row the two marks
+        // coincide, which is what makes the moment they separate legible.
+        let is_open = open_row == Some(display_row);
+        if is_open {
+            mark = OpenRowMark::At(at);
+        }
         if state.tree_mode {
-            tree_row(state, display_row, selected, theme, area, cols, at, buf);
+            tree_row(
+                state,
+                display_row,
+                selected,
+                is_open,
+                theme,
+                area,
+                cols,
+                at,
+                buf,
+            );
         } else if let Some(i) = state.list.index_at(display_row) {
-            key_row(&state.keys, i, selected, theme, area, cols, at, 0, buf);
+            key_row(
+                &state.keys,
+                i,
+                selected,
+                is_open,
+                theme,
+                area,
+                cols,
+                at,
+                0,
+                buf,
+            );
         }
     }
+    mark
 }
 
 /// `/ user:*:session          3,410 of 41,203`
@@ -204,6 +273,7 @@ fn tree_row(
     state: &State,
     display_row: usize,
     selected: bool,
+    is_open: bool,
     theme: &Theme,
     area: Rect,
     cols: Columns,
@@ -263,6 +333,7 @@ fn tree_row(
             &state.keys,
             index as usize,
             selected,
+            is_open,
             theme,
             area,
             cols,
@@ -274,8 +345,13 @@ fn tree_row(
     }
 }
 
-fn header(theme: &Theme, area: Rect, cols: Columns, buf: &mut Buffer) {
-    let style = theme.style(Token::Muted);
+fn header(theme: &Theme, area: Rect, cols: Columns, focused: bool, buf: &mut Buffer) {
+    // The column header doubles as the focus indicator (DESIGN §4). `r` means
+    // different things in the two panes, so which one has focus has to be
+    // legible without pressing anything — a hint bar at the bottom of the
+    // screen is not where someone looks to answer "where am I". Emphasis only:
+    // no glyph, no extra row, identical width either way (G7).
+    let style = theme.style(if focused { Token::Text } else { Token::Muted });
     super::put(buf, area.x + cols.name, area.y, "KEY", style);
     if let Some(x) = cols.kind {
         super::put(buf, area.x + x, area.y, "TYPE", style);
@@ -293,6 +369,7 @@ fn key_row(
     keys: &LoadedSet,
     i: usize,
     selected: bool,
+    is_open: bool,
     theme: &Theme,
     area: Rect,
     cols: Columns,
@@ -305,24 +382,41 @@ fn key_row(
     }
 
     let kind = keys.kind(i);
+    // A key that vanished between the scan and its metadata fetch. It keeps its
+    // row so nothing below the cursor renumbers, and takes over the dot column
+    // — the same `✕` the Viewer header uses for a deleted open key, so one mark
+    // means one thing at both levels.
+    let gone = keys.is_gone(i);
     // The dot carries the type's hue everywhere a key is listed — DESIGN §5's
     // "consistent everywhere a type appears" — while the TYPE column spells
     // the same fact out in words, which is what keeps it legible with no hue
     // at all. Selection overrides both to the row's single highlight colour,
     // same as every other cell on that row.
-    let dot_style = theme.style(if selected {
-        Token::Selected
-    } else {
-        crate::theme::type_token(kind)
+    let dot_style = theme.style(match (selected, gone) {
+        (true, _) => Token::Selected,
+        (false, true) => Token::Danger,
+        (false, false) => crate::theme::type_token(kind),
     });
-    let dot = if kind.is_some() { "●" } else { PENDING };
+    let dot = match (gone, kind.is_some()) {
+        (true, _) => "✕",
+        (false, true) => "●",
+        (false, false) => PENDING,
+    };
     super::put(buf, area.x + cols.name + indent, y, dot, dot_style);
 
-    let name_style = theme.style(if selected {
-        Token::Selected
-    } else {
-        Token::Text
+    // A gone key's name is history, not something to act on, so it drops to the
+    // same weight as its metadata rather than reading as a live row.
+    let mut name_style = theme.style(match (selected, gone) {
+        (true, _) => Token::Selected,
+        (false, true) => Token::Muted,
+        (false, false) => Token::Text,
     });
+    // Underline rather than a glyph or a hue: it costs no column, it composes
+    // with the selection bar when the two coincide, and it is the one modifier
+    // still free in monochrome once `Selected` has taken reverse video.
+    if is_open {
+        name_style = name_style.patch(theme.style(Token::OpenRow));
+    }
     let meta_style = theme.style(if selected {
         Token::Selected
     } else {
@@ -355,11 +449,18 @@ fn key_row(
     // Each of these renders a placeholder at the same position when the value
     // has not arrived, so nothing moves when it does.
     if let Some(x) = cols.kind {
-        let text = kind.map_or(PENDING.to_string(), |k| k.label().to_string());
-        let style = theme.style(if selected {
-            Token::Selected
-        } else {
-            crate::theme::type_token(kind)
+        // Without this the TYPE column would fall back to the pending
+        // placeholder, which says "not fetched yet" — the one reading that is
+        // wrong here, because the fetch is exactly what found the key missing.
+        let text = match (gone, kind) {
+            (true, _) => "gone".to_string(),
+            (false, Some(k)) => k.label().to_string(),
+            (false, None) => PENDING.to_string(),
+        };
+        let style = theme.style(match (selected, gone) {
+            (true, _) => Token::Selected,
+            (false, true) => Token::Danger,
+            (false, false) => crate::theme::type_token(kind),
         });
         super::put(buf, area.x + x, y, &text, style);
     }
@@ -368,7 +469,16 @@ fn key_row(
         super::put_right(buf, area.x + x, y, w, &text, meta_style);
     }
     if let Some((x, w)) = cols.ttl {
-        let text = keys.ttl(i).map_or(PENDING.to_string(), format_ttl);
+        // Size is retrospective — "it held 1.1 MB" stays true after a deletion,
+        // and during an incident it is usually the only answer left. A TTL is
+        // future-tense: "expires in 12m" is a claim about a key that is not
+        // there to expire, so it becomes the not-applicable dash instead. Same
+        // glyph the Stream viewer uses for an age it cannot compute.
+        let text = match (gone, keys.ttl(i)) {
+            (true, _) => "—".to_string(),
+            (false, Some(t)) => format_ttl(t),
+            (false, None) => PENDING.to_string(),
+        };
         super::put_right(buf, area.x + x, y, w, &text, meta_style);
     }
 }

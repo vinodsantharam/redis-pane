@@ -68,6 +68,20 @@ pub trait Viewer {
     /// How many rows the body has. Drives scrolling, which is shared.
     fn row_count(&self) -> usize;
 
+    /// How many rows were fetched, when that is fewer than [`Viewer::measure`]
+    /// counts — `None` when the whole value is on screen.
+    ///
+    /// `measure` states the value's real length, from `LLEN`/`ZCARD`/`XLEN`,
+    /// while the body can only render what the read actually brought back. For
+    /// the windowed types those are different numbers, and a header that gives
+    /// only the first of them turns "you are looking at the newest 500 of
+    /// these" into "this is all of it" — the same defect the scan cap has in
+    /// the keys pane, one level down. Types fetched whole return `None` and say
+    /// nothing extra.
+    fn window(&self) -> Option<usize> {
+        None
+    }
+
     /// One row of cells. Called only for visible rows: render cost is a
     /// function of viewport size, not value size.
     ///
@@ -168,6 +182,9 @@ impl Viewer for IndexedValue {
     fn row_count(&self) -> usize {
         self.items.len()
     }
+    fn window(&self) -> Option<usize> {
+        (self.items.len() < self.total).then_some(self.items.len())
+    }
     fn row(&self, i: usize, _now_ms: u64) -> Vec<String> {
         self.items
             .get(i)
@@ -193,6 +210,9 @@ impl Viewer for MemberValue {
     }
     fn row_count(&self) -> usize {
         self.members.len()
+    }
+    fn window(&self) -> Option<usize> {
+        (self.members.len() < self.total).then_some(self.members.len())
     }
     fn row(&self, i: usize, _now_ms: u64) -> Vec<String> {
         self.members
@@ -221,6 +241,9 @@ impl Viewer for ScoredValue {
     }
     fn row_count(&self) -> usize {
         self.entries.len()
+    }
+    fn window(&self) -> Option<usize> {
+        (self.entries.len() < self.total).then_some(self.entries.len())
     }
     fn row(&self, i: usize, _now_ms: u64) -> Vec<String> {
         self.entries
@@ -256,6 +279,9 @@ impl Viewer for StreamValue {
     }
     fn row_count(&self) -> usize {
         self.entries.len()
+    }
+    fn window(&self) -> Option<usize> {
+        (self.entries.len() < self.total).then_some(self.entries.len())
     }
     fn row(&self, i: usize, now_ms: u64) -> Vec<String> {
         self.entries

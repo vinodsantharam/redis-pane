@@ -121,28 +121,66 @@ pub enum Msg {
         error: String,
     },
     /// Lazily-fetched metadata arrived for some rows (R2.4).
+    ///
+    /// `gone` carries the rows whose key had vanished by the time the fetch
+    /// reached it. They are indices rather than `MetadataEntry` values with a
+    /// flag: every field of a `MetadataEntry` describes metadata, and a key that
+    /// is not there has none, so a flagged entry would have to invent a type.
     MetadataBatch {
         entries: Vec<MetadataEntry>,
+        gone: Vec<usize>,
     },
     /// A read of the open key completed, carrying what the server said.
     ///
     /// The only way a value enters the Viewer. There is no other path, which is
     /// what makes a stale value unrepresentable (ADR-0006).
     ValueLoaded {
-        index: usize,
+        /// Which read this answers. A reply from a superseded read is dropped
+        /// rather than applied — see [`crate::command::ReadToken`].
+        token: crate::command::ReadToken,
+        /// The Loaded set row this key was read from, if one was known. `None`
+        /// after a rescan took it away — the value is still the value, but
+        /// there is no row it may be written back to.
+        index: Option<usize>,
         name: String,
         value: crate::state::Value,
         ttl_seconds: i32,
         size_bytes: u32,
         at_ms: u64,
     },
-    /// The open key is gone: deleted, expired, or evicted.
+    /// The key that was read is gone: deleted, expired, or evicted.
+    ///
+    /// Carries a token for the same reason [`Msg::ValueLoaded`] does, and with
+    /// more at stake: this message tombstones the Open key *and* its row in the
+    /// keys pane, so an unidentified one badges whichever key happens to be
+    /// open now. A healthy key marked `✕ deleted` in both panes is worse than
+    /// the wrong value, because nothing afterwards corrects it — metadata is
+    /// refetched only for rows whose type is unknown, and this row's would be
+    /// known and wrong.
     ValueGone {
+        token: crate::command::ReadToken,
         at_ms: u64,
     },
     /// Something was copied. Drives a notice that fades on its own.
+    ///
+    /// The label is owned rather than `&'static str` because a copy that could
+    /// only take part of a value has to say so, and how much it took is not
+    /// known until the copy is built.
     Copied {
-        label: &'static str,
+        label: String,
+        at_ms: u64,
+    },
+    /// The core raised a notice and needs the shell's clock to date it.
+    ///
+    /// `update` is pure and has no clock (ADR-0011), so a notice it raises by
+    /// itself cannot be timestamped where it is written. Two of them were built
+    /// with `at_ms: 0` and were therefore invisible for the life of the
+    /// process: `notice_now` shows a notice for 2.5 seconds, and the shell's
+    /// clock reads epoch milliseconds. The message existed, explained itself,
+    /// and could never appear. Round-tripping through the shell is how every
+    /// other dated fact reaches the core, and it is how these do now.
+    Noticed {
+        text: String,
         at_ms: u64,
     },
     /// Conditions the server reported: replica status, and anything currently

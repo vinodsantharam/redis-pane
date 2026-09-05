@@ -14,22 +14,22 @@ use ratatui::style::Style;
 
 use crate::clock::Clock;
 use crate::keymap::{Action, key_label};
-use crate::state::{Link, Liveness, State};
+use crate::state::{Attachment, Link, Liveness, State};
 use crate::theme::{Theme, Token, env_token};
 
 /// Render the whole frame into a fresh buffer of the given size.
 pub fn frame(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect) -> Buffer {
     let mut buf = Buffer::empty(area);
-    let plan = layout::layout(area, state.single_pane_view);
+    let plan = layout::layout(area, state.focus);
     title_bar(state, theme, clock, area, &mut buf);
 
-    keys::render(state, theme, plan.keys, plan.density, &mut buf);
+    let open_row = keys::render(state, theme, plan.keys, plan.density, &mut buf);
     if let Some(value) = plan.value {
         // Standalone below 70 columns: the value fills the whole pane with no
         // adjacent keys pane to separate from, and the list it came from is
         // off screen, so its own header carries a breadcrumb back to it.
         let standalone = plan.density == layout::Density::Single;
-        value_pane(state, theme, clock, value, standalone, &mut buf);
+        value_pane(state, theme, clock, value, standalone, open_row, &mut buf);
     }
     status_bar(state, theme, clock, area, &mut buf);
 
@@ -51,29 +51,69 @@ pub fn frame(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect) -> Buf
 
 /// The value pane. Viewers land in M1.8; until then it states what is selected
 /// so the two-pane layout is real rather than a promise.
+#[allow(clippy::too_many_arguments)]
 fn value_pane(
     state: &State,
     theme: &Theme,
     clock: &dyn Clock,
     area: Rect,
     standalone: bool,
+    open_row: keys::OpenRowMark,
     buf: &mut Buffer,
 ) {
     if area.height == 0 || area.width < 6 {
         return;
     }
-    // The left rule separates keys from value in the two-pane layouts; there
-    // is nothing to separate from when this pane is the entire screen.
-    if !standalone {
+    // Is this pane showing the key the cursor is on?
+    let attachment = state.attachment();
+    let detached = !matches!(attachment, None | Some(Attachment::Attached));
+
+    // The wash. It cannot be painted underneath and then written over: `put`
+    // resets the style of every cell it touches, so the background has to ride
+    // on each style drawn in this pane. `sty` is how it does that, and it is
+    // the reason nothing here calls `theme.style` directly.
+    let wash = detached.then(|| theme.style(Token::SurfaceDetached));
+    let sty = |token: Token| match wash {
+        Some(w) => theme.style(token).patch(w),
+        None => theme.style(token),
+    };
+    if let Some(w) = wash {
+        // Fill first so the pane's empty space is washed too — below the body,
+        // and to the right of every short line.
+        let blank = " ".repeat(area.width as usize);
         for y in 0..area.height {
-            put(
-                buf,
-                area.x.saturating_sub(1),
-                area.y + y,
-                "│",
-                theme.style(Token::Border),
-            );
+            put(buf, area.x, area.y + y, &blank, w);
         }
+    }
+
+    // The left rule separates keys from value in the two-pane layouts; there
+    // is nothing to separate from when this pane is the entire screen. Dashed
+    // while detached: a state of the whole right-hand side, readable without
+    // being read, and a glyph rather than a hue so it survives monochrome.
+    if !standalone {
+        let x = area.x.saturating_sub(1);
+        let rule = if detached { "┊" } else { "│" };
+        for y in 0..area.height {
+            put(buf, x, area.y + y, rule, theme.style(Token::Border));
+        }
+        // …and tied to the Open key's row where that row is on screen, so the
+        // two panes are visibly one thing rather than two.
+        match open_row {
+            keys::OpenRowMark::At(y) => put(buf, x, y, "├", theme.style(Token::Warn)),
+            // Scrolled out of the window: point the reader the right way rather
+            // than leaving `not in view` to be searched for by hand.
+            keys::OpenRowMark::Above if detached => {
+                put(buf, x, area.y, "▲", theme.style(Token::Warn))
+            }
+            keys::OpenRowMark::Below if detached => put(
+                buf,
+                x,
+                area.y + area.height.saturating_sub(1),
+                "▼",
+                theme.style(Token::Warn),
+            ),
+            _ => 0,
+        };
     }
 
     let Some(open) = &state.open else {
@@ -84,7 +124,7 @@ fn value_pane(
         } else {
             "no key selected"
         };
-        put(buf, area.x + 1, area.y, label, theme.style(Token::Muted));
+        put(buf, area.x + 1, area.y, label, sty(Token::Muted));
         return;
     };
 
@@ -94,22 +134,52 @@ fn value_pane(
     // Standalone (below 70 columns), the list this key came from is off
     // screen entirely — DESIGN §2's "breadcrumb replaces columns". The
     // effective binding, not a hard-coded key, per R7.5.
-    if standalone {
+    let name_end = if standalone {
         let hint = state
             .keymap
             .hint(crate::keymap::Action::Cancel)
             .unwrap_or_default();
-        let x1 = put(
-            buf,
-            x0,
-            area.y,
-            &format!("{hint} back"),
-            theme.style(Token::Muted),
-        );
-        put(buf, x1, area.y, "  ·  ", theme.style(Token::Border));
-        put(buf, x1 + 5, area.y, &open.name, theme.style(Token::Text));
+        let x1 = put(buf, x0, area.y, &format!("{hint} back"), sty(Token::Muted));
+        put(buf, x1, area.y, "  ·  ", sty(Token::Border));
+        put(buf, x1 + 5, area.y, &open.name, sty(Token::Text))
     } else {
-        put(buf, x0, area.y, &open.name, theme.style(Token::Text));
+        // The key name is this pane's header, and like the keys pane's column
+        // header it carries the focus (DESIGN §4): `r` refetches here and
+        // rescans there, so which pane has focus must be readable at a glance.
+        // Standalone below 70 columns there is only one pane on screen, so it
+        // always has focus and there is nothing to distinguish.
+        let name_style = sty(if state.keys_pane_focused() {
+            Token::Muted
+        } else {
+            Token::Text
+        });
+        put(buf, x0, area.y, &open.name, name_style)
+    };
+
+    // The chip. The wash says *that* the Viewer is off the cursor; this says it
+    // in words, which is what makes the state survive monochrome and what makes
+    // it mean something the first time it is seen.
+    //
+    // Drawn in both layouts. It used to sit inside the two-pane branch, which
+    // left the one place it matters most with no signal at all: below 70
+    // columns the divider, the tie glyph and the row underline are all gone by
+    // construction — there is no second pane to carry them — so the wash was
+    // the only thing left, and the wash is nothing in monochrome. Every fixture
+    // written for this feature was 130 or 80 columns wide, so nothing caught it.
+    //
+    // Dropped before the key name is, following the title bar's rule: the name
+    // is the pane's identity and is never sacrificed to a qualifier.
+    if let Some(chips) = detached_chip(attachment) {
+        let right = area.width.saturating_sub(1);
+        for chip in chips {
+            let width = chip.chars().count() as u16;
+            // One space of daylight, so a long name and the chip can never read
+            // as one string.
+            if area.x + right.saturating_sub(width) > name_end {
+                put_right(buf, area.x, area.y, right, chip, sty(Token::Warn));
+                break;
+            }
+        }
     }
 
     let viewer = open.value.viewer();
@@ -121,14 +191,38 @@ fn value_pane(
         x0,
         area.y + 1,
         kind.label(),
-        theme.style(crate::theme::type_token(Some(kind))),
+        sty(crate::theme::type_token(Some(kind))),
     );
-    let rest = format!(
-        " · {} · {}",
-        viewer.measure(),
-        keys::format_size(open.size_bytes)
+    let x2 = put(
+        buf,
+        x1,
+        area.y + 1,
+        &format!(" · {}", viewer.measure()),
+        sty(Token::Muted),
     );
-    put(buf, x1, area.y + 1, &rest, theme.style(Token::Muted));
+    // `measure` is the value's real length; the body can only show what the
+    // read brought back. When those differ, saying so is not decoration — it is
+    // the difference between "this is all of it" and "this is the newest 500",
+    // and it carries Warn rather than Muted for the same reason the scan-cap
+    // banner does: a limit nobody notices is one they will mistake for the
+    // whole. Both figures sit together so neither can be read without the other.
+    let x3 = match viewer.window() {
+        Some(shown) => put(
+            buf,
+            x2,
+            area.y + 1,
+            &format!(" · {shown} shown"),
+            sty(Token::Warn),
+        ),
+        None => x2,
+    };
+    put(
+        buf,
+        x3,
+        area.y + 1,
+        &format!(" · {}", keys::format_size(open.size_bytes)),
+        sty(Token::Muted),
+    );
 
     // TTL is counted down locally: the most time-sensitive figure on screen
     // costs no round trip (R3.9).
@@ -138,7 +232,7 @@ fn value_pane(
         x0,
         area.y + 2,
         &format!("ttl {ttl}"),
-        theme.style(Token::Muted),
+        sty(Token::Muted),
     );
 
     let currency = open.currency(state.liveness() == Liveness::Live, now);
@@ -160,7 +254,7 @@ fn value_pane(
         area.y + 2,
         area.width.saturating_sub(1),
         &currency,
-        theme.style(token),
+        sty(token),
     );
     // A held update needs a way to ask for it, and the hint must name the
     // effective binding (R7.5).
@@ -173,7 +267,7 @@ fn value_pane(
             area.y + 3,
             area.width.saturating_sub(1),
             &format!("{hint} to load"),
-            theme.style(Token::Muted),
+            sty(Token::Muted),
         );
     }
 
@@ -194,13 +288,7 @@ fn value_pane(
 
     if !cols.is_empty() {
         for (i, heading) in cols.iter().enumerate() {
-            put(
-                buf,
-                x0 + i as u16 * col_w,
-                y,
-                heading,
-                theme.style(Token::Muted),
-            );
+            put(buf, x0 + i as u16 * col_w, y, heading, sty(Token::Muted));
         }
         y += 1;
     }
@@ -219,13 +307,33 @@ fn value_pane(
                 x0 + c as u16 * col_w,
                 y + r as u16,
                 &clip(&cell, width.saturating_sub(1) as usize),
-                theme.style(if c == 0 && cols.len() > 1 {
+                sty(if c == 0 && cols.len() > 1 {
                     Token::Muted
                 } else {
                     Token::Text
                 }),
             );
         }
+    }
+}
+
+/// What the Viewer says when it is holding a key the cursor is not on, widest
+/// phrasing first.
+///
+/// Deliberately about *identity*, never about freshness: the value on screen is
+/// a live tracked read either way (ADR-0006), and CONTEXT.md bans "stale" as a
+/// word for exactly the confusion it would cause here. The Selected key is the
+/// glossary's term, so it is the term on screen.
+///
+/// Position is not stated here — the divider carries that, with `├` on the
+/// Open key's row or `▲`/`▼` when it has scrolled out of the window. This says
+/// what, the divider says where.
+fn detached_chip(attachment: Option<Attachment>) -> Option<&'static [&'static str]> {
+    match attachment? {
+        Attachment::Attached => None,
+        Attachment::Detached { .. } => Some(&["⊘ not the selected key", "⊘ not selected", "⊘"]),
+        // No row to point at, so this one has to say why on its own.
+        Attachment::DetachedOffList => Some(&["⊘ not in the list", "⊘ not listed", "⊘"]),
     }
 }
 
@@ -462,23 +570,30 @@ pub fn status_readout(state: &State, clock: &dyn Clock) -> Vec<(String, Token)> 
         },
     ));
 
-    // Anything short of live owes the reader a fact and a way to act. While
-    // reconnecting, the useful fact is when the next attempt happens: ADR-0009
-    // requires the backoff be visible, because a silent wait is a freeze
-    // wearing a different name.
+    // Anything short of live owes the reader a fact. While a retry is actually
+    // scheduled the useful one is when it lands: ADR-0009 requires the backoff
+    // be visible, because a silent wait is a freeze wearing a different name.
+    // With nothing scheduled the useful one is the Read age — the same fact
+    // every other not-live state shows, and the one ADR-0009 names for a
+    // dropped link. A countdown here would describe a schedule that does not
+    // exist, which is the opposite of what that requirement is for.
     match &state.link {
-        Link::Reconnecting { retry_in_ms, .. } => {
-            out.push((
-                format!(" · retry {}s", retry_in_ms.div_ceil(1000)),
-                Token::Muted,
-            ));
+        Link::Reconnecting {
+            retry_in_ms: Some(ms),
+            ..
+        } => {
+            out.push((format!(" · retry {}s", ms.div_ceil(1000)), Token::Muted));
         }
         _ if liveness != Liveness::Live => {
             out.push((format!(" · {}", read_age(state, clock)), Token::Muted));
         }
         _ => {}
     }
-    if liveness != Liveness::Live
+    // Offer `r` only where it can do something. Disconnected, a Refetch reads a
+    // dead client and returns an error — the same reason a replica reads
+    // `locked` rather than advertising `⌃R`: a key that cannot work is worse
+    // than no key, because the reader spends the incident pressing it.
+    if liveness == Liveness::Manual
         && let Some(hint) = state.keymap.hint(Action::Refetch)
     {
         out.push((format!("  {hint}"), Token::Muted));
@@ -498,7 +613,13 @@ pub fn hint_bar(state: &State) -> String {
     ]
     .into_iter()
     .filter_map(|a| state.keymap.key_for(a).map(|k| (a, k)))
-    .map(|(a, k)| format!("{} {}", key_label(&k), a.label()))
+    .map(|(a, k)| {
+        format!(
+            "{} {}",
+            key_label(&k),
+            a.label_in(state.keys_pane_focused())
+        )
+    })
     .collect::<Vec<_>>()
     .join("   ")
 }

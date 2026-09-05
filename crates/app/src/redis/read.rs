@@ -36,6 +36,70 @@ pub enum Arming {
     Unsupported,
 }
 
+/// Serialises reads on one connection, and supersedes the ones nobody wants.
+///
+/// `CLIENT CACHING YES` arms **the next read-only command on the connection**,
+/// not a command it is bundled with. Two reads running at once can therefore
+/// interleave — A arms, B arms, A reads, B reads — and leave the server
+/// tracking a key the Viewer is not showing. The header would go on saying
+/// `● live` over a value nothing will ever push an update for, which is the
+/// failure ADR-0006 exists to make unreachable, reached by a different route.
+///
+/// So the arm-and-read pair is indivisible: [`ReadGate::begin`] cancels the
+/// previous read and hands out a permit, and the holder runs to completion.
+/// Cancelling matters as much as serialising — dropping a *reply* does not
+/// un-send the `CLIENT CACHING` that went with it, and only a read that never
+/// runs arms nothing.
+#[derive(Debug, Default)]
+pub struct ReadGate {
+    lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    current: Option<tokio_util::sync::CancellationToken>,
+}
+
+/// The right to perform one read, once it is this read's turn.
+pub struct ReadPermit {
+    lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl ReadGate {
+    /// Supersede whatever is in flight and take a permit for a new read.
+    pub fn begin(&mut self) -> ReadPermit {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        if let Some(previous) = self.current.replace(cancel.clone()) {
+            previous.cancel();
+        }
+        ReadPermit {
+            lock: self.lock.clone(),
+            cancel,
+        }
+    }
+}
+
+impl ReadPermit {
+    /// Wait for the connection, then run `read`. Returns `None` if this read was
+    /// superseded before it reached the wire.
+    ///
+    /// Two chances to drop out before touching the connection: while queueing,
+    /// and on acquiring it. Past that point the read completes — interrupting it
+    /// mid-way is what would leave the connection armed for a key nobody is
+    /// looking at.
+    pub async fn run<F, T>(self, read: F) -> Option<T>
+    where
+        F: std::future::Future<Output = T>,
+    {
+        let _guard = tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => return None,
+            guard = self.lock.lock() => guard,
+        };
+        if self.cancel.is_cancelled() {
+            return None;
+        }
+        Some(read.await)
+    }
+}
+
 /// What a completed read produced.
 pub struct ReadValue {
     pub value: Value,

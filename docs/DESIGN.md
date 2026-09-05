@@ -89,7 +89,7 @@ terminal is small and the situation is urgent.
 | `?` | Help overlay | global |
 | `Ctrl-K` | Command palette | global |
 | `:` | Redis console | global |
-| `Tab` / `S-Tab` | Cycle pane focus | global |
+| `Tab` | Move focus between the panes | global |
 | `g` + key | Jump to view | global |
 | `Ctrl-C` ×2 | Quit (single press = cancel current op) | global |
 | `/` | Filter / search in pane | pane |
@@ -106,13 +106,23 @@ terminal is small and the situation is urgent.
 Every one of these is also listed in the palette with its binding shown, so the keymap teaches
 itself. Bindings are user-overridable in config; the hint bar renders the *effective* binding.
 
+**Focus is one concept at every width.** Below 70 columns it decides which pane is *drawn*
+(§2's stack navigation); at or above it, both panes are drawn and focus decides only which one a
+pane-scoped key acts on. Opening a key moves focus to it, `Esc` moves it back, and `Tab` moves it
+without closing the key. Because `r` rescans in one pane and Refetches in the other, focus is
+information rather than decoration: the focused pane's header is drawn in full-strength text and
+the unfocused one muted (dim, not merely grey, so the distinction survives monochrome), and the
+hint bar names the half in force — `r rescan` or `r refetch`. A pane-scoped key whose target the
+reader cannot see is a key that does the wrong thing silently, which is exactly what happened
+when focus was inferred from "is a key open" instead of tracked.
+
 ## 5. Visual language
 
 **Color roles** (semantic tokens, not literal colors — themes remap them):
 
 | Token | Use |
 |---|---|
-| `surface` / `surface-alt` | Pane background, zebra striping |
+| `surface` / `surface-alt` | Pane background; `surface-alt` washes the Viewer while it holds a key that is not the Selected key (§6.4) |
 | `border` / `border-focus` | Pane edges; focused pane gets `border-focus` + bold title |
 | `text` / `text-muted` | Primary content vs. metadata (TTL, sizes, counts) |
 | `accent` | Selection, cursor row, active tab |
@@ -211,14 +221,25 @@ against: the failure users learn to distrust is not a wrong value, it is being u
 │                                                          │
 │ live and current                                  ● live │
 │ an update just landed               ● live · updated now │
+│ a read found no change                ● live · unchanged │
 │ changed, you are scrolled    ● live · changed 2s ago   r │
 │ mid-edit, held back              ● live · changed · held │
 │ key deleted on the server               ✕ deleted 3s ago │
 │ tracking unavailable         ○ manual · read 14s ago   r │
+│ refetch found a change            ○ manual · updated now │
 │ refetch found no change             ○ manual · unchanged │
 │                                                          │
 └──────────────────────────────────────────────────────────┘
 ```
+
+The four `updated now` / `unchanged` rows are one rule, not four cases: **the header states what
+the last read found, and then stops.** They fade after a couple of seconds, because they are an
+account of an event rather than a description of the key — after that the resting phrase takes
+over. The two `● live` variants were not in the original inventory and are here because the
+question they answer does not depend on liveness: `r` pressed by hand on a live key deserves the
+same answer as `r` pressed on a manual one. Without them a Refetch that found nothing rendered a
+frame identical in every cell to one where the reply was dropped as superseded, or failed, or was
+never sent — which is the ADR-0006 ambiguity reproduced by the screen built to remove it.
 
 TTL is a special case worth stating: it counts down locally from the value read at fetch time,
 so the most time-sensitive figure on screen is live at no network cost.
@@ -231,6 +252,41 @@ Where the server cannot support tracking — Redis before 6, or no RESP3 — the
 `○ manual`, Read age replaces it, and `r` does the work. This is the same rule as the Source
 readout in the title bar: the app may choose for you, but it never lets you assume wrongly.
 Silent degradation here would recreate the exact frustration this screen exists to remove.
+
+**Whose value is this?** The Viewer holds the **Open key**, and the cursor sits on the
+**Selected key**; they are frequently not the same, because opening is explicit and arrowing the
+list deliberately does not fire a read and a `CLIENT TRACKING` re-arm per keystroke. Nothing
+about that is a freshness problem — the value is live and tracked either way — but left unsaid it
+reads as the value pane showing the wrong key, which is the complaint this whole section exists
+to answer, one level up.
+
+So the state is stated on both sides of the divider, and the division of labour is: **the Viewer
+says what, the divider says where.**
+
+```
+│ KEY                    TYPE   TTL ┊ user:8812:session   ⊘ not the selected key │
+│ ██user:8812:cart███████zset███12m ┊ hash · 5 fields · 2.1 KB                   │
+│ ● user:8812:profile    json    ∞  ┊ ttl 42m                            ● live  │
+│ ● user:8812:session    hash   42m ├   ← the Open key's row, underlined         │
+│ ● user:8813:session    hash   56m ┊ FIELD        VALUE                         │
+```
+
+- The Viewer is **washed** (`surface-alt`), the divider goes **dashed**, and the header carries
+  `⊘ not the selected key` — or `⊘ not in the list` when the Open key has no row at all, because
+  it is filtered out, folded inside a collapsed group, or waiting to be re-resolved after a
+  rescan. The chip is dropped before the key name is: the name is the pane's identity.
+- The keys pane **underlines** the Open key's name, and the divider cell on that row becomes `├`.
+  Underline is ranked deliberately below the cursor's full-bar highlight — two marks in one list
+  only work if one is obviously the junior — and it is the one modifier still free in monochrome
+  once the selection has taken reverse video. When the Open key has scrolled out of the window the
+  divider carries `▲`/`▼` at its edge instead.
+- **When the two agree, none of this is on screen** and the tie glyph is the only trace. That
+  coincidence is the point rather than redundancy: it teaches the relationship in the ordinary
+  case, so the moment the panes separate reads as a change and not as a puzzle.
+
+The wash is hue and nothing else, so monochrome loses it entirely — the dashed divider, the chip
+and the underline are what carry the state there. That is why the wash is never the only signal,
+and it is the same rule as everywhere else: losing colour must lose emphasis, never information.
 
 ### 6.5 Editing and confirmation
 Editing opens an inline editor in the value pane, not a modal. Committing shows a **command
@@ -317,14 +373,28 @@ the reader's time.
 
 ## 9. Open design questions
 
-- Should the keys pane get liveness too, or does the open key remain the only tracked thing?
-  Tracking the visible rows would show deletions as they happen, at the cost of tracking-table
-  churn on every scroll.
 - Does the dashboard belong in v1 at all, or is the slowlog plus a memory figure in the status
   bar the whole of what triage actually needs? This is now the largest remaining scope risk.
 - With two panes, is the split fixed at a ratio, or does it default to whichever pane has focus?
 - Does the keys pane need a permanent column header row, or can the columns be implied by the
   data and explained once in help?
+
+**Resolved since v0.5** — the keys pane does not get liveness, and the open key remains the only
+tracked thing. Deliberate, not deferred: RedisInsight declines to auto-refresh its key list for
+the same reason, and re-walking a million keys on a timer is what `SCAN`-not-`KEYS` exists to
+avoid. Viewport-scoped `CLIENT TRACKING` — arming only the ~30 visible rows — is the middle
+ground ADR-0006 never considered, and it is rejected here on tracking-table churn during scroll;
+revisiting it needs its own ADR. What the pane gets instead is the half that was already on the
+wire and being discarded: `fetch_metadata` issues `TYPE` for every visible row and sees `"none"`
+for a key that has been deleted, expired or evicted, so those rows are now badged `✕ … gone` at
+no extra round trip. A gone row **keeps its position** — removing it would renumber everything
+below the reader's cursor between one frame and the next — and keeps its last-known size, which
+is usually the only answer left about a key during an incident; its TTL becomes `—`, because a
+countdown is a claim about a key that is no longer there to expire. Anything beyond deletion
+needs the keyspace walked again, which is what `r` in the keys pane now does (R2.7 — documented
+from the start, and unimplemented until now). The value header states its own window the same
+way: `12,000 items · 500 shown`, since `LLEN`/`ZCARD`/`XLEN` and the 500-row read window are
+different numbers and printing only the first turns a slice into the whole.
 
 **Resolved since v0.4** — the scan cap gets a persistent banner row above the key list, not just
 a status-bar line: a copy confirmation or a sort readout could otherwise displace the one signal

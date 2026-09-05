@@ -1,7 +1,8 @@
 healthy and live                            ● live
 tracking refused, degraded to manual        ○ manual · read 14s ago  r
 connected but not yet armed                 ○ manual · read 14s ago  r
-connection lost                             ✕ disconnected · retry 4s  r
+connection lost                             ✕ disconnected · read 14s ago
+connection lost, a retry scheduled          ✕ disconnected · retry 4s
 read-only by Environment                    READ-ONLY environment ⌃R  ● live
 read-only because the target is a replica   READ-ONLY replica locked  ● live
 read-only by choice                         READ-ONLY user ⌃R  ● live

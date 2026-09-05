@@ -30,6 +30,14 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
         Msg::Resized { cols, rows } => {
             state.cols = cols;
             state.rows = rows;
+            // A filter being typed must stay where it can be seen. Narrowing
+            // the terminal past two panes with the Viewer focused would
+            // otherwise leave the capture running inside a pane that is no
+            // longer drawn — the same invisible keystroke sink `/` used to open
+            // directly, arrived at by dragging a window edge instead.
+            if state.filtering && !state.keys_pane_visible() {
+                state.focus = Pane::Keys;
+            }
             (state, Vec::new())
         }
         Msg::ReadCompleted { at_ms } => {
@@ -353,6 +361,17 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
     let Some(action) = state.keymap.action_for(&key) else {
         return (state, Vec::new());
     };
+    // An action whose pane is off screen does nothing. Below 70 columns only
+    // one pane is drawn, so without this `↓` moves a cursor nobody can see and
+    // `/` starts capturing into a filter line of zero width — every keypress
+    // after it vanishing, `q` typing a `q`, the app indistinguishable from
+    // hung. Stack navigation says the other pane is simply not there right now
+    // (DESIGN §2), and the honest reading of "not there" is "does nothing",
+    // not "does something invisible". `Esc` is the way back and it is in the
+    // hint bar. Above 70 columns both panes are drawn and nothing changes.
+    if !action.pane_is_on_screen(&state) {
+        return (state, Vec::new());
+    }
     match action {
         Action::Quit => quit(state),
         Action::Help => {
@@ -1439,6 +1458,9 @@ mod metadata_tests {
 
     fn browsing(n: usize) -> State {
         let mut state = State {
+            // Wide enough for two panes, so both are on screen and a
+            // pane-scoped key is not silently gated out from under the test.
+            cols: 130,
             rows: 30,
             ..State::default()
         };
@@ -1706,6 +1728,113 @@ mod metadata_tests {
             state.attachment(),
             Some(Attachment::DetachedOffList),
             "filtered away, so there is no row to point at"
+        );
+    }
+
+    // ── An action must not act on a pane that is not on screen ─────────────
+    //
+    // Below 70 columns one pane is drawn at a time (DESIGN §2). Aiming a
+    // pane-scoped key at the other one produced no visible change whatsoever,
+    // which is the single worst thing a TUI can look like: indistinguishable
+    // from having stopped responding.
+
+    fn narrow_viewing() -> State {
+        let mut state = browsing(10);
+        state.cols = 60;
+        let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        assert_eq!(state.focus, Pane::Value, "→ pushes onto the value");
+        assert!(
+            !state.keys_pane_visible(),
+            "and the list is off screen there"
+        );
+        state
+    }
+
+    /// The sharpest case. `/` began capturing into a filter line rendered
+    /// inside a pane of zero width: every keypress after it disappeared, `q`
+    /// typed a `q` instead of quitting, and only `Esc` escaped.
+    #[test]
+    fn slash_cannot_open_an_invisible_keystroke_sink() {
+        let state = narrow_viewing();
+        let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('/'))));
+        assert!(
+            !state.filtering,
+            "no capture may start while the pane that would show it is not drawn"
+        );
+
+        // And `q` still means quit, which is the part that mattered.
+        let (_, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('q'))));
+        assert_eq!(cmds, vec![Command::Quit]);
+    }
+
+    /// The cursor moved an arbitrary distance with nothing on screen changing,
+    /// and `Esc` then returned to a list that had silently wandered.
+    #[test]
+    fn the_key_list_does_not_move_while_it_is_off_screen() {
+        let state = narrow_viewing();
+        let before = state.view.selected;
+        let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Down)));
+        let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::End)));
+        assert_eq!(state.view.selected, before, "the cursor stayed put");
+    }
+
+    /// The same defect mirrored: on the list screen the value is not drawn, so
+    /// its scroll keys were moving an offset nobody could see.
+    #[test]
+    fn the_value_does_not_scroll_while_it_is_off_screen() {
+        let mut state = browsing(10);
+        state.cols = 60;
+        state.open = Some(OpenKey::new(
+            Some(0),
+            "k".into(),
+            crate::state::value::Value::Str(crate::state::value::StringValue::new("v", 40)),
+            -1,
+            10,
+            0,
+        ));
+        assert!(
+            !state.value_pane_visible(),
+            "the list is what is drawn here"
+        );
+        let (state, _) = update(state, Msg::Key(KeyPress::ctrl(KeyCode::Down)));
+        assert_eq!(state.open.as_ref().unwrap().offset, 0);
+    }
+
+    /// Both panes are drawn above 70 columns, so the two-pane keymap is
+    /// untouched: plain arrows drive the list from either pane and `⌃`-arrows
+    /// drive the value, exactly as DESIGN §4 specifies.
+    #[test]
+    fn nothing_is_gated_while_both_panes_are_on_screen() {
+        let state = browsing(10);
+        let (mut state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        assert_eq!(state.focus, Pane::Value);
+        assert!(state.keys_pane_visible() && state.value_pane_visible());
+
+        let before = state.view.selected;
+        (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Down)));
+        assert_ne!(
+            state.view.selected, before,
+            "the list still moves from the Viewer at two-pane widths"
+        );
+        let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('/'))));
+        assert!(state.filtering, "and `/` still filters");
+    }
+
+    /// Reached by dragging a window edge rather than by pressing a key: a
+    /// filter being typed at two-pane width, then narrowed past the breakpoint
+    /// with the Viewer focused, would leave the capture running off screen.
+    #[test]
+    fn narrowing_the_terminal_keeps_an_open_filter_where_it_can_be_seen() {
+        let state = browsing(10);
+        let (mut state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('/'))));
+        assert!(state.filtering);
+
+        let (state, _) = update(state, Msg::Resized { cols: 60, rows: 30 });
+        assert!(state.filtering, "the filter is still being typed");
+        assert!(
+            state.keys_pane_visible(),
+            "so the pane showing it must be the one on screen"
         );
     }
 
@@ -1999,6 +2128,11 @@ mod viewer_scroll_tests {
             total: n,
         });
         State {
+            // A real width: at `State::default()`'s zero columns the layout is
+            // single-pane and the Viewer is not on screen, so its own scroll
+            // keys would correctly do nothing.
+            cols: 130,
+            rows: 40,
             open: Some(OpenKey::new(Some(0), "k".into(), value, -1, 10, 0)),
             ..State::default()
         }

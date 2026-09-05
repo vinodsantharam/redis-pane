@@ -60,6 +60,42 @@ pub enum Action {
 }
 
 impl Action {
+    /// Whether the pane this action operates on is currently drawn.
+    ///
+    /// Actions divide cleanly: some move or reshape the key list, some scroll
+    /// the value, and the rest belong to the app rather than to either pane.
+    /// Only the first two can be aimed at something the reader cannot see —
+    /// and only below 70 columns, where one pane is on screen at a time.
+    pub fn pane_is_on_screen(&self, state: &crate::State) -> bool {
+        use crate::render::layout::Pane;
+        match self {
+            // The key list: moving in it, reshaping it, or opening from it.
+            Action::MoveUp
+            | Action::MoveDown
+            | Action::PageUp
+            | Action::PageDown
+            | Action::Top
+            | Action::Bottom
+            | Action::Filter
+            | Action::Sort
+            | Action::ToggleTree
+            | Action::ToggleGroup
+            | Action::Open => state.pane_visible(Pane::Keys),
+            // The value body.
+            Action::ViewerUp
+            | Action::ViewerDown
+            | Action::ViewerPageUp
+            | Action::ViewerPageDown
+            | Action::ViewerTop
+            | Action::ViewerBottom => state.pane_visible(Pane::Value),
+            // Everything else is the app's, not a pane's: quitting, help, Esc,
+            // `Tab` (which is what *changes* which pane is on screen), `r`
+            // (already pane-scoped by R2.7 on its own terms), copying, and the
+            // read-only toggle.
+            _ => true,
+        }
+    }
+
     /// The label used in the help overlay, where every binding is listed at
     /// once and no pane is focused. See [`Action::label_in`] for the hint bar,
     /// which describes what the key will do right now.

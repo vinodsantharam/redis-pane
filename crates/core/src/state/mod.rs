@@ -300,6 +300,33 @@ impl State {
         self.focus == crate::render::layout::Pane::Keys
     }
 
+    /// Whether a pane is actually on screen.
+    ///
+    /// Below 70 columns only one pane is drawn and focus chooses which
+    /// (DESIGN §2, stack navigation), so an action scoped to the other one has
+    /// no visible effect at all — arrow keys moving a cursor nobody can see,
+    /// or `/` opening a filter line inside a pane of zero width while every
+    /// subsequent keypress disappears into it. An action whose result is off
+    /// screen is indistinguishable from an application that has stopped
+    /// responding, which is the worst thing a TUI can look like.
+    ///
+    /// At any wider density both panes are drawn and this is always true, so
+    /// the two-pane keymap is unchanged: plain arrows drive the list and
+    /// `⌃`-arrows drive the value, in both panes, as DESIGN §4 specifies.
+    pub fn pane_visible(&self, pane: crate::render::layout::Pane) -> bool {
+        self.cols >= crate::render::layout::TWO_PANE_MIN_COLS || self.focus == pane
+    }
+
+    /// Whether the keys pane can be seen right now.
+    pub fn keys_pane_visible(&self) -> bool {
+        self.pane_visible(crate::render::layout::Pane::Keys)
+    }
+
+    /// Whether the Viewer can be seen right now.
+    pub fn value_pane_visible(&self) -> bool {
+        self.pane_visible(crate::render::layout::Pane::Value)
+    }
+
     /// What the header may claim about currency.
     ///
     /// There is deliberately no setter for this. Liveness is *derived* from the

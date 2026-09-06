@@ -104,7 +104,9 @@ config file; a **Connection** is a live session, which may be **ad-hoc** (no Pro
 - **R1.9** Ad-hoc Connections infer their Environment: loopback, `::1`, or a unix socket →
   `local`; anything else → `unknown`, which starts in Read-only Mode and is lifted with one
   keypress. See [ADR-0004](adr/0004-untagged-connections-are-read-only.md).
-- **R1.10** TLS, ACL usernames, and per-Profile default database.
+- **R1.10** TLS, ACL usernames, and per-Profile default database — also reachable directly as
+  `--tls`/`--user`/`--password` flags, which always take precedence over a Profile's or the
+  environment's credentials (ADR-0001).
 - **R1.11** Sentinel topology discovery, with failover surfacing as a reconnect to the new
   address. Cluster is **not** in v1 — see [ADR-0008](adr/0008-sentinel-in-v1-cluster-deferred.md)
   and §5.

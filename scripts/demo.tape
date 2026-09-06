@@ -18,6 +18,12 @@
 #
 # Afterwards: ./scripts/redis-up.sh down
 #
+# The recording targets --url redis://localhost:6379 explicitly (not plain
+# `redis-pane`) because connection resolution is flags -> default Profile ->
+# environment -> 127.0.0.1:6379 (CLAUDE.md) — if you have a default Profile
+# configured in ~/.config/redis-pane/config.json, a bare `redis-pane` will
+# try that instead of the disposable Redis this tape just seeded.
+#
 # Keybindings below match ALPHA.md's "What to try" section as of this
 # writing. Keybindings are data (CLAUDE.md) and user-overridable, so if a
 # step doesn't do what its comment says, check `?` in a live session and
@@ -47,7 +53,7 @@ Type "clear"
 Enter
 Show
 
-Type "redis-pane"
+Type "redis-pane --url redis://localhost:6379"
 Enter
 Sleep 2s
 
@@ -56,12 +62,14 @@ Sleep 2s
 Type "t"
 Sleep 1200ms
 
-# Filter down to the one key this demo cares about.
+# Filter down to the one key this demo cares about. Esc clears the filter
+# (ALPHA.md), so open the match with the filter still active — do not Esc
+# first.
 Type "/"
 Sleep 300ms
 Type "demo"
 Sleep 1500ms
-Escape
+Enter
 Sleep 500ms
 
 # Open it and let the liveness path play out on screen.

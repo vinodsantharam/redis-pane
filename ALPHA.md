@@ -12,15 +12,28 @@ byte of it.
 
 ## Install
 
-You'll need Rust. If you don't have it:
+Download the binary for your OS from the [Releases page](https://github.com/vinodsantharam/redis-pane/releases) — macOS (Intel or Apple Silicon), Linux (x86_64), and Windows are all built there. Or, on macOS/Linux, run the installer script from a release page:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/vinodsantharam/redis-pane/releases/latest/download/redis-pane-installer.sh | sh
 ```
 
-Then, once you have access to this repo:
+On Windows, from PowerShell:
+
+```powershell
+irm https://github.com/vinodsantharam/redis-pane/releases/latest/download/redis-pane-installer.ps1 | iex
+```
+
+These builds are **unsigned** — expected for an alpha. On first run:
+
+- **macOS** will refuse to open it as "from an unidentified developer." Either right-click the
+  binary → Open → confirm, or run `xattr -d com.apple.quarantine ./redis-pane` once.
+- **Windows** SmartScreen may show "Windows protected your PC." Click "More info" → "Run anyway."
+
+If your platform isn't covered by the release binaries, or you'd rather build from source:
 
 ```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # if you don't have Rust
 git clone https://github.com/vinodsantharam/redis-pane.git
 cd redis-pane
 cargo build --release

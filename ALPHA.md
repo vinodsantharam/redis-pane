@@ -12,16 +12,21 @@ byte of it.
 
 ## Install
 
-Download the binary for your OS from the [Releases page](https://github.com/vinodsantharam/redis-pane/releases) — macOS (Intel or Apple Silicon), Linux (x86_64), and Windows are all built there. Or, on macOS/Linux, run the installer script from a release page:
+This repo is private, so the download needs to be authenticated as you — a plain `curl` to the
+Releases page won't work anonymously.
+
+**Easiest: download by hand.** Open the [Releases page](https://github.com/vinodsantharam/redis-pane/releases)
+in your browser (your GitHub login covers the auth) and grab the archive for your OS — macOS
+(Intel or Apple Silicon), Linux (x86_64), and Windows are all built there. Unpack it and run the
+`redis-pane` binary inside.
+
+**If you have the [`gh` CLI](https://cli.github.com/) installed and logged in** (`gh auth
+status`), this pulls the right archive for your platform without a browser:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/vinodsantharam/redis-pane/releases/latest/download/redis-pane-installer.sh | sh
-```
-
-On Windows, from PowerShell:
-
-```powershell
-irm https://github.com/vinodsantharam/redis-pane/releases/latest/download/redis-pane-installer.ps1 | iex
+gh release download --repo vinodsantharam/redis-pane --pattern '*<your-target>*'
+# e.g. --pattern '*aarch64-apple-darwin*' (Apple Silicon), '*x86_64-apple-darwin*' (Intel Mac),
+#      '*x86_64-unknown-linux-gnu*' (Linux), '*x86_64-pc-windows-msvc*' (Windows)
 ```
 
 These builds are **unsigned** — expected for an alpha. On first run:

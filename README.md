@@ -8,6 +8,12 @@ keys and unusable where engineers most often need it — inside an SSH session o
 `redis-pane` is the third option: a single static binary, keyboard-driven, that renders
 structured data as structured data and makes dangerous operations feel dangerous.
 
+![Browsing a keyspace in redis-pane: filtering to a key, then watching it update on screen the moment another client changes it, with no keypress or refresh](demo.gif)
+
+*The current alpha build (read-only, M0/M1) — filter to a key, open it, and watch it update live
+via `CLIENT TRACKING`, no refresh. Recorded with [VHS](https://github.com/charmbracelet/vhs);
+see [scripts/demo.tape](scripts/demo.tape) to reproduce.*
+
 ## Status
 
 **Requires Redis 6.0+ (or Valkey).** RESP3 only, TLS supported. Works against managed Redis —

@@ -63,6 +63,24 @@ impl ReadOutcome {
     }
 }
 
+/// A read that has been issued but has not answered yet (PLAN, loading
+/// indicator).
+///
+/// Exists so the frame can say *something* is happening between a key being
+/// opened (or a Refetch being issued) and the reply landing — today's only
+/// alternative is silence, indistinguishable from the app having decided to
+/// do nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRead {
+    /// The key this read is about — compared against the Open key's name at
+    /// render time to tell a first Open (no name match, or nothing open yet)
+    /// from a Refetch (name matches the Open key).
+    pub name: String,
+    pub token: crate::command::ReadToken,
+    /// Mirrors `Command::OpenKey`'s index, for header context on a first Open.
+    pub index: Option<usize>,
+}
+
 /// A value that arrived while the reader was not at rest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pending {

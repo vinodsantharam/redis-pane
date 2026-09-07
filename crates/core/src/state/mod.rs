@@ -15,7 +15,7 @@ pub mod view;
 
 pub use copy::CopyWhat;
 pub use loaded::{KeyKind, LoadedSet};
-pub use open::{Attachment, OpenKey, ReadOutcome};
+pub use open::{Attachment, OpenKey, PendingRead, ReadOutcome};
 pub use scan::ScanState;
 pub use tree::Tree;
 pub use value::{Value, Viewer};
@@ -289,6 +289,16 @@ pub struct State {
     /// core is the only thing that mints one — a shell that could invent a
     /// token could resurrect a superseded read.
     pub read_token: crate::command::ReadToken,
+    /// The read named by `read_token`, while it has not answered yet.
+    ///
+    /// Cleared the moment a reply carrying that token lands — accepted
+    /// (`Msg::ValueLoaded`/`Msg::ValueGone`) or not (`Msg::Failed`,
+    /// `Msg::ConnectionLost`). A stale reply for an older token leaves it
+    /// alone, since a newer read is still outstanding. Whether this describes
+    /// opening a new key or refetching the one already open is derived at
+    /// render time by comparing [`PendingRead::name`] against
+    /// [`OpenKey::name`], the same comparison `Msg::ValueLoaded` already makes.
+    pub open_pending: Option<PendingRead>,
     /// Set between `y` and the key that says what to copy.
     pub copy_pending: bool,
     /// A transient confirmation and when it was raised. It fades on its own

@@ -7,7 +7,7 @@ use crate::msg::KeyPress;
 use crate::msg::MouseAction;
 use crate::render::layout::{self, Pane};
 use crate::state::copy::{CopyWhat, redis_cli_command, value_text};
-use crate::state::{Link, OpenKey, ReadOnlyReason, ScanState, Tracking};
+use crate::state::{Link, OpenKey, PendingRead, ReadOnlyReason, ScanState, Tracking};
 use crate::{Command, Msg, State};
 
 /// Takes a message, returns new state plus commands for a shell to execute.
@@ -23,6 +23,23 @@ use crate::{Command, Msg, State};
 fn issue_read(state: &mut State) -> ReadToken {
     state.read_token = ReadToken(state.read_token.0.wrapping_add(1));
     state.read_token
+}
+
+/// Issue a Refetch of the Open key: mints its token and records it as the
+/// pending read, so the frame can say a read is in flight (loading
+/// indicator) until the reply lands. Every `Command::RefetchOpenKey` site has
+/// an Open key by construction — refetching nothing is a no-op handled
+/// before this is ever called.
+fn issue_refetch(state: &mut State) -> ReadToken {
+    let token = issue_read(state);
+    if let Some(open) = &state.open {
+        state.open_pending = Some(PendingRead {
+            name: open.name.clone(),
+            token,
+            index: open.index,
+        });
+    }
+    token
 }
 
 /// The epoch-seconds reading [`crate::state::loaded::LoadedSet::set_ttl`]
@@ -71,7 +88,7 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             };
             let commands = if tracking_supported {
                 vec![Command::RefetchOpenKey {
-                    token: issue_read(&mut state),
+                    token: issue_refetch(&mut state),
                 }]
             } else {
                 Vec::new()
@@ -83,6 +100,11 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             // may never schedule one. The header shows the Read age instead,
             // which is the fact ADR-0009 actually asks for in this state and
             // the only one that is true.
+            //
+            // Whatever read was in flight will never answer over this link,
+            // so its loading indicator is cleared here rather than left to
+            // read `⟳ fetching…` until the process exits.
+            state.open_pending = None;
             state.link = Link::Reconnecting {
                 attempt: 1,
                 retry_in_ms: None,
@@ -120,7 +142,7 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             {
                 *tracking = Tracking::Consumed;
             }
-            let token = issue_read(&mut state);
+            let token = issue_refetch(&mut state);
             (state, vec![Command::RefetchOpenKey { token }])
         }
         Msg::ScanStarted { estimated_total } => {
@@ -185,7 +207,7 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
                 .as_ref()
                 .is_some_and(|open| open.deleted_at_ms.is_some());
             if (row_says_alive && viewer_says_gone) || (row_says_gone && !viewer_says_gone) {
-                let token = issue_read(&mut state);
+                let token = issue_refetch(&mut state);
                 return (state, vec![Command::RefetchOpenKey { token }]);
             }
             (state, Vec::new())
@@ -229,6 +251,9 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             if token != state.read_token {
                 return (state, Vec::new());
             }
+            // The question this reply answers is the one currently in
+            // flight, so it is no longer in flight.
+            state.open_pending = None;
             // A value came back, so the key is there. Says so on the row too —
             // the same two-pane agreement `ValueGone` keeps in the other
             // direction, and what un-badges a key that was deleted and then
@@ -277,6 +302,7 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             if token != state.read_token {
                 return (state, Vec::new());
             }
+            state.open_pending = None;
             // The row this reply is actually about — never `open.index`. A
             // token-only version of this message shipped once and used
             // `open.index` here, which meant a gone reply for a *different*
@@ -353,6 +379,11 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             detail,
             at_ms,
         } => {
+            // A failed read is still a read that answered — its loading
+            // indicator would otherwise read `⟳ fetching…` forever, which is
+            // exactly the "operation vanishes, nothing on screen explains it"
+            // defect the error toast below exists to prevent.
+            state.open_pending = None;
             state.error = Some((format!("{command}: {detail}"), at_ms));
             (state, Vec::new())
         }
@@ -498,7 +529,7 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
                 open.at_rest = true;
                 return (state, Vec::new());
             }
-            let token = issue_read(&mut state);
+            let token = issue_refetch(&mut state);
             (state, vec![Command::RefetchOpenKey { token }])
         }
         Action::CyclePane => {
@@ -565,6 +596,15 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             // the key, and `Esc` closes the key and moves it back with it.
             state.focus = Pane::Value;
             let token = issue_read(&mut state);
+            state.open_pending = Some(PendingRead {
+                name: state
+                    .keys
+                    .name_str(index)
+                    .map(|n| n.into_owned())
+                    .unwrap_or_default(),
+                token,
+                index: Some(index),
+            });
             (state, vec![Command::OpenKey { index, name, token }])
         }
         Action::ViewerDown => scroll_viewer(state, ViewerMove::By(1)),
@@ -2946,6 +2986,187 @@ mod honesty_tests {
                 .readout()
                 .contains("writes rejected")
         );
+    }
+}
+
+#[cfg(test)]
+mod loading_indicator_tests {
+    //! `state.open_pending` — the loading indicator's state. Set the moment a
+    //! read is issued (`Command::OpenKey`/`RefetchOpenKey`), cleared the
+    //! moment its reply lands, whatever that reply turns out to be.
+
+    use super::*;
+    use crate::msg::KeyCode;
+    use crate::state::value::{StringValue, Value};
+
+    fn browsing(n: usize) -> State {
+        let mut state = State {
+            cols: 130,
+            rows: 30,
+            ..State::default()
+        };
+        (state, _) = update(
+            state,
+            Msg::ScanStarted {
+                estimated_total: n as u64,
+            },
+        );
+        let keys = (0..n).map(|i| format!("k:{i}").into_bytes()).collect();
+        let (state, _) = update(state, Msg::ScanBatch { keys });
+        state
+    }
+
+    #[test]
+    fn opening_a_key_names_it_as_the_pending_read() {
+        let mut state = browsing(10);
+        state.view.selected = 3;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+            panic!("expected an open, got {cmds:?}");
+        };
+        let pending = state.open_pending.expect("a read was just issued");
+        assert_eq!(pending.name, "k:3");
+        assert_eq!(pending.token, token);
+    }
+
+    #[test]
+    fn a_landed_value_clears_the_pending_read() {
+        let mut state = browsing(10);
+        state.view.selected = 3;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+            panic!("expected an open, got {cmds:?}");
+        };
+        let (state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token,
+                index: Some(3),
+                name: "k:3".into(),
+                value: Value::Str(StringValue::new("v", 40)),
+                ttl_seconds: -1,
+                size_bytes: 64,
+                at_ms: 1_000,
+            },
+        );
+        assert!(state.open_pending.is_none());
+    }
+
+    #[test]
+    fn a_gone_reply_clears_the_pending_read_too() {
+        let mut state = browsing(10);
+        state.view.selected = 3;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+            panic!("expected an open, got {cmds:?}");
+        };
+        let (state, _) = update(
+            state,
+            Msg::ValueGone {
+                token,
+                index: Some(3),
+                name: "k:3".into(),
+                at_ms: 1_000,
+            },
+        );
+        assert!(state.open_pending.is_none());
+    }
+
+    /// A stale reply answers a question the reader has already moved on from
+    /// (`metadata_tests::a_reply_from_a_superseded_read_never_reaches_the_viewer`)
+    /// — it must not clear the indicator for the read that superseded it.
+    #[test]
+    fn a_superseded_reply_does_not_clear_the_current_pending_read() {
+        let mut state = browsing(10);
+        state.view.selected = 3;
+        let (mut state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::OpenKey { token: stale, .. }) = cmds.first() else {
+            panic!("expected an open");
+        };
+        state.view.selected = 5;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::OpenKey { token: current, .. }) = cmds.first() else {
+            panic!("expected an open");
+        };
+        let (state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token: stale,
+                index: Some(3),
+                name: "k:3".into(),
+                value: Value::Str(StringValue::new("three", 40)),
+                ttl_seconds: -1,
+                size_bytes: 5,
+                at_ms: 2_000,
+            },
+        );
+        let pending = state.open_pending.expect("the current read is still out");
+        assert_eq!(pending.token, current);
+        assert_eq!(pending.name, "k:5");
+    }
+
+    /// Without this, a failed read leaves the header reading `⟳ fetching…`
+    /// forever — the exact "operation vanishes, nothing on screen explains
+    /// it" defect the error toast exists to prevent.
+    #[test]
+    fn a_failed_read_clears_the_pending_indicator() {
+        let mut state = browsing(10);
+        state.view.selected = 3;
+        let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        assert!(state.open_pending.is_some());
+        let (state, _) = update(
+            state,
+            Msg::Failed {
+                command: "reading k:3".into(),
+                detail: "WRONGTYPE".into(),
+                at_ms: 1_000,
+            },
+        );
+        assert!(state.open_pending.is_none());
+    }
+
+    #[test]
+    fn a_lost_connection_clears_the_pending_indicator() {
+        let mut state = browsing(10);
+        state.view.selected = 3;
+        let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        assert!(state.open_pending.is_some());
+        let (state, _) = update(state, Msg::ConnectionLost);
+        assert!(state.open_pending.is_none());
+    }
+
+    /// A Refetch of the key already open (manual `r`) is issued against the
+    /// Open key's own name, not the row under the cursor.
+    #[test]
+    fn a_manual_refetch_names_the_open_key_as_the_pending_read() {
+        let mut state = browsing(10);
+        state.view.selected = 3;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+            panic!("expected an open, got {cmds:?}");
+        };
+        let (mut state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token,
+                index: Some(3),
+                name: "k:3".into(),
+                value: Value::Str(StringValue::new("v", 40)),
+                ttl_seconds: -1,
+                size_bytes: 64,
+                at_ms: 1_000,
+            },
+        );
+        // Move the cursor elsewhere before refetching, so a bug that named the
+        // Selected row instead of the Open key would be caught.
+        state.view.selected = 7;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('r'))));
+        let Some(&Command::RefetchOpenKey { token }) = cmds.first() else {
+            panic!("expected a refetch, got {cmds:?}");
+        };
+        let pending = state.open_pending.expect("a refetch was just issued");
+        assert_eq!(pending.name, "k:3", "the Open key, not row 7");
+        assert_eq!(pending.token, token);
     }
 }
 

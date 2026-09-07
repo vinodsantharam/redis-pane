@@ -2107,6 +2107,82 @@ fn golden_viewer_gone_before_load_single_pane() {
     assert_golden("viewer_gone_before_load_single", &frame);
 }
 
+// ── loading indicator: a read in flight (PLAN, fetch-latency UX) ────────────
+
+#[test]
+fn golden_viewer_opening() {
+    // Nothing has been read yet — the First Open case. The body must show a
+    // placeholder, never a blank pane or a previous key's value.
+    use redis_pane_core::command::ReadToken;
+    use redis_pane_core::state::PendingRead;
+
+    let mut state = many_keys();
+    state.open_pending = Some(PendingRead {
+        name: "user:8812:session".into(),
+        token: ReadToken(1),
+        index: Some(2),
+    });
+    let frame = draw(&state, 130, 22);
+    assert!(frame.contains("user:8812:session"), "{frame}");
+    assert!(frame.contains("⟳ fetching…"), "{frame}");
+    assert!(
+        !frame.contains("ttl"),
+        "no ttl line for a value that has not arrived:\n{frame}"
+    );
+    assert_golden("viewer_opening", &frame);
+}
+
+#[test]
+fn golden_viewer_opening_a_different_key_than_the_one_already_shown() {
+    // A key is open and showing its value; the reader opens a different key
+    // before the reply lands. The old value must not linger on screen next
+    // to the new key's name — the placeholder replaces it wholesale.
+    use redis_pane_core::command::ReadToken;
+    use redis_pane_core::state::PendingRead;
+
+    let mut state = opened("user:8812:session", hash_value(), 2_537);
+    state.open_pending = Some(PendingRead {
+        name: "user:8812:cart".into(),
+        token: ReadToken(2),
+        index: Some(0),
+    });
+    let frame = draw(&state, 130, 22);
+    assert!(frame.contains("user:8812:cart"), "{frame}");
+    assert!(
+        !frame.contains("device") && !frame.contains("ios/17.2"),
+        "the previous key's value must not linger:\n{frame}"
+    );
+    assert!(frame.contains("⟳ fetching…"), "{frame}");
+    assert_golden("viewer_opening_different_key", &frame);
+}
+
+#[test]
+fn golden_viewer_refetching() {
+    // The key already open is being re-read (invalidation re-arm, manual
+    // Refetch, …). The value already on screen must stay exactly as it is —
+    // only the status text says a read is outstanding.
+    use redis_pane_core::command::ReadToken;
+    use redis_pane_core::state::PendingRead;
+
+    let mut state = opened("user:8812:session", hash_value(), 2_537);
+    state.open_pending = Some(PendingRead {
+        name: "user:8812:session".into(),
+        token: ReadToken(3),
+        index: state.open.as_ref().unwrap().index,
+    });
+    let frame = draw(&state, 130, 22);
+    assert!(
+        frame.contains("device"),
+        "the value stays on screen:\n{frame}"
+    );
+    assert!(
+        frame.contains("id") && frame.contains("8812") && frame.contains("locale"),
+        "every field is still there, unchanged:\n{frame}"
+    );
+    assert!(frame.contains("⟳ fetching…"), "{frame}");
+    assert_golden("viewer_refetching", &frame);
+}
+
 // The preserved case — a key that *was* loaded, then deleted while open,
 // keeps its full value and header exactly as before, because ADR-0006's
 // "what was in it" question still has an answer for it — is already pinned

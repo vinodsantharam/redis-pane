@@ -918,6 +918,50 @@ fn tree_mode_shows_group_counts_and_leaf_names_only() {
 }
 
 #[test]
+fn a_long_group_name_truncates_instead_of_overlapping_the_metadata_columns() {
+    let mut keys = LoadedSet::default();
+    let long_prefix = "a".repeat(100);
+    let rows: &[(&str, KeyKind, i32, u32)] = &[
+        ("short:one", KeyKind::Hash, 720, 412),
+        ("short:two", KeyKind::Hash, 720, 412),
+    ];
+    let long_name = format!("{long_prefix}:session");
+    for (i, (name, kind, ttl, size)) in rows.iter().enumerate() {
+        keys.push(name.as_bytes());
+        keys.set_kind(i, *kind);
+        keys.set_ttl(i, *ttl, 74);
+        keys.set_size(i, *size);
+    }
+    keys.push(long_name.as_bytes());
+    keys.set_kind(2, KeyKind::Hash);
+    keys.set_ttl(2, 720, 74);
+    keys.set_size(2, 412);
+    let mut state = State {
+        keys,
+        link: up(Tk::Armed),
+        ..base()
+    };
+    state.tree_mode = true;
+    state.rebuild_list();
+
+    let frame = draw(&state, 80, 20);
+    let group_line = frame
+        .lines()
+        .find(|l| l.contains('▾') && l.contains('a'))
+        .unwrap_or_else(|| panic!("no group row for the long prefix: {frame}"));
+    assert!(
+        group_line.contains('…'),
+        "a name wider than the column must be truncated, not overrun: {group_line}"
+    );
+    // The row's own count column, drawn after the name, must land at its usual
+    // right-aligned position rather than being swallowed by an unbounded name.
+    assert!(
+        group_line.trim_end().ends_with("1 │") || group_line.trim_end().ends_with('1'),
+        "the descendants count must survive at the end of the row: {group_line:?}"
+    );
+}
+
+#[test]
 fn filtering_narrows_the_tree_as_well_as_the_flat_list() {
     let mut state = many_keys();
     state.tree_mode = true;

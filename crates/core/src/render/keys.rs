@@ -313,13 +313,9 @@ fn tree_row(
             } else {
                 Token::Text
             });
-            super::put(
-                buf,
-                indent,
-                y,
-                &format!("{marker} {name}{}", state.tree.separator),
-                style,
-            );
+            let label = format!("{marker} {name}{}", state.tree.separator);
+            let width = cols.name_width.saturating_sub(depth * 2) as usize;
+            super::put(buf, indent, y, &truncate(&label, width), style);
             // A collapsed node states what it is hiding, so folding never loses
             // information about how much is down there.
             if let Some((x, w)) = cols.ttl.or(cols.size) {

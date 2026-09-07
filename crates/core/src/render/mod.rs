@@ -14,7 +14,7 @@ use ratatui::style::Style;
 
 use crate::clock::Clock;
 use crate::keymap::{Action, key_label};
-use crate::state::{Attachment, Link, Liveness, State};
+use crate::state::{Attachment, Link, Liveness, PendingRead, State};
 use crate::theme::{Theme, Token, env_token};
 
 /// Render the whole frame into a fresh buffer of the given size.
@@ -62,6 +62,20 @@ fn value_pane(
     buf: &mut Buffer,
 ) {
     if area.height == 0 || area.width < 6 {
+        return;
+    }
+
+    // A read is in flight for a key that isn't (yet) what's on screen — a
+    // first Open, or a switch to a different key while another's value was
+    // showing. Neither the previous value nor a blank "no key selected" pane
+    // says anything happened, so this shows a placeholder instead — the
+    // keyspace browser's "pending cell, no layout shift" idiom (DESIGN §6.2),
+    // applied to the body. A Refetch of the key already on screen (same name)
+    // is handled below instead, without disturbing the value in view.
+    if let Some(pending) = &state.open_pending
+        && state.open.as_ref().map(|o| o.name.as_str()) != Some(pending.name.as_str())
+    {
+        opening_placeholder(state, theme, area, standalone, pending, buf);
         return;
     }
 
@@ -291,7 +305,19 @@ fn value_pane(
         sty(Token::Muted),
     );
 
-    let currency = open.currency(state.liveness() == Liveness::Live, now);
+    // A Refetch of this same key is in flight (invalidation re-arm, reconnect
+    // re-arm, manual Refetch, …): the value already on screen stays exactly
+    // as it is — clobbering it on every liveness read would be worse than
+    // showing nothing — and only the status text says a read is outstanding.
+    let refetching = state
+        .open_pending
+        .as_ref()
+        .is_some_and(|p| p.name == open.name);
+    let currency = if refetching {
+        "⟳ fetching…".to_string()
+    } else {
+        open.currency(state.liveness() == Liveness::Live, now)
+    };
     let token = if open.deleted_at_ms.is_some() {
         Token::Danger
     } else if open.pending.is_some() || open.editing {
@@ -370,6 +396,75 @@ fn value_pane(
                 }),
             );
         }
+    }
+}
+
+/// The value pane while a first Open's read has not answered yet.
+///
+/// No value exists to show, so the body fills with a dashed placeholder
+/// rather than staying blank or holding over whatever key was open before —
+/// the same "pending cell, no layout shift" idiom DESIGN §6.2 already uses
+/// for async key-list metadata. The type isn't known yet either, so there
+/// are no column headings to draw — just a name, a status, and rows that say
+/// "something is coming" without claiming to know its shape.
+fn opening_placeholder(
+    state: &State,
+    theme: &Theme,
+    area: Rect,
+    standalone: bool,
+    pending: &PendingRead,
+    buf: &mut Buffer,
+) {
+    solid_divider(buf, area, standalone, theme);
+
+    let body_top = if standalone {
+        let hint = state
+            .keymap
+            .hint(crate::keymap::Action::Cancel)
+            .unwrap_or_default();
+        let x1 = put(
+            buf,
+            area.x + 1,
+            area.y,
+            &format!("{hint} back"),
+            theme.style(Token::Muted),
+        );
+        let x1 = put(buf, x1, area.y, "  ·  ", theme.style(Token::Border));
+        put(buf, x1, area.y, &pending.name, theme.style(Token::Text));
+        put(
+            buf,
+            area.x + 1,
+            area.y + 1,
+            "⟳ fetching…",
+            theme.style(Token::Muted),
+        );
+        area.y + 2
+    } else {
+        put(
+            buf,
+            area.x + 1,
+            area.y,
+            &pending.name,
+            theme.style(Token::Text),
+        );
+        put_right(
+            buf,
+            area.x,
+            area.y,
+            area.width.saturating_sub(1),
+            "⟳ fetching…",
+            theme.style(Token::Muted),
+        );
+        area.y + 1
+    };
+
+    let inner = area.width.saturating_sub(2) as usize;
+    if inner == 0 {
+        return;
+    }
+    let dash: String = "┈".repeat(inner);
+    for y in body_top..area.y + area.height {
+        put(buf, area.x + 1, y, &dash, theme.style(Token::Muted));
     }
 }
 

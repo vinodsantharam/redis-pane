@@ -1,105 +1,90 @@
 # redis-pane
 
-A terminal UI for Redis — the keyspace browser `redis-cli` should have shipped with.
+A terminal UI for browsing Redis — the keyspace viewer `redis-cli` never gave you.
 
-`redis-cli` is a REPL, not a workspace: you cannot *see* a keyspace, only guess at it.
-RedisInsight can see one, but it is an Electron app that is slow past a few hundred thousand
-keys and unusable where engineers most often need it — inside an SSH session on a bastion host.
-`redis-pane` is the third option: a single static binary, keyboard-driven, that renders
-structured data as structured data and makes dangerous operations feel dangerous.
+`redis-cli` is great for running commands, but it can't show you what's actually in your
+keyspace. RedisInsight can, but it's a heavy Electron app that struggles with large keyspaces and
+doesn't work over SSH. `redis-pane` is a single small binary that runs right in your terminal,
+keyboard-driven, and stays fast even with huge keyspaces.
 
 ![Browsing a keyspace in redis-pane: filtering to a key, then watching it update on screen the moment another client changes it, with no keypress or refresh](demo.gif)
 
-*The current alpha build (read-only, M0/M1) — filter to a key, open it, and watch it update live
-via `CLIENT TRACKING`, no refresh. Recorded with [VHS](https://github.com/charmbracelet/vhs);
-see [scripts/demo.tape](scripts/demo.tape) to reproduce.*
+*Filter to a key, open it, and watch it update live the moment it changes on the server — no
+refresh needed.*
 
 ## Status
 
-**Requires Redis 6.0+ (or Valkey).** RESP3 only, TLS supported. Works against managed Redis —
-where `CLIENT TRACKING` is often refused, the header says `○ manual` rather than pretending.
+This is an early alpha. It's **read-only** for now — you can browse and inspect everything, but
+editing, deleting, and other writes are coming in a future release. It already handles browsing a
+keyspace, viewing every Redis type, and live updates when a value changes on the server.
 
-**In progress — [M0 and M1 are complete](docs/PLAN.md).** It browses a keyspace, renders every
-Redis type, and a key changing on the server updates on screen without anyone pressing anything.
-Mutation is M2, so it reads but does not yet write. The specification is still the
-deliverable and is kept current rather than archived. Stack: Rust + [ratatui](https://ratatui.rs)
-+ tokio + [fred](https://docs.rs/fred).
+Requires Redis 6.0 or newer (Valkey works too).
 
-**Trying this out?** See [ALPHA.md](ALPHA.md) — install, connect, and a tour of what's there.
+## Install
+
+Download the binary for your OS from the [Releases page](https://github.com/vinodsantharam/redis-pane/releases) — macOS, Linux, and Windows are all covered. Or run the install script:
 
 ```bash
-cargo run -p redis-pane -- --print-target   # resolve a target, print it, exit
-cargo run -p redis-pane -- --probe          # connect and report what the server supports
-cargo run -p redis-pane                     # the TUI; ? for help, q to quit
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/vinodsantharam/redis-pane/releases/download/v0.1.0-alpha.4/redis-pane-installer.sh | sh
 ```
 
-## What it looks like
+On Windows, from PowerShell:
 
-```
-┌─ redis-pane ─ ● staging · cache-01:6379/0 · from profile ──────────────────┐
-│ KEYS   scanning 41,203 of ~180,000      │ user:8812:session                │
-│ / user:*:session            3,410 match │ hash · 14 fields · 2.1 KB        │
-│ KEY                 TYPE      SIZE  TTL │ ttl 00:42:17                     │
-│ ▾ user:                          41,203 │                                  │
-│   ▾ 8812:                             6 │ FIELD          VALUE             │
-│     ● session       hash    2.1 KB  42m │ id             8812              │
-│     ● profile       json     880 B    ∞ │ device         ios/17.2          │
-│     ● cart          zset     412 B  12m │ region         eu-west-1         │
-│   ▸ 8813:                             6 │ cart_total     4                 │
-│ ▾ cart:                           8,120 │ plan           pro               │
-├─────────────────────────────────────────┼──────────────────────────────────┤
-│ ↑↓ move  → open  / filter  d d delete   │ e edit  y copy  t ttl            │
-└─────────────────────────────────────────┴──────────────────────────────────┘
- Esc back   ⌃K palette   : console   ? help     SCAN 23% ▓▓▓░░░░░  Esc cancel
+```powershell
+irm https://github.com/vinodsantharam/redis-pane/releases/download/v0.1.0-alpha.4/redis-pane-installer.ps1 | iex
 ```
 
-## The documents
+These alpha builds are unsigned, so your OS may flag them on first run — on macOS, right-click the
+binary → Open → confirm; on Windows, click "More info" → "Run anyway" in the SmartScreen prompt.
 
-| File | What it is |
-|---|---|
-| [docs/PRD.md](docs/PRD.md) | Problem, users, goals, numbered requirements (R1.x–R7.x), milestones M0–M4 |
-| [docs/DESIGN.md](docs/DESIGN.md) | Layout, navigation, keymap, visual language, screen-by-screen behaviour |
-| [docs/PLAN.md](docs/PLAN.md) | Implementation plan for M0 and M1 — workspace layout, tasks, and what each one proves |
-| [CONTEXT.md](CONTEXT.md) | The glossary. Several terms are deliberately distinguished and the distinctions are load-bearing |
-| [docs/adr/](docs/adr/) | Decisions, each with the alternatives that were rejected and why |
-| [CLAUDE.md](CLAUDE.md) | Working guidance for contributors and coding agents |
+Prefer to build it yourself? You'll need [Rust](https://rustup.rs):
 
-Requirements are numbered so commits can cite them (`implements R2.1`). When a change diverges
-from these documents, the documents change in the same commit.
+```bash
+git clone https://github.com/vinodsantharam/redis-pane.git
+cd redis-pane
+cargo build --release
+```
 
-## The shape of it, in seven decisions
+The binary lands at `./target/release/redis-pane`.
 
-- **There is no refresh button.** The open key is live: the server pushes an invalidation when
-  it changes and the Viewer refetches. Nothing is ever memoized, so a value cannot go stale
-  behind a control claiming to update it. ([ADR-0006](docs/adr/0006-liveness-without-a-refresh-button.md))
-- **It never claims to be current when it isn't.** A dropped connection keeps your data on
-  screen, says it is disconnected, and tells you how old what you are looking at is — it does not
-  promise a retry it has not scheduled. (Reconnecting on its own is M2; today a dropped link stays
-  dropped, and says so.) When reconnection lands it will re-arm tracking before the header calls
-  itself live again. Read-only Mode names the reason it is on, and says `locked` rather than
-  offering a toggle that a replica would refuse.
-  ([ADR-0009](docs/adr/0009-connection-lifecycle.md))
-- **One Connection per process, one database, fixed at launch.** No switcher, no `SELECT`, no
-  tabs, no sidebar — a second target is a second terminal. Everything else stays small because
-  of this. ([ADR-0005](docs/adr/0005-one-connection-per-process.md))
-- **Connection resolution is deterministic and never prompts:** flags → default Profile →
-  environment → `127.0.0.1:6379`. Zero configuration is a supported way to run. The title bar
-  permanently shows the target *and* where it was resolved from, which is the entire mitigation
-  for resolving silently. ([ADR-0001](docs/adr/0001-connection-resolution-order.md))
-- **Config is read-only to the app.** Profiles are hand-authored JSON at
-  `~/.config/redis-pane/config.json`; anything the app persists goes to a separate state file.
-  ([ADR-0002](docs/adr/0002-json-config-file.md), [ADR-0003](docs/adr/0003-app-never-writes-config.md))
-- **Secrets are references** — `passwordEnv` or `passwordCommand`. Literal passwords work, but
-  the file is refused when group- or world-readable. `--user`/`--password`/`--tls` are the
-  documented exception: a password given directly on the command line, always winning over a
-  Profile's or the environment's, with a printed warning about shell history and `ps`
-  ([ADR-0001](docs/adr/0001-connection-resolution-order.md)).
-- **There are four Environments, not three.** `unknown` is a real one: anything that is not
-  loopback or a unix socket and was not tagged gets it, and starts in Read-only Mode.
-  ([ADR-0004](docs/adr/0004-untagged-connections-are-read-only.md))
+## Using it
 
-## Non-goals
+Point it at a Redis server with a URL:
 
-Not a server manager, not a monitoring product, not a replacement for `redis-cli` in shell
-pipelines, and not a multi-target workspace. No plugins, no embedded scripting, no export/import
-in v1. Sentinel ships; Cluster is deferred past v1. Nothing older than Redis 6.0. The full list is [PRD §5](docs/PRD.md).
+```bash
+redis-pane --url redis://localhost:6379
+```
+
+Or with individual flags:
+
+```bash
+redis-pane --host your-host --port 6379 --user default --password your-password --tls
+```
+
+With no arguments, it connects to `127.0.0.1:6379`. For anything you connect to often, save it as
+a Profile in `~/.config/redis-pane/config.json` — see [ALPHA.md](ALPHA.md) for a full walkthrough,
+including how to keep passwords out of your shell history.
+
+Once you're in:
+
+- `↑↓` or `j`/`k` to move, `→` or `l` to open a key
+- `/` to filter, `Esc` to clear
+- `t` to toggle tree/flat view, `s` to cycle sort order
+- `y y` / `y v` / `y c` to copy a key name / value / `redis-cli` command
+- `?` for help with your actual keybindings
+
+## Trying it out
+
+See [ALPHA.md](ALPHA.md) for a fuller tour — connecting with a password, what to try, and what's
+not built yet.
+
+## Contributing
+
+Working on the code? [CLAUDE.md](CLAUDE.md) has the architecture notes and conventions, and
+[CONTEXT.md](CONTEXT.md) is a short glossary of terms used throughout the project. Deeper design
+docs live under `docs/` if you want the full history behind a decision.
+
+## Not planning to build
+
+Not a server manager, not a monitoring tool, and not a replacement for `redis-cli` in scripts. No
+multi-server workspace, no plugins, no export/import — one connection at a time, kept simple.

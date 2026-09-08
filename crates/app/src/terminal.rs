@@ -425,6 +425,22 @@ fn open_key(
     let permit = gate.begin();
     let client = client.clone();
     let tx = tx.clone();
+
+    // Stamps the loading indicator's delay gate (`PendingRead::APPEAR_DELAY_MS`,
+    // `crates/core/src/state/open.rs`). `update()` has no clock of its own
+    // (ADR-0011); this is the one moment the shell actually knows when the
+    // read was dispatched. Best-effort: a dropped send (the channel full)
+    // just leaves the read unstamped, which the render layer already treats
+    // as "not yet worth mentioning" — never a crash, never a wrong timestamp.
+    let issued_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let _ = tx.try_send(Msg::ReadIssued {
+        token,
+        at_ms: issued_at_ms,
+    });
+
     tokio::spawn(async move {
         let at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

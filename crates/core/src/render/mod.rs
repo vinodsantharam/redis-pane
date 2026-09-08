@@ -64,6 +64,7 @@ fn value_pane(
     if area.height == 0 || area.width < 6 {
         return;
     }
+    let now = clock.now_ms();
 
     // A read is in flight for a key that isn't (yet) what's on screen — a
     // first Open, or a switch to a different key while another's value was
@@ -72,8 +73,16 @@ fn value_pane(
     // keyspace browser's "pending cell, no layout shift" idiom (DESIGN §6.2),
     // applied to the body. A Refetch of the key already on screen (same name)
     // is handled below instead, without disturbing the value in view.
+    //
+    // Gated on `issued_at_ms`: a read that lands inside `APPEAR_DELAY_MS`
+    // never shows this at all, which is what a fast local Redis needs — the
+    // indicator used to flash on and off within a frame or two on almost
+    // every keypress, reading as a glitch rather than feedback.
     if let Some(pending) = &state.open_pending
         && state.open.as_ref().map(|o| o.name.as_str()) != Some(pending.name.as_str())
+        && pending
+            .issued_at_ms
+            .is_some_and(|t| now.saturating_sub(t) >= PendingRead::APPEAR_DELAY_MS)
     {
         opening_placeholder(state, theme, area, standalone, pending, buf);
         return;
@@ -199,7 +208,6 @@ fn value_pane(
     }
 
     // ── header: identical for every type (R3.1) ────────────────────────────
-    let now = clock.now_ms();
     let x0 = area.x + 1;
     // Standalone (below 70 columns), the list this key came from is off
     // screen entirely — DESIGN §2's "breadcrumb replaces columns". The
@@ -309,10 +317,16 @@ fn value_pane(
     // re-arm, manual Refetch, …): the value already on screen stays exactly
     // as it is — clobbering it on every liveness read would be worse than
     // showing nothing — and only the status text says a read is outstanding.
-    let refetching = state
-        .open_pending
-        .as_ref()
-        .is_some_and(|p| p.name == open.name);
+    // Gated on `issued_at_ms` the same way the First-Open placeholder is: a
+    // Refetch that lands inside `APPEAR_DELAY_MS` never touches the header at
+    // all, which matters here even more than for First Open — an invalidation
+    // re-arm fires on every write to the key, so an ungated indicator would
+    // have flickered on essentially every keystroke against a live server.
+    let refetching = state.open_pending.as_ref().is_some_and(|p| {
+        p.name == open.name
+            && p.issued_at_ms
+                .is_some_and(|t| now.saturating_sub(t) >= PendingRead::APPEAR_DELAY_MS)
+    });
     let currency = if refetching {
         "⟳ fetching…".to_string()
     } else {

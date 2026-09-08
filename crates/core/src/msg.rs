@@ -112,6 +112,17 @@ pub enum Msg {
     ReadCompleted {
         at_ms: u64,
     },
+    /// A read was just dispatched to the shell, at this clock reading.
+    ///
+    /// Exists only to timestamp `PendingRead` (`crate::state::PendingRead`)
+    /// for the loading indicator's delay gate — `update()` has no clock of
+    /// its own (ADR-0011), so the shell, which actually dispatches the read,
+    /// supplies the one fact the core needs. A token that no longer names the
+    /// outstanding read (superseded, or already answered) is ignored.
+    ReadIssued {
+        token: crate::command::ReadToken,
+        at_ms: u64,
+    },
     /// The shell connected. `tracking_supported` is the result of *attempting*
     /// `CLIENT TRACKING`, never an inference from the version (ADR-0007).
     Connected {

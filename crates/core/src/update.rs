@@ -37,6 +37,7 @@ fn issue_refetch(state: &mut State) -> ReadToken {
             name: open.name.clone(),
             token,
             index: open.index,
+            issued_at_ms: None,
         });
     }
     token
@@ -68,6 +69,18 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
         }
         Msg::ReadCompleted { at_ms } => {
             state.last_read_ms = Some(at_ms);
+            (state, Vec::new())
+        }
+        Msg::ReadIssued { token, at_ms } => {
+            // A token that no longer names the outstanding read — already
+            // superseded, or already answered — is ignored, the same
+            // discipline `ValueLoaded`/`ValueGone` already apply to a stale
+            // token.
+            if let Some(pending) = &mut state.open_pending
+                && pending.token == token
+            {
+                pending.issued_at_ms = Some(at_ms);
+            }
             (state, Vec::new())
         }
         Msg::Connected {
@@ -604,6 +617,7 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
                     .unwrap_or_default(),
                 token,
                 index: Some(index),
+                issued_at_ms: None,
             });
             (state, vec![Command::OpenKey { index, name, token }])
         }
@@ -3167,6 +3181,77 @@ mod loading_indicator_tests {
         let pending = state.open_pending.expect("a refetch was just issued");
         assert_eq!(pending.name, "k:3", "the Open key, not row 7");
         assert_eq!(pending.token, token);
+    }
+
+    #[test]
+    fn a_pending_read_starts_unstamped() {
+        // `update()` has no clock of its own (ADR-0011) — only the shell
+        // knows when a read was actually dispatched, so this starts `None`
+        // until `Msg::ReadIssued` arrives.
+        let mut state = browsing(10);
+        state.view.selected = 3;
+        let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        assert_eq!(state.open_pending.unwrap().issued_at_ms, None);
+    }
+
+    #[test]
+    fn read_issued_stamps_the_matching_pending_read() {
+        let mut state = browsing(10);
+        state.view.selected = 3;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+            panic!("expected an open, got {cmds:?}");
+        };
+        let (state, _) = update(
+            state,
+            Msg::ReadIssued {
+                token,
+                at_ms: 5_000,
+            },
+        );
+        assert_eq!(state.open_pending.unwrap().issued_at_ms, Some(5_000));
+    }
+
+    #[test]
+    fn read_issued_for_a_superseded_token_is_ignored() {
+        // The read it names is no longer the outstanding one — the same
+        // discipline `ValueLoaded`/`ValueGone` already apply to a stale token.
+        let mut state = browsing(10);
+        state.view.selected = 3;
+        let (mut state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::OpenKey { token: stale, .. }) = cmds.first() else {
+            panic!("expected an open");
+        };
+        state.view.selected = 5;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::OpenKey { token: current, .. }) = cmds.first() else {
+            panic!("expected an open");
+        };
+        let (state, _) = update(
+            state,
+            Msg::ReadIssued {
+                token: stale,
+                at_ms: 5_000,
+            },
+        );
+        let pending = state.open_pending.expect("the current read is still out");
+        assert_eq!(pending.token, current);
+        assert_eq!(
+            pending.issued_at_ms, None,
+            "a stamp for a superseded read must not land on the current one"
+        );
+    }
+
+    #[test]
+    fn read_issued_with_nothing_pending_does_nothing() {
+        let (state, _) = update(
+            State::default(),
+            Msg::ReadIssued {
+                token: ReadToken::default(),
+                at_ms: 5_000,
+            },
+        );
+        assert!(state.open_pending.is_none());
     }
 }
 

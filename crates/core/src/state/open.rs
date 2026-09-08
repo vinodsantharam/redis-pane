@@ -79,6 +79,28 @@ pub struct PendingRead {
     pub token: crate::command::ReadToken,
     /// Mirrors `Command::OpenKey`'s index, for header context on a first Open.
     pub index: Option<usize>,
+    /// When the read was actually issued, per the shell's clock. `None` until
+    /// `Msg::ReadIssued` stamps it — the render layer treats an unstamped
+    /// pending read the same as one issued too recently to have crossed
+    /// [`PendingRead::APPEAR_DELAY_MS`]: not yet worth mentioning.
+    ///
+    /// `update()` has no clock of its own (ADR-0011), so this cannot be
+    /// filled in at the moment the read is issued — only the shell, which
+    /// actually dispatches the read, knows when that was.
+    pub issued_at_ms: Option<u64>,
+}
+
+impl PendingRead {
+    /// How long a read must be outstanding before the frame says anything
+    /// about it.
+    ///
+    /// On a fast local Redis, reads land in single-digit milliseconds — the
+    /// loading indicator used to appear and disappear within a frame or two
+    /// on almost every keypress and every invalidation-triggered Refetch,
+    /// reading as a glitch rather than feedback. Long enough that a read like
+    /// that never touches the loading UI at all; short enough that a read
+    /// that is genuinely slow still reads as live feedback.
+    pub const APPEAR_DELAY_MS: u64 = 200;
 }
 
 /// A value that arrived while the reader was not at rest.

@@ -2300,7 +2300,7 @@ dependencies = [
 
 [[package]]
 name = "redis-pane"
-version = "0.1.0-alpha.5"
+version = "0.1.0-alpha.6"
 dependencies = [
  "anyhow",
  "clap",
@@ -2317,7 +2317,7 @@ dependencies = [
 
 [[package]]
 name = "redis-pane-core"
-version = "0.1.0-alpha.5"
+version = "0.1.0-alpha.6"
 dependencies = [
  "ratatui",
  "serde",

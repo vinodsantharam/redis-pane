@@ -2121,6 +2121,9 @@ fn golden_viewer_opening() {
         name: "user:8812:session".into(),
         token: ReadToken(1),
         index: Some(2),
+        // Well past `APPEAR_DELAY_MS` relative to `CLOCK` (74_000): this read
+        // is genuinely slow, so the placeholder must show.
+        issued_at_ms: Some(73_000),
     });
     let frame = draw(&state, 130, 22);
     assert!(frame.contains("user:8812:session"), "{frame}");
@@ -2130,6 +2133,47 @@ fn golden_viewer_opening() {
         "no ttl line for a value that has not arrived:\n{frame}"
     );
     assert_golden("viewer_opening", &frame);
+}
+
+/// The regression this fix is actually about: on a fast local Redis the read
+/// lands well inside `APPEAR_DELAY_MS`, and the indicator used to flash on and
+/// off within a frame or two — a glitch, not feedback. A read that has not
+/// been outstanding long enough must render *identically* to no pending read
+/// at all, whether it is merely too recent or has not been stamped yet
+/// (`issued_at_ms: None`, before the shell's `Msg::ReadIssued` arrives).
+#[test]
+fn golden_viewer_opening_a_fast_read_shows_nothing_at_all() {
+    use redis_pane_core::command::ReadToken;
+    use redis_pane_core::state::PendingRead;
+
+    let baseline = draw(&many_keys(), 130, 22);
+
+    let mut too_recent = many_keys();
+    too_recent.open_pending = Some(PendingRead {
+        name: "user:8812:session".into(),
+        token: ReadToken(1),
+        index: Some(2),
+        // 100ms elapsed against `CLOCK` (74_000) — under the 200ms gate.
+        issued_at_ms: Some(73_900),
+    });
+    let frame = draw(&too_recent, 130, 22);
+    assert_eq!(
+        frame, baseline,
+        "a read 100ms old must render exactly like no pending read:\n{frame}"
+    );
+
+    let mut unstamped = many_keys();
+    unstamped.open_pending = Some(PendingRead {
+        name: "user:8812:session".into(),
+        token: ReadToken(1),
+        index: Some(2),
+        issued_at_ms: None,
+    });
+    let frame = draw(&unstamped, 130, 22);
+    assert_eq!(
+        frame, baseline,
+        "an unstamped pending read must render exactly like no pending read:\n{frame}"
+    );
 }
 
 #[test]
@@ -2145,6 +2189,7 @@ fn golden_viewer_opening_a_different_key_than_the_one_already_shown() {
         name: "user:8812:cart".into(),
         token: ReadToken(2),
         index: Some(0),
+        issued_at_ms: Some(73_000),
     });
     let frame = draw(&state, 130, 22);
     assert!(frame.contains("user:8812:cart"), "{frame}");
@@ -2169,6 +2214,7 @@ fn golden_viewer_refetching() {
         name: "user:8812:session".into(),
         token: ReadToken(3),
         index: state.open.as_ref().unwrap().index,
+        issued_at_ms: Some(73_000),
     });
     let frame = draw(&state, 130, 22);
     assert!(
@@ -2181,6 +2227,30 @@ fn golden_viewer_refetching() {
     );
     assert!(frame.contains("⟳ fetching…"), "{frame}");
     assert_golden("viewer_refetching", &frame);
+}
+
+/// The sharper version of the same regression: an invalidation re-arm fires
+/// on every write to the key, so an ungated Refetch indicator would flicker
+/// on essentially every keystroke against a live server, not just on Open.
+#[test]
+fn golden_viewer_refetching_a_fast_reply_shows_nothing_at_all() {
+    use redis_pane_core::command::ReadToken;
+    use redis_pane_core::state::PendingRead;
+
+    let baseline = draw(&opened("user:8812:session", hash_value(), 2_537), 130, 22);
+
+    let mut state = opened("user:8812:session", hash_value(), 2_537);
+    state.open_pending = Some(PendingRead {
+        name: "user:8812:session".into(),
+        token: ReadToken(3),
+        index: state.open.as_ref().unwrap().index,
+        issued_at_ms: Some(73_900),
+    });
+    let frame = draw(&state, 130, 22);
+    assert_eq!(
+        frame, baseline,
+        "a refetch 100ms old must render exactly like no pending read:\n{frame}"
+    );
 }
 
 // The preserved case — a key that *was* loaded, then deleted while open,

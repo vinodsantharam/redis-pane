@@ -673,22 +673,53 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
 }
 
 /// The full prefix of the group under the cursor, e.g. `user:8812:`.
+/// The prefix a group row stands for, e.g. `user:profile:` for a depth-1
+/// group under `user:`.
+///
+/// Built from the rows themselves — this row and each ancestor Group row
+/// above it, every one of which already carries its own segment's arena
+/// location — so it needs nothing *beneath* `row` to exist. An earlier
+/// version reconstructed the prefix by searching forward for the first
+/// visible Key row under the group instead, which broke the moment the group
+/// was collapsed: `Tree::row` hides a collapsed group's children entirely, so
+/// the search skipped straight past them onto a *different* group's key (or
+/// found nothing), reconstructing the wrong prefix or none at all. `Enter`
+/// could fold a group but never unfold it again from the same row (#16).
 fn group_prefix_at(state: &State, row: usize) -> Option<String> {
     use crate::state::tree::Row;
     let Some(Row::Group { depth, .. }) = state.tree.row(row) else {
         return None;
     };
-    // Rebuild the prefix from the first key beneath this group, which is the
-    // next Key row at greater depth.
-    let index = (row + 1..state.tree.len()).find_map(|r| state.tree.key_index(r))?;
-    let name = state.keys.name_str(index)?;
-    let sep = state.tree.separator;
-    let mut out = String::new();
-    for (i, segment) in name.split(sep).enumerate() {
-        if i > depth as usize {
+
+    // This row, plus every ancestor Group row: for a group at depth d, the
+    // ancestor at depth d-1 is the nearest *preceding* row at that depth —
+    // true by construction, since `Tree::rebuild` pushes rows in a single
+    // left-to-right pass and only ever reuses an already-pushed ancestor
+    // rather than duplicating it.
+    let mut rows = vec![row];
+    let mut want = depth;
+    for r in (0..row).rev() {
+        if want == 0 {
             break;
         }
-        out.push_str(segment);
+        if let Some(Row::Group { depth: d, .. }) = state.tree.row(r)
+            && d == want - 1
+        {
+            rows.push(r);
+            want -= 1;
+        }
+    }
+    rows.reverse();
+
+    let sep = state.tree.separator;
+    let mut out = String::new();
+    for r in rows {
+        let Some(Row::Group { offset, len, .. }) = state.tree.row(r) else {
+            return None;
+        };
+        out.push_str(&String::from_utf8_lossy(
+            state.keys.arena_slice(offset, len)?,
+        ));
         out.push(sep);
     }
     Some(out)
@@ -3000,6 +3031,118 @@ mod honesty_tests {
                 .readout()
                 .contains("writes rejected")
         );
+    }
+}
+
+#[cfg(test)]
+mod tree_fold_tests {
+    //! `Enter` on a group row (`Action::ToggleGroup`) — fold and unfold must
+    //! be the same operation from the same row (#16).
+
+    use super::*;
+    use crate::msg::KeyCode;
+    use crate::state::tree::Row;
+
+    /// Two levels deep, so folding and unfolding a nested group is exercised
+    /// too, not just a top-level one.
+    fn nested_tree() -> State {
+        let mut state = State {
+            cols: 130,
+            rows: 30,
+            tree_mode: true,
+            ..State::default()
+        };
+        (state, _) = update(state, Msg::ScanStarted { estimated_total: 4 });
+        let keys = vec![
+            b"user:8812:cart".to_vec(),
+            b"user:8812:session".to_vec(),
+            b"user:8813:session".to_vec(),
+            b"feed:global:hot".to_vec(),
+        ];
+        let (state, _) = update(state, Msg::ScanBatch { keys });
+        state
+    }
+
+    fn press_enter(state: State) -> State {
+        update(state, Msg::Key(KeyPress::plain(KeyCode::Enter))).0
+    }
+
+    fn group_row(state: &State, prefix: &str) -> usize {
+        (0..state.tree.len())
+            .find(|&r| {
+                matches!(state.tree.row(r), Some(Row::Group { .. }))
+                    && group_prefix_at(state, r).as_deref() == Some(prefix)
+            })
+            .unwrap_or_else(|| panic!("no group row for {prefix:?}"))
+    }
+
+    #[test]
+    fn a_folded_group_unfolds_from_the_same_row() {
+        let state = nested_tree();
+        let before = state.tree.len();
+
+        let row = group_row(&state, "user:");
+        let mut state = state;
+        state.view.selected = row;
+
+        let state = press_enter(state);
+        assert!(
+            matches!(
+                state.tree.row(row),
+                Some(Row::Group {
+                    expanded: false,
+                    ..
+                })
+            ),
+            "first Enter folds the group"
+        );
+        assert!(state.tree.len() < before, "children are hidden once folded");
+
+        // The bug: a second `Enter` on the *same row* used to search forward
+        // for a descendant key to rebuild the prefix from, and a folded
+        // group's descendants are hidden — so it silently toggled a
+        // different group, or nothing at all.
+        let state = press_enter(state);
+        assert!(
+            matches!(state.tree.row(row), Some(Row::Group { expanded: true, .. })),
+            "second Enter on the same row unfolds it again"
+        );
+        assert_eq!(
+            state.tree.len(),
+            before,
+            "back to exactly the structure it started with"
+        );
+    }
+
+    #[test]
+    fn a_nested_group_folds_and_unfolds_independently_of_its_parent() {
+        let state = nested_tree();
+        let before = state.tree.len();
+
+        let row = group_row(&state, "user:8812:");
+        let mut state = state;
+        state.view.selected = row;
+
+        let state = press_enter(state);
+        assert!(matches!(
+            state.tree.row(row),
+            Some(Row::Group {
+                expanded: false,
+                ..
+            })
+        ));
+        // The parent group and the sibling `user:8813:` group are untouched.
+        assert!(matches!(
+            state.tree.row(group_row(&state, "user:")),
+            Some(Row::Group { expanded: true, .. })
+        ));
+
+        let state = press_enter(state);
+        assert!(
+            matches!(state.tree.row(row), Some(Row::Group { expanded: true, .. })),
+            "unfolds from the same row, same as the top-level case"
+        );
+        assert_eq!(state.tree.len(), before);
     }
 }
 

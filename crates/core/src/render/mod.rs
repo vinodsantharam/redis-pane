@@ -396,6 +396,14 @@ fn value_pane(
         if i >= viewer.row_count() {
             break;
         }
+        // The value cursor (`Enter`/`Action::EnterValueCursor`), highlighted
+        // the same way the keys pane highlights its own selected row — one
+        // visual language for "the row you're on", not two.
+        let cursor_row = open.cursor_active && i == open.cursor;
+        if cursor_row {
+            let blank = " ".repeat(inner as usize);
+            put(buf, x0, y + r as u16, &blank, sty(Token::Selected));
+        }
         for (c, cell) in viewer.row(i, now).into_iter().enumerate() {
             let width = if cols.len() > 1 { col_w } else { inner };
             put(
@@ -403,7 +411,9 @@ fn value_pane(
                 x0 + c as u16 * col_w,
                 y + r as u16,
                 &clip(&cell, width.saturating_sub(1) as usize),
-                sty(if c == 0 && cols.len() > 1 {
+                sty(if cursor_row {
+                    Token::Selected
+                } else if c == 0 && cols.len() > 1 {
                     Token::Muted
                 } else {
                     Token::Text

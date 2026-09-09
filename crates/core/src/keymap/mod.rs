@@ -47,18 +47,11 @@ pub enum Action {
     /// is already expanded, since Right never collapses (`CollapseGroup` is
     /// the only key that does).
     Open,
-    /// Move down inside the open value.
-    ViewerDown,
-    /// Move up inside the open value.
-    ViewerUp,
-    /// Page down inside the open value.
-    ViewerPageDown,
-    /// Page up inside the open value.
-    ViewerPageUp,
-    /// Jump to the top of the open value.
-    ViewerTop,
-    /// Jump to the bottom of the open value.
-    ViewerBottom,
+    /// Start moving a cursor inside the open value. No-op with nothing open.
+    /// Deliberately a separate, explicit action from `Tab`/focus — merely
+    /// looking at the value pane must never silently reprogram what plain
+    /// movement does; `Enter` is the one deliberate key that does.
+    EnterValueCursor,
     /// Begin a copy. The next key chooses what (R3.5).
     Copy,
     /// Move focus between the keys pane and the Viewer (DESIGN §4).
@@ -77,35 +70,39 @@ pub enum Action {
 impl Action {
     /// Whether the pane this action operates on is currently drawn.
     ///
-    /// Actions divide cleanly: some move or reshape the key list, some scroll
-    /// the value, and the rest belong to the app rather than to either pane.
-    /// Only the first two can be aimed at something the reader cannot see —
-    /// and only below 70 columns, where one pane is on screen at a time.
+    /// Actions divide cleanly: some move or reshape the key list, some
+    /// belong to the app rather than to either pane, and the six movement
+    /// actions move *whichever* of the two the reader is currently working
+    /// in. Only below 70 columns, where one pane is on screen at a time, can
+    /// an action be aimed at something the reader cannot see.
     pub fn pane_is_on_screen(&self, state: &crate::State) -> bool {
         use crate::render::layout::Pane;
         match self {
-            // The key list: moving in it, reshaping it, or opening from it.
+            // Movement acts on the value cursor while one is active — which
+            // only happens with a key open, and opening one already moves
+            // focus onto it — and the key list otherwise.
             Action::MoveUp
             | Action::MoveDown
             | Action::PageUp
             | Action::PageDown
             | Action::Top
-            | Action::Bottom
-            | Action::Filter
+            | Action::Bottom => {
+                if state.open.as_ref().is_some_and(|o| o.cursor_active) {
+                    state.pane_visible(Pane::Value)
+                } else {
+                    state.pane_visible(Pane::Keys)
+                }
+            }
+            // The rest of the key list: reshaping it, or opening from it.
+            Action::Filter
             | Action::Sort
             | Action::ToggleTree
             | Action::CollapseGroup
             | Action::Open => state.pane_visible(Pane::Keys),
-            // The value body.
-            Action::ViewerUp
-            | Action::ViewerDown
-            | Action::ViewerPageUp
-            | Action::ViewerPageDown
-            | Action::ViewerTop
-            | Action::ViewerBottom => state.pane_visible(Pane::Value),
             // Everything else is the app's, not a pane's: quitting, help, Esc,
             // `Tab` (which is what *changes* which pane is on screen), `r`
-            // (already pane-scoped by R2.7 on its own terms), copying, and the
+            // (already pane-scoped by R2.7 on its own terms), `Enter`
+            // (no-ops itself with nothing open to enter), copying, and the
             // read-only toggle.
             _ => true,
         }
@@ -132,10 +129,7 @@ impl Action {
             Action::ToggleTree => "tree",
             Action::CollapseGroup => "collapse / parent",
             Action::Open => "open / expand",
-            Action::ViewerDown | Action::ViewerUp => "scroll",
-            Action::ViewerPageDown | Action::ViewerPageUp => "page value",
-            Action::ViewerTop => "value top",
-            Action::ViewerBottom => "value bottom",
+            Action::EnterValueCursor => "move in value",
             Action::Copy => "copy",
             Action::CyclePane => "focus",
             Action::WidenKeysPane => "widen keys",
@@ -294,37 +288,16 @@ impl Default for Keymap {
                     action: Action::CollapseGroup,
                 },
                 Binding {
-                    key: KeyPress::ctrl(KeyCode::Down),
-                    action: Action::ViewerDown,
-                },
-                Binding {
-                    key: KeyPress::ctrl(KeyCode::Up),
-                    action: Action::ViewerUp,
-                },
-                Binding {
-                    key: KeyPress::ctrl(KeyCode::PageDown),
-                    action: Action::ViewerPageDown,
-                },
-                Binding {
-                    key: KeyPress::ctrl(KeyCode::PageUp),
-                    action: Action::ViewerPageUp,
-                },
-                Binding {
-                    key: KeyPress::ctrl(KeyCode::Home),
-                    action: Action::ViewerTop,
-                },
-                Binding {
-                    key: KeyPress::ctrl(KeyCode::End),
-                    action: Action::ViewerBottom,
+                    key: KeyPress::plain(KeyCode::Enter),
+                    action: Action::EnterValueCursor,
                 },
                 Binding {
                     key: KeyPress::plain(KeyCode::Char('y')),
                     action: Action::Copy,
                 },
-                // Horizontal chords for a horizontal action, alongside the
-                // vertical `⌃↑`/`⌃↓` pair that already scrolls the Viewer.
-                // `⌃←`/`⌃→` are otherwise idle, so this adds no ambiguity with
-                // plain `Left`/`Right`, which are `Open`/`CollapseGroup` above.
+                // Horizontal chords for a horizontal action. `⌃←`/`⌃→` are
+                // otherwise idle, so this adds no ambiguity with plain
+                // `Left`/`Right`, which are `Open`/`CollapseGroup` above.
                 Binding {
                     key: KeyPress::ctrl(KeyCode::Right),
                     action: Action::WidenKeysPane,
@@ -486,12 +459,7 @@ mod tests {
             Action::ToggleTree,
             Action::CollapseGroup,
             Action::Open,
-            Action::ViewerDown,
-            Action::ViewerUp,
-            Action::ViewerPageDown,
-            Action::ViewerPageUp,
-            Action::ViewerTop,
-            Action::ViewerBottom,
+            Action::EnterValueCursor,
             Action::Copy,
         ] {
             assert!(k.key_for(action).is_some(), "{action:?} has no binding");

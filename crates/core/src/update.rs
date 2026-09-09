@@ -500,9 +500,16 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
                 return (state, Vec::new());
             }
             // The "pop" half of stack navigation: back to the list you were
-            // just looking at, before an unrelated background scan.
+            // just looking at, before an unrelated background scan. Also
+            // exits value-cursor mode if it was active — the same keypress,
+            // since there is nothing left to pop before it. The value stays
+            // open and unchanged either way; only where plain movement is
+            // aimed changes.
             if state.focus == Pane::Value {
                 state.focus = Pane::Keys;
+                if let Some(open) = &mut state.open {
+                    open.cursor_active = false;
+                }
                 return (state, Vec::new());
             }
             // Every in-flight operation is cancellable (PRD R7.3).
@@ -593,6 +600,16 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             }
             (state, Vec::new())
         }
+        // Each of these six moves the value cursor instead of the key list
+        // while cursor mode is active (`Enter`/`Action::EnterValueCursor`) —
+        // the same keys, aimed at whichever thing the reader is currently
+        // working in, never a silent redirect from merely looking at a pane.
+        Action::MoveDown if cursor_active(&state) => move_cursor(state, 1),
+        Action::MoveUp if cursor_active(&state) => move_cursor(state, -1),
+        Action::PageDown if cursor_active(&state) => move_cursor(state, VALUE_PAGE_ROWS as isize),
+        Action::PageUp if cursor_active(&state) => move_cursor(state, -(VALUE_PAGE_ROWS as isize)),
+        Action::Top if cursor_active(&state) => cursor_to(state, 0),
+        Action::Bottom if cursor_active(&state) => cursor_to(state, usize::MAX),
         Action::MoveDown => move_selection(state, 1),
         Action::MoveUp => move_selection(state, -1),
         Action::PageDown => {
@@ -639,8 +656,9 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             // Opening a key moves focus onto it, at every width. Below 70
             // columns that is the "push" half of stack navigation (DESIGN §2);
             // above it both panes already show and this decides only which one
-            // a pane-scoped key acts on. `Tab` moves it back without closing
-            // the key, and `Esc` closes the key and moves it back with it.
+            // a pane-scoped key acts on. `Tab` and `Esc` both move it back
+            // without closing the key — `Esc` additionally exits value-cursor
+            // mode first, if it was active (`Action::Cancel`'s handler).
             state.focus = Pane::Value;
             let token = issue_read(&mut state);
             state.open_pending = Some(PendingRead {
@@ -655,15 +673,19 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             });
             (state, vec![Command::OpenKey { index, name, token }])
         }
-        Action::ViewerDown => scroll_viewer(state, ViewerMove::By(1)),
-        Action::ViewerUp => scroll_viewer(state, ViewerMove::By(-1)),
-        // A page is approximated at 20 rows: the viewer does not know its own
-        // rendered height here, and a fixed page beats no paging at all for a
-        // 500-entry zset or a large hex dump.
-        Action::ViewerPageDown => scroll_viewer(state, ViewerMove::By(20)),
-        Action::ViewerPageUp => scroll_viewer(state, ViewerMove::By(-20)),
-        Action::ViewerTop => scroll_viewer(state, ViewerMove::Absolute(0)),
-        Action::ViewerBottom => scroll_viewer(state, ViewerMove::Absolute(usize::MAX)),
+        Action::EnterValueCursor => {
+            // No-op with nothing open, or a key confirmed gone before it was
+            // ever loaded — there is no body to move a cursor through.
+            let Some(open) = &mut state.open else {
+                return (state, Vec::new());
+            };
+            if open.value.is_none() {
+                return (state, Vec::new());
+            }
+            open.cursor_active = true;
+            state.focus = Pane::Value;
+            (state, Vec::new())
+        }
         Action::Copy => {
             state.copy_pending = true;
             (state, Vec::new())
@@ -976,7 +998,10 @@ fn scroll_at(
         }
         Some(Pane::Value) => {
             state.focus = Pane::Value;
-            scroll_viewer(state, ViewerMove::By(dir * MOUSE_SCROLL_ROWS))
+            if let Some(open) = &mut state.open {
+                open.cursor_active = true;
+            }
+            move_cursor(state, dir * MOUSE_SCROLL_ROWS)
         }
         None => (state, Vec::new()),
     }
@@ -1013,31 +1038,65 @@ fn after_move(mut state: State) -> (State, Vec<Command>) {
     }
 }
 
-/// Where a viewer scroll ends up: relative or absolute.
-enum ViewerMove {
-    By(isize),
-    /// Clamped to the last row; `usize::MAX` means "the end".
-    Absolute(usize),
+/// Whether plain movement currently drives the value cursor rather than the
+/// key list (`Action::EnterValueCursor` sets this; `Action::Cancel` clears
+/// it). A tiny helper so the six movement handlers read as a guard, not a
+/// chain of `state.open.as_ref()...`.
+fn cursor_active(state: &State) -> bool {
+    state.open.as_ref().is_some_and(|o| o.cursor_active)
 }
 
-/// Scroll the open value. Shared by every viewer, because the frame around a
-/// value is one abstraction (R3.1) — a hex dump and a hash pane both scroll
-/// this way.
-fn scroll_viewer(mut state: State, mv: ViewerMove) -> (State, Vec<Command>) {
-    // Nothing to scroll in a key confirmed gone before it was ever loaded —
-    // there is no body, only a name and a badge.
-    if let Some(open) = &mut state.open
-        && let Some(value) = &open.value
-    {
-        let last = value.viewer().row_count().saturating_sub(1);
-        open.offset = match mv {
-            ViewerMove::By(by) => (open.offset as isize + by).clamp(0, last as isize) as usize,
-            ViewerMove::Absolute(n) => n.min(last),
-        };
-        // Scrolling away from the top means updates are announced rather than
-        // applied; returning to the top does not by itself undo that — the
-        // reader chooses when a held update lands.
-        if open.offset > 0 {
+/// A fixed stand-in for the value pane's visible row count, in the same
+/// spirit the old `Ctrl+PgUp`/`PgDn` page size was ("the viewer does not know
+/// its own rendered height here, and a fixed page beats no paging at all for
+/// a 500-entry zset or a large hex dump") — `update()` has no access to the
+/// layout the render pass computes (ADR-0011), so this is an approximation,
+/// used both for paging and for keeping the cursor inside the visible window.
+const VALUE_PAGE_ROWS: usize = 20;
+
+/// Move the value cursor by `by` rows, clamped to the value's length. Shared
+/// by every viewer, because the frame around a value is one abstraction
+/// (R3.1) — a hex dump and a hash pane both move this way.
+fn move_cursor(mut state: State, by: isize) -> (State, Vec<Command>) {
+    let Some(open) = &mut state.open else {
+        return (state, Vec::new());
+    };
+    let Some(value) = &open.value else {
+        return (state, Vec::new());
+    };
+    let last = value.viewer().row_count().saturating_sub(1);
+    open.cursor = (open.cursor as isize + by).clamp(0, last as isize) as usize;
+    after_cursor_move(state)
+}
+
+/// Move the value cursor straight to `to`, clamped; `usize::MAX` means "the
+/// end".
+fn cursor_to(mut state: State, to: usize) -> (State, Vec<Command>) {
+    let Some(open) = &mut state.open else {
+        return (state, Vec::new());
+    };
+    let Some(value) = &open.value else {
+        return (state, Vec::new());
+    };
+    let last = value.viewer().row_count().saturating_sub(1);
+    open.cursor = to.min(last);
+    after_cursor_move(state)
+}
+
+/// Keep the cursor's row inside the visible window — reusing the key list's
+/// own scroll-follow utility rather than re-deriving it — and hold live
+/// updates once the cursor has moved off the top (ADR-0006). Moving back to
+/// the top does not by itself undo that: the reader chooses when a held
+/// update lands, the same discipline the old raw-offset scroll used.
+fn after_cursor_move(mut state: State) -> (State, Vec<Command>) {
+    if let Some(open) = &mut state.open {
+        let viewport = crate::render::keys::Viewport {
+            offset: open.offset,
+            selected: open.cursor,
+        }
+        .scrolled_to_selection(VALUE_PAGE_ROWS);
+        open.offset = viewport.offset;
+        if open.cursor > 0 {
             open.at_rest = false;
         }
     }
@@ -1563,7 +1622,12 @@ mod tests {
             }),
         );
         assert_eq!(state.focus, Pane::Value);
-        assert_eq!(state.open.unwrap().offset, MOUSE_SCROLL_ROWS as usize);
+        let open = state.open.unwrap();
+        assert!(
+            open.cursor_active,
+            "scrolling the value pane enters cursor mode"
+        );
+        assert_eq!(open.cursor, MOUSE_SCROLL_ROWS as usize);
     }
 
     #[test]
@@ -3578,10 +3642,150 @@ mod loading_indicator_tests {
 }
 
 #[cfg(test)]
+mod cursor_mode_tests {
+    //! `Enter` activates a real cursor inside the open value; `Esc` exits it
+    //! without closing the key. While active, the six movement keys act on
+    //! the value cursor instead of the key list — `viewer_scroll_tests`
+    //! covers the paging/jump half of that once it is active.
+
+    use super::*;
+    use crate::msg::KeyCode;
+    use crate::state::open::OpenKey;
+    use crate::state::value::{PairValue, Value};
+
+    fn open_with(pairs: usize) -> State {
+        let value = Value::Hash(PairValue {
+            pairs: (0..pairs).map(|i| (format!("f{i}"), "v".into())).collect(),
+            total: pairs,
+        });
+        State {
+            cols: 130,
+            rows: 40,
+            open: Some(OpenKey::new(Some(0), "k".into(), value, -1, 10, 0)),
+            ..State::default()
+        }
+    }
+
+    fn press(state: State, code: KeyCode) -> (State, Vec<Command>) {
+        update(state, Msg::Key(KeyPress::plain(code)))
+    }
+
+    #[test]
+    fn enter_activates_cursor_mode_and_focuses_the_value_pane() {
+        let (state, _) = press(open_with(5), KeyCode::Enter);
+        let open = state.open.unwrap();
+        assert!(open.cursor_active);
+        assert_eq!(state.focus, Pane::Value);
+    }
+
+    #[test]
+    fn enter_with_nothing_open_does_nothing() {
+        let (state, cmds) = press(State::default(), KeyCode::Enter);
+        assert!(state.open.is_none());
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn enter_on_a_key_gone_before_load_does_nothing() {
+        // No body to move a cursor through — a name and a badge, nothing else.
+        let state = State {
+            open: Some(OpenKey::gone(Some(0), "k".into(), 0)),
+            ..State::default()
+        };
+        let (state, _) = press(state, KeyCode::Enter);
+        assert!(!state.open.unwrap().cursor_active);
+    }
+
+    #[test]
+    fn plain_movement_acts_on_the_key_list_until_enter_is_pressed() {
+        let state = open_with(5);
+        let (mut state, _) = update(state, Msg::ScanStarted { estimated_total: 2 });
+        state = update(
+            state,
+            Msg::ScanBatch {
+                keys: vec![b"a".to_vec(), b"b".to_vec()],
+            },
+        )
+        .0;
+        let before = state.view.selected;
+
+        let (state, _) = press(state, KeyCode::Down);
+        assert_eq!(
+            state.view.selected,
+            before + 1,
+            "not in cursor mode yet, so ↓ moves the key list"
+        );
+        assert_eq!(
+            state.open.unwrap().cursor,
+            0,
+            "the value cursor never moved"
+        );
+    }
+
+    #[test]
+    fn plain_movement_acts_on_the_value_cursor_once_active() {
+        let mut state = open_with(5);
+        state.keys.push(b"k");
+        state.rebuild_list();
+        let selected_before = state.view.selected;
+
+        let (state, _) = press(state, KeyCode::Enter);
+        let (state, _) = press(state, KeyCode::Down);
+
+        assert_eq!(state.open.unwrap().cursor, 1);
+        assert_eq!(
+            state.view.selected, selected_before,
+            "the key list is untouched while the cursor is active"
+        );
+    }
+
+    #[test]
+    fn esc_exits_cursor_mode_without_closing_the_key() {
+        let (state, _) = press(open_with(5), KeyCode::Enter);
+        let (state, _) = press(state, KeyCode::Esc);
+
+        let open = state.open.unwrap();
+        assert!(!open.cursor_active);
+        assert_eq!(state.focus, Pane::Keys);
+        assert!(
+            open.value.is_some(),
+            "the open key is untouched, not closed"
+        );
+    }
+
+    /// A moved cursor holds live updates (ADR-0006), and exiting cursor mode
+    /// must not silently let one through — the reader chooses when a held
+    /// update lands, same as every other apply-if-idle path.
+    #[test]
+    fn esc_does_not_restore_at_rest_on_its_own() {
+        let (state, _) = press(open_with(5), KeyCode::Enter);
+        let (state, _) = press(state, KeyCode::Down);
+        assert!(!state.open.as_ref().unwrap().may_apply());
+
+        let (state, _) = press(state, KeyCode::Esc);
+        assert!(!state.open.unwrap().may_apply());
+    }
+
+    /// Below 70 columns only one pane is drawn at a time; movement must be
+    /// aimed at whichever one that is, cursor mode or not (the same
+    /// discipline `pane_is_on_screen` already applies to the key list).
+    #[test]
+    fn narrow_width_moves_the_value_cursor_when_it_is_the_pane_on_screen() {
+        let mut state = open_with(5);
+        state.cols = 60;
+        let (state, _) = press(state, KeyCode::Enter);
+        let (state, _) = press(state, KeyCode::Down);
+        assert_eq!(state.open.unwrap().cursor, 1);
+    }
+}
+
+#[cfg(test)]
 mod viewer_scroll_tests {
-    //! Severity-4 UI task: paging and jump-to-start/end for the open value —
-    //! useful on a 500-entry zset or a large hex dump, where single-line
-    //! Ctrl+Up/Down alone is too slow to be worth using.
+    //! Paging and jump-to-start/end for the value cursor — useful on a
+    //! 500-entry zset or a large hex dump, where single-line `↑↓` alone is
+    //! too slow to be worth using. All of this only applies once `Enter`
+    //! (`Action::EnterValueCursor`) has activated the cursor; plain movement
+    //! acts on the key list otherwise (`cursor_mode_tests` covers that half).
 
     use super::*;
     use crate::msg::KeyCode;
@@ -3593,7 +3797,7 @@ mod viewer_scroll_tests {
             members: (0..n).map(|i| format!("m{i}")).collect(),
             total: n,
         });
-        State {
+        let mut state = State {
             // A real width: at `State::default()`'s zero columns the layout is
             // single-pane and the Viewer is not on screen, so its own scroll
             // keys would correctly do nothing.
@@ -3601,60 +3805,57 @@ mod viewer_scroll_tests {
             rows: 40,
             open: Some(OpenKey::new(Some(0), "k".into(), value, -1, 10, 0)),
             ..State::default()
-        }
+        };
+        state.open.as_mut().unwrap().cursor_active = true;
+        state
     }
 
-    fn press(state: State, code: KeyCode, ctrl: bool) -> (State, Vec<Command>) {
-        let key = if ctrl {
-            KeyPress::ctrl(code)
-        } else {
-            KeyPress::plain(code)
-        };
-        update(state, Msg::Key(key))
+    fn press(state: State, code: KeyCode) -> (State, Vec<Command>) {
+        update(state, Msg::Key(KeyPress::plain(code)))
     }
 
     #[test]
     fn page_down_moves_by_twenty_rows_and_clamps_at_the_end() {
-        let (state, _) = press(open_with(100), KeyCode::PageDown, true);
-        assert_eq!(state.open.unwrap().offset, 20);
+        let (state, _) = press(open_with(100), KeyCode::PageDown);
+        assert_eq!(state.open.unwrap().cursor, 20);
     }
 
     #[test]
     fn page_down_past_the_end_clamps_rather_than_overshooting() {
-        let (state, _) = press(open_with(10), KeyCode::PageDown, true);
-        assert_eq!(state.open.unwrap().offset, 9, "clamped to the last row");
+        let (state, _) = press(open_with(10), KeyCode::PageDown);
+        assert_eq!(state.open.unwrap().cursor, 9, "clamped to the last row");
     }
 
     #[test]
     fn page_up_moves_back_and_clamps_at_zero() {
         let mut state = open_with(100);
-        state.open.as_mut().unwrap().offset = 25;
-        let (state, _) = press(state, KeyCode::PageUp, true);
-        assert_eq!(state.open.as_ref().unwrap().offset, 5);
+        state.open.as_mut().unwrap().cursor = 25;
+        let (state, _) = press(state, KeyCode::PageUp);
+        assert_eq!(state.open.as_ref().unwrap().cursor, 5);
 
-        let (state, _) = press(state, KeyCode::PageUp, true);
-        assert_eq!(state.open.unwrap().offset, 0, "clamped, not negative");
+        let (state, _) = press(state, KeyCode::PageUp);
+        assert_eq!(state.open.unwrap().cursor, 0, "clamped, not negative");
     }
 
     #[test]
-    fn ctrl_home_jumps_to_the_top_in_one_keystroke() {
+    fn home_jumps_to_the_top_in_one_keystroke() {
         let mut state = open_with(500);
-        state.open.as_mut().unwrap().offset = 300;
-        let (state, _) = press(state, KeyCode::Home, true);
-        assert_eq!(state.open.unwrap().offset, 0);
+        state.open.as_mut().unwrap().cursor = 300;
+        let (state, _) = press(state, KeyCode::Home);
+        assert_eq!(state.open.unwrap().cursor, 0);
     }
 
     #[test]
-    fn ctrl_end_jumps_to_the_last_row_in_one_keystroke() {
-        let (state, _) = press(open_with(500), KeyCode::End, true);
-        assert_eq!(state.open.unwrap().offset, 499);
+    fn end_jumps_to_the_last_row_in_one_keystroke() {
+        let (state, _) = press(open_with(500), KeyCode::End);
+        assert_eq!(state.open.unwrap().cursor, 499);
     }
 
     #[test]
     fn jumping_away_from_the_top_means_updates_are_announced_not_applied() {
         // The existing apply-if-idle rule (ADR-0006) must hold for paging and
-        // jumping exactly as it already does for single-step scrolling.
-        let (state, _) = press(open_with(500), KeyCode::End, true);
+        // jumping exactly as it already does for single-step movement.
+        let (state, _) = press(open_with(500), KeyCode::End);
         assert!(!state.open.unwrap().may_apply());
     }
 
@@ -3662,34 +3863,24 @@ mod viewer_scroll_tests {
     fn jumping_back_to_the_top_does_not_by_itself_restore_at_rest() {
         // Consistent with the existing single-step behaviour: the reader
         // chooses when a held update lands, rather than it being inferred from
-        // scroll position alone.
+        // cursor position alone.
         let mut state = open_with(500);
-        state.open.as_mut().unwrap().offset = 300;
+        state.open.as_mut().unwrap().cursor = 300;
         state.open.as_mut().unwrap().at_rest = false;
-        let (state, _) = press(state, KeyCode::Home, true);
+        let (state, _) = press(state, KeyCode::Home);
         let open = state.open.unwrap();
-        assert_eq!(open.offset, 0);
+        assert_eq!(open.cursor, 0);
         assert!(!open.at_rest);
     }
 
     #[test]
-    fn scrolling_with_nothing_open_does_nothing() {
-        let (state, cmds) = press(State::default(), KeyCode::PageDown, true);
+    fn movement_with_nothing_open_does_nothing() {
+        // Not in cursor mode (nothing to activate it on), so this falls
+        // through to the key-list branch — which is also empty, hence still
+        // a no-op, just via the other path.
+        let (state, cmds) = press(State::default(), KeyCode::PageDown);
         assert!(state.open.is_none());
         assert!(cmds.is_empty());
-    }
-
-    #[test]
-    fn the_hints_for_paging_and_jumping_are_reachable_in_the_help_overlay() {
-        let keymap = crate::keymap::Keymap::default();
-        for action in [
-            crate::keymap::Action::ViewerPageDown,
-            crate::keymap::Action::ViewerPageUp,
-            crate::keymap::Action::ViewerTop,
-            crate::keymap::Action::ViewerBottom,
-        ] {
-            assert!(keymap.hint(action).is_some(), "{action:?} has no binding");
-        }
     }
 }
 

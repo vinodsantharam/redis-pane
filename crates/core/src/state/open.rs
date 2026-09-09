@@ -149,8 +149,22 @@ pub struct OpenKey {
     /// Clock reading at the last completed read. Drives the TTL countdown and
     /// the Read age, both of which are computed locally (R3.9).
     pub read_at_ms: u64,
-    /// Body scroll. Shared across every type, because the frame is shared.
+    /// Top row of the visible window. Shared across every type, because the
+    /// frame is shared. Purely derived from [`OpenKey::cursor`] via
+    /// [`crate::render::keys::Viewport::scrolled_to_selection`] — the same
+    /// scroll-follow utility the key list uses — so this is never written to
+    /// directly outside of that.
     pub offset: usize,
+    /// The highlighted row inside the value, while [`OpenKey::cursor_active`]
+    /// is set. Meaningless otherwise — plain movement acts on the key list
+    /// until `Enter` activates this.
+    pub cursor: usize,
+    /// Whether plain movement (`↑↓`/`j`/`k`/`PgUp`/`PgDn`/`Home`/`End`) drives
+    /// [`OpenKey::cursor`] instead of the key list right now. Set by `Enter`
+    /// (`Action::EnterValueCursor`), cleared by `Esc` — deliberately, not as
+    /// a side effect of `Tab`/focus changing, so looking at the value pane
+    /// never silently reprograms what the movement keys do.
+    pub cursor_active: bool,
     /// Whether the body is scrolled to the top and no editor is open.
     pub at_rest: bool,
     /// Set while an editor holds an unsaved buffer. An arriving update never
@@ -184,6 +198,8 @@ impl OpenKey {
             size_bytes,
             read_at_ms: at_ms,
             offset: 0,
+            cursor: 0,
+            cursor_active: false,
             at_rest: true,
             editing: false,
             pending: None,
@@ -211,6 +227,8 @@ impl OpenKey {
             size_bytes: 0,
             read_at_ms: at_ms,
             offset: 0,
+            cursor: 0,
+            cursor_active: false,
             at_rest: true,
             editing: false,
             pending: None,
@@ -222,10 +240,13 @@ impl OpenKey {
     /// Whether an arriving update may be applied without asking.
     ///
     /// Never while editing: clobbering someone's half-typed value is not a
-    /// trade-off. Never while scrolled: pulling a row out from under a cursor
-    /// in a 200-field hash is its own kind of broken.
+    /// trade-off. Never while the cursor has moved off the top row: pulling a
+    /// row out from under a cursor in a 200-field hash is its own kind of
+    /// broken. Checked on `cursor`, not `offset` — a value short enough to
+    /// need no scrolling at all still has a cursor sitting on a specific
+    /// field the reader is looking at, and `offset` alone would miss that.
     pub fn may_apply(&self) -> bool {
-        self.at_rest && !self.editing && self.offset == 0
+        self.at_rest && !self.editing && self.cursor == 0
     }
 
     /// How long the header states what the last read found before falling back
@@ -493,6 +514,19 @@ mod tests {
         let mut k = open();
         k.at_rest = false;
         k.offset = 0;
+        assert!(!k.may_apply());
+    }
+
+    /// A value short enough that the whole thing fits on screen never moves
+    /// `offset` — the viewport has nothing to scroll. But the cursor can
+    /// still be sitting on field 3 of 5, and a live update landing there
+    /// unannounced is exactly the bug ADR-0006 exists to prevent. `offset`
+    /// alone would have missed this; `cursor` does not.
+    #[test]
+    fn a_cursor_moved_within_an_unscrolled_value_still_holds_updates() {
+        let mut k = open();
+        k.cursor = 3;
+        assert_eq!(k.offset, 0, "nothing to scroll in a value this short");
         assert!(!k.may_apply());
     }
 

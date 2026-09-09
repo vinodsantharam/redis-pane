@@ -101,6 +101,14 @@ impl Tree {
         self.rows.clear();
         let sep = self.separator as u8;
         let mut previous: Vec<(u32, u16)> = Vec::new();
+        // Row indices of the currently-open ancestor Group rows, kept in
+        // step with `previous` (truncated on divergence, extended on a new
+        // group) rather than recomputed from `self.rows` afterwards — that
+        // is what lets a collapsed group's count include children that
+        // never become rows of their own. `counts` is parallel to
+        // `self.rows`, filled in here and applied once at the end.
+        let mut open_groups: Vec<usize> = Vec::new();
+        let mut counts: Vec<u32> = Vec::new();
 
         for row in 0..view.len() {
             let Some(index) = view.index_at(row) else {
@@ -127,6 +135,7 @@ impl Tree {
                     keys.arena_slice(*ao, *al) == keys.arena_slice(*bo, *bl)
                 })
                 .count();
+            open_groups.truncate(shared);
 
             let mut prefix = String::new();
             for (depth, (offset, len)) in segments.iter().enumerate() {
@@ -146,12 +155,25 @@ impl Tree {
                     descendants: 0,
                     expanded: !collapsed,
                 });
+                counts.push(0);
+                open_groups.push(self.rows.len() - 1);
                 if collapsed {
                     // Stop descending: every key under this prefix is hidden.
                     // `previous` is set to the full segment list below, which
                     // is what stops the next key re-emitting this same header.
+                    // The collapsed group's own row stays in `open_groups`,
+                    // though — its count must keep growing even though none
+                    // of these keys get a row of their own.
                     break;
                 }
+            }
+
+            // Every ancestor still open at this key's depth gains one
+            // descendant — the group itself if it is collapsed, same as an
+            // expanded one; folding hides rows, not the count of what they
+            // represent.
+            for &g in &open_groups {
+                counts[g] += 1;
             }
 
             // If any ancestor is collapsed, the key itself is not shown.
@@ -160,10 +182,20 @@ impl Tree {
                     index: index as u32,
                     depth: segments.len() as u16,
                 });
+                // `counts` is indexed the same as `self.rows`, so every push
+                // to one needs a push to the other — this entry is never
+                // read back (only `Row::Group` rows are), it just keeps the
+                // two in step.
+                counts.push(0);
             }
             previous = segments;
         }
-        self.count_descendants();
+
+        for (i, row) in self.rows.iter_mut().enumerate() {
+            if let Row::Group { descendants, .. } = row {
+                *descendants = counts[i];
+            }
+        }
     }
 
     fn ancestor_collapsed(&self, _keys: &LoadedSet, name: &[u8]) -> bool {
@@ -172,35 +204,6 @@ impl Tree {
         }
         let name = String::from_utf8_lossy(name);
         self.collapsed.iter().any(|p| name.starts_with(p.as_str()))
-    }
-
-    /// Walk backwards filling in how many keys sit beneath each group.
-    fn count_descendants(&mut self) {
-        let mut counts: Vec<u32> = vec![0; self.rows.len()];
-        let mut stack: Vec<usize> = Vec::new();
-        for i in 0..self.rows.len() {
-            let depth = self.rows[i].depth();
-            while let Some(&top) = stack.last() {
-                if self.rows[top].depth() >= depth {
-                    stack.pop();
-                } else {
-                    break;
-                }
-            }
-            if matches!(self.rows[i], Row::Key { .. }) {
-                for &g in &stack {
-                    counts[g] += 1;
-                }
-            }
-            if matches!(self.rows[i], Row::Group { .. }) {
-                stack.push(i);
-            }
-        }
-        for (i, row) in self.rows.iter_mut().enumerate() {
-            if let Row::Group { descendants, .. } = row {
-                *descendants = counts[i];
-            }
-        }
     }
 }
 
@@ -289,10 +292,40 @@ mod tests {
         tree.toggle("user:");
         tree.rebuild(&keys, &view);
         let rows = rendered(&keys, &tree);
-        assert!(rows.iter().any(|r| r.starts_with("user:")));
-        assert!(
-            !rows.iter().any(|r| r.contains("user:1:a")),
-            "collapsed children must be hidden: {rows:?}"
+        assert_eq!(
+            rows,
+            ["feed: (1)", "  feed:hot", "user: (2)"],
+            "a collapsed group states what it is hiding, count included — \
+             hidden children must not read as an empty group"
+        );
+    }
+
+    /// A collapsed group's count must include *every* real descendant, not
+    /// just the ones that happen to have a row of their own — a nested
+    /// group collapsed two levels down used to be invisible to
+    /// `count_descendants`, which only ever counted rows it could see.
+    #[test]
+    fn a_nested_collapse_still_counts_toward_every_open_ancestor() {
+        let (keys, view, mut tree) = built(&[
+            "user:1:cart",
+            "user:1:session",
+            "user:2:session",
+            "feed:hot",
+        ]);
+        tree.toggle("user:1:");
+        tree.rebuild(&keys, &view);
+        assert_eq!(
+            rendered(&keys, &tree),
+            [
+                "feed: (1)",
+                "  feed:hot",
+                "user: (3)",
+                "  1: (2)",
+                "  2: (1)",
+                "    user:2:session",
+            ],
+            "user:'s count must still include the two keys hidden under the \
+             collapsed user:1: subgroup"
         );
     }
 

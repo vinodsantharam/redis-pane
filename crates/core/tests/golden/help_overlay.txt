@@ -16,9 +16,10 @@ End     bottom
 /       filter
 s       sort
 t       tree
-⏎       fold
-→       open
-l       open
+→       open / expand
+l       open / expand
+←       collapse / parent
+h       collapse / parent
 ⌃↓      scroll
 ⌃↑      scroll
 ⌃PGDN   page value

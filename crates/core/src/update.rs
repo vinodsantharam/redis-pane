@@ -612,6 +612,24 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             after_move(state)
         }
         Action::Open => {
+            // Right on a group row: expand it if collapsed, or step into its
+            // first child if it is already expanded. Right never collapses —
+            // `CollapseGroup` is the only key that does — matching the
+            // standard treeview Right-arrow behavior (VS Code, macOS/Windows
+            // outline views, the WAI-ARIA treeview pattern).
+            if state.tree_mode
+                && let Some(crate::state::tree::Row::Group { expanded, .. }) =
+                    state.tree.row(state.view.selected)
+            {
+                if expanded {
+                    return move_selection(state, 1);
+                }
+                if let Some(prefix) = group_prefix_at(&state, state.view.selected) {
+                    state.tree.toggle(&prefix);
+                    state.rebuild_list();
+                }
+                return after_move(state);
+            }
             let Some(index) = state.selected_key() else {
                 return (state, Vec::new());
             };
@@ -666,12 +684,25 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             state.rebuild_list();
             after_move(state)
         }
-        Action::ToggleGroup => {
-            if state.tree_mode
-                && let Some(prefix) = group_prefix_at(&state, state.view.selected)
-            {
-                state.tree.toggle(&prefix);
-                state.rebuild_list();
+        Action::CollapseGroup => {
+            // Left never expands (`Open` is the only key that does):
+            // collapses an expanded group in place; a group that is already
+            // collapsed, or a key row (which has no children of its own to
+            // collapse), moves the cursor to the parent group instead. A
+            // top-level group with nothing left to collapse has no parent to
+            // go to either, so this is a no-op — the standard treeview
+            // Left-arrow behavior.
+            if state.tree_mode {
+                if let Some(crate::state::tree::Row::Group { expanded: true, .. }) =
+                    state.tree.row(state.view.selected)
+                {
+                    if let Some(prefix) = group_prefix_at(&state, state.view.selected) {
+                        state.tree.toggle(&prefix);
+                        state.rebuild_list();
+                    }
+                } else if let Some(parent) = parent_row(&state, state.view.selected) {
+                    state.view.selected = parent;
+                }
             }
             after_move(state)
         }
@@ -688,42 +719,51 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
     }
 }
 
-/// The full prefix of the group under the cursor, e.g. `user:8812:`.
+/// The row of the parent of `row` — the nearest *preceding* row one depth
+/// shallower — or `None` at depth 0, which has no parent.
+///
+/// True by construction: `Tree::rebuild` pushes rows in a single
+/// left-to-right pass and only ever reuses an already-pushed ancestor rather
+/// than duplicating it, so the nearest preceding row at each shallower depth
+/// is always the immediate parent. Works the same for a Key row or a Group
+/// row — `Row::depth` is defined for both — which is what lets `Left`
+/// (`Action::CollapseGroup`) treat "collapse, then go to parent" as one walk
+/// regardless of what row it started on.
+fn parent_row(state: &State, row: usize) -> Option<usize> {
+    use crate::state::tree::Row;
+    let depth = state.tree.row(row)?.depth();
+    if depth == 0 {
+        return None;
+    }
+    (0..row)
+        .rev()
+        .find(|&r| matches!(state.tree.row(r), Some(Row::Group { depth: d, .. }) if d == depth - 1))
+}
+
 /// The prefix a group row stands for, e.g. `user:profile:` for a depth-1
 /// group under `user:`.
 ///
 /// Built from the rows themselves — this row and each ancestor Group row
-/// above it, every one of which already carries its own segment's arena
-/// location — so it needs nothing *beneath* `row` to exist. An earlier
-/// version reconstructed the prefix by searching forward for the first
-/// visible Key row under the group instead, which broke the moment the group
-/// was collapsed: `Tree::row` hides a collapsed group's children entirely, so
-/// the search skipped straight past them onto a *different* group's key (or
-/// found nothing), reconstructing the wrong prefix or none at all. `Enter`
-/// could fold a group but never unfold it again from the same row (#16).
+/// above it via [`parent_row`], every one of which already carries its own
+/// segment's arena location — so it needs nothing *beneath* `row` to exist.
+/// An earlier version reconstructed the prefix by searching forward for the
+/// first visible Key row under the group instead, which broke the moment the
+/// group was collapsed: `Tree::row` hides a collapsed group's children
+/// entirely, so the search skipped straight past them onto a *different*
+/// group's key (or found nothing), reconstructing the wrong prefix or none
+/// at all — folding a group worked, unfolding it from the same row didn't
+/// (#16).
 fn group_prefix_at(state: &State, row: usize) -> Option<String> {
     use crate::state::tree::Row;
-    let Some(Row::Group { depth, .. }) = state.tree.row(row) else {
+    let Some(Row::Group { .. }) = state.tree.row(row) else {
         return None;
     };
 
-    // This row, plus every ancestor Group row: for a group at depth d, the
-    // ancestor at depth d-1 is the nearest *preceding* row at that depth —
-    // true by construction, since `Tree::rebuild` pushes rows in a single
-    // left-to-right pass and only ever reuses an already-pushed ancestor
-    // rather than duplicating it.
     let mut rows = vec![row];
-    let mut want = depth;
-    for r in (0..row).rev() {
-        if want == 0 {
-            break;
-        }
-        if let Some(Row::Group { depth: d, .. }) = state.tree.row(r)
-            && d == want - 1
-        {
-            rows.push(r);
-            want -= 1;
-        }
+    let mut r = row;
+    while let Some(parent) = parent_row(state, r) {
+        rows.push(parent);
+        r = parent;
     }
     rows.reverse();
 
@@ -3113,8 +3153,12 @@ mod tree_fold_tests {
         state
     }
 
-    fn press_enter(state: State) -> State {
-        update(state, Msg::Key(KeyPress::plain(KeyCode::Enter))).0
+    fn press_left(state: State) -> State {
+        update(state, Msg::Key(KeyPress::plain(KeyCode::Left))).0
+    }
+
+    fn press_right(state: State) -> State {
+        update(state, Msg::Key(KeyPress::plain(KeyCode::Right))).0
     }
 
     fn group_row(state: &State, prefix: &str) -> usize {
@@ -3126,8 +3170,15 @@ mod tree_fold_tests {
             .unwrap_or_else(|| panic!("no group row for {prefix:?}"))
     }
 
+    fn expanded(state: &State, row: usize) -> bool {
+        matches!(state.tree.row(row), Some(Row::Group { expanded: true, .. }))
+    }
+
+    /// The regression this module exists for (#16, then re-fought over which
+    /// keys should drive it): collapsing and expanding the same row must be
+    /// the same operation done twice, whichever keys it lives on.
     #[test]
-    fn a_folded_group_unfolds_from_the_same_row() {
+    fn left_collapses_in_place_and_right_expands_it_again_from_the_same_row() {
         let state = nested_tree();
         let before = state.tree.len();
 
@@ -3135,28 +3186,17 @@ mod tree_fold_tests {
         let mut state = state;
         state.view.selected = row;
 
-        let state = press_enter(state);
-        assert!(
-            matches!(
-                state.tree.row(row),
-                Some(Row::Group {
-                    expanded: false,
-                    ..
-                })
-            ),
-            "first Enter folds the group"
+        let state = press_left(state);
+        assert!(!expanded(&state, row), "Left collapses the group");
+        assert_eq!(
+            state.view.selected, row,
+            "collapsing does not move the cursor"
         );
         assert!(state.tree.len() < before, "children are hidden once folded");
 
-        // The bug: a second `Enter` on the *same row* used to search forward
-        // for a descendant key to rebuild the prefix from, and a folded
-        // group's descendants are hidden — so it silently toggled a
-        // different group, or nothing at all.
-        let state = press_enter(state);
-        assert!(
-            matches!(state.tree.row(row), Some(Row::Group { expanded: true, .. })),
-            "second Enter on the same row unfolds it again"
-        );
+        let state = press_right(state);
+        assert!(expanded(&state, row), "Right expands it again, in place");
+        assert_eq!(state.view.selected, row);
         assert_eq!(
             state.tree.len(),
             before,
@@ -3165,7 +3205,7 @@ mod tree_fold_tests {
     }
 
     #[test]
-    fn a_nested_group_folds_and_unfolds_independently_of_its_parent() {
+    fn a_nested_group_collapses_and_expands_independently_of_its_parent() {
         let state = nested_tree();
         let before = state.tree.len();
 
@@ -3173,26 +3213,115 @@ mod tree_fold_tests {
         let mut state = state;
         state.view.selected = row;
 
-        let state = press_enter(state);
-        assert!(matches!(
-            state.tree.row(row),
-            Some(Row::Group {
-                expanded: false,
-                ..
-            })
-        ));
+        let state = press_left(state);
+        assert!(!expanded(&state, row));
         // The parent group and the sibling `user:8813:` group are untouched.
-        assert!(matches!(
-            state.tree.row(group_row(&state, "user:")),
-            Some(Row::Group { expanded: true, .. })
-        ));
+        assert!(expanded(&state, group_row(&state, "user:")));
 
-        let state = press_enter(state);
+        let state = press_right(state);
         assert!(
-            matches!(state.tree.row(row), Some(Row::Group { expanded: true, .. })),
-            "unfolds from the same row, same as the top-level case"
+            expanded(&state, row),
+            "expands from the same row, same as the top-level case"
         );
         assert_eq!(state.tree.len(), before);
+    }
+
+    /// The standard treeview Right-arrow behavior: it never re-collapses an
+    /// already-open group, it steps into the first child instead. Only Left
+    /// ever collapses.
+    #[test]
+    fn right_on_an_expanded_group_steps_into_its_first_child_rather_than_collapsing_it() {
+        let state = nested_tree();
+        let row = group_row(&state, "user:");
+        let mut state = state;
+        state.view.selected = row;
+
+        let state = press_right(state);
+        assert!(expanded(&state, row), "Right must not have collapsed it");
+        assert_eq!(
+            state.view.selected,
+            row + 1,
+            "the cursor stepped into the first child row"
+        );
+    }
+
+    /// The symmetric standard behavior for Left: it never expands anything,
+    /// it only collapses or moves toward the root.
+    #[test]
+    fn left_on_an_already_collapsed_group_moves_to_its_parent() {
+        let mut state = nested_tree();
+        let row = group_row(&state, "user:8812:");
+        state.tree.toggle(&group_prefix_at(&state, row).unwrap());
+        state.rebuild_list();
+        // The row index may have shifted once `user:8812:`'s children hid.
+        let row = group_row(&state, "user:8812:");
+        state.view.selected = row;
+
+        let state = press_left(state);
+        assert!(
+            !expanded(&state, group_row(&state, "user:8812:")),
+            "an already-collapsed group must not have been touched"
+        );
+        assert_eq!(
+            state.view.selected,
+            group_row(&state, "user:"),
+            "the cursor moved to the parent group"
+        );
+    }
+
+    #[test]
+    fn left_on_a_key_row_moves_to_its_parent_group() {
+        let state = nested_tree();
+        let key_row = (0..state.tree.len())
+            .find(|&r| state.tree.key_index(r).is_some())
+            .expect("at least one key row is visible");
+        let mut state = state;
+        state.view.selected = key_row;
+
+        let state = press_left(state);
+        assert_eq!(
+            state.view.selected,
+            parent_row(&state, key_row).expect("a key always has a parent group"),
+            "a key has no children of its own to collapse, so Left goes straight to its parent"
+        );
+    }
+
+    /// The standard behavior at the root: a top-level group has nothing left
+    /// to collapse into and no parent to jump to, so Left is a no-op.
+    #[test]
+    fn left_on_a_collapsed_top_level_group_is_a_no_op() {
+        let mut state = nested_tree();
+        let row = group_row(&state, "user:");
+        state.tree.toggle(&group_prefix_at(&state, row).unwrap());
+        state.rebuild_list();
+        let row = group_row(&state, "user:");
+        state.view.selected = row;
+        let before = state.clone();
+
+        let state = press_left(state);
+        assert_eq!(state.view.selected, row, "the cursor does not move");
+        assert_eq!(
+            state.tree, before.tree,
+            "fold state is unchanged: there was nothing left to collapse"
+        );
+    }
+
+    /// Right on a key row is unaffected by any of this — it still opens the
+    /// key, tree mode or not.
+    #[test]
+    fn right_on_a_key_row_still_opens_it() {
+        let state = nested_tree();
+        let key_row = (0..state.tree.len())
+            .find(|&r| state.tree.key_index(r).is_some())
+            .expect("at least one key row is visible");
+        let mut state = state;
+        state.view.selected = key_row;
+
+        let (_, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        assert!(
+            matches!(cmds.as_slice(), [Command::OpenKey { .. }]),
+            "expected an open, got {cmds:?}"
+        );
     }
 }
 

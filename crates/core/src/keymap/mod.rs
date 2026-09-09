@@ -33,9 +33,19 @@ pub enum Action {
     Sort,
     /// Fold the list on the separator, or unfold it.
     ToggleTree,
-    /// Expand or collapse the group under the cursor.
-    ToggleGroup,
-    /// Open the selected key in the Viewer.
+    /// Collapse the group under the cursor, matching the standard treeview
+    /// Left-arrow behavior (VS Code, macOS/Windows outline views, the
+    /// WAI-ARIA treeview pattern): an already-collapsed group moves the
+    /// cursor to its parent instead — the only thing left for Left to do —
+    /// and a key row (which has no children of its own) does the same. Right
+    /// (`Action::Open`) is the only key that ever expands; this one never
+    /// does, so folding and moving up the tree are always unambiguous.
+    CollapseGroup,
+    /// Right-arrow behavior on the selected row: opens a key in the Viewer;
+    /// on a group, expands it if collapsed, or — matching the same standard
+    /// this key follows everywhere else — steps into its first child if it
+    /// is already expanded, since Right never collapses (`CollapseGroup` is
+    /// the only key that does).
     Open,
     /// Move down inside the open value.
     ViewerDown,
@@ -84,7 +94,7 @@ impl Action {
             | Action::Filter
             | Action::Sort
             | Action::ToggleTree
-            | Action::ToggleGroup
+            | Action::CollapseGroup
             | Action::Open => state.pane_visible(Pane::Keys),
             // The value body.
             Action::ViewerUp
@@ -120,8 +130,8 @@ impl Action {
             Action::Filter => "filter",
             Action::Sort => "sort",
             Action::ToggleTree => "tree",
-            Action::ToggleGroup => "fold",
-            Action::Open => "open",
+            Action::CollapseGroup => "collapse / parent",
+            Action::Open => "open / expand",
             Action::ViewerDown | Action::ViewerUp => "scroll",
             Action::ViewerPageDown | Action::ViewerPageUp => "page value",
             Action::ViewerTop => "value top",
@@ -268,16 +278,20 @@ impl Default for Keymap {
                     action: Action::ToggleTree,
                 },
                 Binding {
-                    key: KeyPress::plain(KeyCode::Enter),
-                    action: Action::ToggleGroup,
-                },
-                Binding {
                     key: KeyPress::plain(KeyCode::Right),
                     action: Action::Open,
                 },
                 Binding {
                     key: KeyPress::plain(KeyCode::Char('l')),
                     action: Action::Open,
+                },
+                Binding {
+                    key: KeyPress::plain(KeyCode::Left),
+                    action: Action::CollapseGroup,
+                },
+                Binding {
+                    key: KeyPress::plain(KeyCode::Char('h')),
+                    action: Action::CollapseGroup,
                 },
                 Binding {
                     key: KeyPress::ctrl(KeyCode::Down),
@@ -309,8 +323,8 @@ impl Default for Keymap {
                 },
                 // Horizontal chords for a horizontal action, alongside the
                 // vertical `⌃↑`/`⌃↓` pair that already scrolls the Viewer.
-                // Plain `Left`/`Right` are unbound and `⌃←`/`⌃→` otherwise
-                // idle, so this adds no ambiguity to the existing scheme.
+                // `⌃←`/`⌃→` are otherwise idle, so this adds no ambiguity with
+                // plain `Left`/`Right`, which are `Open`/`CollapseGroup` above.
                 Binding {
                     key: KeyPress::ctrl(KeyCode::Right),
                     action: Action::WidenKeysPane,
@@ -470,7 +484,7 @@ mod tests {
             Action::Filter,
             Action::Sort,
             Action::ToggleTree,
-            Action::ToggleGroup,
+            Action::CollapseGroup,
             Action::Open,
             Action::ViewerDown,
             Action::ViewerUp,

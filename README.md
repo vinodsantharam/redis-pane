@@ -67,11 +67,18 @@ including how to keep passwords out of your shell history.
 
 Once you're in:
 
-- `↑↓` or `j`/`k` to move, `→` or `l` to open a key
+- `↑↓` or `j`/`k` to move, `→` or `l` to open a key (or expand/descend a tree group), `←` or `h`
+  to collapse a group or jump to its parent
+- `Enter` to move a cursor inside an open value, `Esc` to leave it
 - `/` to filter, `Esc` to clear
 - `t` to toggle tree/flat view, `s` to cycle sort order
 - `y y` / `y v` / `y c` to copy a key name / value / `redis-cli` command
 - `?` for help with your actual keybindings
+
+![Folding a tree group with Left/Right, filtering down to one key, and moving a real cursor through its value with Enter and the arrow keys](navigation-demo.gif)
+
+*`←`/`→` fold and step through the tree; `Enter` drops a cursor into the open value so you can move
+through a long list without the mouse, and `Esc` takes you back to the key list.*
 
 ## Trying it out
 

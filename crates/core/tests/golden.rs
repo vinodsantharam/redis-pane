@@ -341,11 +341,12 @@ fn live_states_no_age_manual_states_one_and_reconnecting_states_the_countdown() 
     });
     assert!(manual.contains("read 14s ago"), "{manual}");
 
-    // A dropped link with nothing scheduled — the state the app actually
-    // reaches today, since `Command::Reconnect` is not wired until M2. It shows
-    // the Read age, which is what ADR-0009 asks for and what is true. This test
-    // used to assert `retry 4s` here, from a state the running app could not
-    // produce: a fixture keeping a promise the code never made.
+    // A dropped link with nothing scheduled — the moment right after
+    // `Msg::ConnectionLost`, before the shell's first reconnect attempt has
+    // failed and reported a backoff. It shows the Read age, which is what
+    // ADR-0009 asks for and what is true, plus the `r` key: disconnected, `r`
+    // retries the connection immediately (ADR-0009) rather than reading a now
+    // -dead client, so it belongs here exactly because it does something.
     let dropped = readout(&State {
         link: Link::Reconnecting {
             attempt: 1,
@@ -359,9 +360,8 @@ fn live_states_no_age_manual_states_one_and_reconnecting_states_the_countdown() 
         "no countdown for a retry nobody scheduled: {dropped}"
     );
     assert!(
-        dropped.trim_end().ends_with("ago"),
-        "nothing after the age — no Refetch key offered, since it would only \
-         read a dead client: {dropped}"
+        dropped.trim_end().ends_with("r"),
+        "the age, then the reconnect key: {dropped}"
     );
 
     // Once a retry really is scheduled the countdown is the useful fact
@@ -378,6 +378,10 @@ fn live_states_no_age_manual_states_one_and_reconnecting_states_the_countdown() 
     assert!(
         !retrying.contains("read "),
         "the countdown replaces the age: {retrying}"
+    );
+    assert!(
+        retrying.trim_end().ends_with("r"),
+        "immediate retry is still on offer while a backoff counts down: {retrying}"
     );
 }
 

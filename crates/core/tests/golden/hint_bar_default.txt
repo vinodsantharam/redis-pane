@@ -1,1 +1,1 @@
-Esc back   r rescan   ⌃R read-only   ? help   q quit
+Esc back   r reconnect   ⌃R read-only   ? help   q quit

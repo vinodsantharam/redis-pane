@@ -769,11 +769,13 @@ pub fn status_readout(state: &State, clock: &dyn Clock) -> Vec<(String, Token)> 
         }
         _ => {}
     }
-    // Offer `r` only where it can do something. Disconnected, a Refetch reads a
-    // dead client and returns an error — the same reason a replica reads
-    // `locked` rather than advertising `⌃R`: a key that cannot work is worse
-    // than no key, because the reader spends the incident pressing it.
-    if liveness == Liveness::Manual
+    // Offer `r` wherever it can do something. It used to be withheld while
+    // disconnected on the reasoning that a Refetch reads a dead client and
+    // returns an error — true when disconnected meant nothing could reconnect
+    // it, but ADR-0009 promises `r` retries immediately rather than waiting
+    // out the timer, and now it does (`Action::Refetch`, `update.rs`): the
+    // key does something disconnected too, so it belongs here too.
+    if liveness != Liveness::Live
         && let Some(hint) = state.keymap.hint(Action::Refetch)
     {
         out.push((format!("  {hint}"), Token::Muted));
@@ -797,7 +799,10 @@ pub fn hint_bar(state: &State) -> String {
         format!(
             "{} {}",
             key_label(&k),
-            a.label_in(state.keys_pane_focused())
+            a.label_in(
+                state.keys_pane_focused(),
+                state.liveness() == Liveness::Disconnected
+            )
         )
     })
     .collect::<Vec<_>>()

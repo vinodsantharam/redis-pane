@@ -20,12 +20,7 @@ t       tree
 l       open / expand
 ←       collapse / parent
 h       collapse / parent
-⌃↓      scroll
-⌃↑      scroll
-⌃PGDN   page value
-⌃PGUP   page value
-⌃HOME   value top
-⌃END    value bottom
+⏎       move in value
 y       copy
 ⌃→      widen keys
 ⌃←      narrow keys

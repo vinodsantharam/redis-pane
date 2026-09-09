@@ -1053,6 +1053,86 @@ fn golden_viewer_hash() {
 }
 
 #[test]
+fn golden_viewer_cursor_active() {
+    // `Enter` (`Action::EnterValueCursor`) highlights a row inside the value
+    // the same way the keys pane highlights its own selected row. `draw()`
+    // renders monochrome text only, so this fixture pins the row content and
+    // layout; the style itself is proved by the two tests below, mirroring
+    // `the_selected_row_carries_a_background_all_the_way_across_not_just_on_the_name`.
+    let mut state = opened("user:8812:session", hash_value(), 2_537);
+    let open = state.open.as_mut().unwrap();
+    open.cursor_active = true;
+    open.cursor = 1;
+    let frame = draw(&state, 130, 22);
+    assert!(
+        frame.contains("device"),
+        "the highlighted row's field: {frame}"
+    );
+    assert_golden("viewer_cursor_active", &frame);
+}
+
+#[test]
+fn the_value_cursor_row_carries_the_selected_background_all_the_way_across() {
+    let mut state = opened("user:8812:session", hash_value(), 2_537);
+    let open = state.open.as_mut().unwrap();
+    open.cursor_active = true;
+    open.cursor = 1; // the "device" row
+    let theme = Theme::new(ColorDepth::TrueColor);
+    let frame = render::frame(&state, &theme, &CLOCK, Rect::new(0, 0, 130, 22));
+    let y = row_of(&frame, "device");
+
+    let selected_bg = theme.style(Token::Selected).bg;
+    assert!(selected_bg.is_some());
+
+    let value_pane = redis_pane_core::render::layout::layout(
+        Rect::new(0, 0, 130, 22),
+        redis_pane_core::render::layout::Pane::Value,
+        0,
+    )
+    .value
+    .unwrap();
+
+    // The value pane reserves a one-column margin on each side everywhere
+    // (the name/header text starts at `area.x + 1`, right-aligned status
+    // text spans `area.width - 1`) — the highlight matches that, rather than
+    // touching the frame's outer border column.
+    let mut gaps = Vec::new();
+    for x in value_pane.x + 1..value_pane.x + value_pane.width - 1 {
+        match frame.cell((x, y)) {
+            Some(cell) if cell.style().bg == selected_bg => {}
+            other => gaps.push((x, other.map(|c| c.style().bg))),
+        }
+    }
+    assert!(
+        gaps.is_empty(),
+        "the cursor row's highlight has gaps: {gaps:?}"
+    );
+}
+
+#[test]
+fn a_row_is_only_highlighted_while_the_cursor_is_active_and_on_it() {
+    let state = opened("user:8812:session", hash_value(), 2_537);
+    let theme = Theme::new(ColorDepth::TrueColor);
+    let frame = render::frame(&state, &theme, &CLOCK, Rect::new(0, 0, 130, 22));
+    let y = row_of(&frame, "device");
+    let selected_bg = theme.style(Token::Selected).bg;
+
+    let value_pane = redis_pane_core::render::layout::layout(
+        Rect::new(0, 0, 130, 22),
+        redis_pane_core::render::layout::Pane::Value,
+        0,
+    )
+    .value
+    .unwrap();
+
+    assert!(
+        (value_pane.x + 1..value_pane.x + value_pane.width)
+            .all(|x| frame.cell((x, y)).map(|c| c.style().bg) != Some(selected_bg)),
+        "cursor_active is false, so nothing should be highlighted"
+    );
+}
+
+#[test]
 fn golden_viewer_zset() {
     let v = Value::ZSet(ScoredValue {
         entries: vec![

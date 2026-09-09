@@ -74,7 +74,11 @@ terminal is small and the situation is urgent.
 
 - **`Tab` toggles the two panes**; focus is shown by border color *and* a
   brightened title — never by border alone (colorblind and monochrome safety).
-- **Within a pane**, `↑↓` / `j k` move, `→` / `Enter` descends, `←` / `Esc` ascends.
+- **Within a pane**, `↑↓` / `j k` move, `→` / `l` descends (opens a key, expands
+  a collapsed tree group, or steps into an already-expanded one), `←` / `h`
+  ascends (collapses an expanded group, or moves to its parent). `Esc` is
+  always "back" (§below) and is a separate axis from this pair — it pops the
+  pane stack, not the tree.
 - **Global jumps** use a `g`-prefixed chord: `g k` keys, `g d` dashboard, `g m` monitor,
   `g p` pub/sub, `g s` slowlog. There is no `g c` — there is only ever one Connection.
 - **The command palette** (`Ctrl-K`, or `Cmd-K` where the terminal forwards it) is the escape
@@ -96,7 +100,8 @@ terminal is small and the situation is urgent.
 | `/` | Filter / search in pane | pane |
 | `n` / `N` | Next / previous match | pane |
 | `Space` | Toggle multi-select | key list |
-| `Enter` | Open key in value pane | key list |
+| `→` / `l` | Open key in value pane, or expand/descend a tree group | key list |
+| `←` / `h` | Collapse a tree group, or move to its parent | key list |
 | `r` | Refresh / rescan | pane |
 | `e` | Edit value | value pane |
 | `t` | Edit TTL | value pane |

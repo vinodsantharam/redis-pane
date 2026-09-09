@@ -229,7 +229,15 @@ fn main() {
     let theme = Theme::new(terminal::detect_color_depth());
 
     let tracking = established.tracking_supported;
-    if let Err(err) = runtime.block_on(terminal::run(state, theme, &clock, client, tracking)) {
+    if let Err(err) = runtime.block_on(terminal::run(
+        state,
+        theme,
+        &clock,
+        client,
+        tracking,
+        dial.to_string(),
+        resolution.credentials.clone(),
+    )) {
         eprintln!("redis-pane: {err}");
         std::process::exit(exit::CONNECTION);
     }

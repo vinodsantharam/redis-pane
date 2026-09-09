@@ -512,6 +512,22 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             (state, Vec::new())
         }
         Action::Refetch => {
+            // A dropped link, not merely `Link::Connecting` (before the first
+            // connect): there is nothing to refetch or rescan over a dead
+            // connection, only a reconnect to retry. ADR-0009: "`r` retries
+            // immediately rather than waiting out the timer." Checked before
+            // the pane-focus split below, which presupposes a connection to
+            // act over.
+            //
+            // Deliberately narrower than `Liveness::Disconnected`, which also
+            // covers `Link::Connecting` — real startup never renders an
+            // interactive frame in that state (the shell connects before the
+            // event loop starts), but a great many tests build off
+            // `State::default()`, whose `Link` defaults to `Connecting`, and
+            // never mean to be testing reconnection at all.
+            if matches!(state.link, Link::Reconnecting { .. }) {
+                return (state, vec![Command::Reconnect { after_ms: 0 }]);
+            }
             // `r` acts on the focused pane and nothing else (R2.7), and the
             // hint bar names which half is in force. The keys pane is not
             // push-live — the deletions it can detect for free arrive with the
@@ -1100,6 +1116,40 @@ mod tests {
             press_r(state),
             vec![Command::StartScan { pattern: None }],
             "with no key open, the keys pane is what `r` acts on"
+        );
+    }
+
+    /// ADR-0009: "`r` retries immediately rather than waiting out the
+    /// timer." Disconnected, there is nothing to refetch or rescan — checked
+    /// before the pane-focus split, in both panes, with or without a key open.
+    #[test]
+    fn r_reconnects_immediately_while_disconnected_regardless_of_pane() {
+        fn dropped_link() -> Link {
+            Link::Reconnecting {
+                attempt: 1,
+                retry_in_ms: Some(4_000),
+            }
+        }
+        let keys_pane = State {
+            cols: 130,
+            rows: 40,
+            link: dropped_link(),
+            ..State::default()
+        };
+        assert_eq!(
+            press_r(keys_pane),
+            vec![Command::Reconnect { after_ms: 0 }],
+            "keys pane focused, but there is nothing to rescan without a link"
+        );
+
+        let viewer = State {
+            link: dropped_link(),
+            ..viewing()
+        };
+        assert_eq!(
+            press_r(viewer),
+            vec![Command::Reconnect { after_ms: 0 }],
+            "Viewer focused, but there is nothing to refetch without a link"
         );
     }
 

@@ -81,16 +81,15 @@ recorded golden frame.
 | 7 | Config schema, strict parse rejecting unknown fields, permission refusal | Line/column errors; a typo'd `passwordEnv` fails loudly; group-readable file refused (R1.5, R1.7) |
 | 8 | Redis shell: `fred`, RESP3, version floor, **capability probe** | Connects to 6.2 and 7.x; Redis 5 is refused with a diagnostic rather than a protocol error; a server refusing `CLIENT TRACKING` degrades to `○ manual` (R1.13, ADR-0007) |
 | 9 | Startup diagnostics and exit codes | Unreachable target exits non-zero with target, Source and cause on stderr (R1.14) |
-| 10 | ~~Reconnect with visible backoff~~, **both re-arm invariants** | **Reconnection is not built** — `Command::Reconnect` is a no-op and fred is configured with no retry policy, so a dropped link stays dropped until the process is restarted. Deferred to M2. The re-arm invariants themselves hold and are tested: the header never reads `● live` until tracking is armed, and a second write after an invalidation produces a push only once the Refetch re-armed (ADR-0006, ADR-0009). The header no longer claims a retry it is not scheduling |
+| 10 | Reconnect with visible backoff, both re-arm invariants | The shell redials on `Command::Reconnect` (exponential backoff, `redis::backoff_for`), redoing the full startup ritual — version floor, tracking probe, server conditions — since a server that vanished and came back is not guaranteed to still be the same one. `r` retries immediately rather than waiting out the timer (ADR-0009), cancelling whatever backoff or in-flight attempt was already running. Both re-arm invariants hold and are tested: the header never reads `● live` until tracking is armed, and a second write after an invalidation produces a push only once the Refetch re-armed (ADR-0006, ADR-0009). The header states the retry countdown while one is scheduled |
 | 11 | Title bar: Environment dot, target, db, Source, Read-only reason | Golden frames of every readout in DESIGN §6.8, including `replica … locked` |
 | 12 | Help overlay, keymap as data, hint bar | An overridden binding changes the on-screen hint (R7.5) |
 
 **Done when** `redis-pane staging` opens against a real server, shows exactly what it is
 connected to and why, survives the server being restarted underneath it, and exits usefully when
-it cannot connect. No keyspace. — **Met apart from surviving a restart**, which needs the
-reconnection in M0.10 above and is deferred to M2. What the app does today is keep the last read
-value, say `✕ disconnected`, and state the Read age — honest about where it is, and unable to
-recover on its own.
+it cannot connect. No keyspace. — **Met.** A dropped link keeps the last read value, says
+`✕ disconnected`, states the Read age, and reconnects on its own with a visible backoff
+(M0.10); `r` retries immediately rather than waiting out the timer.
 
 ## 4. M1 — Browse
 

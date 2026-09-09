@@ -135,12 +135,16 @@ impl Action {
 
     /// The label for the hint bar, which describes what the key does *now*.
     ///
-    /// Only `Refetch` differs: it acts on the focused pane (R2.7), so a bar
-    /// that always read "refetch" would name the wrong half of it half the
-    /// time. Takes the answer rather than a `&State` so the keymap stays free
-    /// of the rest of the core, and so this is trivially testable both ways.
-    pub fn label_in(&self, keys_pane_focused: bool) -> &'static str {
+    /// `Refetch` differs in two ways: it acts on the focused pane (R2.7), so a
+    /// bar that always read "refetch" would name the wrong half of it half the
+    /// time; and disconnected, there is nothing to refetch or rescan — `r`
+    /// retries the connection instead (ADR-0009), so it must say so rather
+    /// than naming an action that would just error against a dead client.
+    /// Takes the answer rather than a `&State` so the keymap stays free of the
+    /// rest of the core, and so this is trivially testable all three ways.
+    pub fn label_in(&self, keys_pane_focused: bool, disconnected: bool) -> &'static str {
         match self {
+            Action::Refetch if disconnected => "reconnect",
             Action::Refetch if keys_pane_focused => "rescan",
             Action::Refetch => "refetch",
             other => other.label(),
@@ -394,6 +398,20 @@ mod tests {
             k.action_for(&KeyPress::plain(KeyCode::Char('r'))),
             k.action_for(&KeyPress::ctrl(KeyCode::Char('r')))
         );
+    }
+
+    /// Disconnected outranks pane focus: there is nothing to refetch or
+    /// rescan without a connection, only a reconnect to retry (ADR-0009).
+    #[test]
+    fn refetch_says_reconnect_while_disconnected_regardless_of_focus() {
+        assert_eq!(Action::Refetch.label_in(true, true), "reconnect");
+        assert_eq!(Action::Refetch.label_in(false, true), "reconnect");
+    }
+
+    #[test]
+    fn refetch_still_splits_on_pane_focus_when_connected() {
+        assert_eq!(Action::Refetch.label_in(true, false), "rescan");
+        assert_eq!(Action::Refetch.label_in(false, false), "refetch");
     }
 
     #[test]

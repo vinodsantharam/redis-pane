@@ -20,10 +20,13 @@ use fred::prelude::Client;
 use redis_pane_core::clock::Clock;
 use redis_pane_core::command::ReadToken;
 use redis_pane_core::msg::{KeyCode, KeyPress, MouseAction};
+use redis_pane_core::resolve::Credentials;
 use redis_pane_core::theme::{ColorDepth, Theme};
 use redis_pane_core::{Command, Msg, State, render, update};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+use crate::redis::Established;
 
 /// Restores the terminal on drop, including when the process is unwinding.
 /// Leaving a terminal in raw mode after a panic is the rudest thing a TUI can
@@ -97,8 +100,10 @@ pub async fn run(
     mut state: State,
     theme: Theme,
     clock: &dyn Clock,
-    client: Client,
-    tracking: bool,
+    mut client: Client,
+    mut tracking: bool,
+    dial: String,
+    credentials: Credentials,
 ) -> std::io::Result<()> {
     terminal::enable_raw_mode()?;
     execute!(
@@ -161,7 +166,10 @@ pub async fn run(
     );
 
     // Driven by the capability probe, never by preference (ADR-0007).
-    let arming = if tracking {
+    // Mutable: a reconnect re-probes tracking (a fresh connection may find a
+    // different server, or the same server in a different mood), and every
+    // read after that must arm — or not — accordingly.
+    let mut arming = if tracking {
         crate::redis::read::Arming::Enabled
     } else {
         crate::redis::read::Arming::Unsupported
@@ -174,79 +182,33 @@ pub async fn run(
     let mut read_gate = crate::redis::read::ReadGate::default();
     start_scan(&client, None, &tx, &mut scan_cancel);
 
+    // Superseded exactly like `scan_cancel`/`read_gate`: a manual retry
+    // (`r` while disconnected, ADR-0009) must cancel whatever backoff sleep
+    // or in-flight attempt was already running rather than race it.
+    let mut reconnect_cancel: Option<CancellationToken> = None;
+    // How many attempts this outage has cost, purely for the backoff curve
+    // and the header's countdown (`Msg::ReconnectScheduled`) — reset to 0 the
+    // moment a reconnect actually lands. `Command::Reconnect` carries no
+    // attempt number of its own; this is the one place that counts.
+    let mut reconnect_attempt: u32 = 0;
+    // A successful reconnect swaps in a brand new `Client` (`connect_with`
+    // redoes the whole startup ritual — version floor, tracking probe, server
+    // conditions — exactly as it should: a server that vanished and came back
+    // is not guaranteed to still be the same server). `Client` cannot travel
+    // through `tx`/`Msg`: the core stays free of `fred` by construction
+    // (ADR-0011's boundary), so a fresh client can only reach `run`'s own
+    // locals through a side channel the main loop polls directly, never
+    // through `update()`.
+    let (reconnected_tx, mut reconnected_rx) = mpsc::channel::<(Client, Established)>(1);
+
     // fred reconnects underneath us, and the server on the other side remembers
     // nothing about what we were watching. Telling the core lets it drop the
     // liveness claim and re-arm — the invariant ADR-0009 exists for, which
-    // until now was enforced only where it was tested (PLAN M0.10).
-    {
-        let mut reconnects = client.reconnect_rx();
-        let tx = tx.clone();
-        let probe = client.clone();
-        tokio::spawn(async move {
-            while reconnects.recv().await.is_ok() {
-                // A fresh connection tracks nothing, so capability must be
-                // re-probed rather than remembered.
-                let tracking = crate::redis::probe_tracking_public(&probe).await;
-                let (read_only, condition) = crate::redis::server_conditions(&probe).await;
-                let _ = tx
-                    .send(Msg::ServerState {
-                        read_only,
-                        condition,
-                    })
-                    .await;
-                if tx
-                    .send(Msg::Connected {
-                        version: String::new(),
-                        tracking_supported: tracking,
-                    })
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-        });
-    }
-    {
-        let mut errors = client.error_rx();
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            while let Ok((error, _server)) = errors.recv().await {
-                // A connection-level error means the link is gone; anything
-                // else is a command failure and belongs in a notification.
-                let msg = if matches!(error.kind(), fred::error::ErrorKind::IO) {
-                    Msg::ConnectionLost
-                } else {
-                    Msg::Failed {
-                        command: "connection".into(),
-                        detail: error.details().to_string(),
-                        at_ms: 0,
-                    }
-                };
-                if tx.send(msg).await.is_err() {
-                    return;
-                }
-            }
-        });
-    }
-
-    // Invalidation pushes arrive on their own task and become messages like
-    // everything else. This is what makes a value update with no keypress —
-    // and it is the whole reason this project exists (ADR-0006).
-    if tracking {
-        let mut invalidations = fred::interfaces::TrackingInterface::invalidation_rx(&client);
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            while let Ok(_invalidation) = invalidations.recv().await {
-                // The server has told us the open key changed, which also
-                // consumed the arming. Refetching is what re-arms, and the core
-                // decides whether the result lands or is announced.
-                if tx.send(Msg::Invalidated).await.is_err() {
-                    return;
-                }
-            }
-        });
-    }
+    // until now was enforced only where it was tested (PLAN M0.10). Re-run
+    // after every successful reconnect (below), against the new client, since
+    // subscriptions are tied to the `Client` instance they were opened on —
+    // one that has been replaced no longer delivers anything.
+    spawn_link_watchers(&client, &tx, tracking);
 
     loop {
         term.draw(|f| {
@@ -264,6 +226,32 @@ pub async fn run(
         let msg = tokio::select! {
             biased;
             msg = rx.recv() => msg,
+            // A reconnect that landed. Swapped in here, in the same task as
+            // everything else in this loop, rather than inside the spawned
+            // task that found it — so `client`/`arming` are current *before*
+            // the `Msg::Connected` this constructs is ever handed to
+            // `update()`, and so `Command::RefetchOpenKey` (which
+            // `Msg::Connected` already asks for when tracking is supported)
+            // reads the new connection rather than the dead one. Ordering
+            // here is not incidental: the same guarantee through `tx`/`rx`
+            // would need `Msg::Connected` to arrive only after the client was
+            // already swapped, and two independent channels give no such
+            // promise about which is drained first.
+            Some((new_client, established)) = reconnected_rx.recv() => {
+                client = new_client;
+                tracking = established.tracking_supported;
+                arming = if tracking {
+                    crate::redis::read::Arming::Enabled
+                } else {
+                    crate::redis::read::Arming::Unsupported
+                };
+                reconnect_attempt = 0;
+                spawn_link_watchers(&client, &tx, tracking);
+                Some(Msg::Connected {
+                    version: established.version.to_string(),
+                    tracking_supported: tracking,
+                })
+            },
             () = tokio::time::sleep(std::time::Duration::from_secs(1)) => continue,
         };
         let Some(msg) = msg else {
@@ -385,8 +373,18 @@ pub async fn run(
                     let at_ms = clock.now_ms();
                     let _ = tx.send(Msg::Noticed { text, at_ms }).await;
                 }
-                // Reconnection wiring lands with M2.
-                Command::Reconnect { .. } => {}
+                Command::Reconnect { after_ms } => {
+                    reconnect_attempt += 1;
+                    spawn_reconnect_attempt(
+                        dial.clone(),
+                        credentials.clone(),
+                        after_ms,
+                        reconnect_attempt,
+                        tx.clone(),
+                        reconnected_tx.clone(),
+                        &mut reconnect_cancel,
+                    );
+                }
             }
         }
     }
@@ -516,6 +514,157 @@ fn start_scan(
     let tx = tx.clone();
     tokio::spawn(async move {
         crate::redis::scan::stream_keys(&client, pattern.as_deref(), tx, token).await;
+    });
+}
+
+/// Subscribe to a client's link-level streams: reconnect notifications, wire
+/// errors, and (while tracking is supported) invalidation pushes. Tied to the
+/// `Client` instance passed in, so this has to be called again after every
+/// successful reconnect — a subscription opened on the old, now-dead client
+/// delivers nothing about the new one.
+fn spawn_link_watchers(client: &Client, tx: &mpsc::Sender<Msg>, tracking: bool) {
+    // fred reconnects underneath us on its own schedule if it has a
+    // `ReconnectPolicy` (this app sets none, so in practice this fires only
+    // if that ever changes) — and the server on the other side remembers
+    // nothing about what we were watching. Telling the core lets it drop the
+    // liveness claim and re-arm, the invariant ADR-0009 exists for.
+    {
+        let mut reconnects = client.reconnect_rx();
+        let tx = tx.clone();
+        let probe = client.clone();
+        tokio::spawn(async move {
+            while reconnects.recv().await.is_ok() {
+                // A fresh connection tracks nothing, so capability must be
+                // re-probed rather than remembered.
+                let tracking = crate::redis::probe_tracking_public(&probe).await;
+                let (read_only, condition) = crate::redis::server_conditions(&probe).await;
+                let _ = tx
+                    .send(Msg::ServerState {
+                        read_only,
+                        condition,
+                    })
+                    .await;
+                if tx
+                    .send(Msg::Connected {
+                        version: String::new(),
+                        tracking_supported: tracking,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+    }
+    {
+        let mut errors = client.error_rx();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            while let Ok((error, _server)) = errors.recv().await {
+                // A connection-level error means the link is gone; anything
+                // else is a command failure and belongs in a notification.
+                let msg = if matches!(error.kind(), fred::error::ErrorKind::IO) {
+                    Msg::ConnectionLost
+                } else {
+                    Msg::Failed {
+                        command: "connection".into(),
+                        detail: error.details().to_string(),
+                        at_ms: 0,
+                    }
+                };
+                if tx.send(msg).await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    // Invalidation pushes arrive on their own task and become messages like
+    // everything else. This is what makes a value update with no keypress —
+    // and it is the whole reason this project exists (ADR-0006).
+    if tracking {
+        let mut invalidations = fred::interfaces::TrackingInterface::invalidation_rx(client);
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            while let Ok(_invalidation) = invalidations.recv().await {
+                // The server has told us the open key changed, which also
+                // consumed the arming. Refetching is what re-arms, and the core
+                // decides whether the result lands or is announced.
+                if tx.send(Msg::Invalidated).await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+}
+
+/// Attempt one reconnect after `after_ms`, cancellable by a fresh call — `r`
+/// while disconnected retries immediately (ADR-0009) by cancelling whatever
+/// backoff sleep or in-flight attempt was already running rather than racing
+/// it, the same discipline `start_scan` applies to `scan_cancel`.
+///
+/// Success reaches `run`'s own locals through `reconnected`, never through a
+/// `Msg`: a fresh `Client` cannot travel through the core's message type
+/// without giving the core a dependency on `fred`, which the core/shell
+/// boundary (ADR-0011) forbids. Failure is ordinary shell-reported state —
+/// `Msg::Failed` for what went wrong, `Msg::ReconnectScheduled` for when to
+/// try again — and needs no special channel.
+#[allow(clippy::too_many_arguments)]
+fn spawn_reconnect_attempt(
+    dial: String,
+    credentials: Credentials,
+    after_ms: u64,
+    attempt: u32,
+    tx: mpsc::Sender<Msg>,
+    reconnected: mpsc::Sender<(Client, Established)>,
+    slot: &mut Option<CancellationToken>,
+) {
+    if let Some(previous) = slot.take() {
+        previous.cancel();
+    }
+    let token = CancellationToken::new();
+    *slot = Some(token.clone());
+    tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            () = token.cancelled() => {}
+            () = async {
+                tokio::time::sleep(std::time::Duration::from_millis(after_ms)).await;
+                match crate::redis::connect_with(&dial, &credentials).await {
+                    Ok((client, established)) => {
+                        let _ = tx
+                            .send(Msg::ServerState {
+                                read_only: established.read_only,
+                                condition: established.condition,
+                            })
+                            .await;
+                        let _ = reconnected.send((client, established)).await;
+                    }
+                    Err(err) => {
+                        let next = attempt + 1;
+                        let retry_in_ms = crate::redis::backoff_for(next).as_millis() as u64;
+                        let at_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        let _ = tx
+                            .send(Msg::Failed {
+                                command: "reconnecting".into(),
+                                detail: err.to_string(),
+                                at_ms,
+                            })
+                            .await;
+                        let _ = tx
+                            .send(Msg::ReconnectScheduled {
+                                attempt: next,
+                                retry_in_ms,
+                            })
+                            .await;
+                    }
+                }
+            } => {}
+        }
     });
 }
 

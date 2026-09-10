@@ -129,7 +129,7 @@ impl Action {
             Action::ToggleTree => "tree",
             Action::CollapseGroup => "collapse / parent",
             Action::Open => "open / expand",
-            Action::EnterValueCursor => "move in value",
+            Action::EnterValueCursor => "open / move in value",
             Action::Copy => "copy",
             Action::CyclePane => "focus",
             Action::WidenKeysPane => "widen keys",

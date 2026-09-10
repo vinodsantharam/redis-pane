@@ -78,13 +78,22 @@ terminal is small and the situation is urgent.
 - **In the key list**, `↑↓` / `j k` move, `→` / `l` descends (opens a key,
   expands a collapsed tree group, or steps into an already-expanded one),
   `←` / `h` ascends (collapses an expanded group, or moves to its parent).
-- **`Enter` starts moving a real cursor inside the open value** — a
-  highlighted row, not just a scroll position — and `↑↓` / `j k` / `PgUp` /
-  `PgDn` / `Home` / `End` then move it instead of the key list, exactly the
-  same keys, redirected. `Esc` exits back to the key list without closing the
-  value. This is deliberately a separate keypress from `Tab`/focus: merely
-  looking at the value pane must never silently reprogram what the movement
-  keys do.
+- **`Enter` opens the Selected key and starts moving a real cursor inside
+  it** — a highlighted row, not just a scroll position — and `↑↓` / `j k` /
+  `PgUp` / `PgDn` / `Home` / `End` then move it instead of the key list,
+  exactly the same keys, redirected. `Esc` exits back to the key list without
+  closing the value. This is deliberately a separate keypress from
+  `Tab`/focus: merely looking at the value pane must never silently
+  reprogram what the movement keys do. A no-op on a tree group row — a group
+  has no value of its own; `→` is what expands or steps into one.
+  If the Selected key is already open and at rest, the cursor drops straight
+  in with no read; otherwise `Enter` opens it first, same as `→`, and the
+  cursor activates the moment that read lands — one keystroke to both dive
+  into a key and start moving through it. This also means the value pane
+  never shows a value it can be moved through only to leave it silently
+  stale: switching the Selected key with the cursor already active (`Esc`,
+  then `↑↓` to a different row, then `Enter` again) always re-anchors on
+  what is actually selected rather than the last key `Enter` was pressed on.
 - **Global jumps** use a `g`-prefixed chord: `g k` keys, `g d` dashboard, `g m` monitor,
   `g p` pub/sub, `g s` slowlog. There is no `g c` — there is only ever one Connection.
 - **The command palette** (`Ctrl-K`, or `Cmd-K` where the terminal forwards it) is the escape
@@ -110,7 +119,7 @@ terminal is small and the situation is urgent.
 | `Space` | Toggle multi-select | key list |
 | `→` / `l` | Open key in value pane, or expand/descend a tree group | key list |
 | `←` / `h` | Collapse a tree group, or move to its parent | key list |
-| `Enter` | Start moving a cursor inside the open value | key list / value pane |
+| `Enter` | Open the Selected key (if needed) and start moving a cursor inside it | key list / value pane |
 | `r` | Refresh / rescan | pane |
 | `e` | Edit value | value pane |
 | `t` | Edit TTL | value pane |

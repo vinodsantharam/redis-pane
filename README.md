@@ -69,7 +69,7 @@ Once you're in:
 
 - `↑↓` or `j`/`k` to move, `→` or `l` to open a key (or expand/descend a tree group), `←` or `h`
   to collapse a group or jump to its parent
-- `Enter` to move a cursor inside an open value, `Esc` to leave it
+- `Enter` to open the selected key and move a cursor inside its value, `Esc` to leave it
 - `/` to filter, `Esc` to clear
 - `t` to toggle tree/flat view, `s` to cycle sort order
 - `y y` / `y v` / `y c` to copy a key name / value / `redis-cli` command

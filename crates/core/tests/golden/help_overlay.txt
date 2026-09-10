@@ -20,7 +20,7 @@ t       tree
 l       open / expand
 ←       collapse / parent
 h       collapse / parent
-⏎       move in value
+⏎       open / move in value
 y       copy
 ⌃→      widen keys
 ⌃←      narrow keys

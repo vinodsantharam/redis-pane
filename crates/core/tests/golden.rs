@@ -2208,6 +2208,7 @@ fn golden_viewer_opening() {
         // Well past `APPEAR_DELAY_MS` relative to `CLOCK` (74_000): this read
         // is genuinely slow, so the placeholder must show.
         issued_at_ms: Some(73_000),
+        activate_cursor: false,
     });
     let frame = draw(&state, 130, 22);
     assert!(frame.contains("user:8812:session"), "{frame}");
@@ -2239,6 +2240,7 @@ fn golden_viewer_opening_a_fast_read_shows_nothing_at_all() {
         index: Some(2),
         // 100ms elapsed against `CLOCK` (74_000) — under the 200ms gate.
         issued_at_ms: Some(73_900),
+        activate_cursor: false,
     });
     let frame = draw(&too_recent, 130, 22);
     assert_eq!(
@@ -2252,6 +2254,7 @@ fn golden_viewer_opening_a_fast_read_shows_nothing_at_all() {
         token: ReadToken(1),
         index: Some(2),
         issued_at_ms: None,
+        activate_cursor: false,
     });
     let frame = draw(&unstamped, 130, 22);
     assert_eq!(
@@ -2274,6 +2277,7 @@ fn golden_viewer_opening_a_different_key_than_the_one_already_shown() {
         token: ReadToken(2),
         index: Some(0),
         issued_at_ms: Some(73_000),
+        activate_cursor: false,
     });
     let frame = draw(&state, 130, 22);
     assert!(frame.contains("user:8812:cart"), "{frame}");
@@ -2299,6 +2303,7 @@ fn golden_viewer_refetching() {
         token: ReadToken(3),
         index: state.open.as_ref().unwrap().index,
         issued_at_ms: Some(73_000),
+        activate_cursor: false,
     });
     let frame = draw(&state, 130, 22);
     assert!(
@@ -2329,6 +2334,7 @@ fn golden_viewer_refetching_a_fast_reply_shows_nothing_at_all() {
         token: ReadToken(3),
         index: state.open.as_ref().unwrap().index,
         issued_at_ms: Some(73_900),
+        activate_cursor: false,
     });
     let frame = draw(&state, 130, 22);
     assert_eq!(

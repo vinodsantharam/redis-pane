@@ -137,34 +137,65 @@ impl Tree {
                 .count();
             open_groups.truncate(shared);
 
-            let mut prefix = String::new();
-            for (depth, (offset, len)) in segments.iter().enumerate() {
-                prefix.push_str(&String::from_utf8_lossy(
-                    keys.arena_slice(*offset, *len).unwrap_or_default(),
-                ));
-                prefix.push(self.separator);
+            // `shared` is a *byte* comparison against `previous`'s full
+            // segment list, which is set below regardless of whether the
+            // matching key actually got rows for every one of those
+            // segments. If it broke early because an ancestor was collapsed,
+            // `previous` still carries every segment past that point — so
+            // the next key in a *different* branch under the same collapsed
+            // ancestor (e.g. `cache:user:…` right after `cache:page:…`, both
+            // hidden under a collapsed `cache:`) can still show `shared >= 1`
+            // purely because their leading bytes coincide, and `depth <
+            // shared` below would then `continue` straight past re-checking
+            // whether `cache:` is collapsed — walking right into creating a
+            // fresh `user:` row underneath a parent marked shut (#reported
+            // as "collapsing cache: leaves one child visible").
+            //
+            // `open_groups` does not have this problem: it only ever holds
+            // rows that were actually pushed, so if an ancestor was
+            // collapsed, its row is always the *last* entry (nothing deeper
+            // was ever opened past a `break`). Checking it directly is the
+            // fix — anything still open and collapsed hides this key's
+            // entire remaining subtree, group rows included.
+            let hidden_by_collapsed_ancestor = open_groups.last().is_some_and(|&r| {
+                matches!(
+                    self.rows[r],
+                    Row::Group {
+                        expanded: false,
+                        ..
+                    }
+                )
+            });
 
-                if depth < shared {
-                    continue;
-                }
-                let collapsed = self.is_collapsed(&prefix);
-                self.rows.push(Row::Group {
-                    offset: *offset,
-                    len: *len,
-                    depth: depth as u16,
-                    descendants: 0,
-                    expanded: !collapsed,
-                });
-                counts.push(0);
-                open_groups.push(self.rows.len() - 1);
-                if collapsed {
-                    // Stop descending: every key under this prefix is hidden.
-                    // `previous` is set to the full segment list below, which
-                    // is what stops the next key re-emitting this same header.
-                    // The collapsed group's own row stays in `open_groups`,
-                    // though — its count must keep growing even though none
-                    // of these keys get a row of their own.
-                    break;
+            if !hidden_by_collapsed_ancestor {
+                let mut prefix = String::new();
+                for (depth, (offset, len)) in segments.iter().enumerate() {
+                    prefix.push_str(&String::from_utf8_lossy(
+                        keys.arena_slice(*offset, *len).unwrap_or_default(),
+                    ));
+                    prefix.push(self.separator);
+
+                    if depth < shared {
+                        continue;
+                    }
+                    let collapsed = self.is_collapsed(&prefix);
+                    self.rows.push(Row::Group {
+                        offset: *offset,
+                        len: *len,
+                        depth: depth as u16,
+                        descendants: 0,
+                        expanded: !collapsed,
+                    });
+                    counts.push(0);
+                    open_groups.push(self.rows.len() - 1);
+                    if collapsed {
+                        // Stop descending: every key under this prefix is
+                        // hidden. The collapsed group's own row stays in
+                        // `open_groups`, though — its count must keep
+                        // growing even though none of these keys get a row
+                        // of their own.
+                        break;
+                    }
                 }
             }
 
@@ -326,6 +357,35 @@ mod tests {
             ],
             "user:'s count must still include the two keys hidden under the \
              collapsed user:1: subgroup"
+        );
+    }
+
+    /// Collapsing a top-level group used to leave a *later* nested subgroup
+    /// visible, still expanded, right where the collapsed group's children
+    /// should be hidden entirely — reported as "collapsing cache: leaves
+    /// user: showing". The cause: `shared` matches `cache:page:…` and
+    /// `cache:user:…` only at depth 0 (byte comparison, not row identity),
+    /// so once the `page:` keys had broken out of the loop under the
+    /// collapsed `cache:`, the very next key — in the `user:` branch —
+    /// walked straight past the `depth < shared` reuse check without ever
+    /// re-examining whether `cache:` (its open ancestor) was collapsed.
+    #[test]
+    fn a_collapsed_top_level_group_hides_every_sibling_subgroup_not_just_the_first() {
+        let (keys, view, mut tree) = built(&[
+            "cache:page:aaa",
+            "cache:page:bbb",
+            "cache:user:aaa",
+            "cache:user:bbb",
+            "counter:hits",
+        ]);
+        tree.toggle("cache:");
+        tree.rebuild(&keys, &view);
+        assert_eq!(
+            rendered(&keys, &tree),
+            ["cache: (4)", "counter: (1)", "  counter:hits"],
+            "no page: or user: row, however far into the collapsed group's \
+             keys the fold walks — a sibling subgroup discovered after the \
+             first one must stay just as hidden"
         );
     }
 

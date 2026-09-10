@@ -72,7 +72,8 @@ Once you're in:
 - `Enter` to open the selected key and move a cursor inside its value, `Esc` to leave it
 - `/` to filter, `Esc` to clear
 - `t` to toggle tree/flat view, `s` to cycle sort order
-- `y y` / `y v` / `y c` to copy a key name / value / `redis-cli` command
+- `y` to copy the key name or the value, whichever pane is focused; `c` to copy a `redis-cli`
+  command for the open key
 - `?` for help with your actual keybindings
 
 ![Folding a tree group with Left/Right, filtering down to one key, and moving a real cursor through its value with Enter and the arrow keys](navigation-demo.gif)

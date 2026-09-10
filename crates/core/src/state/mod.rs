@@ -277,7 +277,7 @@ pub struct State {
     /// Set between a mouse-down that grabbed the divider and the matching
     /// mouse-up (R7.3, drag-to-resize). While true, `Drag` events move
     /// [`State::split_adjust`] to follow the cursor; a chord-armed flag in
-    /// the same family as `copy_pending` and `filtering`.
+    /// the same family as `filtering`.
     pub resizing_split: bool,
     /// The Open key, if one is open. There is no cache behind this — it holds
     /// what the server last said and nothing more (ADR-0006).
@@ -299,8 +299,6 @@ pub struct State {
     /// render time by comparing [`PendingRead::name`] against
     /// [`OpenKey::name`], the same comparison `Msg::ValueLoaded` already makes.
     pub open_pending: Option<PendingRead>,
-    /// Set between `y` and the key that says what to copy.
-    pub copy_pending: bool,
     /// A transient confirmation and when it was raised. It fades on its own
     /// rather than needing dismissal — a notice you must acknowledge is a
     /// modal dialog wearing a smaller hat.

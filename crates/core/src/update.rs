@@ -469,11 +469,6 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
     if state.filtering {
         return filter_key(state, key);
     }
-    // `y` arms a chord; the next key says what to copy.
-    if state.copy_pending {
-        state.copy_pending = false;
-        return copy_key(state, key);
-    }
     let Some(action) = state.keymap.action_for(&key) else {
         return (state, Vec::new());
     };
@@ -753,9 +748,16 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             (state, vec![Command::OpenKey { index, name, token }])
         }
         Action::Copy => {
-            state.copy_pending = true;
-            (state, Vec::new())
+            // Which pane the reader is looking at decides what `y` copies —
+            // no mnemonic to remember, no chord to get half right (DESIGN §4).
+            let what = if state.keys_pane_focused() {
+                CopyWhat::Key
+            } else {
+                CopyWhat::Value
+            };
+            build_copy(state, what)
         }
+        Action::CopyCommand => build_copy(state, CopyWhat::Command),
         Action::Filter => {
             state.filtering = true;
             (state, Vec::new())
@@ -873,19 +875,8 @@ fn group_prefix_at(state: &State, row: usize) -> Option<String> {
     Some(out)
 }
 
-/// The second half of the `y` chord.
-///
-/// `y y` copies the key, `y v` the value, `y c` a `redis-cli` command. Anything
-/// else cancels — an unrecognised second key should do nothing rather than
-/// guess, because the clipboard is somewhere the user cannot see.
-fn copy_key(state: State, key: KeyPress) -> (State, Vec<Command>) {
-    let what = match key.code {
-        KeyCode::Char('y') | KeyCode::Char('k') => CopyWhat::Key,
-        KeyCode::Char('v') => CopyWhat::Value,
-        KeyCode::Char('c') => CopyWhat::Command,
-        _ => return (state, Vec::new()),
-    };
-
+/// Builds the clipboard payload for `y` (key or value, by focus) and `Action::CopyCommand`.
+fn build_copy(state: State, what: CopyWhat) -> (State, Vec<Command>) {
     // The key name is copyable from the list alone; the other two need an open
     // value, because there is nothing to copy until the server has said what it
     // holds (ADR-0006).

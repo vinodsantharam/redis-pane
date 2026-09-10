@@ -1519,15 +1519,12 @@ fn press(state: State, c: char) -> (State, Vec<Command>) {
     update(state, Msg::Key(KeyPress::plain(KC::Char(c))))
 }
 
+/// Focused on the Keys pane, `y` copies the key name — no mnemonic, no chord.
 #[test]
-fn y_then_y_copies_the_key_name() {
+fn y_copies_the_key_name_when_the_keys_pane_is_focused() {
     let state = opened("user:8812:session", hash_value(), 600);
-    let (state, cmds) = press(state, 'y');
-    assert!(cmds.is_empty(), "the chord waits for its second key");
-    assert!(state.copy_pending);
-
-    let (state, cmds) = press(state, 'y');
-    assert!(!state.copy_pending);
+    assert!(state.keys_pane_focused(), "opening does not move focus");
+    let (_, cmds) = press(state, 'y');
     match cmds.first() {
         Some(Command::CopyToClipboard { text, label }) => {
             assert_eq!(text, "user:8812:session");
@@ -1537,11 +1534,13 @@ fn y_then_y_copies_the_key_name() {
     }
 }
 
+/// Focused on the Viewer, the same `y` copies the value instead — the pane
+/// under the reader's cursor decides what "it" refers to.
 #[test]
-fn y_then_v_copies_the_whole_value() {
-    let state = opened("k", hash_value(), 600);
-    let (state, _) = press(state, 'y');
-    let (_, cmds) = press(state, 'v');
+fn y_copies_the_value_when_the_viewer_is_focused() {
+    let mut state = opened("k", hash_value(), 600);
+    state.focus = redis_pane_core::render::layout::Pane::Value;
+    let (_, cmds) = press(state, 'y');
     match cmds.first() {
         Some(Command::CopyToClipboard { text, .. }) => {
             assert_eq!(
@@ -1556,9 +1555,8 @@ fn y_then_v_copies_the_whole_value() {
 }
 
 #[test]
-fn y_then_c_copies_a_command_that_would_actually_run() {
+fn c_copies_a_command_that_would_actually_run() {
     let state = opened("user:8812:session", hash_value(), 600);
-    let (state, _) = press(state, 'y');
     let (_, cmds) = press(state, 'c');
     match cmds.first() {
         Some(Command::CopyToClipboard { text, .. }) => {
@@ -1572,21 +1570,9 @@ fn y_then_c_copies_a_command_that_would_actually_run() {
 }
 
 #[test]
-fn an_unrecognised_second_key_cancels_rather_than_guessing() {
-    // The clipboard is somewhere the user cannot see, so guessing is worse
-    // than doing nothing.
-    let state = opened("k", hash_value(), 600);
-    let (state, _) = press(state, 'y');
-    let (state, cmds) = press(state, 'z');
-    assert!(cmds.is_empty());
-    assert!(!state.copy_pending, "and the chord does not stay armed");
-}
-
-#[test]
 fn the_key_name_is_copyable_from_the_list_with_nothing_open() {
     let mut state = many_keys();
     state.open = None;
-    let (state, _) = press(state, 'y');
     let (_, cmds) = press(state, 'y');
     assert!(
         matches!(cmds.first(), Some(Command::CopyToClipboard { .. })),
@@ -1598,8 +1584,8 @@ fn the_key_name_is_copyable_from_the_list_with_nothing_open() {
 fn copying_a_value_with_nothing_open_says_so_instead_of_copying_nothing() {
     let mut state = many_keys();
     state.open = None;
-    let (state, _) = press(state, 'y');
-    let (state, cmds) = press(state, 'v');
+    state.focus = redis_pane_core::render::layout::Pane::Value;
+    let (state, cmds) = press(state, 'y');
     assert!(
         !cmds
             .iter()
@@ -1612,7 +1598,7 @@ fn copying_a_value_with_nothing_open_says_so_instead_of_copying_nothing() {
     // guarding is invisible. The core built the notice with `at_ms: 0`, and
     // `notice_now` shows a notice for 2.5s against a clock reading epoch
     // milliseconds, so in the running app the message could never appear:
-    // `y v` with nothing open did nothing at all, forever.
+    // `y` with nothing open did nothing at all, forever.
     let Some(Command::Notify { text }) = cmds.first().cloned() else {
         panic!("expected a notice, got {cmds:?}");
     };
@@ -1635,9 +1621,9 @@ fn copying_a_windowed_value_says_how_much_it_took() {
         items: (0..500).map(|i| format!("item-{i}")).collect(),
         total: 12_000,
     });
-    let state = opened("feed:global:hot", windowed, 600);
-    let (state, _) = press(state, 'y');
-    let (_, cmds) = press(state, 'v');
+    let mut state = opened("feed:global:hot", windowed, 600);
+    state.focus = redis_pane_core::render::layout::Pane::Value;
+    let (_, cmds) = press(state, 'y');
 
     let Some(Command::CopyToClipboard { label, text }) = cmds.first() else {
         panic!("expected a copy, got {cmds:?}");
@@ -1653,9 +1639,9 @@ fn copying_a_windowed_value_says_how_much_it_took() {
 /// is something to qualify.
 #[test]
 fn copying_a_complete_value_stays_quiet_about_it() {
-    let state = opened("user:8812:session", hash_value(), 600);
-    let (state, _) = press(state, 'y');
-    let (_, cmds) = press(state, 'v');
+    let mut state = opened("user:8812:session", hash_value(), 600);
+    state.focus = redis_pane_core::render::layout::Pane::Value;
+    let (_, cmds) = press(state, 'y');
     let Some(Command::CopyToClipboard { label, .. }) = cmds.first() else {
         panic!("expected a copy");
     };

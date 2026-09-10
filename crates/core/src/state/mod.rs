@@ -448,7 +448,21 @@ impl State {
 
     /// Recompute the list after the keys, the filter, the sort or the mode
     /// changed. Tree mode needs name order to fold in one pass.
+    ///
+    /// The Selected key is tracked by identity across the rebuild, the same
+    /// way `relocate_open_key` already tracks the Open key: capture which key
+    /// the cursor is on before the rows move, then find that key's new row
+    /// once they have. A row number alone means nothing once the rows behind
+    /// it have changed — reusing it is how the cursor used to land on an
+    /// unrelated key after a filter changed.
+    ///
+    /// A Group row (tree mode) has no such identity — `key_at` returns `None`
+    /// for it, since a group is a fold over the arena, not an entry in the
+    /// Loaded set — so a cursor resting on one is only ever clamped to the
+    /// new row count, same as before this existed. Folding a group open or
+    /// shut must not fling the cursor to the top of the list.
     pub fn rebuild_list(&mut self) {
+        let selected_index = self.key_at(self.view.selected);
         if self.tree_mode && self.list.sort == SortBy::Scan {
             self.list.sort = SortBy::Name;
         }
@@ -456,9 +470,20 @@ impl State {
         if self.tree_mode {
             self.tree.rebuild(&self.keys, &self.list);
         }
-        let last = self.row_count().saturating_sub(1);
-        if self.view.selected > last {
-            self.view.selected = last;
+        match selected_index {
+            Some(index) => match self.row_of(index) {
+                Some(row) => self.view.selected = row,
+                None => {
+                    self.view.selected = 0;
+                    self.view.offset = 0;
+                }
+            },
+            None => {
+                let last = self.row_count().saturating_sub(1);
+                if self.view.selected > last {
+                    self.view.selected = last;
+                }
+            }
         }
         self.relocate_open_key();
     }

@@ -795,7 +795,15 @@ pub fn status_readout(state: &State, clock: &dyn Clock) -> Vec<(String, Token)> 
 
 /// The hint bar: the effective binding for each action, never a hard-coded
 /// label (R7.5).
+///
+/// Filter capture is the one input mode that already bypasses the keymap
+/// (`update::filter_key` matches `KeyCode` directly, not through `Action`),
+/// so there is no binding to look up here either — the hint has to be
+/// hard-coded too, or the fact that Esc clears and exits stays invisible.
 pub fn hint_bar(state: &State) -> String {
+    if state.filtering {
+        return "Esc clear & exit   Enter apply".to_string();
+    }
     [
         Action::Cancel,
         Action::Refetch,

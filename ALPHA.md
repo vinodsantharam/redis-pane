@@ -103,8 +103,8 @@ redis-pane --profile mine --probe
 - **`t`** — toggle tree/flat. Tree is the default.
 - **`/`** then type — filter the list. `Esc` clears it.
 - **`s`** — cycle sort: scan order → name → ttl → size → type.
-- **`y y`** / **`y v`** / **`y c`** — copy the key name / the value / a ready-to-run `redis-cli`
-  command.
+- **`c`** — copy the key name or the value, whichever pane is focused. **`C`** — copy a
+  ready-to-run `redis-cli` command for the open key.
 - **`⌃R`** — toggle Read-only Mode (some environments start locked and say why).
 - **`?`** — help, showing your actual keybindings.
 - **Resize the terminal.** Columns drop in order above 70 wide; below 70, opening a key pushes
@@ -112,6 +112,20 @@ redis-pane --profile mine --probe
 - **If your server supports `CLIENT TRACKING`**, open a key and change it from another terminal
   (`redis-cli HSET the-key field value`) — it should update on screen with no keypress. If it
   doesn't, or the header never says `● live`, that's exactly the kind of thing to report.
+
+## Copying
+
+`c`/`C` reach the clipboard one of two ways, chosen automatically (ADR-0013):
+
+- **Locally, on macOS:** a direct system-clipboard call (`pbcopy`). This is the common case and
+  should just work.
+- **Over SSH** (detected via `SSH_TTY`/`SSH_CONNECTION`/`SSH_CLIENT`), or locally on any other
+  OS: the OSC 52 terminal escape sequence. This hands the text to your *local* terminal emulator
+  rather than the SSH server, but not every terminal implements it, and there's no reply to
+  confirm it landed. Known-working: iTerm2, kitty, WezTerm, Alacritty, foot, Windows Terminal,
+  and tmux (with `set -g set-clipboard on`). If a paste comes back empty or stale, check your
+  terminal's OSC 52 / "allow clipboard access" setting first — the app can't tell the difference
+  between "the terminal ignored it" and "it worked."
 
 ## What's not there yet, on purpose
 

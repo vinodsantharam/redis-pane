@@ -21,6 +21,7 @@ l       open / expand
 ←       collapse / parent
 h       collapse / parent
 ⏎       open / move in value
-y       copy
+c       copy
+C       copy redis-cli command
 ⌃→      widen keys
 ⌃←      narrow keys

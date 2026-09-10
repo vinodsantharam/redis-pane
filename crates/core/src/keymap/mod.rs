@@ -52,8 +52,12 @@ pub enum Action {
     /// looking at the value pane must never silently reprogram what plain
     /// movement does; `Enter` is the one deliberate key that does.
     EnterValueCursor,
-    /// Begin a copy. The next key chooses what (R3.5).
+    /// Copy the key name or the value to the clipboard, whichever pane is
+    /// focused (R3.5, DESIGN §4) — no mnemonic, no chord.
     Copy,
+    /// Copy a ready-to-paste `redis-cli` command for the open key (R3.5).
+    /// Not focus-dependent: there is only one sensible target.
+    CopyCommand,
     /// Move focus between the keys pane and the Viewer (DESIGN §4).
     ///
     /// With two panes this is the only way to say which one a pane-scoped key
@@ -131,6 +135,7 @@ impl Action {
             Action::Open => "open / expand",
             Action::EnterValueCursor => "open / move in value",
             Action::Copy => "copy",
+            Action::CopyCommand => "copy redis-cli command",
             Action::CyclePane => "focus",
             Action::WidenKeysPane => "widen keys",
             Action::NarrowKeysPane => "narrow keys",
@@ -292,8 +297,12 @@ impl Default for Keymap {
                     action: Action::EnterValueCursor,
                 },
                 Binding {
-                    key: KeyPress::plain(KeyCode::Char('y')),
+                    key: KeyPress::plain(KeyCode::Char('c')),
                     action: Action::Copy,
+                },
+                Binding {
+                    key: KeyPress::plain(KeyCode::Char('C')),
+                    action: Action::CopyCommand,
                 },
                 // Horizontal chords for a horizontal action. `⌃←`/`⌃→` are
                 // otherwise idle, so this adds no ambiguity with plain
@@ -461,6 +470,7 @@ mod tests {
             Action::Open,
             Action::EnterValueCursor,
             Action::Copy,
+            Action::CopyCommand,
         ] {
             assert!(k.key_for(action).is_some(), "{action:?} has no binding");
         }

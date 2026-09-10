@@ -336,11 +336,16 @@ pub async fn run(
                     }
                 }
                 Command::CopyToClipboard { text, label } => {
-                    let truncated = crate::clipboard::was_truncated(&text);
-                    // Redraw from scratch either way: the escape sequence went
-                    // to the same stdout ratatui is drawing on.
-                    let result = crate::clipboard::copy(&text);
-                    let _ = term.clear();
+                    let method = crate::clipboard::detect_method();
+                    // Truncation is an OSC-52-only concern (native has no
+                    // comparable cap), and only OSC 52 writes to our own
+                    // stdout, so only it needs a redraw after.
+                    let truncated = method == crate::clipboard::Method::Osc52
+                        && crate::clipboard::was_truncated(&text);
+                    let result = crate::clipboard::copy(&text, method);
+                    if method == crate::clipboard::Method::Osc52 {
+                        let _ = term.clear();
+                    }
                     let at_ms = clock.now_ms();
                     match result {
                         Ok(()) => {

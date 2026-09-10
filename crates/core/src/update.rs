@@ -954,8 +954,6 @@ fn filter_key(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
         }
         KeyCode::Char(c) if !key.ctrl && !key.alt => {
             state.list.filter.push(c);
-            state.view.selected = 0;
-            state.view.offset = 0;
             state.rebuild_list();
             after_move(state)
         }
@@ -3081,6 +3079,155 @@ mod metadata_tests {
         let (state, cmds) = update(State::default(), Msg::Key(KeyPress::plain(KeyCode::Down)));
         assert_eq!(state.view.selected, 0);
         assert!(cmds.is_empty());
+    }
+
+    // ── Selection follows the key, not the row (search-filter cursor bug) ──
+    //
+    // `view.selected` is a row number, and rows are meaningless across a
+    // filter change: the same number can point at an unrelated key once the
+    // list has narrowed, widened or been cleared. The cursor must stick to
+    // the key the reader was on, not the row it happened to occupy.
+
+    fn selected_name(state: &State) -> Option<String> {
+        state
+            .selected_key()
+            .and_then(|i| state.keys.name_str(i))
+            .map(|s| s.into_owned())
+    }
+
+    fn open_filter(state: State) -> State {
+        let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('/'))));
+        assert!(state.filtering);
+        state
+    }
+
+    fn type_filter(state: State, text: &str) -> State {
+        let mut state = state;
+        for c in text.chars() {
+            (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char(c))));
+        }
+        state
+    }
+
+    /// `k:5` is the only key containing a `5`, so narrowing to it must keep
+    /// the cursor on it rather than resetting to the top of the match.
+    #[test]
+    fn typing_a_narrower_filter_keeps_the_selected_key_selected() {
+        let mut state = browsing(10);
+        for _ in 0..5 {
+            (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Down)));
+        }
+        assert_eq!(selected_name(&state).as_deref(), Some("k:5"));
+
+        let state = type_filter(open_filter(state), "5");
+        assert_eq!(
+            selected_name(&state).as_deref(),
+            Some("k:5"),
+            "the only match is the key that was already selected"
+        );
+    }
+
+    /// Typing past the selected key's last match has nothing to stick to, so
+    /// it falls back to the top of the new list rather than an arbitrary row.
+    #[test]
+    fn typing_a_filter_the_selected_key_fails_falls_back_to_the_top() {
+        let mut state = browsing(10);
+        for _ in 0..5 {
+            (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Down)));
+        }
+        assert_eq!(selected_name(&state).as_deref(), Some("k:5"));
+
+        // "k:1" matches "k:1" only, excluding the selected "k:5".
+        let state = type_filter(open_filter(state), "k:1");
+        assert_eq!(state.view.selected, 0, "nothing to stick to but the top");
+        assert_eq!(selected_name(&state).as_deref(), Some("k:1"));
+    }
+
+    /// Backspacing the filter back down widens the list again; the cursor
+    /// must not silently become whatever key now falls on its old row.
+    #[test]
+    fn backspacing_the_filter_keeps_the_selected_key_selected() {
+        let mut state = browsing(10);
+        for _ in 0..5 {
+            (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Down)));
+        }
+        let state = type_filter(open_filter(state), "5");
+        assert_eq!(selected_name(&state).as_deref(), Some("k:5"));
+
+        let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Backspace)));
+        assert_eq!(
+            selected_name(&state).as_deref(),
+            Some("k:5"),
+            "widening the filter must not relocate the cursor to an unrelated row"
+        );
+    }
+
+    /// This is the reported bug: clear the filter entirely with Esc, and the
+    /// cursor used to land on whatever key the old row number now pointed at.
+    #[test]
+    fn clearing_the_filter_with_esc_keeps_the_selected_key_selected() {
+        let mut state = browsing(10);
+        for _ in 0..5 {
+            (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Down)));
+        }
+        let state = type_filter(open_filter(state), "5");
+        assert_eq!(selected_name(&state).as_deref(), Some("k:5"));
+
+        let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Esc)));
+        assert!(!state.filtering, "Esc also exits filter capture");
+        assert_eq!(
+            selected_name(&state).as_deref(),
+            Some("k:5"),
+            "clearing the filter must not relocate the cursor to an unrelated row"
+        );
+    }
+
+    /// The same three transitions, but in tree mode, where rows can be group
+    /// headers with no key behind them — `row_of`/`key_at` must still resolve
+    /// the selected key correctly rather than only working for the flat list.
+    #[test]
+    fn the_selected_key_stays_selected_across_a_filter_change_in_tree_mode() {
+        let mut state = browsing(10);
+        state.tree_mode = true;
+        state.rebuild_list();
+        for _ in 0..5 {
+            (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Down)));
+        }
+        // Tree mode may spend rows on group headers, so which key ends up
+        // selected after five Downs is a tree-folding detail, not something
+        // this test should assert — only that the fold landed on an actual
+        // key, and that that key is the one that stays selected below.
+        let name = selected_name(&state).expect("landed on a key, not a group header");
+        let digit = name.strip_prefix("k:").expect("browsing() names are k:N");
+
+        let state = type_filter(open_filter(state), digit);
+        assert_eq!(selected_name(&state).as_deref(), Some(name.as_str()));
+
+        let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Esc)));
+        assert_eq!(
+            selected_name(&state).as_deref(),
+            Some(name.as_str()),
+            "tree mode must relocate the selected key too, not just the flat list"
+        );
+    }
+
+    /// The filter-mode hint is the only on-screen surface reachable while
+    /// filtering (the help overlay cannot be opened, since `?` is captured as
+    /// text there) — it must say what Esc/Enter do, not repeat the generic
+    /// five-action hint bar.
+    #[test]
+    fn the_hint_bar_explains_filter_capture_while_it_is_open() {
+        let state = browsing(10);
+        assert!(
+            !crate::render::hint_bar(&state).contains("clear & exit"),
+            "the generic hint bar applies outside filter capture"
+        );
+
+        let state = open_filter(state);
+        assert!(
+            crate::render::hint_bar(&state).contains("clear & exit"),
+            "the filter hint must say what Esc does, since nothing else does"
+        );
     }
 }
 

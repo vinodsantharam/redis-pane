@@ -268,6 +268,32 @@ pub async fn refetch_and_rearm(client: &Client, key: &str) -> Result<Option<Stri
     client.get(key).await
 }
 
+/// Delete one key outright (`DEL`, R4.3, PLAN M2.3).
+///
+/// The one mutating call in this module so far — everything else here reads.
+/// Whether the key still existed when this ran is not this function's
+/// question: `DEL` on a key that is already gone is a success reporting zero
+/// removed, and the core's job (`Msg::KeyDeleted`) is the same either way —
+/// the key is gone now, which is the only fact the Viewer badges.
+///
+/// **Must build a `Key` before calling `del`, never hand it a bare `Vec<u8>`.**
+/// `fred`'s `del<R, K: Into<MultipleKeys>>` takes *one or more* keys, and
+/// `Vec<T>` converts to "many keys" whenever `T: Into<Key>` — which `u8` is,
+/// for the numeric-key convenience (`DEL 1` meaning the key named `"1"`). So
+/// `client.del(name.to_vec())` compiles, returns `Ok`, and does something
+/// else entirely: it sends `DEL <byte0> <byte1> …`, one key per raw byte
+/// value of `name`, none of which exist, so nothing is ever deleted while the
+/// call still reports success. Wrapping `name` in a single `Key` first (via
+/// `Key`'s own `From<&[u8]>`) is what selects the single-binary-key
+/// conversion instead of the elementwise one. The same shape of trap as the
+/// `Options { caching: Some(true) }` note above — a fred call that compiles
+/// clean and lies about what it sent.
+pub async fn delete_key(client: &Client, name: &[u8]) -> Result<(), Error> {
+    let key = fred::types::Key::from(name);
+    let _: i64 = client.del(key).await?;
+    Ok(())
+}
+
 /// Exponential backoff with a ceiling, so a long outage does not turn into a
 /// long silence. The countdown is shown; a silent wait is a freeze wearing a
 /// different name (ADR-0009).

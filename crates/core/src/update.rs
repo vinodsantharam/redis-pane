@@ -7,7 +7,9 @@ use crate::msg::KeyPress;
 use crate::msg::MouseAction;
 use crate::render::layout::{self, Pane};
 use crate::state::copy::{CopyWhat, redis_cli_command, value_text};
-use crate::state::{Attachment, Link, OpenKey, PendingRead, ReadOnlyReason, ScanState, Tracking};
+use crate::state::{
+    Attachment, Link, OpenKey, PendingMutation, PendingRead, ReadOnlyReason, ScanState, Tracking,
+};
 use crate::{Command, Msg, State};
 
 /// Takes a message, returns new state plus commands for a shell to execute.
@@ -365,6 +367,29 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             }
             (state, Vec::new())
         }
+        Msg::KeyDeleted { index, name, at_ms } => {
+            // A completed delete is exactly the "gone" state ADR-0006 already
+            // has words and a badge for — the row `set_gone`, and if this was
+            // the Open key, its last read value stays on screen, tombstoned,
+            // never silently cleared. Guarded by name for the same reason
+            // `ValueGone` is: a rescan between staging and confirming
+            // renumbers the Loaded set, and an unguarded index would then
+            // tombstone an unrelated key.
+            if let Some(index) = index
+                && state.keys.name(index) == Some(name.as_bytes())
+            {
+                state.keys.set_gone(index);
+            }
+            match &mut state.open {
+                Some(open) if open.name == name => {
+                    open.deleted_at_ms = Some(at_ms);
+                    open.pending = None;
+                }
+                _ => {}
+            }
+            state.notice = Some((format!("deleted {name}"), at_ms));
+            (state, Vec::new())
+        }
         Msg::Copied { label, at_ms } => {
             state.notice = Some((format!("copied {label}"), at_ms));
             (state, Vec::new())
@@ -464,6 +489,16 @@ fn scan_batch(mut state: State, keys: Vec<Vec<u8>>) -> (State, Vec<Command>) {
 /// The hint bar and help overlay read the same map, so what is shown is always
 /// the effective binding after user overrides (R7.5).
 fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
+    // A staged mutation is a modal dialog: it is the only thing on screen
+    // that can act on the keypress until it is confirmed or dismissed,
+    // exactly as `state.filtering`, below, is the only thing capturing text.
+    // Read-only Mode is decided *here*, at confirm — never at the keypress
+    // that staged the mutation — so the preview always shows the real
+    // command and its blast radius before the reader learns whether they
+    // are allowed to run it (R4.4, DESIGN §6.5).
+    if let Some(pending) = state.confirm.take() {
+        return confirm_key(state, pending, key);
+    }
     // While the filter is capturing, ordinary characters are text rather than
     // commands. Only Esc and Enter mean anything else.
     if state.filtering {
@@ -601,6 +636,26 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             }
             (state, Vec::new())
         }
+        Action::Delete => {
+            // The Selected key, not the Open key — the same target every
+            // other keys-pane action takes. A gone row has nothing left to
+            // delete.
+            let Some(index) = state.selected_key() else {
+                return (state, Vec::new());
+            };
+            if state.keys.is_gone(index) {
+                return (state, Vec::new());
+            }
+            let Some(name) = state.keys.name(index).map(<[u8]>::to_vec) else {
+                return (state, Vec::new());
+            };
+            state.confirm = Some(PendingMutation::DeleteKey { index, name });
+            (state, Vec::new())
+        }
+        // Nothing is staged — `key_press` intercepts every keypress before
+        // this match while `state.confirm` is `Some`, so `y` only ever
+        // reaches here with nothing to confirm.
+        Action::ConfirmMutation => (state, Vec::new()),
         // Each of these six moves the value cursor instead of the key list
         // while cursor mode is active (`Enter`/`Action::EnterValueCursor`) —
         // the same keys, aimed at whichever thing the reader is currently
@@ -940,6 +995,35 @@ fn build_copy(state: State, what: CopyWhat) -> (State, Vec<Command>) {
     };
 
     (state, vec![Command::CopyToClipboard { text, label }])
+}
+
+/// Keys read while a mutation preview is on screen. Nothing else — not
+/// movement, not the filter, not another Delete — reaches the app while one
+/// is staged; `y` and Esc are the whole of the dialog's vocabulary, spelled
+/// out here rather than resolved through the keymap because a confirm
+/// dialog, like filter capture, is a mode of its own rather than an ordinary
+/// action (R4.4, R4.6).
+fn confirm_key(state: State, pending: PendingMutation, key: KeyPress) -> (State, Vec<Command>) {
+    match key.code {
+        KeyCode::Char('y') if !key.ctrl && !key.alt => {
+            // Read-only Mode refuses here, at confirm, not at the keypress
+            // that staged the preview — the reader has already seen the real
+            // command and its blast radius by the time this fires
+            // (DESIGN §6.5).
+            if let Some(reason) = state.read_only {
+                let notice = format!("read-only ({}): not executed", reason.label());
+                return (state, vec![Command::Notify { text: notice }]);
+            }
+            (state, pending.into_commands())
+        }
+        _ => {
+            // Esc dismisses; anything else is simply not the dialog's
+            // vocabulary. Either way the mutation is not confirmed, and
+            // `state.confirm` was already cleared by `take()` before this
+            // was called.
+            (state, Vec::new())
+        }
+    }
 }
 
 /// Keys typed while the filter is capturing.
@@ -1774,6 +1858,91 @@ mod tests {
         };
         let (s, _) = update(replica, Msg::Key(KeyPress::ctrl(KeyCode::Char('r'))));
         assert_eq!(s.read_only, Some(ReadOnlyReason::Replica));
+    }
+
+    fn state_with_one_key() -> State {
+        let (s, _) = update(
+            State::default(),
+            Msg::ScanBatch {
+                keys: vec![b"k:0".to_vec()],
+            },
+        );
+        s
+    }
+
+    #[test]
+    fn delete_stages_a_preview_rather_than_executing_immediately() {
+        let s = state_with_one_key();
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        assert!(cmds.is_empty(), "nothing runs before it is confirmed");
+        match s.confirm {
+            Some(PendingMutation::DeleteKey { index, ref name }) => {
+                assert_eq!(index, 0);
+                assert_eq!(name, b"k:0");
+            }
+            other => panic!("expected a staged delete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn confirming_a_staged_delete_issues_del() {
+        let s = state_with_one_key();
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        assert!(s.confirm.is_none(), "the dialog closes on confirm");
+        assert_eq!(
+            cmds,
+            vec![Command::DeleteKey {
+                index: 0,
+                name: b"k:0".to_vec()
+            }]
+        );
+    }
+
+    #[test]
+    fn esc_dismisses_a_staged_delete_without_running_it() {
+        let s = state_with_one_key();
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Esc)));
+        assert!(s.confirm.is_none());
+        assert!(cmds.is_empty());
+    }
+
+    /// R4.4/DESIGN §6.5: the preview is composed first regardless of
+    /// Read-only Mode — refusal happens only at the confirm keypress, so the
+    /// reader always sees the real command before learning they cannot run
+    /// it.
+    #[test]
+    fn read_only_mode_refuses_at_confirm_not_at_the_keypress() {
+        let s = State {
+            read_only: Some(ReadOnlyReason::Environment),
+            ..state_with_one_key()
+        };
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        assert!(s.confirm.is_some(), "the preview is composed anyway");
+        assert!(cmds.is_empty());
+
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        assert!(s.confirm.is_none(), "the dialog still closes");
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Command::DeleteKey { .. })),
+            "but nothing was actually sent to the server"
+        );
+    }
+
+    #[test]
+    fn a_completed_delete_badges_the_row_gone() {
+        let s = state_with_one_key();
+        assert!(!s.keys.is_gone(0));
+        let (s, _) = update(
+            s,
+            Msg::KeyDeleted {
+                index: Some(0),
+                name: "k:0".to_string(),
+                at_ms: 1_000,
+            },
+        );
+        assert!(s.keys.is_gone(0));
     }
 
     #[test]

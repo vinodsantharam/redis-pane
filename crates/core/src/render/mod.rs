@@ -14,7 +14,7 @@ use ratatui::style::Style;
 
 use crate::clock::Clock;
 use crate::keymap::{Action, key_label};
-use crate::state::{Attachment, Link, Liveness, PendingRead, State};
+use crate::state::{Attachment, Link, Liveness, PendingMutation, PendingRead, State};
 use crate::theme::{Theme, Token, env_token};
 
 /// Render the whole frame into a fresh buffer of the given size.
@@ -45,6 +45,9 @@ pub fn frame(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect) -> Buf
     }
     if state.help_open {
         help_overlay(state, theme, area, &mut buf);
+    }
+    if let Some(pending) = &state.confirm {
+        confirm_overlay(state, pending, theme, area, &mut buf);
     }
     buf
 }
@@ -635,6 +638,73 @@ fn help_overlay(state: &State, theme: &Theme, area: Rect, buf: &mut Buffer) {
                 theme.style(Token::Text),
             );
         }
+    }
+}
+
+/// The mutation-preview dialog (R4.4, DESIGN §6.5).
+///
+/// Composes the real command first, and only then says whether Read-only
+/// Mode will let it run — the reader learns what they were about to do
+/// before they learn they are not allowed to, never the other way round.
+fn confirm_overlay(
+    state: &State,
+    pending: &PendingMutation,
+    theme: &Theme,
+    area: Rect,
+    buf: &mut Buffer,
+) {
+    let command = pending.command_text();
+    let refused = state.read_only;
+    let hint = match refused {
+        Some(reason) => format!("read-only ({}) · Esc dismiss", reason.label()),
+        None => "y confirm · Esc cancel".to_string(),
+    };
+    let lines = [command.as_str(), hint.as_str()];
+    let inner_w = lines.iter().map(|l| l.chars().count()).max().unwrap_or(10);
+    let w = (inner_w + 4).min(area.width as usize);
+    let h = (lines.len() + 4).min(area.height as usize);
+    let x0 = (area.width as usize - w) / 2;
+    let y0 = (area.height as usize - h) / 2;
+
+    let border = theme.style(if refused.is_some() {
+        Token::Danger
+    } else {
+        Token::Warn
+    });
+    for y in 0..h {
+        let row = (y0 + y) as u16;
+        let line = if y == 0 || y == h - 1 {
+            format!(
+                "{}{}{}",
+                if y == 0 { "┌" } else { "└" },
+                "─".repeat(w - 2),
+                if y == 0 { "┐" } else { "┘" }
+            )
+        } else {
+            format!("│{}│", " ".repeat(w - 2))
+        };
+        put(buf, x0 as u16, row, &line, border);
+    }
+    put(
+        buf,
+        x0 as u16 + 2,
+        y0 as u16,
+        " confirm ",
+        theme.style(Token::Text),
+    );
+    for (i, line) in lines.iter().enumerate() {
+        let token = if refused.is_some() && i == 1 {
+            Token::Danger
+        } else {
+            Token::Text
+        };
+        put(
+            buf,
+            x0 as u16 + 2,
+            (y0 + 2 + i) as u16,
+            line,
+            theme.style(token),
+        );
     }
 }
 

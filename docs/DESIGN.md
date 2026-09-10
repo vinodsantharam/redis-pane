@@ -123,8 +123,9 @@ terminal is small and the situation is urgent.
 | `r` | Refresh / rescan | pane |
 | `e` | Edit value | value pane |
 | `t` | Edit TTL | value pane |
-| `y` | Copy (key / value / command — submenu) | value pane |
-| `d d` | Delete selection | key list |
+| `c` / `C` | Copy key or value / copy `redis-cli` command | key list, value pane |
+| `d` | Stage delete of the Selected key (previews `DEL`) | key list |
+| `y` | Confirm a staged mutation (`Esc` dismisses) | global, only while one is staged |
 | `Ctrl-R` | Toggle read-only mode | global |
 
 Every one of these is also listed in the palette with its binding shown, so the keymap teaches

@@ -61,6 +61,13 @@ pub enum Command {
         name: Vec<u8>,
         token: ReadToken,
     },
+    /// Delete a key outright (`DEL`).
+    ///
+    /// Only ever issued once the reader has confirmed the preview
+    /// [`crate::state::PendingMutation::DeleteKey`] described — this is the
+    /// one point where the chokepoint's decision (allowed, or refused by
+    /// Read-only Mode) becomes a command a shell will actually run (R4.4).
+    DeleteKey { index: usize, name: Vec<u8> },
     /// Put text on the clipboard.
     ///
     /// The core builds the text; how it reaches a clipboard is the shell's

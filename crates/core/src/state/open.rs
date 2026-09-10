@@ -88,6 +88,12 @@ pub struct PendingRead {
     /// filled in at the moment the read is issued — only the shell, which
     /// actually dispatches the read, knows when that was.
     pub issued_at_ms: Option<u64>,
+    /// Whether `Enter` asked for the value cursor the moment this read
+    /// lands, because it was pressed on a key that was not already the Open
+    /// key at rest. `Msg::ValueLoaded` reads this once, on the reply that
+    /// matches this read's token, and drops it either way — it is not
+    /// carried forward onto whatever key opens next.
+    pub activate_cursor: bool,
 }
 
 impl PendingRead {

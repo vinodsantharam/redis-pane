@@ -1,14 +1,14 @@
-─ redis-pane ─ ● staging · cache-01┌─ keys ────────────────────┐g ───────────────────────── ● live ─
-                                   │                           │
- KEY                               │ Tab     focus             │ted
-                                   │ q       quit              │
-                                   │ ⌃C      quit              │
-                                   │ r       refetch / rescan  │
-                                   │ ⌃R      read-only         │
-                                   │ ?       help              │
-                                   │ Esc     back              │
-                                   │ ↓       move              │
-                                   │ j       move              │
-                                   │ ↑       move              │
-                                   │ k       move              │
-                                   └───────────────────────────┘
+─ redis-pane ─ ● staging · cache-0┌─ keys ───────────────────────┐───────────────────────── ● live ─
+                                  │                              │
+ KEY                              │ Tab     focus                │d
+                                  │ q       quit                 │
+                                  │ ⌃C      quit                 │
+                                  │ r       refetch / rescan     │
+                                  │ ⌃R      read-only            │
+                                  │ ?       help                 │
+                                  │ Esc     back                 │
+                                  │ ↓       move                 │
+                                  │ j       move                 │
+                                  │ ↑       move                 │
+                                  │ k       move                 │
+                                  └──────────────────────────────┘

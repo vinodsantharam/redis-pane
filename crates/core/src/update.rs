@@ -7,7 +7,7 @@ use crate::msg::KeyPress;
 use crate::msg::MouseAction;
 use crate::render::layout::{self, Pane};
 use crate::state::copy::{CopyWhat, redis_cli_command, value_text};
-use crate::state::{Link, OpenKey, PendingRead, ReadOnlyReason, ScanState, Tracking};
+use crate::state::{Attachment, Link, OpenKey, PendingRead, ReadOnlyReason, ScanState, Tracking};
 use crate::{Command, Msg, State};
 
 /// Takes a message, returns new state plus commands for a shell to execute.
@@ -38,6 +38,7 @@ fn issue_refetch(state: &mut State) -> ReadToken {
             token,
             index: open.index,
             issued_at_ms: None,
+            activate_cursor: false,
         });
     }
     token
@@ -265,7 +266,13 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
                 return (state, Vec::new());
             }
             // The question this reply answers is the one currently in
-            // flight, so it is no longer in flight.
+            // flight, so it is no longer in flight. Whether `Enter` asked
+            // for the cursor the moment this landed travels with it — read
+            // once here, since the pending read is dropped either way.
+            let activate_cursor = state
+                .open_pending
+                .as_ref()
+                .is_some_and(|p| p.activate_cursor);
             state.open_pending = None;
             // A value came back, so the key is there. Says so on the row too —
             // the same two-pane agreement `ValueGone` keeps in the other
@@ -288,17 +295,16 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
                 // A read of the key already open is an update, and where it
                 // lands depends on where the reader is (ADR-0006).
                 Some(open) if open.name == name => {
-                    open.absorb(value, ttl_seconds, size_bytes, at_ms)
+                    open.absorb(value, ttl_seconds, size_bytes, at_ms);
+                    if activate_cursor {
+                        open.cursor_active = true;
+                    }
                 }
                 _ => {
-                    state.open = Some(OpenKey::new(
-                        index,
-                        name,
-                        value,
-                        ttl_seconds,
-                        size_bytes,
-                        at_ms,
-                    ));
+                    let mut opened =
+                        OpenKey::new(index, name, value, ttl_seconds, size_bytes, at_ms);
+                    opened.cursor_active = activate_cursor;
+                    state.open = Some(opened);
                     // A newly opened key has to find its row before either pane
                     // can point at it.
                     state.relocate_open_key();
@@ -680,21 +686,71 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
                 token,
                 index: Some(index),
                 issued_at_ms: None,
+                activate_cursor: false,
             });
             (state, vec![Command::OpenKey { index, name, token }])
         }
         Action::EnterValueCursor => {
-            // No-op with nothing open, or a key confirmed gone before it was
-            // ever loaded — there is no body to move a cursor through.
-            let Some(open) = &mut state.open else {
-                return (state, Vec::new());
-            };
-            if open.value.is_none() {
+            // A no-op on a group row: Enter only ever means "put a cursor in
+            // the Selected key's value," and a group has no value of its own
+            // to move through — `Right` (`Action::Open`) is what expands or
+            // steps into one. Every row is implicitly a leaf outside tree
+            // mode, so this only ever excludes a Group row.
+            if state.tree_mode
+                && !matches!(
+                    state.tree.row(state.view.selected),
+                    Some(crate::state::tree::Row::Key { .. })
+                )
+            {
                 return (state, Vec::new());
             }
-            open.cursor_active = true;
+            let Some(index) = state.selected_key() else {
+                return (state, Vec::new());
+            };
+
+            if matches!(state.attachment(), Some(Attachment::Attached)) {
+                let open = state.open.as_mut().expect("Attached implies Some");
+                // Nothing to move a cursor through: a key confirmed gone
+                // before it ever loaded has no body, and one confirmed gone
+                // since has nothing worth re-reading on every Enter — `r` is
+                // the deliberate way to check again (ADR-0006: there is no
+                // silent refresh button).
+                if open.value.is_none() {
+                    return (state, Vec::new());
+                }
+                // Fast path: the Open key is already the Selected key and
+                // already has a value on screen, so there is nothing to
+                // fetch — just drop the cursor into what is already there.
+                open.cursor_active = true;
+                state.focus = Pane::Value;
+                return (state, Vec::new());
+            }
+
+            // Otherwise the Selected key is not the Open key (or nothing is
+            // open at all): open it exactly like `Action::Open` does, except
+            // the reply also activates the cursor the moment it lands — the
+            // "open and dive in" this action exists to shortcut over `→`
+            // then `Enter`. `state.open` itself is left untouched until then,
+            // same as `Action::Open`: the previous value stays on screen,
+            // correctly badged detached, rather than being blanked out for
+            // the read's duration.
+            let Some(name) = state.keys.name(index).map(|n| n.to_vec()) else {
+                return (state, Vec::new());
+            };
             state.focus = Pane::Value;
-            (state, Vec::new())
+            let token = issue_read(&mut state);
+            state.open_pending = Some(PendingRead {
+                name: state
+                    .keys
+                    .name_str(index)
+                    .map(|n| n.into_owned())
+                    .unwrap_or_default(),
+                token,
+                index: Some(index),
+                issued_at_ms: None,
+                activate_cursor: true,
+            });
+            (state, vec![Command::OpenKey { index, name, token }])
         }
         Action::Copy => {
             state.copy_pending = true;
@@ -3667,17 +3723,24 @@ mod cursor_mode_tests {
     use crate::state::open::OpenKey;
     use crate::state::value::{PairValue, Value};
 
+    /// A key open and Attached: the Selected row is the Open key's own row,
+    /// which is what lets plain `Enter` take the fast path straight into
+    /// cursor mode without a read. `attached_and_gone_tests` covers the
+    /// opposite case, where Enter has to open the Selected key first.
     fn open_with(pairs: usize) -> State {
         let value = Value::Hash(PairValue {
             pairs: (0..pairs).map(|i| (format!("f{i}"), "v".into())).collect(),
             total: pairs,
         });
-        State {
+        let mut state = State {
             cols: 130,
             rows: 40,
             open: Some(OpenKey::new(Some(0), "k".into(), value, -1, 10, 0)),
             ..State::default()
-        }
+        };
+        state.keys.push(b"k");
+        state.rebuild_list();
+        state
     }
 
     fn press(state: State, code: KeyCode) -> (State, Vec<Command>) {
@@ -3701,13 +3764,21 @@ mod cursor_mode_tests {
 
     #[test]
     fn enter_on_a_key_gone_before_load_does_nothing() {
-        // No body to move a cursor through — a name and a badge, nothing else.
-        let state = State {
+        // No body to move a cursor through — a name and a badge, nothing
+        // else. Attached (not merely open), so this exercises the branch
+        // that would otherwise re-read a key already confirmed gone on
+        // every Enter press.
+        let mut state = State {
             open: Some(OpenKey::gone(Some(0), "k".into(), 0)),
             ..State::default()
         };
-        let (state, _) = press(state, KeyCode::Enter);
+        state.keys.push(b"k");
+        state.rebuild_list();
+        assert_eq!(state.attachment(), Some(Attachment::Attached));
+
+        let (state, cmds) = press(state, KeyCode::Enter);
         assert!(!state.open.unwrap().cursor_active);
+        assert!(cmds.is_empty(), "a confirmed-gone key is not re-read");
     }
 
     #[test]
@@ -3738,9 +3809,7 @@ mod cursor_mode_tests {
 
     #[test]
     fn plain_movement_acts_on_the_value_cursor_once_active() {
-        let mut state = open_with(5);
-        state.keys.push(b"k");
-        state.rebuild_list();
+        let state = open_with(5);
         let selected_before = state.view.selected;
 
         let (state, _) = press(state, KeyCode::Enter);
@@ -3828,6 +3897,113 @@ mod cursor_mode_tests {
         assert_eq!(state.view.selected, selected_before);
         assert!(cmds.is_empty());
         assert!(state.open.unwrap().cursor_active);
+    }
+
+    /// Reported live: open a key, move the cursor, `Esc` back to the key
+    /// list, move the selection to a *different* key, press `Enter` — the
+    /// value pane kept showing the old key's value, un-highlighted, badged
+    /// `not the selected key`. Blocking `Enter` there would just trade one
+    /// confusing no-op for another (CLAUDE.md: an operation that silently
+    /// vanishes is indistinguishable from a bug); refetching what `Enter`
+    /// actually points at is the fix, and it is what `Action::Open` (`→`)
+    /// already does in the same situation — this only skips the extra
+    /// keystroke.
+    #[test]
+    fn enter_on_a_different_key_opens_it_and_activates_the_cursor_once_it_lands() {
+        let mut state = open_with(5);
+        state.keys.push(b"other");
+        state.rebuild_list();
+        // Name order: "k" (the Open key, row 0) then "other" (row 1) — select
+        // the latter, so the Open key is Detached rather than Attached.
+        state.view.selected = 1;
+        assert_eq!(state.attachment(), Some(Attachment::Detached { rows: -1 }));
+
+        let (state, cmds) = press(state, KeyCode::Enter);
+        // The stale value stays on screen, correctly badged, until the fresh
+        // read lands — not blanked out, and not silently ignored.
+        assert_eq!(state.open.as_ref().unwrap().name, "k");
+        assert!(!state.open.as_ref().unwrap().cursor_active);
+        assert_eq!(state.focus, Pane::Value);
+        let Some(Command::OpenKey { token, index, name }) = cmds.into_iter().next() else {
+            panic!("Enter on a detached key must open it, same as →");
+        };
+        assert_eq!(index, state.selected_key().unwrap());
+
+        let (state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token,
+                index: Some(index),
+                name: String::from_utf8(name).unwrap(),
+                value: Value::Hash(PairValue {
+                    pairs: vec![("f".into(), "v".into())],
+                    total: 1,
+                }),
+                ttl_seconds: -1,
+                size_bytes: 4,
+                at_ms: 0,
+            },
+        );
+        let open = state.open.unwrap();
+        assert_eq!(open.name, "other");
+        assert!(
+            open.cursor_active,
+            "the cursor Enter asked for activates the moment the read it \
+             had to wait on actually lands"
+        );
+        assert_eq!(state.focus, Pane::Value);
+    }
+
+    #[test]
+    fn enter_with_nothing_open_opens_the_selected_key_and_activates_the_cursor_once_it_lands() {
+        let mut state = State {
+            rows: 40,
+            ..State::default()
+        };
+        state.keys.push(b"only");
+        state.rebuild_list();
+
+        let (state, cmds) = press(state, KeyCode::Enter);
+        assert!(state.open.is_none(), "nothing to show yet");
+        let Some(Command::OpenKey { token, index, name }) = cmds.into_iter().next() else {
+            panic!("Enter with a key selected but none open must open it");
+        };
+
+        let (state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token,
+                index: Some(index),
+                name: String::from_utf8(name).unwrap(),
+                value: Value::Hash(PairValue {
+                    pairs: vec![("f".into(), "v".into())],
+                    total: 1,
+                }),
+                ttl_seconds: -1,
+                size_bytes: 4,
+                at_ms: 0,
+            },
+        );
+        assert!(state.open.unwrap().cursor_active);
+    }
+
+    #[test]
+    fn enter_on_a_collapsed_group_row_does_nothing() {
+        let mut state = State {
+            tree_mode: true,
+            ..State::default()
+        };
+        state.keys.push(b"page:a");
+        state.keys.push(b"page:b");
+        state.rebuild_list();
+        assert!(matches!(
+            state.tree.row(0),
+            Some(crate::state::tree::Row::Group { .. })
+        ));
+
+        let (state, cmds) = press(state, KeyCode::Enter);
+        assert!(state.open.is_none(), "a group has no value to open");
+        assert!(cmds.is_empty());
     }
 }
 

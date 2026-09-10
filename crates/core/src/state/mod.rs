@@ -463,7 +463,14 @@ impl State {
     /// shut must not fling the cursor to the top of the list.
     pub fn rebuild_list(&mut self) {
         let selected_index = self.key_at(self.view.selected);
-        if self.tree_mode && self.list.sort == SortBy::Scan {
+        // Tree mode folds one pass over a name-ordered view (`Tree::rebuild`'s
+        // own doc comment says so); any other sort scatters same-prefix keys
+        // across the view, so `Tree::rebuild` emits a fresh group header each
+        // time it loses the run, instead of one header with every descendant
+        // under it. `Action::Sort` no-ops in tree mode for exactly this reason,
+        // but this is the invariant's actual enforcement point — every path
+        // that can flip `tree_mode` or `list.sort` funnels through here.
+        if self.tree_mode && self.list.sort != SortBy::Name {
             self.list.sort = SortBy::Name;
         }
         self.list.rebuild(&self.keys);

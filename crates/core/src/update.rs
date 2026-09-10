@@ -763,6 +763,16 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             (state, Vec::new())
         }
         Action::Sort => {
+            // Folding needs name order to group consecutive keys in one pass
+            // (`Tree::rebuild`'s doc comment); cycling to another sort while
+            // folded fragments every group into repeated headers with
+            // undercounted descendants. `rebuild_list` would snap the sort
+            // back to Name immediately anyway, so this is a no-op either way —
+            // guarding here just avoids advertising a key that visibly does
+            // nothing.
+            if state.tree_mode {
+                return (state, Vec::new());
+            }
             state.list.sort = state.list.sort.next();
             state.rebuild_list();
             after_move(state)
@@ -3444,6 +3454,52 @@ mod tree_fold_tests {
 
     fn expanded(state: &State, row: usize) -> bool {
         matches!(state.tree.row(row), Some(Row::Group { expanded: true, .. }))
+    }
+
+    /// Pressing Sort in tree mode used to cycle `list.sort` to Ttl/Size/Kind —
+    /// `rebuild_list` only ever snapped `Scan` back to `Name`, so any other
+    /// sort stuck. `Tree::rebuild` requires a name-ordered view to fold same-
+    /// prefix keys into one group in a single pass; under any other order it
+    /// loses the run and emits a fresh header each time adjacency breaks,
+    /// each with only part of the real descendant count — indistinguishable
+    /// from "expanding a group doesn't show its children".
+    #[test]
+    fn sort_is_inert_in_tree_mode_so_folding_never_sees_another_order() {
+        let mut state = State {
+            cols: 130,
+            rows: 30,
+            tree_mode: true,
+            ..State::default()
+        };
+        (state, _) = update(state, Msg::ScanStarted { estimated_total: 4 });
+        let keys = vec![
+            b"feed:a".to_vec(),
+            b"user:1:x".to_vec(),
+            b"feed:b".to_vec(),
+            b"user:1:y".to_vec(),
+        ];
+        (state, _) = update(state, Msg::ScanBatch { keys });
+        let before = state.tree.clone();
+
+        (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('s'))));
+
+        assert_eq!(
+            state.list.sort,
+            crate::state::view::SortBy::Name,
+            "Sort must not move the list off name order while folded"
+        );
+        assert_eq!(
+            state.tree, before,
+            "a no-op Sort must leave the fold exactly as it was"
+        );
+        let group_rows = (0..state.tree.len())
+            .filter(|&r| matches!(state.tree.row(r), Some(Row::Group { .. })))
+            .count();
+        assert_eq!(
+            group_rows, 3,
+            "one header each for feed:, user:, user:1: — not a fresh one \
+             per broken run of adjacency"
+        );
     }
 
     /// The regression this module exists for (#16, then re-fought over which

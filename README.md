@@ -72,8 +72,9 @@ Once you're in:
 - `Enter` to open the selected key and move a cursor inside its value, `Esc` to leave it
 - `/` to filter, `Esc` to clear
 - `t` to toggle tree/flat view, `s` to cycle sort order
-- `y` to copy the key name or the value, whichever pane is focused; `c` to copy a `redis-cli`
-  command for the open key
+- `c` to copy the key name or the value, whichever pane is focused; `C` to copy a `redis-cli`
+  command for the open key (locally this uses the system clipboard directly; over SSH it relies
+  on OSC 52 — see [ALPHA.md](ALPHA.md#copying) if a paste comes back empty)
 - `?` for help with your actual keybindings
 
 ![Folding a tree group with Left/Right, filtering down to one key, and moving a real cursor through its value with Enter and the arrow keys](navigation-demo.gif)

@@ -1521,10 +1521,10 @@ fn press(state: State, c: char) -> (State, Vec<Command>) {
 
 /// Focused on the Keys pane, `y` copies the key name — no mnemonic, no chord.
 #[test]
-fn y_copies_the_key_name_when_the_keys_pane_is_focused() {
+fn c_copies_the_key_name_when_the_keys_pane_is_focused() {
     let state = opened("user:8812:session", hash_value(), 600);
     assert!(state.keys_pane_focused(), "opening does not move focus");
-    let (_, cmds) = press(state, 'y');
+    let (_, cmds) = press(state, 'c');
     match cmds.first() {
         Some(Command::CopyToClipboard { text, label }) => {
             assert_eq!(text, "user:8812:session");
@@ -1537,10 +1537,10 @@ fn y_copies_the_key_name_when_the_keys_pane_is_focused() {
 /// Focused on the Viewer, the same `y` copies the value instead — the pane
 /// under the reader's cursor decides what "it" refers to.
 #[test]
-fn y_copies_the_value_when_the_viewer_is_focused() {
+fn c_copies_the_value_when_the_viewer_is_focused() {
     let mut state = opened("k", hash_value(), 600);
     state.focus = redis_pane_core::render::layout::Pane::Value;
-    let (_, cmds) = press(state, 'y');
+    let (_, cmds) = press(state, 'c');
     match cmds.first() {
         Some(Command::CopyToClipboard { text, .. }) => {
             assert_eq!(
@@ -1555,9 +1555,9 @@ fn y_copies_the_value_when_the_viewer_is_focused() {
 }
 
 #[test]
-fn c_copies_a_command_that_would_actually_run() {
+fn shift_c_copies_a_command_that_would_actually_run() {
     let state = opened("user:8812:session", hash_value(), 600);
-    let (_, cmds) = press(state, 'c');
+    let (_, cmds) = press(state, 'C');
     match cmds.first() {
         Some(Command::CopyToClipboard { text, .. }) => {
             assert_eq!(
@@ -1573,7 +1573,7 @@ fn c_copies_a_command_that_would_actually_run() {
 fn the_key_name_is_copyable_from_the_list_with_nothing_open() {
     let mut state = many_keys();
     state.open = None;
-    let (_, cmds) = press(state, 'y');
+    let (_, cmds) = press(state, 'c');
     assert!(
         matches!(cmds.first(), Some(Command::CopyToClipboard { .. })),
         "a key name needs no open value"
@@ -1585,7 +1585,7 @@ fn copying_a_value_with_nothing_open_says_so_instead_of_copying_nothing() {
     let mut state = many_keys();
     state.open = None;
     state.focus = redis_pane_core::render::layout::Pane::Value;
-    let (state, cmds) = press(state, 'y');
+    let (state, cmds) = press(state, 'c');
     assert!(
         !cmds
             .iter()
@@ -1623,7 +1623,7 @@ fn copying_a_windowed_value_says_how_much_it_took() {
     });
     let mut state = opened("feed:global:hot", windowed, 600);
     state.focus = redis_pane_core::render::layout::Pane::Value;
-    let (_, cmds) = press(state, 'y');
+    let (_, cmds) = press(state, 'c');
 
     let Some(Command::CopyToClipboard { label, text }) = cmds.first() else {
         panic!("expected a copy, got {cmds:?}");
@@ -1641,7 +1641,7 @@ fn copying_a_windowed_value_says_how_much_it_took() {
 fn copying_a_complete_value_stays_quiet_about_it() {
     let mut state = opened("user:8812:session", hash_value(), 600);
     state.focus = redis_pane_core::render::layout::Pane::Value;
-    let (_, cmds) = press(state, 'y');
+    let (_, cmds) = press(state, 'c');
     let Some(Command::CopyToClipboard { label, .. }) = cmds.first() else {
         panic!("expected a copy");
     };

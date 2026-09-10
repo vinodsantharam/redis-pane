@@ -297,11 +297,11 @@ impl Default for Keymap {
                     action: Action::EnterValueCursor,
                 },
                 Binding {
-                    key: KeyPress::plain(KeyCode::Char('y')),
+                    key: KeyPress::plain(KeyCode::Char('c')),
                     action: Action::Copy,
                 },
                 Binding {
-                    key: KeyPress::plain(KeyCode::Char('c')),
+                    key: KeyPress::plain(KeyCode::Char('C')),
                     action: Action::CopyCommand,
                 },
                 // Horizontal chords for a horizontal action. `⌃←`/`⌃→` are

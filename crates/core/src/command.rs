@@ -78,6 +78,38 @@ pub enum Command {
     /// to reach the Viewer is a real read (ADR-0006), and `ValueSet`'s job is
     /// only to ask for one.
     SetValue { name: Vec<u8>, new: Vec<u8> },
+    /// Overwrite one Hash field's value, keeping the field's own TTL
+    /// (guarded `HSET`, sent as `EVAL`, PLAN M2 task 6, D1, ADR-0015).
+    ///
+    /// Only ever issued once the reader has confirmed the preview
+    /// [`crate::state::PendingMutation::SetHashField`] described — the same
+    /// chokepoint every other mutation goes through (R4.4). On success the
+    /// shell sends [`crate::Msg::ValueSet`], never a value read straight off
+    /// this call's own reply, for the same reason [`Command::SetValue`]
+    /// does not (ADR-0006).
+    SetHashField {
+        name: Vec<u8>,
+        field: Vec<u8>,
+        value: Vec<u8>,
+    },
+    /// Add a Hash field that does not exist yet, never overwriting one that
+    /// does (guarded `HSETNX`, sent as `EVAL`, PLAN M2 task 6, D1, ADR-0015).
+    ///
+    /// Only ever issued once the reader has confirmed the preview
+    /// [`crate::state::PendingMutation::AddHashField`] described (R4.4).
+    /// Success is reported the same way [`Command::SetHashField`] is.
+    AddHashField {
+        name: Vec<u8>,
+        field: Vec<u8>,
+        value: Vec<u8>,
+    },
+    /// Remove one Hash field (`HDEL`, PLAN M2 task 6, D3, D4).
+    ///
+    /// Only ever issued once the reader has confirmed the preview
+    /// [`crate::state::PendingMutation::DeleteHashField`] described (R4.4).
+    /// Deleting the last field deletes the key itself — Redis's own
+    /// behaviour, not something this command arranges.
+    DeleteHashField { name: Vec<u8>, field: Vec<u8> },
     /// Put text on the clipboard.
     ///
     /// The core builds the text; how it reaches a clipboard is the shell's

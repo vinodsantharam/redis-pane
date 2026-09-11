@@ -51,7 +51,10 @@ _Avoid_: Pending action, draft, queued command
 **Command preview**:
 The literal command a staged mutation shows before it runs, in the confirm dialog. It exists so
 the reader learns what they were about to do before they learn whether they are allowed to —
-Read-only Mode refuses at this dialog, never at the keypress that staged it.
+Read-only Mode refuses at this dialog, never at the keypress that staged it. For a mutation sent as
+a guarded script rather than the literal command (a Hash field edit or add, ADR-0015), the preview
+is the effective command it performs plus the guard it runs under — never the `EVAL "<script>" …`
+it is actually sent as, which would defeat the point of showing it at all.
 _Avoid_: Confirmation dialog (names the UI, not what it shows), dry run
 
 **Loaded set**:

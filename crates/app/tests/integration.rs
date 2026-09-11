@@ -1436,3 +1436,420 @@ async fn setting_a_value_on_a_key_that_is_gone_writes_nothing_and_does_not_recre
     let _ = client.quit().await;
     let _ = writer.quit().await;
 }
+
+// ── M2 task 6 step 0 — binary safety of HSCAN, checked before writing any
+//    edit path ──────────────────────────────────────────────────────────
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn a_hash_with_non_utf8_field_and_value_fails_to_read_rather_than_reading_lossily() {
+    // `hscan_window` asks fred for `Vec<String>`, and fred's `FromValue for
+    // String` goes through `Value::into_string`, which for a `Bytes` reply is
+    // `String::from_utf8(bytes).ok()` — `None`, not a replacement-character
+    // fallback, on invalid UTF-8. So a field name or value that isn't valid
+    // UTF-8 must make `read_value` return `Err`, not a lossily-decoded pair.
+    // This test exists to pin that finding down against a real server before
+    // any editing code is written on top of it: Phase 1 does not fix this,
+    // only reports it, per the task 6 plan step 0.
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let bad_field: &[u8] = &[0xff, 0xfe, b'x'];
+    let bad_value: &[u8] = &[b'y', 0xff, 0xfe];
+    let _: () = writer
+        .hset("bytey-hash", vec![(bad_field, bad_value)])
+        .await
+        .unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let arming = redis_pane::redis::read::Arming::Enabled;
+    let result = redis_pane::redis::read::read_value(&client, b"bytey-hash", 40, arming).await;
+
+    match result {
+        Err(e) => {
+            // Report the exact shape of the failure for the checkpoint.
+            eprintln!("non-UTF-8 hash field/value read failed as expected: {e}");
+        }
+        Ok(_) => panic!(
+            "expected fred's String conversion to reject invalid UTF-8 with an error, but the read succeeded"
+        ),
+    }
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+// ── M2 task 6 — guarded Hash field writes (D1, ADR-0015) ─────────────────
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn editing_a_hash_field_overwrites_it_and_keeps_the_keys_ttl() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer.hset("h:1", [("token", "old")]).await.unwrap();
+    let _: () = writer.expire("h:1", 600, None).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::set_hash_field(&client, b"h:1", b"token", b"new")
+        .await
+        .unwrap();
+    assert_eq!(outcome, redis_pane::redis::FieldWrite::Written);
+
+    let now: Option<String> = writer.hget("h:1", "token").await.unwrap();
+    assert_eq!(now.as_deref(), Some("new"));
+    let ttl: i64 = writer.ttl("h:1").await.unwrap();
+    assert!((1..=600).contains(&ttl), "key TTL must survive, got {ttl}");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn editing_a_hash_field_with_a_field_ttl_keeps_it_on_redis_7_4() {
+    field_ttl_survives_an_edit("redis", "7.4-alpine").await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn editing_a_hash_field_with_a_field_ttl_keeps_it_on_redis_8_4() {
+    field_ttl_survives_an_edit("redis", "8.4-alpine").await;
+}
+
+/// Shared body for the two field-TTL tests above: `HEXPIRE` is 7.4+, so this
+/// is only run against servers that have it.
+async fn field_ttl_survives_an_edit(image: &str, tag: &str) {
+    let (_c, url) = start(image, tag).await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer.hset("h:2", [("token", "old")]).await.unwrap();
+    let field_ttl: Vec<i64> = writer
+        .custom(
+            fred::types::CustomCommand::new("HEXPIRE", None, false),
+            vec!["h:2", "600", "FIELDS", "1", "token"],
+        )
+        .await
+        .unwrap();
+    assert_eq!(field_ttl, vec![1], "HEXPIRE must have set the field TTL");
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::set_hash_field(&client, b"h:2", b"token", b"new")
+        .await
+        .unwrap();
+    assert_eq!(outcome, redis_pane::redis::FieldWrite::Written);
+
+    let now: Option<String> = writer.hget("h:2", "token").await.unwrap();
+    assert_eq!(now.as_deref(), Some("new"));
+    let httl: Vec<i64> = writer
+        .custom(
+            fred::types::CustomCommand::new("HTTL", None, false),
+            vec!["h:2", "FIELDS", "1", "token"],
+        )
+        .await
+        .unwrap();
+    assert_eq!(httl.len(), 1);
+    assert!(
+        (1..=600).contains(&httl[0]),
+        "field TTL must survive the edit, got {httl:?}"
+    );
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn the_edit_script_still_works_on_redis_6_2_where_hpexpiretime_does_not_exist() {
+    // The `HPEXPIRETIME` `pcall` must be harmless here: 6.2 predates the
+    // whole `HEXPIRE` family, so the unknown-subcommand error has to come
+    // back as a Lua error table the script keeps running past, not abort the
+    // script outright.
+    let (_c, url) = start("redis", "6.2-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer.hset("h:3", [("token", "old")]).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::set_hash_field(&client, b"h:3", b"token", b"new")
+        .await
+        .unwrap();
+    assert_eq!(outcome, redis_pane::redis::FieldWrite::Written);
+
+    let now: Option<String> = writer.hget("h:3", "token").await.unwrap();
+    assert_eq!(now.as_deref(), Some("new"));
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn editing_a_gone_field_writes_nothing() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer.hset("h:4", [("a", "1")]).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::set_hash_field(&client, b"h:4", b"missing", b"new")
+        .await
+        .unwrap();
+    assert_eq!(outcome, redis_pane::redis::FieldWrite::FieldGone);
+
+    let still_absent: Option<String> = writer.hget("h:4", "missing").await.unwrap();
+    assert_eq!(still_absent, None, "nothing must have been written");
+    let untouched: Option<String> = writer.hget("h:4", "a").await.unwrap();
+    assert_eq!(
+        untouched.as_deref(),
+        Some("1"),
+        "the other field is untouched"
+    );
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn editing_a_field_on_a_gone_key_does_not_recreate_it() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::set_hash_field(&client, b"h:gone", b"token", b"new")
+        .await
+        .unwrap();
+    assert_eq!(outcome, redis_pane::redis::FieldWrite::KeyGone);
+
+    let exists: i64 = writer.exists("h:gone").await.unwrap();
+    assert_eq!(exists, 0, "the key must not be recreated");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn adding_a_new_hash_field_creates_it() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer.hset("h:5", [("a", "1")]).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::add_hash_field(&client, b"h:5", b"b", b"2")
+        .await
+        .unwrap();
+    assert_eq!(outcome, redis_pane::redis::FieldAdd::Added);
+
+    let value: Option<String> = writer.hget("h:5", "b").await.unwrap();
+    assert_eq!(value.as_deref(), Some("2"));
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn adding_a_field_that_already_exists_leaves_it_unchanged() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer.hset("h:6", [("a", "1")]).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::add_hash_field(&client, b"h:6", b"a", b"clobbered")
+        .await
+        .unwrap();
+    assert_eq!(outcome, redis_pane::redis::FieldAdd::FieldExists);
+
+    let value: Option<String> = writer.hget("h:6", "a").await.unwrap();
+    assert_eq!(value.as_deref(), Some("1"), "must not be overwritten");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn adding_a_field_to_a_gone_key_does_not_recreate_it() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::add_hash_field(&client, b"h:gone2", b"a", b"1")
+        .await
+        .unwrap();
+    assert_eq!(outcome, redis_pane::redis::FieldAdd::KeyGone);
+
+    let exists: i64 = writer.exists("h:gone2").await.unwrap();
+    assert_eq!(exists, 0, "the key must not be recreated");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn deleting_a_hash_field_removes_only_that_field() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer.hset("h:7", [("a", "1"), ("b", "2")]).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let removed = redis_pane::redis::delete_hash_field(&client, b"h:7", b"a")
+        .await
+        .unwrap();
+    assert!(removed);
+
+    let a: Option<String> = writer.hget("h:7", "a").await.unwrap();
+    assert_eq!(a, None);
+    let b: Option<String> = writer.hget("h:7", "b").await.unwrap();
+    assert_eq!(b.as_deref(), Some("2"), "the other field is untouched");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn deleting_an_already_gone_field_reports_false() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer.hset("h:8", [("a", "1")]).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let removed = redis_pane::redis::delete_hash_field(&client, b"h:8", b"missing")
+        .await
+        .unwrap();
+    assert!(!removed);
+
+    let a: Option<String> = writer.hget("h:8", "a").await.unwrap();
+    assert_eq!(a.as_deref(), Some("1"), "untouched");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn deleting_the_last_field_deletes_the_key() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer.hset("h:9", [("only", "1")]).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let removed = redis_pane::redis::delete_hash_field(&client, b"h:9", b"only")
+        .await
+        .unwrap();
+    assert!(removed);
+
+    let exists: i64 = writer.exists("h:9").await.unwrap();
+    assert_eq!(exists, 0, "the key must be gone once its last field is");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn deleting_a_field_with_bytes_that_look_like_small_integers_touches_only_that_field() {
+    // The mirror of `deleting_a_key_with_bytes_that_look_like_small_integers`
+    // above, for `hdel`'s own `Into<MultipleKeys>` field parameter: a bare
+    // `Vec<u8>` would be read elementwise, one field per byte value, rather
+    // than as one binary-safe field name.
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let field: &[u8] = &[7, 8];
+    let _: () = writer
+        .hset("h:10", vec![(field, b"v".as_slice())])
+        .await
+        .unwrap();
+    // Decoy fields named after the byte values, as strings — if the bug were
+    // present, deleting `field` would remove one of these instead.
+    let _: () = writer
+        .hset("h:10", [("7", "decoy7"), ("8", "decoy8")])
+        .await
+        .unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let removed = redis_pane::redis::delete_hash_field(&client, b"h:10", field)
+        .await
+        .unwrap();
+    assert!(removed);
+
+    let target: Option<String> = writer.hget("h:10", field).await.unwrap();
+    assert_eq!(target, None, "the intended field must be gone");
+    let decoy7: Option<String> = writer.hget("h:10", "7").await.unwrap();
+    assert_eq!(decoy7.as_deref(), Some("decoy7"), "decoy must be untouched");
+    let decoy8: Option<String> = writer.hget("h:10", "8").await.unwrap();
+    assert_eq!(decoy8.as_deref(), Some("decoy8"), "decoy must be untouched");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn a_bytey_field_name_can_be_edited_without_touching_a_decoy() {
+    // Mirror of the delete-side byte test above, for `set_hash_field`'s
+    // `ARGV` path.
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let field: &[u8] = &[7, 8];
+    let _: () = writer
+        .hset("h:11", vec![(field, b"old".as_slice())])
+        .await
+        .unwrap();
+    let _: () = writer.hset("h:11", [("7", "decoy")]).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::set_hash_field(&client, b"h:11", field, b"new")
+        .await
+        .unwrap();
+    assert_eq!(outcome, redis_pane::redis::FieldWrite::Written);
+
+    let target: Option<String> = writer.hget("h:11", field).await.unwrap();
+    assert_eq!(target.as_deref(), Some("new"));
+    let decoy: Option<String> = writer.hget("h:11", "7").await.unwrap();
+    assert_eq!(decoy.as_deref(), Some("decoy"), "decoy must be untouched");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}

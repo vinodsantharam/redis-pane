@@ -15,11 +15,12 @@ refresh needed.*
 ## Status
 
 This is an early alpha. It handles browsing a keyspace, viewing every Redis type, and live updates
-when a value changes on the server. Mutation is arriving type by type: you can delete a key or edit
-a String value today (`d` to stage a delete, `e` to open a String value for editing right in the
-value pane, `Ctrl-S` to stage the edit, `y` to confirm — every mutation previews the exact command
+when a value changes on the server. Mutation is arriving type by type: you can delete a key, edit a
+String value, or edit/add/remove a Hash field today (`d` to stage a delete, `e` to open a value —
+or, on a Hash, the field under the cursor — for editing right in the value pane, `a` to add a Hash
+field, `Ctrl-S` to stage the edit, `y` to confirm — every mutation previews the exact command
 first, and Read-only Mode still refuses it where it should). Editing happens inline, so a value
-that reads as JSON stays visible while you type; other Redis types, TTLs, rename and copy are
+that reads as JSON stays visible while you type; List, Set, Sorted set, TTLs, rename and copy are
 coming next.
 
 Requires Redis 6.0 or newer (Valkey works too).

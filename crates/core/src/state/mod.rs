@@ -15,12 +15,12 @@ pub mod value;
 pub mod view;
 
 pub use copy::CopyWhat;
-pub use editor::EditBuffer;
+pub use editor::{EditBuffer, EditTarget, FieldPart};
 pub use loaded::{KeyKind, LoadedSet};
 pub use open::{Attachment, OpenKey, PendingRead, ReadOutcome};
 pub use scan::ScanState;
 pub use tree::Tree;
-pub use value::{Value, Viewer};
+pub use value::{Value, Viewer, looks_like_json};
 pub use view::{FilterMode, KeyView, SortBy};
 
 /// Where a Connection's target came from (ADR-0001).
@@ -230,10 +230,42 @@ pub enum PendingMutation {
         new: Vec<u8>,
         was_json: bool,
     },
+    /// Overwrite one Hash field's value, keeping the field's own TTL
+    /// (guarded `HSET`, PLAN M2 task 6, D1, ADR-0015). `old`/`was_json` carry
+    /// the same meaning `SetString` gives them, one field wide.
+    SetHashField {
+        name: Vec<u8>,
+        field: Vec<u8>,
+        old: Vec<u8>,
+        new: Vec<u8>,
+        was_json: bool,
+    },
+    /// Add a Hash field that does not exist yet, never overwriting one that
+    /// does (guarded `HSETNX`, PLAN M2 task 6, D1, ADR-0015).
+    AddHashField {
+        name: Vec<u8>,
+        field: Vec<u8>,
+        value: Vec<u8>,
+    },
+    /// Remove one Hash field (`HDEL`, PLAN M2 task 6, D3, D4). `last_field` is
+    /// whether this was the hash's only field at the moment it was staged —
+    /// the confirm dialog warns that the key itself will go, since `HDEL`
+    /// deletes a Hash whose last field is removed.
+    DeleteHashField {
+        name: Vec<u8>,
+        field: Vec<u8>,
+        last_field: bool,
+    },
 }
 
 impl PendingMutation {
     /// The literal command this will send, shown at preview (R4.4).
+    ///
+    /// For a guarded Hash write this is the effective command it performs —
+    /// `HSET user:1 token`, not the `EVAL "<script>" 1 …` it is actually sent
+    /// as, which is unreadable in the dialog — paired with
+    /// [`PendingMutation::guard_text`]'s one muted line naming the guard it
+    /// runs under (D2, ADR-0015; CONTEXT.md's *Command preview*, R4.4).
     pub fn command_text(&self) -> String {
         match self {
             PendingMutation::DeleteKey { name, .. } => {
@@ -246,6 +278,44 @@ impl PendingMutation {
                     String::from_utf8_lossy(new)
                 )
             }
+            PendingMutation::SetHashField { name, field, .. } => {
+                format!(
+                    "HSET {} {}",
+                    String::from_utf8_lossy(name),
+                    String::from_utf8_lossy(field)
+                )
+            }
+            PendingMutation::AddHashField { name, field, .. } => {
+                format!(
+                    "HSETNX {} {}",
+                    String::from_utf8_lossy(name),
+                    String::from_utf8_lossy(field)
+                )
+            }
+            PendingMutation::DeleteHashField { name, field, .. } => {
+                format!(
+                    "HDEL {} {}",
+                    String::from_utf8_lossy(name),
+                    String::from_utf8_lossy(field)
+                )
+            }
+        }
+    }
+
+    /// The muted guard line under a guarded Hash write's command, naming what
+    /// the script checks before it writes (D1, D2, ADR-0015). `None` for
+    /// everything else — `DeleteKey` and `SetString` need no such line, and
+    /// `DeleteHashField` is plain `HDEL`, guarded by nothing but its own
+    /// last-field warning (see [`crate::render`]'s confirm dialog).
+    pub fn guard_text(&self) -> Option<&'static str> {
+        match self {
+            PendingMutation::SetHashField { .. } => {
+                Some("only if the field still exists · keeps its TTL")
+            }
+            PendingMutation::AddHashField { .. } => {
+                Some("only if the key still exists · never overwrites a field")
+            }
+            _ => None,
         }
     }
 
@@ -257,6 +327,11 @@ impl PendingMutation {
     pub fn json_warning(&self) -> Option<bool> {
         match self {
             PendingMutation::SetString {
+                was_json: true,
+                new,
+                ..
+            }
+            | PendingMutation::SetHashField {
                 was_json: true,
                 new,
                 ..
@@ -276,6 +351,21 @@ impl PendingMutation {
             }
             PendingMutation::SetString { name, new, .. } => {
                 vec![crate::Command::SetValue { name, new }]
+            }
+            PendingMutation::SetHashField {
+                name, field, new, ..
+            } => {
+                vec![crate::Command::SetHashField {
+                    name,
+                    field,
+                    value: new,
+                }]
+            }
+            PendingMutation::AddHashField { name, field, value } => {
+                vec![crate::Command::AddHashField { name, field, value }]
+            }
+            PendingMutation::DeleteHashField { name, field, .. } => {
+                vec![crate::Command::DeleteHashField { name, field }]
             }
         }
     }

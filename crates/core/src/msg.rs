@@ -93,6 +93,22 @@ pub enum MouseAction {
     ScrollDown { col: u16, row: u16 },
 }
 
+/// Why a guarded write did not write anything (PLAN M2 task 6, D1, ADR-0015).
+///
+/// One enum for every guard a write can trip, whichever mutation it was —
+/// `Msg::NotWritten` carries this rather than the mutation itself, so the
+/// `update()` handler is one match on *why*, not one per command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotWritten {
+    /// The key itself was already gone. Tombstoned, the same as a
+    /// `ValueGone` — the key is never recreated (ADR-0014).
+    KeyGone,
+    /// A `SetHashField` found the field already gone.
+    FieldGone,
+    /// An `AddHashField` found the field already there.
+    FieldExists,
+}
+
 /// Every input to the core: keystrokes, resizes, and replies from the shells.
 ///
 /// The core has no other way in. A shell that wants to tell the core something
@@ -272,14 +288,38 @@ pub enum Msg {
         name: String,
         at_ms: u64,
     },
-    /// A `SET … XX` from `Command::SetValue` wrote nothing: the key was gone
-    /// by the time it landed (R4.1, ADR-0014).
+    /// A guarded write refused to write, because its precondition was no
+    /// longer true by the time it reached the server (R4.1, PLAN M2 task 6,
+    /// D1, ADR-0014, ADR-0015).
     ///
-    /// Not a `Failed` — the server did as asked, and the edit is not over.
-    /// The key is tombstoned and the edited text goes back into the buffer,
-    /// since no read can recover it. Guarded by `name`, like `ValueSet`.
-    ValueSetKeyGone {
+    /// Not a `Failed` — the server did exactly as asked and nothing broke;
+    /// the write is simply not there to reread. The edited text goes back
+    /// into the buffer either way, since no read can recover it — what
+    /// differs by `why` is whether the key itself is gone (tombstoned, same
+    /// as a `ValueGone`) or only the precondition failed (the buffer is
+    /// handed back with a Refetch in flight, held under R3.8 while it is
+    /// open again). Guarded by `name`, like `ValueSet`: the reader may have
+    /// moved on to a different key by the time this lands. The command this
+    /// was — `SET`, `HSET key field`, or `HSETNX key field` — is not carried
+    /// here: the buffer that is about to be handed back already knows, via
+    /// `EditBuffer::target`, so the core derives it rather than trusting a
+    /// second copy the shell could get out of sync with the first.
+    NotWritten {
         name: String,
+        why: NotWritten,
+        at_ms: u64,
+    },
+    /// A staged `DeleteHashField` found the field already gone (PLAN M2 task
+    /// 6, D1, D4).
+    ///
+    /// Not an error, and not routed through `NotWritten`: `HDEL` did exactly
+    /// what was asked and found nothing to remove, and there is no buffer to
+    /// hand anything back to — `Delete` never opens one. Reported as a
+    /// notice, then a Refetch, the same way every other change to the open
+    /// key is (ADR-0006).
+    HashFieldAlreadyGone {
+        name: String,
+        field: String,
         at_ms: u64,
     },
     /// An operation failed. Carries the command that failed (R7.4).

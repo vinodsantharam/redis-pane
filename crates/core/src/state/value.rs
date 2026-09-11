@@ -12,6 +12,22 @@
 
 use super::loaded::KeyKind;
 
+/// Whether `text` is shaped like JSON — an object or an array, after leading
+/// whitespace — rather than merely something `serde_json` happens to parse.
+///
+/// One rule shared by every path that classifies a value as JSON: the shell's
+/// `string_value` (`crates/app/src/redis/read.rs`) uses it to choose the JSON
+/// viewer over the plain String one, and the core's
+/// [`super::EditBuffer::for_hash_field`] uses it to decide whether a Hash
+/// field's edit gets the JSON-parses warning. A bare scalar — `8812`, `true`,
+/// `null` — parses as valid JSON syntax but is not what either caller means
+/// by "this looks like JSON"; without this shared rule, a numeric Hash field
+/// edited into plain text wrongly warned `⚠ no longer valid JSON`.
+pub fn looks_like_json(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with('{') || trimmed.starts_with('[')
+}
+
 /// A fetched value, ready to display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
@@ -164,6 +180,16 @@ pub struct PairValue {
     /// newest `WINDOW` fields via `HSCAN`, with `total` from `HLEN` so the
     /// header can say what fraction that is.
     pub total: usize,
+}
+
+impl PairValue {
+    /// Whether a field of exactly this name is in the fetched window (PLAN M2
+    /// task 6 follow-up, D) — byte-for-byte, not case-folded. A hidden
+    /// duplicate outside the window is not answered here; the `HSETNX` guard
+    /// at write time is what catches those.
+    pub fn has_field(&self, name: &str) -> bool {
+        self.pairs.iter().any(|(f, _)| f == name)
+    }
 }
 
 impl Viewer for PairValue {

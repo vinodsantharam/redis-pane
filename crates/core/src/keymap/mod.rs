@@ -78,10 +78,16 @@ pub enum Action {
     /// not if Read-only Mode refuses it. No-op with nothing staged.
     ConfirmMutation,
     /// Open the inline value editor on the Open value's whole body (R3.2,
-    /// R4.1, ADR-0014). Acts on focus alone, like `Copy` — no cursor-mode
-    /// prerequisite, since a String has exactly one thing to edit, not rows
-    /// to navigate to first.
+    /// R4.1, ADR-0014), or on a Hash field's value (PLAN M2 task 6, D4). A
+    /// String has exactly one thing to edit, so this acts on focus alone,
+    /// like `Copy`; a Hash needs the value cursor active on a row first —
+    /// there is no "the whole hash" to edit in place of one field.
     Edit,
+    /// Add a field to the Open Hash (PLAN M2 task 6, D1, D4): captures a
+    /// field name, then opens the inline editor on an empty value targeting
+    /// it. Value-pane scoped, like `Edit` — it needs no cursor, since a new
+    /// field has no row yet to pick.
+    AddField,
     /// Stage the inline editor's buffer for confirmation, or close it
     /// silently if nothing changed (ADR-0014).
     EditorStage,
@@ -122,12 +128,34 @@ impl Action {
             | Action::Sort
             | Action::ToggleTree
             | Action::CollapseGroup
-            | Action::Open
-            | Action::Delete => state.pane_visible(Pane::Keys),
-            // Edits the Open value's body — meaningless without the value
-            // pane on screen to hold it. The editor-scoped actions only ever
-            // matter while that same pane holds an open buffer.
-            Action::Edit | Action::EditorStage | Action::EditorUndo | Action::EditorRedo => {
+            | Action::Open => state.pane_visible(Pane::Keys),
+            // `d` is focus-dependent, like `c` (D4, PLAN M2 task 6): the keys
+            // pane's Selected-key delete and the Viewer's Hash-field delete
+            // are different commands on different targets, and whichever
+            // pane is not drawn has no target for its half to act on.
+            Action::Delete => {
+                if state.keys_pane_focused() {
+                    state.pane_visible(Pane::Keys)
+                } else {
+                    state.pane_visible(Pane::Value)
+                }
+            }
+            // `e`/`a` are focus-dependent too, like `d` above (PLAN M2 task 6
+            // follow-up, G): with the keys pane focused they act on nothing
+            // (`open_editor`/`begin_add_field` refuse with a notice rather
+            // than acting on whatever key happens to be open), so route them
+            // the same way — following focus, not merely "is the value pane
+            // drawn at all".
+            Action::Edit | Action::AddField => {
+                if state.keys_pane_focused() {
+                    state.pane_visible(Pane::Keys)
+                } else {
+                    state.pane_visible(Pane::Value)
+                }
+            }
+            // The editor-scoped actions only ever matter while the value pane
+            // holds an open buffer, which itself requires that pane focused.
+            Action::EditorStage | Action::EditorUndo | Action::EditorRedo => {
                 state.pane_visible(Pane::Value)
             }
             // Everything else is the app's, not a pane's: quitting, help, Esc,
@@ -169,6 +197,7 @@ impl Action {
             Action::Delete => "delete",
             Action::ConfirmMutation => "confirm",
             Action::Edit => "edit",
+            Action::AddField => "add",
             Action::EditorStage => "stage",
             Action::EditorUndo => "undo",
             Action::EditorRedo => "redo",
@@ -361,6 +390,10 @@ impl Default for Keymap {
                     key: KeyPress::plain(KeyCode::Char('e')),
                     action: Action::Edit,
                 },
+                Binding {
+                    key: KeyPress::plain(KeyCode::Char('a')),
+                    action: Action::AddField,
+                },
                 // Ctrl+S is reliable in raw mode on every platform this ships
                 // for (IXON cleared on Unix, processed input off on Windows).
                 // Ctrl+Enter/Shift+Enter are not, so they are not used here
@@ -536,6 +569,7 @@ mod tests {
             Action::Delete,
             Action::ConfirmMutation,
             Action::Edit,
+            Action::AddField,
             Action::EditorStage,
             Action::EditorUndo,
             Action::EditorRedo,

@@ -376,7 +376,7 @@ impl OpenKey {
             return format!("✕ deleted {}", ago(now_ms, gone));
         }
         if self.editing && self.pending.is_some() {
-            return "✎ editing · changed · held".into();
+            return format!("{} · changed · held", self.edit_verb());
         }
         if let Some(p) = &self.pending {
             return format!("● live · changed {}", ago(now_ms, p.at_ms));
@@ -389,7 +389,7 @@ impl OpenKey {
         // this exists so the header is correct the day one lands, rather than
         // silently wrong from the first edit built.
         if self.editing {
-            return "✎ editing".into();
+            return self.edit_verb().into();
         }
         // What the last read found, while it is still news. This is the half
         // ADR-0006 named and the app did not have: without it, a Refetch that
@@ -417,6 +417,36 @@ impl OpenKey {
         } else {
             format!("○ manual · read {}", ago(now_ms, self.read_at_ms))
         }
+    }
+
+    /// The header's verb for an open edit — distinct for a Hash add and a
+    /// Hash field edit, so the header names what is actually happening rather
+    /// than one generic "editing" for every target (PLAN M2 task 6
+    /// follow-up, F). `None` editor (the `editing_indicator_tests` forward
+    /// plumbing, and any future editor-less use of the flag) falls back to
+    /// the plain form.
+    fn edit_verb(&self) -> &'static str {
+        match self.editor.as_ref().map(super::EditBuffer::target) {
+            Some(super::EditTarget::NewHashField { .. }) => "✎ adding field",
+            Some(super::EditTarget::HashField { .. }) => "✎ editing field",
+            Some(super::EditTarget::Value) | None => "✎ editing",
+        }
+    }
+
+    /// Whether the reader's typed field name, while adding one, matches a
+    /// field already in the fetched window (PLAN M2 task 6 follow-up, D) —
+    /// exact byte equality, not case-folded. `false` with nothing to check:
+    /// no editor, an empty name, or a target other than `NewHashField`. A
+    /// hidden duplicate outside the window is not this function's job; the
+    /// `HSETNX` guard at write time is what catches those.
+    pub fn hash_field_shown_duplicate(&self) -> bool {
+        let Some(name) = self.editor.as_ref().and_then(super::EditBuffer::field_name) else {
+            return false;
+        };
+        if name.is_empty() {
+            return false;
+        }
+        matches!(&self.value, Some(Value::Hash(pairs)) if pairs.has_field(name))
     }
 }
 

@@ -121,11 +121,12 @@ terminal is small and the situation is urgent.
 | `←` / `h` | Collapse a tree group, or move to its parent | key list |
 | `Enter` | Open the Selected key (if needed) and start moving a cursor inside it | key list / value pane |
 | `r` | Refresh / rescan | pane |
-| `e` | Open the inline value editor | value pane |
+| `e` | Open the inline value editor, or (Hash, cursor on a field) edit that field's value | value pane, focused |
+| `a` | Add a field to the open Hash — opens the two-part FIELD/VALUE add form | value pane, focused |
 | `Ctrl-S` | Stage the inline editor's buffer for confirmation | value pane, editing |
 | `t` | Edit TTL | value pane |
 | `c` / `C` | Copy key or value / copy `redis-cli` command | key list, value pane |
-| `d` | Stage delete of the Selected key (previews `DEL`) | key list |
+| `d` | Stage delete of the Selected key (`DEL`), or (Hash, cursor on a field) of that field (`HDEL`) | key list, value pane |
 | `y` | Confirm a staged mutation (`Esc` dismisses) | global, only while one is staged |
 | `Ctrl-R` | Toggle read-only mode | global |
 
@@ -326,6 +327,15 @@ misplaced keypress, which was a deliberate choice over special-casing edits. **O
 and only `Esc` dismisses the confirm dialog; every other key is ignored rather than discarding** —
 a stray or leaked keystroke can never silently throw away a staged mutation (ADR-0014).
 
+**`e`/`a`/`d` act on the Open key only with the value pane focused, and the value fetched.**
+With the keys pane focused, moving the cursor there fetches nothing, so `e`/`a` would otherwise act
+on whatever key happens to be open rather than the one under the cursor — a short notice (`Tab to
+the value pane to edit`, or `open a key first` with nothing open) says so instead of silently acting
+on the wrong key. `d` is unaffected: it already targets the Selected key's `DEL` from the keys pane,
+a different command on a different target, unchanged by this. With the value pane focused but
+nothing ever read for the Open key (a key confirmed gone before it loaded), both refuse with
+`nothing open to edit` — or `gone — nothing to edit` if the key was seen and is now gone.
+
 **String values edit inline, in the value pane.** `e` opens an embedded text editor
 (`ratatui-textarea`) directly where the value was, replacing the body rows; the header keeps
 showing `✎ editing · changed · held` and, for a value that reads as JSON, a live `json ✓`/`json ✗`
@@ -345,8 +355,33 @@ at `y`), the key is badged gone, and the edited text goes back into the buffer r
 lost, where `Esc` still discards it. `Ctrl-Z`/`Ctrl-Y` undo and redo
 inside the buffer. A value that already reads as JSON (R3.2) opens pretty-printed; the confirm
 dialog still warns, without blocking, if the edited text no longer parses — it is still just a
-STRING underneath, and Redis has no opinion on whether its bytes are valid JSON. Collection values
-(hash, list, set, sorted set) and binary strings are not editable yet; that lands type by type.
+STRING underneath, and Redis has no opinion on whether its bytes are valid JSON. List, Set, Sorted
+set and binary strings are not editable yet; that lands type by type.
+
+**Hash fields edit, add and remove the same way, one field at a time.** With the value cursor on a
+field (`Enter` first), `e` opens that field's raw value in the same inline editor, with its name
+shown read-only above it; `d` stages removing it. `a` needs no cursor — it opens a two-part form in
+place of the body, labelled `FIELD` and `VALUE` like the table's own columns, with a `▌` marker
+before whichever half is active (a glyph, not colour alone, so it survives monochrome). `Enter` or
+`↓` moves from `FIELD` to `VALUE`; `↑` moves back once the value's cursor has nowhere left to go
+(the top screen row, including inside a wrapped first line); `Tab` still inserts a tab in `VALUE`.
+While typing the name, a live `⚠ exists` marker appears the moment it matches a field already
+fetched, and `Enter`/`↓`/`Ctrl-S` are all blocked until it is corrected — a duplicate outside the
+fetched window is still caught only by the guard below, at write time. `Ctrl-S` stages from either
+part once the name is non-empty and not a shown duplicate; `Esc` discards the whole add from
+either part. All three write through a guarded Lua script rather than
+a plain `HSET`/`HSETNX`/`HDEL`, so the confirm dialog shows the effective command it performs —
+`HSET user:1 token`, never the literal `EVAL` — with one muted guard line underneath naming what
+the script checks first: *only if the field still exists · keeps its TTL* for an edit, *only if the
+key still exists · never overwrites a field* for an add. A field that is gone by the time an edit
+lands, or already there by the time an add lands, writes nothing; the dialog closes (or, if it
+already closed at `y`, a notice says so) and the typed text goes back into the buffer, held under
+the same "an open editor is never touched" guarantee as a String edit. Removing a Hash's last field
+carries an extra warning in the dialog — *last field — the key will be deleted* — because `HDEL`
+deletes the key itself when nothing is left in it. As with a String edit, the key itself is never
+recreated if it is gone by the time the write lands. See
+[ADR-0015](adr/0015-hash-field-writes-are-guarded.md) for the scripts, the guards, and why a plain
+`HSET`/`HSETNX` was rejected.
 
 **Values over 200KB are refused, with a notice.** `e` on a value whose raw byte length exceeds
 that threshold says so, and mentions that an external-editor escape hatch is planned for values

@@ -183,7 +183,10 @@ config file; a **Connection** is a live session, which may be **ad-hoc** (no Pro
 - **R4.1** In-place edit for scalar values and collection members, with a diff-style confirm.
 - **R4.2** TTL editing (set/persist/extend) as a first-class action.
 - **R4.3** Rename, copy, move-across-db, delete — single and bulk.
-- **R4.4** Every mutation shows the exact command it will run before it runs.
+- **R4.4** Every mutation shows the exact command it will run before it runs. For a mutation sent
+  as a guarded script rather than the literal command — a Hash field edit or add (ADR-0015) — this
+  means the effective command it performs (`HSET user:1 token`) and the guard it runs under, never
+  the unreadable `EVAL "<script>" …` it is actually transported as.
 - **R4.5** **Read-only Mode**, default-on for `prod` and `unknown` Environments, toggled
   explicitly (`Ctrl-R`). It carries a **reason** — `environment`, `replica`, or `user` — which is
   displayed. The `replica` reason cannot be lifted, because the server will refuse regardless

@@ -15,7 +15,10 @@ use ratatui::widgets::Widget;
 
 use crate::clock::Clock;
 use crate::keymap::{Action, key_label};
-use crate::state::{Attachment, EditBuffer, Link, Liveness, PendingMutation, PendingRead, State};
+use crate::state::value::Value;
+use crate::state::{
+    Attachment, EditBuffer, FieldPart, Link, Liveness, PendingMutation, PendingRead, State,
+};
 use crate::theme::{Theme, Token, env_token};
 
 /// Render the whole frame into a fresh buffer of the given size.
@@ -399,22 +402,111 @@ fn value_pane(
     // The text colour is painted underneath instead of set on the widget,
     // since setting a style needs `&mut` and render only borrows `State`.
     if let Some(editor) = &open.editor {
+        if let Some(name) = editor.field_name() {
+            // The two-part FIELD/VALUE form (PLAN M2 task 6 follow-up, F):
+            // adding a field shows both, name first; editing an existing one
+            // shows both too, but FIELD is fixed (renaming is a follow-up)
+            // and VALUE is always the active half. The active half carries a
+            // `▌` marker before its label — a glyph, not a colour alone, so
+            // which half is "live" survives monochrome (DESIGN §5).
+            // Layout follows which part is active; the `▌` marker itself is
+            // suppressed once the buffer is staged — under the confirm
+            // dialog the form is frozen (D3), so nothing on it should still
+            // read as "the one taking keys right now".
+            let name_part = editor.active_part() == Some(FieldPart::Name);
+            let value_part = !name_part;
+            let show_marker = !editor.is_staged();
+            let name_active = show_marker && name_part;
+            let value_active = show_marker && value_part;
+            // "FIELD"/"VALUE" are both five characters, so one constant
+            // covers the gap to where the content column starts: the marker,
+            // the label, and two spaces of daylight — the same pairing the
+            // body's own FIELD/VALUE columns use elsewhere in this pane.
+            const LABEL_W: u16 = 5;
+            let content_x = x0 + 1 + LABEL_W + 2;
+            let mark = |active: bool| if active { "▌" } else { " " };
+            let mark_token = |active: bool| {
+                if active {
+                    Token::Selected
+                } else {
+                    Token::Muted
+                }
+            };
+
+            put(
+                buf,
+                x0,
+                body_top,
+                mark(name_active),
+                sty(mark_token(name_active)),
+            );
+            put(buf, x0 + 1, body_top, "FIELD", sty(Token::Muted));
+            let name_end = put(buf, content_x, body_top, name, sty(Token::Text));
+            if name_active {
+                // The same cursor cell the capture line used to draw.
+                if name_end < area.x + area.width {
+                    let cell = &mut buf[(name_end, body_top)];
+                    cell.set_symbol(" ");
+                    cell.set_style(sty(Token::Selected));
+                }
+                if open.hash_field_shown_duplicate() {
+                    put(buf, name_end + 2, body_top, "⚠ exists", sty(Token::Warn));
+                }
+            }
+
+            if body_height < 2 {
+                return;
+            }
+            let value_row = body_top + 1;
+            put(
+                buf,
+                x0,
+                value_row,
+                mark(value_active),
+                sty(mark_token(value_active)),
+            );
+            put(buf, x0 + 1, value_row, "VALUE", sty(Token::Muted));
+
+            if value_part {
+                let editor_area = Rect::new(
+                    content_x,
+                    value_row,
+                    (area.x + area.width).saturating_sub(content_x + 1).max(1),
+                    body_height - 1,
+                );
+                buf.set_style(editor_area, sty(Token::Text));
+                editor.widget().render(editor_area, buf);
+                repaint_reversed_cursor(buf, editor_area, sty(Token::Selected));
+            } else {
+                // The name part is active: no multi-row editor yet, just a
+                // one-line preview of VALUE so far — empty on a fresh add, so
+                // this is also where the placeholder tells the reader what
+                // comes next.
+                let text = editor.text();
+                let first_line =
+                    String::from_utf8_lossy(text.split(|&b| b == b'\n').next().unwrap_or(&[]))
+                        .into_owned();
+                if first_line.is_empty() {
+                    put(
+                        buf,
+                        content_x,
+                        value_row,
+                        "·· Enter to write the value",
+                        sty(Token::Muted),
+                    );
+                } else {
+                    put(buf, content_x, value_row, &first_line, sty(Token::Text));
+                }
+            }
+            return;
+        }
+
+        // A plain String edit (`EditTarget::Value`): the editor takes over
+        // the whole body, unchanged since M2 task 4 (ADR-0014).
         let editor_area = Rect::new(x0, body_top, area.width.saturating_sub(2), body_height);
         buf.set_style(editor_area, sty(Token::Text));
         editor.widget().render(editor_area, buf);
-        // The crate draws its cursor in reverse video, and nothing else in
-        // this area uses it, so that one cell is repainted with the token the
-        // Viewer's cursor uses.
-        let reversed = ratatui::style::Modifier::REVERSED;
-        for y in editor_area.top()..editor_area.bottom() {
-            for x in editor_area.left()..editor_area.right() {
-                let cell = &mut buf[(x, y)];
-                if cell.modifier.contains(reversed) {
-                    cell.modifier.remove(reversed);
-                    cell.set_style(sty(Token::Selected));
-                }
-            }
-        }
+        repaint_reversed_cursor(buf, editor_area, sty(Token::Selected));
         return;
     }
 
@@ -758,6 +850,38 @@ fn confirm_overlay(
                 lines.push(("⚠ no longer valid JSON".to_string(), Token::Warn));
             }
         }
+        // Guarded Hash writes (D1, D2, ADR-0015): the command line is the
+        // effective command, never the `EVAL "<script>" …` it is actually
+        // sent as — unreadable in the dialog — followed by the one muted
+        // guard line naming what the script checks before it writes.
+        PendingMutation::SetHashField { old, new, .. } => {
+            lines.push((pending.command_text(), Token::Text));
+            if let Some(guard) = pending.guard_text() {
+                lines.push((guard.to_string(), Token::Muted));
+            }
+            push_diff_side(&mut lines, "-", old, Token::Danger);
+            push_diff_side(&mut lines, "+", new, Token::Ok);
+            if pending.json_warning() == Some(true) {
+                lines.push(("⚠ no longer valid JSON".to_string(), Token::Warn));
+            }
+        }
+        PendingMutation::AddHashField { value, .. } => {
+            lines.push((pending.command_text(), Token::Text));
+            if let Some(guard) = pending.guard_text() {
+                lines.push((guard.to_string(), Token::Muted));
+            }
+            // `+` side only: there is no prior value to diff against.
+            push_diff_side(&mut lines, "+", value, Token::Ok);
+        }
+        PendingMutation::DeleteHashField { last_field, .. } => {
+            lines.push((pending.command_text(), Token::Text));
+            if *last_field {
+                lines.push((
+                    "last field — the key will be deleted".to_string(),
+                    Token::Warn,
+                ));
+            }
+        }
     }
     let hint_token = if refused.is_some() {
         Token::Danger
@@ -1009,17 +1133,58 @@ pub fn hint_bar(state: &State) -> String {
     }
     // The inline editor is a mode of its own (ADR-0014), the same way filter
     // capture is above: hard-coded wording, effective bindings looked up
-    // from the keymap so a rebinding still shows correctly (R7.5).
-    if state
+    // from the keymap so a rebinding still shows correctly (R7.5). The add
+    // form's two parts each get their own wording (PLAN M2 task 6
+    // follow-up, F/N) — the name part shares the editor's rank but not its
+    // vocabulary, since `⌃S`/`↑` mean nothing there yet.
+    if let Some(editor) = state
         .open
         .as_ref()
         .and_then(|o| o.editor.as_ref())
-        .is_some_and(|e| !e.is_staged())
+        .filter(|e| !e.is_staged())
     {
-        let stage = state.keymap.hint(Action::EditorStage).unwrap_or_default();
-        let undo = state.keymap.hint(Action::EditorUndo).unwrap_or_default();
         let cancel = state.keymap.hint(Action::Cancel).unwrap_or_default();
-        return format!("{stage} stage   {undo} undo   {cancel} cancel");
+        match editor.active_part() {
+            Some(FieldPart::Name) => {
+                let duplicate = state
+                    .open
+                    .as_ref()
+                    .is_some_and(|o| o.hash_field_shown_duplicate());
+                return if duplicate {
+                    let edit = state.keymap.hint(Action::Edit).unwrap_or_default();
+                    format!("field exists — {cancel}, then {edit} to edit")
+                } else {
+                    format!("Enter value · {cancel} cancel")
+                };
+            }
+            Some(FieldPart::Value) => {
+                let stage = state.keymap.hint(Action::EditorStage).unwrap_or_default();
+                let undo = state.keymap.hint(Action::EditorUndo).unwrap_or_default();
+                return format!("{stage} stage · ↑ field · {undo} undo · {cancel} cancel");
+            }
+            None => {
+                let stage = state.keymap.hint(Action::EditorStage).unwrap_or_default();
+                let undo = state.keymap.hint(Action::EditorUndo).unwrap_or_default();
+                return format!("{stage} stage   {undo} undo   {cancel} cancel");
+            }
+        }
+    }
+    // A Hash with the value cursor on a row, *and the value pane focused*:
+    // `e`/`a`/`d` all mean something there (D4), and the hint names the
+    // effective binding for each (R7.5). `Tab` (`Action::CyclePane`) can move
+    // focus back to the keys pane without clearing `cursor_active`, and `d`
+    // there is `DeleteKey`, not `HDEL` — the hint must not claim `remove`
+    // for a `d` that is about to stage something else entirely.
+    if !state.keys_pane_focused()
+        && state
+            .open
+            .as_ref()
+            .is_some_and(|o| o.cursor_active && matches!(o.value, Some(Value::Hash(_))))
+    {
+        let edit = state.keymap.hint(Action::Edit).unwrap_or_default();
+        let add = state.keymap.hint(Action::AddField).unwrap_or_default();
+        let remove = state.keymap.hint(Action::Delete).unwrap_or_default();
+        return format!("{edit} edit · {add} add · {remove} remove");
     }
     [
         Action::Cancel,
@@ -1068,6 +1233,26 @@ pub fn read_age(state: &State, clock: &dyn Clock) -> String {
                 format!("read {secs}s ago")
             } else {
                 format!("read {}m ago", secs / 60)
+            }
+        }
+    }
+}
+
+/// Repaint the inline editor's own cursor cell with the Viewer's cursor
+/// token, over the whole of `area`.
+///
+/// `ratatui-textarea` draws its cursor in reverse video, and nothing else in
+/// an editor area uses that modifier, so the one cell wearing it is always
+/// exactly the cursor — found by the modifier rather than by asking the
+/// widget for its position, since the crate does not expose one.
+fn repaint_reversed_cursor(buf: &mut Buffer, area: Rect, style: Style) {
+    let reversed = ratatui::style::Modifier::REVERSED;
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let cell = &mut buf[(x, y)];
+            if cell.modifier.contains(reversed) {
+                cell.modifier.remove(reversed);
+                cell.set_style(style);
             }
         }
     }

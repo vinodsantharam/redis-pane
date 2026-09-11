@@ -294,6 +294,27 @@ pub async fn delete_key(client: &Client, name: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
+/// Overwrite a String value (`SET`, R4.1, PLAN M2 task 4).
+///
+/// `set`'s key parameter is `K: Into<Key>` — a single key, never
+/// `Into<MultipleKeys>` — so it does not carry `del`'s trap above: there is
+/// no elementwise `Vec<T> -> Key` conversion to fall into by accident. Built
+/// the same way regardless (`Key::from(name)`, `name: &[u8]`) for the same
+/// reason `delete_key` is: `Vec<u8>` has no `Into<Key>` impl of its own, only
+/// `&[u8]` does, so passing `name.to_vec()` here would simply fail to
+/// compile rather than silently misbehave — a narrower trap than `del`'s, but
+/// worth the explicit build-a-`Key`-first habit regardless, given fred has
+/// already surprised this module once.
+///
+/// The caller must not treat a successful call as the value now on screen —
+/// [`crate::terminal`] always re-reads through the one read path afterward
+/// (`Msg::ValueSet`), never trusts what it just wrote (ADR-0006).
+pub async fn set_value(client: &Client, name: &[u8], new: &[u8]) -> Result<(), Error> {
+    let key = fred::types::Key::from(name);
+    let _: () = client.set(key, new.to_vec(), None, None, false).await?;
+    Ok(())
+}
+
 /// Exponential backoff with a ceiling, so a long outage does not turn into a
 /// long silence. The countdown is shown; a silent wait is a freeze wearing a
 /// different name (ADR-0009).

@@ -42,6 +42,18 @@ property of the running app, not of the Redis user's ACL. It always carries a **
 be lifted.
 _Avoid_: Safe mode, locked, protected
 
+**Staged mutation**:
+A change proposed but not yet sent — the state between pressing a mutating key (`d`, or
+committing an edit) and confirming it. Every mutation is staged before it can run: staging composes
+the real command, and only confirming decides whether Read-only Mode lets it through.
+_Avoid_: Pending action, draft, queued command
+
+**Command preview**:
+The literal command a staged mutation shows before it runs, in the confirm dialog. It exists so
+the reader learns what they were about to do before they learn whether they are allowed to —
+Read-only Mode refuses at this dialog, never at the keypress that staged it.
+_Avoid_: Confirmation dialog (names the UI, not what it shows), dry run
+
 **Loaded set**:
 The keys the current session has scanned and is holding. Sorting, filtering and bulk selection
 all operate on the Loaded set, never on the whole keyspace — so the UI must be able to say how

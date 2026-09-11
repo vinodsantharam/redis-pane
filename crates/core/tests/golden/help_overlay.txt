@@ -27,3 +27,4 @@ C       copy redis-cli command
 ⌃←      narrow keys
 d       delete
 y       confirm
+e       edit

@@ -77,6 +77,10 @@ pub enum Action {
     /// Confirm whatever mutation is currently staged and run it, or say why
     /// not if Read-only Mode refuses it. No-op with nothing staged.
     ConfirmMutation,
+    /// Stage an edit of the Open value's whole body in `$EDITOR` (R3.2, R4.1).
+    /// Acts on focus alone, like `Copy` — no cursor-mode prerequisite, since a
+    /// String has exactly one thing to edit, not rows to navigate to first.
+    Edit,
 }
 
 impl Action {
@@ -112,6 +116,9 @@ impl Action {
             | Action::CollapseGroup
             | Action::Open
             | Action::Delete => state.pane_visible(Pane::Keys),
+            // Edits the Open value's body — meaningless without the value
+            // pane on screen to hold it.
+            Action::Edit => state.pane_visible(Pane::Value),
             // Everything else is the app's, not a pane's: quitting, help, Esc,
             // `Tab` (which is what *changes* which pane is on screen), `r`
             // (already pane-scoped by R2.7 on its own terms), `Enter`
@@ -150,6 +157,7 @@ impl Action {
             Action::NarrowKeysPane => "narrow keys",
             Action::Delete => "delete",
             Action::ConfirmMutation => "confirm",
+            Action::Edit => "edit",
         }
     }
 
@@ -334,6 +342,10 @@ impl Default for Keymap {
                     key: KeyPress::plain(KeyCode::Char('y')),
                     action: Action::ConfirmMutation,
                 },
+                Binding {
+                    key: KeyPress::plain(KeyCode::Char('e')),
+                    action: Action::Edit,
+                },
             ],
         }
     }
@@ -492,6 +504,7 @@ mod tests {
             Action::CopyCommand,
             Action::Delete,
             Action::ConfirmMutation,
+            Action::Edit,
         ] {
             assert!(k.key_for(action).is_some(), "{action:?} has no binding");
         }

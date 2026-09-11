@@ -128,18 +128,28 @@ RedisInsight-shaped bugs M0/M1 were built to make structurally impossible.
 
 **Progress: in flight.** Task 1 was already done incidentally while building M0's title bar and
 Ctrl-R toggle — `ReadOnlyReason`, its precedence rules, and the DESIGN §6.8 chrome all shipped
-with golden-frame coverage before this table existed. Tasks 2–3 (the chokepoint and Delete) are
-done. The rest is ordered per a grilling session with the user: value edit ships type by type
-(String → Hash → Set → List → ZSet) before TTL editing, single-key confirmation is always one
-keypress regardless of Environment (friction scales with count, not Environment — that is
-Read-only Mode's job), and move-across-db (part of R4.3) is parked — see the note below.
+with golden-frame coverage before this table existed. Tasks 2–4 (the chokepoint, Delete, and
+String edit) are done. The rest is ordered per a grilling session with the user: value edit ships
+type by type (String → Hash → Set → List → ZSet) before TTL editing, single-key confirmation is
+always one keypress regardless of Environment (friction scales with count, not Environment — that
+is Read-only Mode's job), and move-across-db (part of R4.3) is parked — see the note below.
+
+Task 4 landed differently than first planned, after a second grilling session: String edit shells
+out to `$EDITOR` on a temp file rather than an inline text buffer in the value pane, because no
+terminal reliably distinguishes "commit" from "insert a newline" for a hand-rolled multi-line
+editor, and a real editor is a better one than this app would build from scratch. That needed its
+own fix first: the input-reading thread blocked on `crossterm::event::read()` forever, which would
+have raced a child editor process for the same terminal input — it is now a pausable poll loop
+(`crates/app/src/terminal.rs`). Landing this also caught a second real fred footgun (see
+`crates/app/src/redis/mod.rs`'s `set_value` doc comment) and settled that an editor's own
+trailing-newline-on-save habit is never mistaken for something the reader typed.
 
 | # | Task | Proves |
 |---|---|---|
 | 1 | Read-only Mode as real state: `State` field, reason (`environment`/`replica`/`user`), `Ctrl-R` toggle, title-bar chrome | Golden frames of all four DESIGN §6.8 readouts; `replica` is never liftable (R4.5, ADR-0004) — **done** |
 | 2 | Mutation chokepoint: `PendingMutation`, `State::confirm`, propose → preview → confirm → execute as `Command`/`Msg` additions | A state-transition test proves Read-only Mode refuses *at confirm*, after composing the real command, never at the keypress that staged it (R4.4, DESIGN §6.5) — **done** |
 | 3 | Delete: single key, `DEL <key>`, preview + one keypress (`d` stages, `y` confirms, `Esc` dismisses) | Confirmed and refused paths both covered by unit tests; a completed delete reuses the existing "gone" badge machinery (`state.keys.set_gone`), so a deleted row behaves exactly like one that expired or was evicted — **done** |
-| 4 | Value edit — String: inline editor in the value pane, commit shows red/green diff preview | A round-trip test: edit, preview, confirm, `GET` reflects the change; canceled edits touch nothing |
+| 4 | Value edit — String (and JSON-as-string, R3.2): `e` hands the raw value to `$VISUAL`/`$EDITOR`/`vi` on a temp file; saving stages a `SET` with a stacked red/green diff preview | Core unit tests cover stage/confirm/discard and the JSON-invalid warning; an app-level test fakes `$EDITOR` with a shell script (no Docker) to prove the temp-file round trip and trailing-newline normalization; a Docker-backed integration test proves `SET` actually lands — **done** |
 | 5 | Value edit — Hash: field/value inline edit, add/remove field | Same preview/diff machinery as String, applied to one field at a time |
 | 6 | Value edit — Set: add/remove member | Membership diff in the preview; no ordering assumptions |
 | 7 | Value edit — List: index-addressed edit, insert, remove | Preview correctly represents index shift on insert/remove |

@@ -314,12 +314,28 @@ and the underline are what carry the state there. That is why the wash is never 
 and it is the same rule as everywhere else: losing colour must lose emphasis, never information.
 
 ### 6.5 Editing and confirmation
-Editing opens an inline editor in the value pane, not a modal. Committing shows a **command
-preview**: the literal command(s) that will be sent, plus a red/green diff for value changes.
+Every mutation is staged, previewed, then confirmed — one chokepoint, whether it deletes a key or
+rewrites a value. Committing shows a **command preview**: the literal command that will be sent.
 Confirmation friction scales with blast radius — a single-key `y` for one non-prod delete, a
 typed key-count for a bulk prod delete. Read-only Mode refuses at the preview, not at the keypress: the dialog composes the real
 command and its blast radius first, and only then says you cannot run it. You learn what you
-were about to do before you learn that you are not allowed to.
+were about to do before you learn that you are not allowed to. `Esc` always discards, at any
+stage — consistent with every other overlay in the app, at the cost of losing a draft to a
+misplaced keypress, which was a deliberate choice over special-casing edits.
+
+**String values edit in `$EDITOR`, not inline.** `e` writes the value to a temp file and hands the
+terminal to `$VISUAL`/`$EDITOR`/`vi`; saving and quitting reads it back and stages the change.
+This was chosen over a hand-rolled inline text buffer for two reasons: it sidesteps the
+cross-terminal unreliability of distinguishing "commit" from "insert a newline" (no `Ctrl-Enter`
+guesswork), and it gets a real, familiar multi-line editor for free rather than one built from
+scratch. The confirm dialog that follows shows a stacked diff — the old value in red, the new one
+in green, not a line-by-line diff — capped to a handful of lines so one long value cannot take
+over the screen. A value that already reads as JSON (R3.2) is handed to the editor pretty-printed,
+and the dialog warns, without blocking, if the edited text no longer parses as JSON — it is still
+just a STRING underneath, and Redis has no opinion on whether its bytes are valid JSON. An
+editor's own habit of appending a trailing newline on save is never mistaken for something the
+reader typed — saving without a real change produces no preview at all. Collection values (hash,
+list, set, sorted set) and binary strings are not editable yet; that lands type by type.
 
 ### 6.6 Dashboard
 Triage-first: memory used vs. peak vs. maxmemory as a bar, hit ratio, ops/sec sparkline,

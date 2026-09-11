@@ -252,6 +252,39 @@ pub enum Msg {
         name: String,
         at_ms: u64,
     },
+    /// The `$EDITOR` round trip finished with a real change (R4.1).
+    ///
+    /// `old` is exactly what was handed to the editor — not re-read from the
+    /// server — because this message only exists to stage a preview; the
+    /// diff it draws is "what you started from" vs "what you're about to
+    /// send", not a claim about the server's current value, which `SET`'s own
+    /// unconditional-overwrite semantics never checked anyway (ADR-0006: no
+    /// value cache, no compare-and-swap invented on top of one).
+    EditCommitted {
+        name: String,
+        old: Vec<u8>,
+        new: Vec<u8>,
+    },
+    /// The `$EDITOR` round trip finished with nothing to send: the editor
+    /// exited non-zero, or the reader's own edit produced no change once the
+    /// editor's own trailing-newline habit was normalized away. Either way,
+    /// `OpenKey::editing` clears and nothing is staged.
+    EditDiscarded {
+        name: String,
+    },
+    /// A `SET` from `Command::SetValue` completed (R4.1).
+    ///
+    /// Carries no value of its own: what follows is the same Refetch every
+    /// other change to the open key goes through
+    /// (`crate::update::issue_refetch`) — the reply is what actually reaches
+    /// the Viewer, never the bytes this message's own sender already knew
+    /// (ADR-0006: no value cache, not even a one-message-long one). Guarded
+    /// by `name`, the same way `ValueGone`/`KeyDeleted` are: the reader may
+    /// have moved on to a different key by the time this lands.
+    ValueSet {
+        name: String,
+        at_ms: u64,
+    },
     /// An operation failed. Carries the command that failed (R7.4).
     ///
     /// Errors are never swallowed: a Redis error that produces no visible

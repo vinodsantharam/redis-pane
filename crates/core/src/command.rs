@@ -68,6 +68,28 @@ pub enum Command {
     /// one point where the chokepoint's decision (allowed, or refused by
     /// Read-only Mode) becomes a command a shell will actually run (R4.4).
     DeleteKey { index: usize, name: Vec<u8> },
+    /// Open the value in `$EDITOR` on a temp file (R3.2, R4.1).
+    ///
+    /// Handled synchronously by the terminal shell — not spawned onto a task
+    /// — because nothing else may draw over the terminal while the editor
+    /// owns it. `is_json` picks the temp file's extension, so the reader's
+    /// own editor applies JSON syntax highlighting automatically for a value
+    /// that reads as JSON.
+    EditInEditor {
+        name: Vec<u8>,
+        current: Vec<u8>,
+        is_json: bool,
+    },
+    /// Overwrite a String value (`SET`).
+    ///
+    /// Only ever issued once the reader has confirmed the preview
+    /// [`crate::state::PendingMutation::SetString`] described — the same
+    /// chokepoint [`Command::DeleteKey`] goes through (R4.4). On success the
+    /// shell must send [`crate::Msg::ValueSet`], **never** a value read
+    /// straight off this call's own reply — the core's only path for a value
+    /// to reach the Viewer is a real read (ADR-0006), and `ValueSet`'s job is
+    /// only to ask for one.
+    SetValue { name: Vec<u8>, new: Vec<u8> },
     /// Put text on the clipboard.
     ///
     /// The core builds the text; how it reaches a clipboard is the shell's

@@ -12,6 +12,7 @@ carry a TTL between 10s and 2m so the countdown visibly moves while you watch.
 """
 
 import argparse
+import json
 import random
 import string
 import sys
@@ -44,6 +45,8 @@ NAMESPACES = [
     ("counter", "string"),
     ("flag", "string"),
     ("lock", "string"),
+    ("profile", "json"),
+    ("config", "json"),
 ]
 
 
@@ -53,6 +56,25 @@ def blob(rng, n):
 
 def sentence(rng, n=6):
     return " ".join(rng.choice(WORDS) for _ in range(n))
+
+
+def json_object(rng, key):
+    """A plausible JSON-as-string payload (R3.2): still a plain STRING on the
+    server, but readable as JSON to redis-pane's own string_value detection
+    and, once shipped, its String-edit round trip (PLAN M2 task 4)."""
+    if key.startswith("config:"):
+        obj = {"feature:%s" % w: rng.random() < 0.5 for w in rng.sample(WORDS, k=min(5, len(WORDS)))}
+        obj["version"] = rng.randint(1, 50)
+        obj["updated_at"] = int(time.time())
+        return obj
+    return {
+        "id": rng.randint(1, 999_999),
+        "plan": rng.choice(["free", "pro", "enterprise"]),
+        "seats": rng.randint(1, 50),
+        "region": rng.choice(["us-east-1", "eu-west-1", "ap-south-1"]),
+        "tags": [rng.choice(WORDS) for _ in range(rng.randint(0, 4))],
+        "active": rng.random() < 0.8,
+    }
 
 
 def size_for(rng):
@@ -75,6 +97,14 @@ def commands_for(rng, key, kind):
         if key.startswith("lock:"):
             return [("SET", key, "held-by-worker-%d" % rng.randint(1, 32))]
         return [("SET", key, blob(rng, n * rng.choice([8, 32, 200])))]
+    if kind == "json":
+        obj = json_object(rng, key)
+        # Roughly half pretty-printed, half compact — both are the same
+        # string as far as Redis is concerned, and redis-pane's own JSON
+        # viewer pretty-prints either on read, so this exercises both shapes
+        # of what might actually be sitting in a real keyspace.
+        body = json.dumps(obj, indent=2) if rng.random() < 0.5 else json.dumps(obj)
+        return [("SET", key, body)]
     if kind == "hash":
         fields = []
         for i in range(min(n, 200)):

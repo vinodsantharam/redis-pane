@@ -9,6 +9,7 @@ use crate::render::layout::{self, Pane};
 use crate::state::copy::{CopyWhat, redis_cli_command, value_text};
 use crate::state::{
     Attachment, Link, OpenKey, PendingMutation, PendingRead, ReadOnlyReason, ScanState, Tracking,
+    Value,
 };
 use crate::{Command, Msg, State};
 
@@ -428,8 +429,48 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             // exactly the "operation vanishes, nothing on screen explains it"
             // defect the error toast below exists to prevent.
             state.open_pending = None;
+            // Any failure while an edit is in flight (the editor could not be
+            // spawned, the `SET` was refused) ends the edit — never leaves
+            // `editing` stuck on, which would hold R3.8's live-update guard
+            // long after there is anything left to protect.
+            if let Some(open) = &mut state.open {
+                open.editing = false;
+            }
             state.error = Some((format!("{command}: {detail}"), at_ms));
             (state, Vec::new())
+        }
+        Msg::EditCommitted { name, old, new } => {
+            let was_json = state
+                .open
+                .as_ref()
+                .is_some_and(|o| o.name == name && matches!(o.value, Some(Value::Json(_))));
+            state.confirm = Some(PendingMutation::SetString {
+                name: name.into_bytes(),
+                old,
+                new,
+                was_json,
+            });
+            (state, Vec::new())
+        }
+        Msg::EditDiscarded { name } => {
+            if let Some(open) = &mut state.open
+                && open.name == name
+            {
+                open.editing = false;
+            }
+            (state, Vec::new())
+        }
+        Msg::ValueSet { name, .. } => {
+            if !state.open.as_ref().is_some_and(|o| o.name == name) {
+                return (state, Vec::new());
+            }
+            // Clear *before* minting the Refetch, not after its reply lands —
+            // `issue_refetch`'s own `Command::RefetchOpenKey` is answered by
+            // `Msg::ValueLoaded`, which applies immediately only if
+            // `may_apply()` is already true by the time it arrives.
+            state.open.as_mut().expect("checked above").editing = false;
+            let token = issue_refetch(&mut state);
+            (state, vec![Command::RefetchOpenKey { token }])
         }
         Msg::Quit => quit(state),
     }
@@ -813,6 +854,7 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             build_copy(state, what)
         }
         Action::CopyCommand => build_copy(state, CopyWhat::Command),
+        Action::Edit => stage_edit(state),
         Action::Filter => {
             state.filtering = true;
             (state, Vec::new())
@@ -997,13 +1039,61 @@ fn build_copy(state: State, what: CopyWhat) -> (State, Vec<Command>) {
     (state, vec![Command::CopyToClipboard { text, label }])
 }
 
+/// Stages `e`: hands the open value to `$EDITOR` (R3.2, R4.1).
+///
+/// Only `Value::Str` and `Value::Json` are editable this way — a text editor
+/// is not guaranteed to round-trip arbitrary bytes, so `Value::Binary` and
+/// every collection type are refused with a notice rather than risking silent
+/// corruption of a value nobody asked to have reformatted.
+fn stage_edit(mut state: State) -> (State, Vec<Command>) {
+    let notify = |text: &str| vec![Command::Notify { text: text.into() }];
+    let Some(open) = state.open.as_ref() else {
+        return (state, notify("nothing open to edit"));
+    };
+    if open.deleted_at_ms.is_some() {
+        return (state, notify("gone — nothing to edit"));
+    }
+    let Some(value) = open.value.as_ref() else {
+        return (state, notify("nothing open to edit"));
+    };
+    let (current, is_json) = match value {
+        // `raw` is the text exactly as read — never the wrapped display
+        // `lines`, which cannot be losslessly turned back into the original
+        // bytes (see `StringValue::raw`'s doc comment).
+        Value::Str(s) => (s.raw.clone().into_bytes(), false),
+        // Already pretty-printed at read time (`JsonValue::parse`) — handed
+        // to the editor in that form on purpose, so the reader's editor gets
+        // JSON syntax highlighting and something legible to work with. A
+        // JSON-looking string is still a string underneath: whatever comes
+        // back is staged as a plain `SET`, reformatting included.
+        Value::Json(j) => (j.lines.join("\n").into_bytes(), true),
+        Value::Binary(_) => return (state, notify("binary values aren't editable here yet")),
+        Value::Hash(_) | Value::List(_) | Value::Set(_) | Value::ZSet(_) | Value::Stream(_) => {
+            return (state, notify("only string values are editable so far"));
+        }
+    };
+    let name = open.name.clone().into_bytes();
+    // Set before the shell has done anything: R3.8's "an open editor is never
+    // touched" has to hold from the moment the reader asked to edit, not from
+    // whenever the shell gets around to it.
+    state.open.as_mut().expect("checked above").editing = true;
+    (
+        state,
+        vec![Command::EditInEditor {
+            name,
+            current,
+            is_json,
+        }],
+    )
+}
+
 /// Keys read while a mutation preview is on screen. Nothing else — not
 /// movement, not the filter, not another Delete — reaches the app while one
 /// is staged; `y` and Esc are the whole of the dialog's vocabulary, spelled
 /// out here rather than resolved through the keymap because a confirm
 /// dialog, like filter capture, is a mode of its own rather than an ordinary
 /// action (R4.4, R4.6).
-fn confirm_key(state: State, pending: PendingMutation, key: KeyPress) -> (State, Vec<Command>) {
+fn confirm_key(mut state: State, pending: PendingMutation, key: KeyPress) -> (State, Vec<Command>) {
     match key.code {
         KeyCode::Char('y') if !key.ctrl && !key.alt => {
             // Read-only Mode refuses here, at confirm, not at the keypress
@@ -1011,18 +1101,37 @@ fn confirm_key(state: State, pending: PendingMutation, key: KeyPress) -> (State,
             // command and its blast radius by the time this fires
             // (DESIGN §6.5).
             if let Some(reason) = state.read_only {
+                clear_editing(&mut state);
                 let notice = format!("read-only ({}): not executed", reason.label());
                 return (state, vec![Command::Notify { text: notice }]);
             }
+            // A confirmed `SetString` stays `editing` on purpose: R3.8's
+            // guard needs to hold until `Msg::ValueSet` clears it (see that
+            // handler below), not just until the dialog closes — otherwise
+            // this very `SET`'s own Refetch would find `editing` still true
+            // and hold its own reply instead of applying it. Delete never
+            // sets `editing` in the first place, so this is a no-op for it.
             (state, pending.into_commands())
         }
         _ => {
             // Esc dismisses; anything else is simply not the dialog's
             // vocabulary. Either way the mutation is not confirmed, and
             // `state.confirm` was already cleared by `take()` before this
-            // was called.
+            // was called — a full discard, never a return to the editor
+            // (settled deliberately: consistent with every other Esc in the
+            // app, at the cost of losing a draft to a misplaced keypress).
+            clear_editing(&mut state);
             (state, Vec::new())
         }
+    }
+}
+
+/// Clears `OpenKey::editing` if it is set. Harmless (and a no-op) for
+/// mutations that never touch it, such as `DeleteKey` — safe to call
+/// unconditionally from both of `confirm_key`'s non-executing branches.
+fn clear_editing(state: &mut State) {
+    if let Some(open) = &mut state.open {
+        open.editing = false;
     }
 }
 
@@ -1943,6 +2052,268 @@ mod tests {
             },
         );
         assert!(s.keys.is_gone(0));
+    }
+
+    fn open_with_string(text: &str) -> State {
+        let value = crate::state::Value::Str(crate::state::value::StringValue::new(text, 80));
+        let mut state = State {
+            cols: 130,
+            rows: 40,
+            focus: Pane::Value,
+            open: Some(OpenKey::new(Some(0), "k".into(), value, -1, 10, 0)),
+            ..State::default()
+        };
+        state.keys.push(b"k");
+        state.rebuild_list();
+        state
+    }
+
+    fn open_with_json(text: &str) -> State {
+        let value = crate::state::Value::Json(crate::state::value::JsonValue::parse(text));
+        let mut state = State {
+            cols: 130,
+            rows: 40,
+            focus: Pane::Value,
+            open: Some(OpenKey::new(Some(0), "k".into(), value, -1, 10, 0)),
+            ..State::default()
+        };
+        state.keys.push(b"k");
+        state.rebuild_list();
+        state
+    }
+
+    #[test]
+    fn e_hands_the_raw_text_to_the_editor_not_the_wrapped_display_lines() {
+        // A long, unwrapped value: `StringValue::new` would wrap this at 80
+        // columns for display, and rejoining those wrapped lines would insert
+        // newlines the value never had. `current` must be the original text.
+        let text = "x".repeat(200);
+        let s = open_with_string(&text);
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        assert!(
+            s.open.unwrap().editing,
+            "R3.8's guard must be up immediately"
+        );
+        assert_eq!(
+            cmds,
+            vec![Command::EditInEditor {
+                name: b"k".to_vec(),
+                current: text.into_bytes(),
+                is_json: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn e_hands_json_the_pretty_printed_form_with_the_json_flag_set() {
+        let s = open_with_json("{\"a\":1}");
+        let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let Some(Command::EditInEditor {
+            current, is_json, ..
+        }) = cmds.into_iter().next()
+        else {
+            panic!("expected EditInEditor");
+        };
+        assert!(is_json);
+        // Pretty-printed, not the compact original — editing hands over the
+        // already-pretty form on purpose.
+        assert_eq!(current, b"{\n  \"a\": 1\n}");
+    }
+
+    #[test]
+    fn e_on_a_collection_or_binary_value_refuses_with_a_notice_not_a_panic() {
+        let hash = crate::state::Value::Hash(crate::state::value::PairValue {
+            pairs: vec![("f".into(), "v".into())],
+            total: 1,
+        });
+        let mut s = State {
+            focus: Pane::Value,
+            open: Some(OpenKey::new(Some(0), "k".into(), hash, -1, 10, 0)),
+            ..State::default()
+        };
+        s.keys.push(b"k");
+        s.rebuild_list();
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        assert!(!s.open.unwrap().editing);
+        assert!(matches!(cmds.as_slice(), [Command::Notify { .. }]));
+    }
+
+    #[test]
+    fn confirming_a_commited_edit_issues_set_and_stays_editing_through_the_dialog() {
+        let s = open_with_string("old");
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let (s, _) = update(
+            s,
+            Msg::EditCommitted {
+                name: "k".into(),
+                old: b"old".to_vec(),
+                new: b"new".to_vec(),
+            },
+        );
+        assert!(
+            s.open.as_ref().unwrap().editing,
+            "still mid-edit at preview"
+        );
+        match &s.confirm {
+            Some(PendingMutation::SetString {
+                name,
+                old,
+                new,
+                was_json,
+            }) => {
+                assert_eq!(name, b"k");
+                assert_eq!(old, b"old");
+                assert_eq!(new, b"new");
+                assert!(!was_json);
+            }
+            other => panic!("expected a staged SetString, got {other:?}"),
+        }
+
+        let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        assert_eq!(
+            cmds,
+            vec![Command::SetValue {
+                name: b"k".to_vec(),
+                new: b"new".to_vec(),
+            }]
+        );
+    }
+
+    #[test]
+    fn was_json_is_carried_from_the_pre_edit_value_not_guessed_from_the_new_text() {
+        let s = open_with_json("{\"a\":1}");
+        let (s, _) = update(
+            s,
+            Msg::EditCommitted {
+                name: "k".into(),
+                old: b"{\n  \"a\": 1\n}".to_vec(),
+                // The user broke the JSON — was_json still reflects that this
+                // *was* a JSON value, independent of the edit's own validity.
+                new: b"not json at all".to_vec(),
+            },
+        );
+        let Some(PendingMutation::SetString { was_json, .. }) = &s.confirm else {
+            panic!("expected a staged SetString");
+        };
+        assert!(*was_json);
+        assert_eq!(s.confirm.as_ref().unwrap().json_warning(), Some(true));
+    }
+
+    #[test]
+    fn a_discarded_edit_clears_editing_with_nothing_staged() {
+        let s = open_with_string("old");
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        assert!(s.open.as_ref().unwrap().editing);
+        let (s, cmds) = update(s, Msg::EditDiscarded { name: "k".into() });
+        assert!(!s.open.unwrap().editing);
+        assert!(cmds.is_empty());
+        // No PendingMutation, so `state.confirm` was never touched by this.
+    }
+
+    #[test]
+    fn a_failure_while_editing_always_clears_the_flag() {
+        let s = open_with_string("old");
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        assert!(s.open.as_ref().unwrap().editing);
+        let (s, _) = update(
+            s,
+            Msg::Failed {
+                command: "SET k".into(),
+                detail: "READONLY".into(),
+                at_ms: 0,
+            },
+        );
+        assert!(!s.open.unwrap().editing);
+    }
+
+    #[test]
+    fn esc_at_the_edit_confirm_dialog_clears_editing_with_nothing_sent() {
+        let s = open_with_string("old");
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let (s, _) = update(
+            s,
+            Msg::EditCommitted {
+                name: "k".into(),
+                old: b"old".to_vec(),
+                new: b"new".to_vec(),
+            },
+        );
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Esc)));
+        assert!(!s.open.unwrap().editing);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn value_set_clears_editing_before_minting_the_refetch() {
+        let s = open_with_string("old");
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let (s, _) = update(
+            s,
+            Msg::EditCommitted {
+                name: "k".into(),
+                old: b"old".to_vec(),
+                new: b"new".to_vec(),
+            },
+        );
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        assert!(
+            s.open.as_ref().unwrap().editing,
+            "still true until ValueSet"
+        );
+
+        let (s, cmds) = update(
+            s,
+            Msg::ValueSet {
+                name: "k".into(),
+                at_ms: 5_000,
+            },
+        );
+        assert!(!s.open.as_ref().unwrap().editing);
+        assert!(
+            matches!(cmds.as_slice(), [Command::RefetchOpenKey { .. }]),
+            "the reply, not this message, is what the Viewer will show (ADR-0006)"
+        );
+    }
+
+    #[test]
+    fn value_set_for_a_key_no_longer_open_touches_nothing() {
+        let s = open_with_string("old");
+        let (s, cmds) = update(
+            s,
+            Msg::ValueSet {
+                name: "some other key".into(),
+                at_ms: 5_000,
+            },
+        );
+        assert!(!s.open.unwrap().editing, "was never true here");
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn read_only_mode_refuses_a_set_at_confirm_not_at_e() {
+        let s = State {
+            read_only: Some(ReadOnlyReason::Environment),
+            ..open_with_string("old")
+        };
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Command::EditInEditor { .. }))
+        );
+        let (s, _) = update(
+            s,
+            Msg::EditCommitted {
+                name: "k".into(),
+                old: b"old".to_vec(),
+                new: b"new".to_vec(),
+            },
+        );
+        assert!(s.confirm.is_some(), "the preview is composed anyway");
+        let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Command::SetValue { .. })),
+            "but nothing was actually sent to the server"
+        );
     }
 
     #[test]

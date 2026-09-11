@@ -1173,3 +1173,86 @@ async fn deleting_a_key_with_bytes_that_look_like_small_integers_does_not_delete
     let _ = client.quit().await;
     let _ = writer.quit().await;
 }
+
+// ── M2 task 4 — String edit actually overwrites the value ────────────────
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn setting_a_value_overwrites_it_on_the_server() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer.set("k:0", "old", None, None, false).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    redis_pane::redis::set_value(&client, b"k:0", b"new")
+        .await
+        .unwrap();
+
+    let now: Option<String> = writer.get("k:0").await.unwrap();
+    assert_eq!(now.as_deref(), Some("new"));
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn setting_a_value_with_bytes_that_look_like_small_integers_does_not_touch_the_wrong_key() {
+    // The mirror of `deleting_a_key_with_bytes...` above: `set`'s key
+    // parameter is `K: Into<Key>`, never `Into<MultipleKeys>`, so it does not
+    // share `del`'s trap — but this is the test that would have caught it if
+    // it somehow did, keyed the same deliberate way.
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let name: &[u8] = &[7, 8];
+    let _: () = writer.set(name, "old", None, None, false).await.unwrap();
+    let _: () = writer.set("7", "decoy", None, None, false).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    redis_pane::redis::set_value(&client, name, b"new")
+        .await
+        .unwrap();
+
+    let target: Option<Vec<u8>> = writer.get(name).await.unwrap();
+    assert_eq!(target.as_deref(), Some(b"new".as_slice()));
+    let decoy: Option<String> = writer.get("7").await.unwrap();
+    assert_eq!(
+        decoy.as_deref(),
+        Some("decoy"),
+        "the decoy must be untouched"
+    );
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn setting_a_json_looking_value_preserves_the_bytes_exactly() {
+    // R3.2/R4.1: a JSON-classified value is still just a STRING underneath —
+    // `SET` must not reformat, validate, or otherwise touch what the reader
+    // typed, including whitespace that happens to not be "pretty".
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let compact = br#"{"a":1,"b":[1,2,3]}"#;
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    redis_pane::redis::set_value(&client, b"cfg:1", compact)
+        .await
+        .unwrap();
+
+    let stored: Option<Vec<u8>> = writer.get("cfg:1").await.unwrap();
+    assert_eq!(stored.as_deref(), Some(compact.as_slice()));
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}

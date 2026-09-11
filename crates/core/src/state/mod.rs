@@ -6,6 +6,7 @@
 //! [`loaded::LoadedSet`].
 
 pub mod copy;
+pub mod editor;
 pub mod loaded;
 pub mod open;
 pub mod scan;
@@ -14,6 +15,7 @@ pub mod value;
 pub mod view;
 
 pub use copy::CopyWhat;
+pub use editor::EditBuffer;
 pub use loaded::{KeyKind, LoadedSet};
 pub use open::{Attachment, OpenKey, PendingRead, ReadOutcome};
 pub use scan::ScanState;
@@ -215,6 +217,19 @@ pub enum PendingMutation {
     /// from, carried the same way `Msg::ValueGone` carries it, so a rescan
     /// between staging and confirming cannot make this land on the wrong row.
     DeleteKey { index: usize, name: Vec<u8> },
+    /// Overwrite a String value (`SET`), staged from an `$EDITOR` round trip
+    /// (R3.2, R4.1). `was_json` is whether the *pre-edit* value was rendered
+    /// through the JSON viewer — it is what the confirm dialog checks before
+    /// warning that the edited text no longer parses, and it is deliberately
+    /// not re-derived from `new` at preview time: whether this key *was*
+    /// JSON is a fact about the read that produced `old`, not about whatever
+    /// the reader just typed.
+    SetString {
+        name: Vec<u8>,
+        old: Vec<u8>,
+        new: Vec<u8>,
+        was_json: bool,
+    },
 }
 
 impl PendingMutation {
@@ -224,6 +239,29 @@ impl PendingMutation {
             PendingMutation::DeleteKey { name, .. } => {
                 format!("DEL {}", String::from_utf8_lossy(name))
             }
+            PendingMutation::SetString { name, new, .. } => {
+                format!(
+                    "SET {} {} KEEPTTL XX",
+                    String::from_utf8_lossy(name),
+                    String::from_utf8_lossy(new)
+                )
+            }
+        }
+    }
+
+    /// Whether the edited text no longer parses as JSON, when the value being
+    /// replaced was JSON-classified to begin with. `None` when the question
+    /// does not arise (a plain String edit, or any mutation that isn't a
+    /// value edit at all) — the confirm dialog only warns when this is
+    /// `Some(true)`.
+    pub fn json_warning(&self) -> Option<bool> {
+        match self {
+            PendingMutation::SetString {
+                was_json: true,
+                new,
+                ..
+            } => Some(serde_json::from_slice::<serde_json::Value>(new).is_err()),
+            _ => None,
         }
     }
 
@@ -235,6 +273,9 @@ impl PendingMutation {
         match self {
             PendingMutation::DeleteKey { index, name } => {
                 vec![crate::Command::DeleteKey { index, name }]
+            }
+            PendingMutation::SetString { name, new, .. } => {
+                vec![crate::Command::SetValue { name, new }]
             }
         }
     }

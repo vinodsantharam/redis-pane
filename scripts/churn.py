@@ -13,6 +13,7 @@ pane open and rows should appear, change and vanish under the cursor.
 """
 
 import argparse
+import json
 import random
 import signal
 import string
@@ -39,6 +40,22 @@ def blob(rng, n=16):
     return "".join(rng.choice(string.ascii_letters + string.digits) for _ in range(n))
 
 
+def json_or_none(value):
+    """Parse a GET reply as JSON if it looks like one, else None — the same
+    "starts with { or [" sniff redis-pane's own string_value detection uses,
+    so this script and the app agree on what counts as JSON (R3.2)."""
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    if value.lstrip()[:1] not in ("{", "["):
+        return None
+    try:
+        return json.loads(value)
+    except ValueError:
+        return None
+
+
 def mutate(r, rng, key):
     """Type-appropriate in-place change. Returns a one-line description, or None
     if the key vanished between the pick and the write."""
@@ -49,6 +66,26 @@ def mutate(r, rng, key):
     if kind == "none":
         return None
     if kind == "string":
+        # JSON-as-string is a content classification, same as redis-pane's
+        # own `string_value` detection (R3.2) — there is no Redis TYPE for
+        # it, so sniffing the current bytes is the only way to tell. A JSON
+        # key mutated by field, rather than overwritten with a random blob,
+        # is what makes it worth leaving open while this runs: the point of
+        # churn is to watch a *live* value change, not to watch it turn into
+        # noise on the first touch.
+        obj = json_or_none(r.call("GET", key))
+        if isinstance(obj, dict):
+            field = rng.choice(list(obj.keys())) if obj and rng.random() < 0.6 else "field_%s" % rng.choice(WORDS)
+            obj[field] = rng.choice([rng.randint(0, 1000), rng.choice(WORDS), rng.random() < 0.5])
+            r.call("SET", key, json.dumps(obj, indent=2))
+            return "SET %s (json.%s)" % (key, field)
+        if isinstance(obj, list):
+            if obj and rng.random() < 0.3:
+                obj.pop(rng.randrange(len(obj)))
+            else:
+                obj.append(rng.choice(WORDS))
+            r.call("SET", key, json.dumps(obj, indent=2))
+            return "SET %s (json)" % key
         if rng.random() < 0.3:
             try:
                 return "INCRBY %s -> %s" % (key, r.call("INCRBY", key, rng.randint(-50, 50)))
@@ -94,10 +131,15 @@ def create(r, rng, prefix):
     ns, kind = rng.choice([
         ("session", "string"), ("cache:page", "string"), ("user", "hash"),
         ("queue", "list"), ("tag", "set"), ("leaderboard", "zset"), ("events", "stream"),
+        ("profile", "json"),
     ])
     key = "%s%s:%s" % (prefix, ns, blob(rng, 10))
     if kind == "string":
         r.call("SET", key, blob(rng, rng.randint(16, 512)))
+    elif kind == "json":
+        obj = {"id": rng.randint(1, 999_999), "plan": rng.choice(["free", "pro", "enterprise"]),
+               "created": int(time.time())}
+        r.call("SET", key, json.dumps(obj, indent=2))
     elif kind == "hash":
         r.call("HSET", key, "created", int(time.time()), "who", rng.choice(WORDS))
     elif kind == "list":

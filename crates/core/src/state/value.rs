@@ -97,6 +97,17 @@ pub trait Viewer {
 pub struct StringValue {
     pub lines: Vec<String>,
     pub bytes: usize,
+    /// The text exactly as read, before wrapping.
+    ///
+    /// `lines` is a *display* artifact — wrapped at whatever the pane's width
+    /// happened to be when this was built, with wrap-inserted breaks and real
+    /// `\n`s flattened into the same `Vec<String>` and therefore no longer
+    /// distinguishable from each other. That makes `lines` a one-way
+    /// transform: there is no rejoining it back into the original text
+    /// without either guessing wrong at word boundaries or inventing
+    /// newlines the value never had. Editing (R4.1) needs the real bytes, not
+    /// a reconstruction of them, so they are kept here untouched.
+    pub raw: String,
 }
 
 impl StringValue {
@@ -119,6 +130,7 @@ impl StringValue {
         Self {
             lines,
             bytes: text.len(),
+            raw: text.to_string(),
         }
     }
 }

@@ -94,6 +94,11 @@ pub struct PendingRead {
     /// matches this read's token, and drops it either way — it is not
     /// carried forward onto whatever key opens next.
     pub activate_cursor: bool,
+    /// Whether this read is the Refetch that follows a confirmed write from
+    /// this session. Its reply is applied even with the cursor off the top:
+    /// the reader asked for exactly this value, so holding it would show the
+    /// old one as if the write had not happened.
+    pub own_write: bool,
 }
 
 impl PendingRead {
@@ -176,6 +181,16 @@ pub struct OpenKey {
     /// Set while an editor holds an unsaved buffer. An arriving update never
     /// touches it — that is a bug, not a trade-off.
     pub editing: bool,
+    /// The reader's unsaved text, while the inline editor is open (R3.8).
+    ///
+    /// Distinct from `value`: this is what the reader is typing, never a
+    /// cache of what the server last said. `editing` is the R3.8 guard and
+    /// spans the buffer, the confirm dialog, and the `SET` in flight; this
+    /// field lasts while the buffer is on screen — through typing and, once
+    /// staged, under the confirm dialog and while the `SET` is in flight —
+    /// and is `None` again once a newer read reaches the screen or the edit
+    /// ends (`Esc`, a refusal, a failure, the key gone).
+    pub editor: Option<super::EditBuffer>,
     /// An update that arrived while the reader was not at rest.
     pub pending: Option<Pending>,
     /// The server said this key was deleted, expired or evicted. The last read
@@ -208,6 +223,7 @@ impl OpenKey {
             cursor_active: false,
             at_rest: true,
             editing: false,
+            editor: None,
             pending: None,
             deleted_at_ms: None,
             last_read: ReadOutcome::Opened,
@@ -237,6 +253,7 @@ impl OpenKey {
             cursor_active: false,
             at_rest: true,
             editing: false,
+            editor: None,
             pending: None,
             deleted_at_ms: Some(at_ms),
             last_read: ReadOutcome::Opened,
@@ -270,20 +287,7 @@ impl OpenKey {
     /// case — there is no prior value for the new one to be "unchanged" from.
     pub fn absorb(&mut self, value: Value, ttl_seconds: i32, size_bytes: u32, at_ms: u64) {
         if self.may_apply() {
-            // Recorded before the move, and only where the value actually
-            // reaches the screen — a held update has not changed anything the
-            // reader can see, and `pending` is what speaks for it.
-            self.last_read = if self.value.as_ref() == Some(&value) {
-                ReadOutcome::Unchanged { at_ms }
-            } else {
-                ReadOutcome::Updated { at_ms }
-            };
-            self.value = Some(value);
-            self.ttl_seconds = ttl_seconds;
-            self.size_bytes = size_bytes;
-            self.read_at_ms = at_ms;
-            self.pending = None;
-            self.deleted_at_ms = None;
+            self.apply(value, ttl_seconds, size_bytes, at_ms);
         } else {
             self.pending = Some(Pending {
                 value,
@@ -294,9 +298,54 @@ impl OpenKey {
         }
     }
 
+    /// Put a read on screen now, whatever the cursor is doing.
+    ///
+    /// `absorb` calls this when an update may land; the Refetch after this
+    /// session's own write calls it directly. The cursor is clamped because
+    /// the new value can be shorter than the one it was sitting in.
+    pub fn apply(&mut self, value: Value, ttl_seconds: i32, size_bytes: u32, at_ms: u64) {
+        // Recorded before the move, and only where the value actually
+        // reaches the screen — a held update has not changed anything the
+        // reader can see, and `pending` is what speaks for it.
+        self.last_read = if self.value.as_ref() == Some(&value) {
+            ReadOutcome::Unchanged { at_ms }
+        } else {
+            ReadOutcome::Updated { at_ms }
+        };
+        let last = value.viewer().row_count().saturating_sub(1);
+        self.cursor = self.cursor.min(last);
+        self.offset = self.offset.min(self.cursor);
+        self.value = Some(value);
+        self.ttl_seconds = ttl_seconds;
+        self.size_bytes = size_bytes;
+        self.read_at_ms = at_ms;
+        self.pending = None;
+        self.deleted_at_ms = None;
+        self.drop_staged_buffer();
+    }
+
+    /// A staged buffer only stands in for the value until a newer read or
+    /// the end of the edit replaces it. A buffer still being typed into is
+    /// never touched (R3.8).
+    pub fn drop_staged_buffer(&mut self) {
+        if self.editor.as_ref().is_some_and(|e| e.is_staged()) {
+            self.editor = None;
+        }
+    }
+
+    /// Hand a staged buffer back to be typed into, when it turned out there
+    /// was no key left to write it to. `editing` is left alone: the buffer is
+    /// open again, and R3.8's guard spans it.
+    pub fn unstage_buffer(&mut self) {
+        if let Some(editor) = &mut self.editor {
+            editor.unstage();
+        }
+    }
+
     /// Apply a held update, when the reader asks for it.
     pub fn take_pending(&mut self) {
         if let Some(p) = self.pending.take() {
+            self.drop_staged_buffer();
             self.last_read = if self.value.as_ref() == Some(&p.value) {
                 ReadOutcome::Unchanged { at_ms: p.at_ms }
             } else {

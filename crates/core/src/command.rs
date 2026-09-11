@@ -68,6 +68,16 @@ pub enum Command {
     /// one point where the chokepoint's decision (allowed, or refused by
     /// Read-only Mode) becomes a command a shell will actually run (R4.4).
     DeleteKey { index: usize, name: Vec<u8> },
+    /// Overwrite a String value (`SET`).
+    ///
+    /// Only ever issued once the reader has confirmed the preview
+    /// [`crate::state::PendingMutation::SetString`] described — the same
+    /// chokepoint [`Command::DeleteKey`] goes through (R4.4). On success the
+    /// shell must send [`crate::Msg::ValueSet`], **never** a value read
+    /// straight off this call's own reply — the core's only path for a value
+    /// to reach the Viewer is a real read (ADR-0006), and `ValueSet`'s job is
+    /// only to ask for one.
+    SetValue { name: Vec<u8>, new: Vec<u8> },
     /// Put text on the clipboard.
     ///
     /// The core builds the text; how it reaches a clipboard is the shell's

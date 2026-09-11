@@ -1173,3 +1173,150 @@ async fn deleting_a_key_with_bytes_that_look_like_small_integers_does_not_delete
     let _ = client.quit().await;
     let _ = writer.quit().await;
 }
+
+// ── M2 task 4 — String edit actually overwrites the value ────────────────
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn setting_a_value_overwrites_it_on_the_server() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer.set("k:0", "old", None, None, false).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    redis_pane::redis::set_value(&client, b"k:0", b"new")
+        .await
+        .unwrap();
+
+    let now: Option<String> = writer.get("k:0").await.unwrap();
+    assert_eq!(now.as_deref(), Some("new"));
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn setting_a_value_with_bytes_that_look_like_small_integers_does_not_touch_the_wrong_key() {
+    // The mirror of `deleting_a_key_with_bytes...` above: `set`'s key
+    // parameter is `K: Into<Key>`, never `Into<MultipleKeys>`, so it does not
+    // share `del`'s trap — but this is the test that would have caught it if
+    // it somehow did, keyed the same deliberate way.
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let name: &[u8] = &[7, 8];
+    let _: () = writer.set(name, "old", None, None, false).await.unwrap();
+    let _: () = writer.set("7", "decoy", None, None, false).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    redis_pane::redis::set_value(&client, name, b"new")
+        .await
+        .unwrap();
+
+    let target: Option<Vec<u8>> = writer.get(name).await.unwrap();
+    assert_eq!(target.as_deref(), Some(b"new".as_slice()));
+    let decoy: Option<String> = writer.get("7").await.unwrap();
+    assert_eq!(
+        decoy.as_deref(),
+        Some("decoy"),
+        "the decoy must be untouched"
+    );
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn setting_a_json_looking_value_preserves_the_bytes_exactly() {
+    // R3.2/R4.1: a JSON-classified value is still just a STRING underneath —
+    // `SET` must not reformat, validate, or otherwise touch what the reader
+    // typed, including whitespace that happens to not be "pretty".
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let compact = br#"{"a":1,"b":[1,2,3]}"#;
+    // An edit only ever overwrites a key that exists (`XX`).
+    let _: () = writer.set("cfg:1", "{}", None, None, false).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let written = redis_pane::redis::set_value(&client, b"cfg:1", compact)
+        .await
+        .unwrap();
+    assert!(written);
+
+    let stored: Option<Vec<u8>> = writer.get("cfg:1").await.unwrap();
+    assert_eq!(stored.as_deref(), Some(compact.as_slice()));
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn setting_a_value_keeps_the_keys_ttl() {
+    // A plain `SET` clears the TTL, which made every edited key permanent —
+    // a session or a lock that was meant to expire, living forever.
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer
+        .set(
+            "session:1",
+            "old",
+            Some(fred::types::Expiration::EX(600)),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let written = redis_pane::redis::set_value(&client, b"session:1", b"new")
+        .await
+        .unwrap();
+
+    assert!(written);
+    let now: Option<String> = writer.get("session:1").await.unwrap();
+    assert_eq!(now.as_deref(), Some("new"));
+    let ttl: i64 = writer.ttl("session:1").await.unwrap();
+    assert!(
+        (1..=600).contains(&ttl),
+        "TTL must survive the edit, got {ttl}"
+    );
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn setting_a_value_on_a_key_that_is_gone_writes_nothing_and_does_not_recreate_it() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let written = redis_pane::redis::set_value(&client, b"expired:1", b"new")
+        .await
+        .unwrap();
+
+    assert!(!written);
+    let exists: i64 = writer.exists("expired:1").await.unwrap();
+    assert_eq!(exists, 0, "the key must not be recreated");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}

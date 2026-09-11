@@ -42,6 +42,18 @@ property of the running app, not of the Redis user's ACL. It always carries a **
 be lifted.
 _Avoid_: Safe mode, locked, protected
 
+**Staged mutation**:
+A change proposed but not yet sent — the state between pressing a mutating key (`d`, or
+committing an edit) and confirming it. Every mutation is staged before it can run: staging composes
+the real command, and only confirming decides whether Read-only Mode lets it through.
+_Avoid_: Pending action, draft, queued command
+
+**Command preview**:
+The literal command a staged mutation shows before it runs, in the confirm dialog. It exists so
+the reader learns what they were about to do before they learn whether they are allowed to —
+Read-only Mode refuses at this dialog, never at the keypress that staged it.
+_Avoid_: Confirmation dialog (names the UI, not what it shows), dry run
+
 **Loaded set**:
 The keys the current session has scanned and is holding. Sorting, filtering and bulk selection
 all operate on the Loaded set, never on the whole keyspace — so the UI must be able to say how
@@ -90,3 +102,13 @@ _Avoid_: Staleness, last updated, timestamp
 The type-specific rendering of a value — one per Redis type, all sharing a common frame so
 navigation transfers between them.
 _Avoid_: Renderer, panel, inspector, formatter
+
+**Edit buffer**:
+The reader's unsaved text in the value pane, open while an inline edit is in progress. It is
+distinct from the Open key's read value: the buffer is what the reader is typing, never a copy of
+what the server last said, and a live update never touches it while it is open. It becomes a
+Staged mutation only when the reader asks — `Ctrl-S` — never on its own. Once staged it stays on
+screen, taking no more keys, until the write is read back or the edit ends. If the key is gone by
+the time it would be written, nothing is written — the key is never recreated — and the buffer is
+handed back to be typed into.
+_Avoid_: Draft, scratch value, cache

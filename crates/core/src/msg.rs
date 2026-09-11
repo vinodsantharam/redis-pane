@@ -33,6 +33,7 @@ pub enum KeyCode {
     End,
     PageUp,
     PageDown,
+    Delete,
 }
 
 /// A keypress with its modifiers.
@@ -249,6 +250,35 @@ pub enum Msg {
         /// The Loaded set row this key was staged from, if one was known —
         /// same meaning as [`Msg::ValueGone::index`].
         index: Option<usize>,
+        name: String,
+        at_ms: u64,
+    },
+    /// The terminal reported a bracketed paste (ADR-0014).
+    ///
+    /// With the inline editor open this is one `insert_str`, staged as a
+    /// single undo step; while the filter is capturing it is appended
+    /// (newlines stripped); otherwise it is ignored.
+    Paste(String),
+    /// A `SET` from `Command::SetValue` completed (R4.1).
+    ///
+    /// Carries no value of its own: what follows is the same Refetch every
+    /// other change to the open key goes through
+    /// (`crate::update::issue_refetch`) — the reply is what actually reaches
+    /// the Viewer, never the bytes this message's own sender already knew
+    /// (ADR-0006: no value cache, not even a one-message-long one). Guarded
+    /// by `name`, the same way `ValueGone`/`KeyDeleted` are: the reader may
+    /// have moved on to a different key by the time this lands.
+    ValueSet {
+        name: String,
+        at_ms: u64,
+    },
+    /// A `SET … XX` from `Command::SetValue` wrote nothing: the key was gone
+    /// by the time it landed (R4.1, ADR-0014).
+    ///
+    /// Not a `Failed` — the server did as asked, and the edit is not over.
+    /// The key is tombstoned and the edited text goes back into the buffer,
+    /// since no read can recover it. Guarded by `name`, like `ValueSet`.
+    ValueSetKeyGone {
         name: String,
         at_ms: u64,
     },

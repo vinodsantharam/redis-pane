@@ -38,6 +38,7 @@ impl Drop for Guard {
         let _ = terminal::disable_raw_mode();
         let _ = execute!(
             stdout(),
+            event::DisableBracketedPaste,
             event::DisableMouseCapture,
             terminal::LeaveAlternateScreen
         );
@@ -66,6 +67,7 @@ pub fn translate(key: KeyEvent) -> Option<Msg> {
         XKeyCode::End => KeyCode::End,
         XKeyCode::PageUp => KeyCode::PageUp,
         XKeyCode::PageDown => KeyCode::PageDown,
+        XKeyCode::Delete => KeyCode::Delete,
         _ => return None,
     };
     Some(Msg::Key(KeyPress {
@@ -109,7 +111,8 @@ pub async fn run(
     execute!(
         stdout(),
         terminal::EnterAlternateScreen,
-        event::EnableMouseCapture
+        event::EnableMouseCapture,
+        event::EnableBracketedPaste
     )?;
     let _guard = Guard;
 
@@ -119,7 +122,10 @@ pub async fn run(
     let (tx, mut rx) = mpsc::channel::<Msg>(256);
 
     // Keyboard reads block, so they live on their own thread and arrive as
-    // messages like everything else.
+    // messages like everything else. A plain blocking `event::read()` —
+    // nothing here ever hands the terminal to a child process the way the
+    // `$EDITOR` escape hatch (Phase 2, `m2-editor-escape-hatch`) will, so
+    // there is no second reader to avoid racing for the same fd.
     let input_tx = tx.clone();
     std::thread::spawn(move || {
         loop {
@@ -140,6 +146,11 @@ pub async fn run(
                 }
                 Ok(Event::Resize(cols, rows)) => {
                     if input_tx.blocking_send(Msg::Resized { cols, rows }).is_err() {
+                        return;
+                    }
+                }
+                Ok(Event::Paste(text)) => {
+                    if input_tx.blocking_send(Msg::Paste(text)).is_err() {
                         return;
                     }
                 }
@@ -401,6 +412,44 @@ pub async fn run(
                                 let _ = tx
                                     .send(Msg::Failed {
                                         command: format!("DEL {name_str}"),
+                                        detail: e.details().to_string(),
+                                        at_ms,
+                                    })
+                                    .await;
+                            }
+                        }
+                    });
+                }
+                Command::SetValue { name, new } => {
+                    let client = client.clone();
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let at_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        let name_str = String::from_utf8_lossy(&name).into_owned();
+                        match crate::redis::set_value(&client, &name, &new).await {
+                            Ok(true) => {
+                                let _ = tx
+                                    .send(Msg::ValueSet {
+                                        name: name_str,
+                                        at_ms,
+                                    })
+                                    .await;
+                            }
+                            Ok(false) => {
+                                let _ = tx
+                                    .send(Msg::ValueSetKeyGone {
+                                        name: name_str,
+                                        at_ms,
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Msg::Failed {
+                                        command: format!("SET {name_str}"),
                                         detail: e.details().to_string(),
                                         at_ms,
                                     })

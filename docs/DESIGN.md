@@ -121,7 +121,8 @@ terminal is small and the situation is urgent.
 | `←` / `h` | Collapse a tree group, or move to its parent | key list |
 | `Enter` | Open the Selected key (if needed) and start moving a cursor inside it | key list / value pane |
 | `r` | Refresh / rescan | pane |
-| `e` | Edit value | value pane |
+| `e` | Open the inline value editor | value pane |
+| `Ctrl-S` | Stage the inline editor's buffer for confirmation | value pane, editing |
 | `t` | Edit TTL | value pane |
 | `c` / `C` | Copy key or value / copy `redis-cli` command | key list, value pane |
 | `d` | Stage delete of the Selected key (previews `DEL`) | key list |
@@ -248,7 +249,7 @@ against: the failure users learn to distrust is not a wrong value, it is being u
 │ an update just landed               ● live · updated now │
 │ a read found no change                ● live · unchanged │
 │ changed, you are scrolled    ● live · changed 2s ago   r │
-│ mid-edit, held back              ● live · changed · held │
+│ mid-edit, held back           ✎ editing · changed · held │
 │ key deleted on the server               ✕ deleted 3s ago │
 │ tracking unavailable         ○ manual · read 14s ago   r │
 │ refetch found a change            ○ manual · updated now │
@@ -314,12 +315,58 @@ and the underline are what carry the state there. That is why the wash is never 
 and it is the same rule as everywhere else: losing colour must lose emphasis, never information.
 
 ### 6.5 Editing and confirmation
-Editing opens an inline editor in the value pane, not a modal. Committing shows a **command
-preview**: the literal command(s) that will be sent, plus a red/green diff for value changes.
+Every mutation is staged, previewed, then confirmed — one chokepoint, whether it deletes a key or
+rewrites a value. Committing shows a **command preview**: the literal command that will be sent.
 Confirmation friction scales with blast radius — a single-key `y` for one non-prod delete, a
 typed key-count for a bulk prod delete. Read-only Mode refuses at the preview, not at the keypress: the dialog composes the real
 command and its blast radius first, and only then says you cannot run it. You learn what you
-were about to do before you learn that you are not allowed to.
+were about to do before you learn that you are not allowed to. `Esc` always discards, at any
+stage — consistent with every other overlay in the app, at the cost of losing a draft to a
+misplaced keypress, which was a deliberate choice over special-casing edits. **Only `y` confirms
+and only `Esc` dismisses the confirm dialog; every other key is ignored rather than discarding** —
+a stray or leaked keystroke can never silently throw away a staged mutation (ADR-0014).
+
+**String values edit inline, in the value pane.** `e` opens an embedded text editor
+(`ratatui-textarea`) directly where the value was, replacing the body rows; the header keeps
+showing `✎ editing · changed · held` and, for a value that reads as JSON, a live `json ✓`/`json ✗`
+indicator next to the TTL. The editor's cursor opens at the start of the line the Viewer's cursor
+was on, so `e` edits what you were looking at. After `y`, the value read back is shown at once,
+even with the cursor below the top row: this session's own write is never held as an update.
+`Ctrl-S` stages the buffer for confirmation — the same command-preview
+dialog every other mutation uses, showing a stacked diff (old value in red, new one in green, not
+a line-by-line diff) capped to a handful of lines so one long value cannot take over the screen —
+and `Esc` discards it outright, with no return to a prior draft. Staging with no actual change
+closes the buffer silently rather than opening an empty preview. While the dialog is up, and until
+the write is read back, the pane keeps showing the edited text rather than the value it replaces.
+The write is `SET key value KEEPTTL XX`: it keeps whatever TTL the key has, and writes only if the
+key still exists. A key that is gone by then — expired or deleted under the dialog — is never
+recreated: nothing is written, the dialog closes (at once when Liveness sees the key go, otherwise
+at `y`), the key is badged gone, and the edited text goes back into the buffer rather than being
+lost, where `Esc` still discards it. `Ctrl-Z`/`Ctrl-Y` undo and redo
+inside the buffer. A value that already reads as JSON (R3.2) opens pretty-printed; the confirm
+dialog still warns, without blocking, if the edited text no longer parses — it is still just a
+STRING underneath, and Redis has no opinion on whether its bytes are valid JSON. Collection values
+(hash, list, set, sorted set) and binary strings are not editable yet; that lands type by type.
+
+**Values over 200KB are refused, with a notice.** `e` on a value whose raw byte length exceeds
+that threshold says so, and mentions that an external-editor escape hatch is planned for values
+too large to hold comfortably in the inline editor — without promising a keybinding, since none
+exists yet. The threshold comes from measuring `ratatui-textarea` 0.9.2 in release, keystroke plus
+full render, at 120×40 wrapping at words and splitting any word wider than the pane: p99 was clean (≤8.5ms, comfortably inside the 16ms frame
+budget) at 100KB and 200KB on every run, while 300KB was noisy across runs — the cost is dominated
+by re-wrapping one long logical line, not by the edit operation itself. See
+[ADR-0014](adr/0014-values-are-edited-inline.md) for the full numbers and the rejected
+alternatives, including why `$EDITOR` as the *default* path was dropped.
+
+**Why not `$EDITOR` by default.** The original build of this feature shelled straight out to
+`$VISUAL`/`$EDITOR`/`vi` on a temp file. Manual testing over a real terminal found a live bug: a
+child editor process (vim, reliably) queries the terminal's colours at startup over the same tty
+this app reads from, and the reply can arrive *after* the editor has already exited and control
+has returned — landing on our own input thread and replaying as a burst of keystrokes into
+whatever was on screen. That is a known class of bug in other terminal apps, and it is worse over
+SSH, where the round trip is slower. The inline editor removes the terminal handoff — and the
+race with it — from the default path entirely; the escape hatch keeps `$EDITOR` available,
+hardened, for the reader who wants it.
 
 ### 6.6 Dashboard
 Triage-first: memory used vs. peak vs. maxmemory as a bar, hit ratio, ops/sec sparkline,

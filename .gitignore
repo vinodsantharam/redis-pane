@@ -13,3 +13,6 @@
 .env.*
 /.local/
 __pycache__/
+
+# Personal Claude Code overrides
+/.claude/settings.local.json

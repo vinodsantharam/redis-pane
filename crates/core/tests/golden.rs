@@ -1731,6 +1731,94 @@ fn editing_is_visibly_distinct_from_plain_live_in_monochrome_too() {
     assert!(render::to_text(&mono).contains("editing"));
 }
 
+// ── M2 task 4 rework: the inline value editor (ADR-0014) ────────────────────
+
+use redis_pane_core::state::EditBuffer;
+
+#[test]
+fn golden_editor_open_on_a_string() {
+    let mut state = opened(
+        "user:8812:session",
+        Value::Str(StringValue::new("v1", 65)),
+        600,
+    );
+    let editor = EditBuffer::from_value(
+        &Value::Str(StringValue::new("hello, this is the unsaved buffer", 65)),
+        0,
+    )
+    .unwrap();
+    let open = state.open.as_mut().unwrap();
+    open.editor = Some(editor);
+    open.editing = true;
+    assert_golden("editor_open_on_a_string", &draw(&state, 130, 22));
+}
+
+#[test]
+fn golden_editor_json_invalid_shows_json_cross() {
+    let mut state = opened(
+        "user:8812:session",
+        Value::Json(JsonValue::parse("{\"a\":1}")),
+        600,
+    );
+    let mut editor =
+        EditBuffer::from_value(&Value::Json(JsonValue::parse("{\"a\":1}")), 0).unwrap();
+    editor.insert_char('x'); // breaks the JSON
+    let open = state.open.as_mut().unwrap();
+    open.editor = Some(editor);
+    open.editing = true;
+    let frame = draw(&state, 130, 22);
+    assert!(
+        frame.contains("json ✗"),
+        "must show the invalid marker:\n{frame}"
+    );
+    assert_golden("editor_json_invalid", &frame);
+}
+
+#[test]
+fn golden_editor_wraps_a_long_line() {
+    let mut state = opened(
+        "user:8812:session",
+        Value::Str(StringValue::new("v1", 65)),
+        600,
+    );
+    let long = "word ".repeat(60);
+    let editor = EditBuffer::from_value(&Value::Str(StringValue::new(&long, 65)), 0).unwrap();
+    let open = state.open.as_mut().unwrap();
+    open.editor = Some(editor);
+    open.editing = true;
+    assert_golden("editor_wraps_a_long_line", &draw(&state, 80, 22));
+}
+
+#[test]
+fn golden_editor_hint_bar() {
+    let mut state = opened(
+        "user:8812:session",
+        Value::Str(StringValue::new("v1", 65)),
+        600,
+    );
+    let editor = EditBuffer::from_value(&Value::Str(StringValue::new("v1", 65)), 0).unwrap();
+    let open = state.open.as_mut().unwrap();
+    open.editor = Some(editor);
+    open.editing = true;
+    assert_eq!(hint_bar(&state), "⌃S stage   ⌃Z undo   Esc cancel");
+}
+
+#[test]
+fn golden_confirm_diff_after_staging_an_edit() {
+    let state = opened(
+        "user:8812:session",
+        Value::Str(StringValue::new("old value", 65)),
+        600,
+    );
+    let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+    let mut state = state;
+    let editor = state.open.as_mut().unwrap().editor.as_mut().unwrap();
+    editor.insert_str("!");
+    let (state, _) = update(state, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+    assert!(state.confirm.is_some());
+    assert_golden("editor_confirm_diff_after_staging", &draw(&state, 130, 22));
+}
+
 // ── UI task: type colour dots and the selection bar (style-verified) ────────
 
 use redis_pane_core::theme::Token;
@@ -2195,6 +2283,7 @@ fn golden_viewer_opening() {
         // is genuinely slow, so the placeholder must show.
         issued_at_ms: Some(73_000),
         activate_cursor: false,
+        own_write: false,
     });
     let frame = draw(&state, 130, 22);
     assert!(frame.contains("user:8812:session"), "{frame}");
@@ -2227,6 +2316,7 @@ fn golden_viewer_opening_a_fast_read_shows_nothing_at_all() {
         // 100ms elapsed against `CLOCK` (74_000) — under the 200ms gate.
         issued_at_ms: Some(73_900),
         activate_cursor: false,
+        own_write: false,
     });
     let frame = draw(&too_recent, 130, 22);
     assert_eq!(
@@ -2241,6 +2331,7 @@ fn golden_viewer_opening_a_fast_read_shows_nothing_at_all() {
         index: Some(2),
         issued_at_ms: None,
         activate_cursor: false,
+        own_write: false,
     });
     let frame = draw(&unstamped, 130, 22);
     assert_eq!(
@@ -2264,6 +2355,7 @@ fn golden_viewer_opening_a_different_key_than_the_one_already_shown() {
         index: Some(0),
         issued_at_ms: Some(73_000),
         activate_cursor: false,
+        own_write: false,
     });
     let frame = draw(&state, 130, 22);
     assert!(frame.contains("user:8812:cart"), "{frame}");
@@ -2290,6 +2382,7 @@ fn golden_viewer_refetching() {
         index: state.open.as_ref().unwrap().index,
         issued_at_ms: Some(73_000),
         activate_cursor: false,
+        own_write: false,
     });
     let frame = draw(&state, 130, 22);
     assert!(
@@ -2321,6 +2414,7 @@ fn golden_viewer_refetching_a_fast_reply_shows_nothing_at_all() {
         index: state.open.as_ref().unwrap().index,
         issued_at_ms: Some(73_900),
         activate_cursor: false,
+        own_write: false,
     });
     let frame = draw(&state, 130, 22);
     assert_eq!(
@@ -2454,5 +2548,70 @@ fn the_open_row_is_underlined_and_the_cursor_row_is_not_merely_that() {
             .add_modifier
             .contains(Modifier::UNDERLINED),
         "and the two marks are not the same mark"
+    );
+}
+
+/// Drawing is where the editor learns the pane's width. If the frame drew a
+/// copy, `Down` in a value with no newlines would have no row to go to.
+#[test]
+fn down_moves_by_wrapped_row_in_a_value_with_no_newlines_once_drawn() {
+    let token = "x".repeat(400);
+    let state = opened(
+        "user:8812:token",
+        Value::Str(StringValue::new(&token, 65)),
+        600,
+    );
+    let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+    draw(&state, 130, 22);
+    let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Down)));
+    let cursor = state
+        .open
+        .as_ref()
+        .unwrap()
+        .editor
+        .as_ref()
+        .unwrap()
+        .widget()
+        .cursor();
+    let (line, col) = (cursor.0, cursor.1);
+    assert_eq!(line, 0, "still the one logical line");
+    assert!(
+        col > 0,
+        "moved one wrapped row down, not nowhere: col {col}"
+    );
+}
+
+/// The crate's own cursor is reverse video, which on light text reads as
+/// barely anything. It is repainted with the Viewer's cursor token instead.
+#[test]
+fn the_editor_cursor_is_drawn_with_the_viewers_cursor_colour() {
+    use ratatui::style::Modifier;
+    use redis_pane_core::theme::Token;
+    let token = "x".repeat(400);
+    let state = opened(
+        "user:8812:token",
+        Value::Str(StringValue::new(&token, 65)),
+        600,
+    );
+    let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+    let theme = Theme::new(ColorDepth::TrueColor);
+    let buf = render::frame(&state, &theme, &CLOCK, Rect::new(0, 0, 130, 22));
+    let selected = theme.style(Token::Selected);
+    let cursor_cells = (1..22)
+        .flat_map(|y| (0..130).map(move |x| (x, y)))
+        .filter(|&(x, y)| {
+            let cell = &buf[(x, y)];
+            cell.symbol() == "x" && Some(cell.bg) == selected.bg && Some(cell.fg) == selected.fg
+        })
+        .count();
+    assert_eq!(
+        cursor_cells, 1,
+        "exactly the cursor, on a character of the value"
+    );
+    assert!(
+        !buf.content
+            .iter()
+            .any(|c| c.modifier.contains(Modifier::REVERSED)),
+        "no reverse-video cursor left over"
     );
 }

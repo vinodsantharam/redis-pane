@@ -11,10 +11,11 @@ pub mod layout;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
+use ratatui::widgets::Widget;
 
 use crate::clock::Clock;
 use crate::keymap::{Action, key_label};
-use crate::state::{Attachment, Link, Liveness, PendingMutation, PendingRead, State};
+use crate::state::{Attachment, EditBuffer, Link, Liveness, PendingMutation, PendingRead, State};
 use crate::theme::{Theme, Token, env_token};
 
 /// Render the whole frame into a fresh buffer of the given size.
@@ -308,13 +309,24 @@ fn value_pane(
     // TTL is counted down locally: the most time-sensitive figure on screen
     // costs no round trip (R3.9).
     let ttl = keys::format_ttl(open.ttl_now(now));
-    put(
+    let ttl_end = put(
         buf,
         x0,
         area.y + 2,
         &format!("ttl {ttl}"),
         sty(Token::Muted),
     );
+    // Whether the inline editor's current text still parses as JSON, when
+    // the value being edited was JSON-classified to begin with (ADR-0014) —
+    // the live counterpart to the confirm dialog's `⚠ no longer valid JSON`.
+    if let Some(valid) = open.editor.as_ref().and_then(EditBuffer::json_valid) {
+        let (label, token) = if valid {
+            (" · json ✓", Token::Muted)
+        } else {
+            (" · json ✗", Token::Warn)
+        };
+        put(buf, ttl_end, area.y + 2, label, sty(token));
+    }
 
     // A Refetch of this same key is in flight (invalidation re-arm, reconnect
     // re-arm, manual Refetch, …): the value already on screen stays exactly
@@ -376,6 +388,36 @@ fn value_pane(
     if body_height == 0 {
         return;
     }
+
+    // The inline editor takes over the whole body in place of the viewer's
+    // own rows (ADR-0014) — the same frame, header included, with an
+    // unsaved buffer where the read-only rows would otherwise be.
+    //
+    // The stored `TextArea` is drawn itself, never a clone: drawing is where
+    // it learns the pane's width and keeps its scroll position, and without
+    // that width `Up`/`Down` move by whole lines, which in a token is none.
+    // The text colour is painted underneath instead of set on the widget,
+    // since setting a style needs `&mut` and render only borrows `State`.
+    if let Some(editor) = &open.editor {
+        let editor_area = Rect::new(x0, body_top, area.width.saturating_sub(2), body_height);
+        buf.set_style(editor_area, sty(Token::Text));
+        editor.widget().render(editor_area, buf);
+        // The crate draws its cursor in reverse video, and nothing else in
+        // this area uses it, so that one cell is repainted with the token the
+        // Viewer's cursor uses.
+        let reversed = ratatui::style::Modifier::REVERSED;
+        for y in editor_area.top()..editor_area.bottom() {
+            for x in editor_area.left()..editor_area.right() {
+                let cell = &mut buf[(x, y)];
+                if cell.modifier.contains(reversed) {
+                    cell.modifier.remove(reversed);
+                    cell.set_style(sty(Token::Selected));
+                }
+            }
+        }
+        return;
+    }
+
     let cols = viewer.columns();
     let mut y = body_top;
     let inner = area.width.saturating_sub(2);
@@ -641,6 +683,46 @@ fn help_overlay(state: &State, theme: &Theme, area: Rect, buf: &mut Buffer) {
     }
 }
 
+/// How many lines of a String value's old/new side the diff block in
+/// [`confirm_overlay`] shows before saying how many more there are. A stacked
+/// old/new block, not a real line-level diff (v1 — DESIGN §6.5 asks only for
+/// "see the real change before it runs", not a specific diff algorithm).
+const MAX_DIFF_LINES: usize = 8;
+
+/// Truncate from the *right*, keeping the start — the complement of
+/// [`truncate_left`]. Diff content is read left-to-right like code, so what
+/// distinguishes one line from the next is usually at the front.
+fn truncate_right(s: &str, width: usize) -> String {
+    let len = s.chars().count();
+    if len <= width {
+        return s.to_string();
+    }
+    if width <= 1 {
+        return String::new();
+    }
+    let keep = width - 1;
+    let mut out: String = s.chars().take(keep).collect();
+    out.push('…');
+    out
+}
+
+/// Renders one side of a String-edit diff into `lines`: up to
+/// [`MAX_DIFF_LINES`] rows of `bytes`, each prefixed with `mark`, plus a
+/// "N more lines" footer when it was longer than that.
+fn push_diff_side(lines: &mut Vec<(String, Token)>, mark: &str, bytes: &[u8], token: Token) {
+    let text = String::from_utf8_lossy(bytes);
+    let rows: Vec<&str> = text.split('\n').collect();
+    for row in rows.iter().take(MAX_DIFF_LINES) {
+        lines.push((format!("{mark} {row}"), token));
+    }
+    if rows.len() > MAX_DIFF_LINES {
+        lines.push((
+            format!("  … {} more lines", rows.len() - MAX_DIFF_LINES),
+            Token::Muted,
+        ));
+    }
+}
+
 /// The mutation-preview dialog (R4.4, DESIGN §6.5).
 ///
 /// Composes the real command first, and only then says whether Read-only
@@ -653,16 +735,54 @@ fn confirm_overlay(
     area: Rect,
     buf: &mut Buffer,
 ) {
-    let command = pending.command_text();
     let refused = state.read_only;
     let hint = match refused {
         Some(reason) => format!("read-only ({}) · Esc dismiss", reason.label()),
         None => "y confirm · Esc cancel".to_string(),
     };
-    let lines = [command.as_str(), hint.as_str()];
-    let inner_w = lines.iter().map(|l| l.chars().count()).max().unwrap_or(10);
+
+    let mut lines: Vec<(String, Token)> = Vec::new();
+    match pending {
+        PendingMutation::DeleteKey { .. } => {
+            lines.push((pending.command_text(), Token::Text));
+        }
+        PendingMutation::SetString { name, old, new, .. } => {
+            // The value itself is the `+` side of the diff below.
+            lines.push((
+                format!("SET {} KEEPTTL XX", String::from_utf8_lossy(name)),
+                Token::Text,
+            ));
+            push_diff_side(&mut lines, "-", old, Token::Danger);
+            push_diff_side(&mut lines, "+", new, Token::Ok);
+            if pending.json_warning() == Some(true) {
+                lines.push(("⚠ no longer valid JSON".to_string(), Token::Warn));
+            }
+        }
+    }
+    let hint_token = if refused.is_some() {
+        Token::Danger
+    } else {
+        Token::Text
+    };
+    // Kept separate from `lines` rather than pushed onto the end: the hint is
+    // how the dialog is dismissed or confirmed, so it must always be the last
+    // thing drawn, never a line a tall diff pushes past the bottom of a short
+    // terminal.
+    let hint_line = (hint, hint_token);
+
+    // Capped well short of the frame, so one long JSON line never turns the
+    // dialog into the whole screen — width and line count are both bounded,
+    // so render cost here is a function of the cap, not of the value.
+    let max_w = (area.width as usize).saturating_sub(6).clamp(10, 100);
+    let inner_w = lines
+        .iter()
+        .chain(std::iter::once(&hint_line))
+        .map(|(l, _)| l.chars().count().min(max_w))
+        .max()
+        .unwrap_or(10);
     let w = (inner_w + 4).min(area.width as usize);
-    let h = (lines.len() + 4).min(area.height as usize);
+    // +1 content lines, +1 hint, +4 for the border/title rows.
+    let h = (lines.len() + 5).min(area.height as usize);
     let x0 = (area.width as usize - w) / 2;
     let y0 = (area.height as usize - h) / 2;
 
@@ -692,20 +812,33 @@ fn confirm_overlay(
         " confirm ",
         theme.style(Token::Text),
     );
-    for (i, line) in lines.iter().enumerate() {
-        let token = if refused.is_some() && i == 1 {
-            Token::Danger
-        } else {
-            Token::Text
-        };
+    // The box may be shorter than there are lines to show (a value taller
+    // than the terminal) — draw what fits, but the hint always gets the last
+    // visible row: it is how the dialog is dismissed or confirmed, never the
+    // thing a tall diff is allowed to push off screen.
+    let visible_rows = h.saturating_sub(3);
+    if visible_rows == 0 {
+        return;
+    }
+    let content_rows = visible_rows.saturating_sub(1);
+    for (i, (line, token)) in lines.iter().take(content_rows).enumerate() {
+        let text = truncate_right(line, w.saturating_sub(4));
         put(
             buf,
             x0 as u16 + 2,
             (y0 + 2 + i) as u16,
-            line,
-            theme.style(token),
+            &text,
+            theme.style(*token),
         );
     }
+    let hint_text = truncate_right(&hint_line.0, w.saturating_sub(4));
+    put(
+        buf,
+        x0 as u16 + 2,
+        (y0 + 2 + visible_rows - 1) as u16,
+        &hint_text,
+        theme.style(hint_line.1),
+    );
 }
 
 /// The title bar: what we are connected to, and where that came from.
@@ -873,6 +1006,20 @@ pub fn status_readout(state: &State, clock: &dyn Clock) -> Vec<(String, Token)> 
 pub fn hint_bar(state: &State) -> String {
     if state.filtering {
         return "Esc clear & exit   Enter apply".to_string();
+    }
+    // The inline editor is a mode of its own (ADR-0014), the same way filter
+    // capture is above: hard-coded wording, effective bindings looked up
+    // from the keymap so a rebinding still shows correctly (R7.5).
+    if state
+        .open
+        .as_ref()
+        .and_then(|o| o.editor.as_ref())
+        .is_some_and(|e| !e.is_staged())
+    {
+        let stage = state.keymap.hint(Action::EditorStage).unwrap_or_default();
+        let undo = state.keymap.hint(Action::EditorUndo).unwrap_or_default();
+        let cancel = state.keymap.hint(Action::Cancel).unwrap_or_default();
+        return format!("{stage} stage   {undo} undo   {cancel} cancel");
     }
     [
         Action::Cancel,

@@ -538,9 +538,10 @@ fn open_key(
             return;
         };
 
-        // `read_value` awaits `CLIENT CACHING YES` with `?` before doing
-        // anything else, so any Ok(_) here means arming already succeeded on
-        // the wire — this message is what makes that fact reach the core.
+        // `read_value` sends `CLIENT CACHING YES` in one pipeline with its
+        // first read and returns early with `?` if either fails, so any Ok(_)
+        // here means arming already succeeded on the wire — this message is
+        // what makes that fact reach the core.
         if arming == crate::redis::read::Arming::Enabled && result.is_ok() {
             let _ = tx.send(Msg::TrackingArmed).await;
         }

@@ -53,15 +53,19 @@ pub enum Arming {
 
 /// Serialises reads on one connection, and supersedes the ones nobody wants.
 ///
-/// `CLIENT CACHING YES` arms **the next read-only command on the connection**,
-/// not a command it is bundled with. Two reads running at once can therefore
-/// interleave — A arms, B arms, A reads, B reads — and leave the server
-/// tracking a key the Viewer is not showing. The header would go on saying
-/// `● live` over a value nothing will ever push an update for, which is the
-/// failure ADR-0006 exists to make unreachable, reached by a different route.
+/// `CLIENT CACHING YES` arms **the next command on the connection**, whatever
+/// it is, not a command it is bundled with. Two reads running at once could
+/// therefore interleave — A arms, B arms, A reads, B reads — and leave the
+/// server tracking a key the Viewer is not showing. The header would go on
+/// saying `● live` over a value nothing will ever push an update for, which
+/// is the failure ADR-0006 exists to make unreachable, reached by a different
+/// route.
 ///
 /// So the arm-and-read pair is indivisible: [`ReadGate::begin`] cancels the
 /// previous read and hands out a permit, and the holder runs to completion.
+/// Taking turns only keeps reads apart from each other, though — keys-pane
+/// metadata, `SCAN` pages and writes share the connection too — so
+/// [`read_value`] also sends the arming and its first read as one pipeline.
 /// Cancelling matters as much as serialising — dropping a *reply* does not
 /// un-send the `CLIENT CACHING` that went with it, and only a read that never
 /// runs arms nothing.
@@ -131,13 +135,22 @@ pub async fn read_value(
 ) -> Result<Option<ReadValue>, Error> {
     let key: Key = name.into();
 
-    // Arm first: `CLIENT CACHING YES` applies to the next read-only command on
-    // this connection. Do not "simplify" this into fred's Options.caching,
-    // which is inert in 10.1.0.
-    if arming == Arming::Enabled {
-        let _: () = client.client_caching(true).await?;
-    }
-    let kind: String = client.r#type(key.clone()).await?;
+    // `CLIENT CACHING YES` arms the next command on the connection, whatever
+    // it is, and keys-pane metadata, SCAN pages and writes share this client.
+    // Sent separately, any of them could land in between and take the arming,
+    // leaving the Viewer saying live over a key nothing tracks. So the arming
+    // and `TYPE` go out as one pipeline, which fred writes with nothing in
+    // between. Do not "simplify" this into fred's Options.caching, which is
+    // inert in 10.1.0.
+    let kind: String = if arming == Arming::Enabled {
+        let pipeline = client.pipeline();
+        let _: () = pipeline.client_caching(true).await?;
+        let _: () = pipeline.r#type(key.clone()).await?;
+        let (_, kind): (String, String) = pipeline.all().await?;
+        kind
+    } else {
+        client.r#type(key.clone()).await?
+    };
     if kind == "none" {
         return Ok(None);
     }

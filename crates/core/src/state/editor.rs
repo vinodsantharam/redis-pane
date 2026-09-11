@@ -142,13 +142,21 @@ impl EditBuffer {
     /// JSON-shaped field stops parsing, the same courtesy `SetString`
     /// extends a String. The cursor opens at the start: a field has no
     /// viewer row of its own to map back from, the way a String's rows do.
+    ///
+    /// Classified with [`super::value::looks_like_json`], the same rule the
+    /// shell's `string_value` uses to choose the JSON viewer over the plain
+    /// String one — not bare `serde_json::from_str(..).is_ok()`, which also
+    /// accepts a scalar like `8812` or `true`. A numeric Hash field is not
+    /// "JSON" in any sense either caller means, and classifying it as such
+    /// warned `⚠ no longer valid JSON` on every edit that turned it into
+    /// plain text.
     pub fn for_hash_field(field: String, value: &str) -> Result<EditBuffer, &'static str> {
         if value.len() > MAX_EDIT_BYTES {
             return Err(
                 "too large to edit inline (over 200KB) — an external-editor escape hatch is planned",
             );
         }
-        let was_json = serde_json::from_str::<serde_json::Value>(value).is_ok();
+        let was_json = super::value::looks_like_json(value);
         let lines: Vec<String> = value.split('\n').map(str::to_string).collect();
         let mut area = TextArea::new(lines);
         area.set_wrap_mode(WrapMode::WordOrGlyph);

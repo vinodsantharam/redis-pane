@@ -3175,6 +3175,38 @@ mod hash_field_edit_tests {
         ));
     }
 
+    /// A bare scalar parses as valid JSON syntax but is not what "this field
+    /// was JSON" means to a reader — the review that caught this used a
+    /// numeric field ("id": "8812") to show the false-positive warning it
+    /// used to produce. Shares `looks_like_json` with the shell's
+    /// `string_value`, which never treated a bare number as JSON either.
+    #[test]
+    fn a_numeric_field_edited_into_text_stages_with_no_json_warning() {
+        let s = with_cursor(open_with_hash(&[("id", "8812")], 1), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        assert!(
+            !s.open.as_ref().unwrap().editor.as_ref().unwrap().was_json(),
+            "a bare number is not JSON-shaped"
+        );
+        let s = type_text(s, "x");
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert_eq!(
+            s.confirm.as_ref().unwrap().json_warning(),
+            None,
+            "the question must not even arise for a field that was never JSON-shaped"
+        );
+    }
+
+    #[test]
+    fn a_json_object_field_edited_into_something_invalid_warns() {
+        let s = with_cursor(open_with_hash(&[("f", "{\"a\":1}")], 1), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        assert!(s.open.as_ref().unwrap().editor.as_ref().unwrap().was_json());
+        let s = type_text(s, "x"); // breaks the JSON
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert_eq!(s.confirm.as_ref().unwrap().json_warning(), Some(true));
+    }
+
     #[test]
     fn ctrl_s_stages_set_hash_field_with_the_right_field_old_new_and_command_text() {
         let s = with_cursor(open_with_hash(&[("f", "old")], 1), 0);

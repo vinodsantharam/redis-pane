@@ -1821,6 +1821,8 @@ fn golden_confirm_diff_after_staging_an_edit() {
 
 // ── PLAN M2 task 6: editing Hash fields (D1–D4, ADR-0015) ───────────────────
 
+use redis_pane_core::state::PendingMutation;
+
 #[test]
 fn golden_editing_a_hash_field_shows_its_name_above_the_editor() {
     let mut state = opened("user:8812:session", hash_value(), 2_537);
@@ -1846,7 +1848,8 @@ fn golden_confirm_set_hash_field_shows_the_effective_command_and_its_guard() {
     let mut state = opened("user:8812:session", hash_value(), 2_537);
     let open = state.open.as_mut().unwrap();
     open.cursor_active = true;
-    open.cursor = 1; // "device", a plain string — not a JSON scalar like "id"
+    open.cursor = 1; // "device": a plain string, to keep this fixture about
+    // the guard line and the diff rather than the JSON-parses warning
     let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
     let mut state = state;
     let editor = state.open.as_mut().unwrap().editor.as_mut().unwrap();
@@ -1882,9 +1885,16 @@ fn golden_confirm_delete_hash_field_warns_when_it_is_the_last_field() {
         }),
         600,
     );
+    // `d` is focus-dependent (D4): without this, `opened()`'s default focus
+    // (the keys pane) makes `d` stage `DeleteKey`, not `DeleteHashField` — the
+    // HDEL dialog and its last-field warning never appear at all, silently.
+    state.focus = Pane::Value;
     state.open.as_mut().unwrap().cursor_active = true;
     let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
-    assert!(state.confirm.is_some());
+    assert!(matches!(
+        state.confirm,
+        Some(PendingMutation::DeleteHashField { .. })
+    ));
     assert_golden(
         "confirm_delete_hash_field_last_field",
         &draw(&state, 130, 22),
@@ -1894,8 +1904,26 @@ fn golden_confirm_delete_hash_field_warns_when_it_is_the_last_field() {
 #[test]
 fn golden_hint_bar_names_all_three_hash_field_actions_with_a_cursor_active() {
     let mut state = opened("user:8812:session", hash_value(), 2_537);
+    state.focus = Pane::Value;
     state.open.as_mut().unwrap().cursor_active = true;
     assert_eq!(hint_bar(&state), "e edit · a add · d remove");
+}
+
+/// D4: `Tab` (`Action::CyclePane`) can move focus back to the keys pane
+/// without clearing `cursor_active` — the Hash field hints must not survive
+/// that, since `d` there stages `DeleteKey`, not `HDEL` (the bug the review
+/// caught: the hint claimed `remove` for a `d` that would delete the whole
+/// key).
+#[test]
+fn the_hash_field_hint_does_not_claim_remove_when_the_keys_pane_is_focused() {
+    let mut state = opened("user:8812:session", hash_value(), 2_537);
+    state.focus = Pane::Keys;
+    state.open.as_mut().unwrap().cursor_active = true;
+    let hint = hint_bar(&state);
+    assert!(
+        !hint.contains("remove"),
+        "keys-pane `d` stages DeleteKey, not HDEL: {hint}"
+    );
 }
 
 // ── UI task: type colour dots and the selection bar (style-verified) ────────

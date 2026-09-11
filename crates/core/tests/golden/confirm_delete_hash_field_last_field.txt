@@ -5,13 +5,13 @@
  ● user:8812:profile               json       880 B     ∞ │ ttl 9m                                                         ● live
  ● user:8812:session               hash      2.1 KB   42m ├
  ● user:8813:session               hash      1.9 KB   56m │ FIELD                             VALUE
- ● cart:91af3c9d2e                 zset      1.1 MB   12m │ only                              v
- ● feed:global:hot                 list     63.0 KB ┌─ confirm ──────────────┐
-                                                    │                        │
-                                                    │ DEL user:8812:session  │
-                                                    │                        │
-                                                    │ y confirm · Esc cancel │
-                                                    └────────────────────────┘
+ ● cart:91af3c9d2e                 zset      ┌─ confirm ────────────────────────────┐         v
+ ● feed:global:hot                 list     6│                                      │
+                                             │ HDEL user:8812:session only          │
+                                             │ last field — the key will be deleted │
+                                             │                                      │
+                                             │ y confirm · Esc cancel               │
+                                             └──────────────────────────────────────┘
                                                           │
                                                           │
                                                           │

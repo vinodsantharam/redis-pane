@@ -1101,12 +1101,17 @@ pub fn hint_bar(state: &State) -> String {
     {
         return "Enter next · Esc cancel".to_string();
     }
-    // A Hash with the value cursor on a row: `e`/`a`/`d` all mean something
-    // (D4), and the hint names the effective binding for each (R7.5).
-    if state
-        .open
-        .as_ref()
-        .is_some_and(|o| o.cursor_active && matches!(o.value, Some(Value::Hash(_))))
+    // A Hash with the value cursor on a row, *and the value pane focused*:
+    // `e`/`a`/`d` all mean something there (D4), and the hint names the
+    // effective binding for each (R7.5). `Tab` (`Action::CyclePane`) can move
+    // focus back to the keys pane without clearing `cursor_active`, and `d`
+    // there is `DeleteKey`, not `HDEL` — the hint must not claim `remove`
+    // for a `d` that is about to stage something else entirely.
+    if !state.keys_pane_focused()
+        && state
+            .open
+            .as_ref()
+            .is_some_and(|o| o.cursor_active && matches!(o.value, Some(Value::Hash(_))))
     {
         let edit = state.keymap.hint(Action::Edit).unwrap_or_default();
         let add = state.keymap.hint(Action::AddField).unwrap_or_default();

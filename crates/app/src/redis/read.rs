@@ -18,7 +18,7 @@ use fred::types::CustomCommand;
 use fred::types::Value as RedisValue;
 use redis_pane_core::state::value::{
     BinaryValue, IndexedValue, JsonValue, MemberValue, PairValue, ScoredValue, StreamValue,
-    StringValue, Value,
+    StringValue, Value, looks_like_json,
 };
 
 /// How much of a large collection to fetch. The Viewer is for reading, not for
@@ -303,8 +303,7 @@ async fn string_value(client: &Client, key: Key, width: usize) -> Result<Value, 
         .unwrap_or_default();
     match String::from_utf8(bytes.clone()) {
         Ok(text) => {
-            let trimmed = text.trim_start();
-            if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            if looks_like_json(&text) {
                 Ok(Value::Json(JsonValue::parse(&text)))
             } else {
                 Ok(Value::Str(StringValue::new(&text, width)))

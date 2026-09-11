@@ -126,9 +126,12 @@ anything runs. Without an active cursor on a Hash, `e`/`d` give the notice `Ente
 - `crates/core/src/state/editor.rs` gains `EditTarget` (`Value` / `HashField` / `NewHashField`) on
   `EditBuffer`, and `EditBuffer::for_hash_field`/`EditBuffer::new_hash_field` alongside the existing
   `from_value`. A Hash field opens its **raw** value, never reformatted, mirroring `from_value`'s
-  String path; `was_json` is still classified from the raw text, so the dialog can warn the same
-  way a String edit does — including, correctly, for a field whose value happens to be a bare JSON
-  scalar such as a numeric ID, since a lone number is valid JSON syntax.
+  String path; `was_json` is classified with the new `state::value::looks_like_json` (a leading
+  `{`/`[` after trimming), the same rule `crates/app/src/redis/read.rs`'s `string_value` uses to
+  choose the JSON viewer — not bare `serde_json::from_str(..).is_ok()`, which also accepts a
+  scalar like a numeric ID or `true`. An early version used the bare `serde_json` check and warned
+  `⚠ no longer valid JSON` on every edit that turned a numeric field into plain text; `looks_like_json`
+  is the fix, shared so the two callers cannot drift apart on what "was JSON" means again.
 - `crates/core/src/state/mod.rs` gains `PendingMutation::{SetHashField, AddHashField,
   DeleteHashField}`, each with `command_text()` (D2) and a new `guard_text()` for the muted line.
 - `crates/core/src/command.rs` gains `Command::{SetHashField, AddHashField, DeleteHashField}`,

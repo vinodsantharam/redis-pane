@@ -20,7 +20,7 @@ pub use loaded::{KeyKind, LoadedSet};
 pub use open::{Attachment, OpenKey, PendingRead, ReadOutcome};
 pub use scan::ScanState;
 pub use tree::Tree;
-pub use value::{Value, Viewer};
+pub use value::{Value, Viewer, looks_like_json};
 pub use view::{FilterMode, KeyView, SortBy};
 
 /// Where a Connection's target came from (ADR-0001).

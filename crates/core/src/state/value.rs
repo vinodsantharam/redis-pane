@@ -12,6 +12,22 @@
 
 use super::loaded::KeyKind;
 
+/// Whether `text` is shaped like JSON — an object or an array, after leading
+/// whitespace — rather than merely something `serde_json` happens to parse.
+///
+/// One rule shared by every path that classifies a value as JSON: the shell's
+/// `string_value` (`crates/app/src/redis/read.rs`) uses it to choose the JSON
+/// viewer over the plain String one, and the core's
+/// [`super::EditBuffer::for_hash_field`] uses it to decide whether a Hash
+/// field's edit gets the JSON-parses warning. A bare scalar — `8812`, `true`,
+/// `null` — parses as valid JSON syntax but is not what either caller means
+/// by "this looks like JSON"; without this shared rule, a numeric Hash field
+/// edited into plain text wrongly warned `⚠ no longer valid JSON`.
+pub fn looks_like_json(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with('{') || trimmed.starts_with('[')
+}
+
 /// A fetched value, ready to display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {

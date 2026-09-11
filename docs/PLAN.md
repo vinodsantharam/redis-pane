@@ -134,30 +134,37 @@ type by type (String → Hash → Set → List → ZSet) before TTL editing, sin
 always one keypress regardless of Environment (friction scales with count, not Environment — that
 is Read-only Mode's job), and move-across-db (part of R4.3) is parked — see the note below.
 
-Task 4 landed differently than first planned, after a second grilling session: String edit shells
-out to `$EDITOR` on a temp file rather than an inline text buffer in the value pane, because no
-terminal reliably distinguishes "commit" from "insert a newline" for a hand-rolled multi-line
-editor, and a real editor is a better one than this app would build from scratch. That needed its
-own fix first: the input-reading thread blocked on `crossterm::event::read()` forever, which would
-have raced a child editor process for the same terminal input — it is now a pausable poll loop
-(`crates/app/src/terminal.rs`). Landing this also caught a second real fred footgun (see
-`crates/app/src/redis/mod.rs`'s `set_value` doc comment) and settled that an editor's own
-trailing-newline-on-save habit is never mistaken for something the reader typed.
+Task 4 landed differently twice. First, after a grilling session, as String edit shelling out to
+`$EDITOR` on a temp file rather than an inline text buffer, on the reasoning that no terminal
+reliably distinguishes "commit" from "insert a newline" for a hand-rolled multi-line editor. That
+needed its own fix first — the input-reading thread blocked on `crossterm::event::read()` forever,
+which would have raced a child editor process for the same terminal input, so it briefly became a
+pausable poll loop — and landing it caught a second real fred footgun (see
+`crates/app/src/redis/mod.rs`'s `set_value` doc comment) along the way.
+
+Manual testing over a real terminal then found a live bug in that approach: vim's own
+terminal-colour query (`ESC]10;?`/`ESC]11;?`) can reply *after* the editor has exited, land on our
+input thread, and replay as a burst of keystrokes — discarding the confirm dialog and typing into
+the filter. See [ADR-0014](adr/0014-values-are-edited-inline.md) for the root cause. Task 4 was
+reworked a second time to an embedded editor (`ratatui-textarea`) directly in the value pane,
+which removes the terminal handoff — and the race in it — from the default path; `$EDITOR`
+survives as a separate, later, opt-in escape hatch (task 5 below) rather than the default.
 
 | # | Task | Proves |
 |---|---|---|
 | 1 | Read-only Mode as real state: `State` field, reason (`environment`/`replica`/`user`), `Ctrl-R` toggle, title-bar chrome | Golden frames of all four DESIGN §6.8 readouts; `replica` is never liftable (R4.5, ADR-0004) — **done** |
 | 2 | Mutation chokepoint: `PendingMutation`, `State::confirm`, propose → preview → confirm → execute as `Command`/`Msg` additions | A state-transition test proves Read-only Mode refuses *at confirm*, after composing the real command, never at the keypress that staged it (R4.4, DESIGN §6.5) — **done** |
 | 3 | Delete: single key, `DEL <key>`, preview + one keypress (`d` stages, `y` confirms, `Esc` dismisses) | Confirmed and refused paths both covered by unit tests; a completed delete reuses the existing "gone" badge machinery (`state.keys.set_gone`), so a deleted row behaves exactly like one that expired or was evicted — **done** |
-| 4 | Value edit — String (and JSON-as-string, R3.2): `e` hands the raw value to `$VISUAL`/`$EDITOR`/`vi` on a temp file; saving stages a `SET` with a stacked red/green diff preview | Core unit tests cover stage/confirm/discard and the JSON-invalid warning; an app-level test fakes `$EDITOR` with a shell script (no Docker) to prove the temp-file round trip and trailing-newline normalization; a Docker-backed integration test proves `SET` actually lands — **done** |
-| 5 | Value edit — Hash: field/value inline edit, add/remove field | Same preview/diff machinery as String, applied to one field at a time |
-| 6 | Value edit — Set: add/remove member | Membership diff in the preview; no ordering assumptions |
-| 7 | Value edit — List: index-addressed edit, insert, remove | Preview correctly represents index shift on insert/remove |
-| 8 | Value edit — ZSet: edit member's score, add/remove member+score | Preview shows score diff distinctly from membership diff |
-| 9 | TTL editing: set / persist / extend | Local countdown (M1.11) reflects the new TTL immediately post-confirm, no round trip; `PERSIST` clears it (R4.2) |
-| 10 | Rename: `RENAME`, collision handling when target key exists | Preview shows source → target; a colliding target is caught before execute, not as a server error surfacing after |
-| 11 | Copy: `COPY`, collision handling | Same as Rename; TTL carries over per Redis's own `COPY` semantics, not reimplemented |
-| 12 | Bulk operations: multi-select (`Space`, already bound) feeding the same chokepoint; bulk delete with typed key-count confirmation on `prod` | Confirmation friction scales with count exactly as DESIGN §6.5 specifies; single-key path (task 3) is untouched — bulk is additive, not a rewrite |
+| 4 | Value edit — String (and JSON-as-string, R3.2): `e` opens an inline editor in the value pane; `Ctrl-S` stages a `SET` with a stacked red/green diff preview; values over 200KB are refused with a notice (ADR-0014) | Core unit tests cover open/stage/discard, the JSON-invalid indicator, the size refusal at the boundary, and that a live update is held while the buffer is open (R3.8); golden frames pin the editor body, the wrapped-line case, and the hint bar; a Docker-backed integration test proves `SET` actually lands — **done** |
+| 5 | `$EDITOR` escape hatch: `E` in the value pane and `Ctrl-E` inside the inline editor seed `$VISUAL`/`$EDITOR`/`vi` with the current buffer, hardened against the terminal-reply race ADR-0014 documents (synchronous pause handoff, a settle delay, an input-buffer flush before returning to raw mode) | An app-level test fakes `$EDITOR` with a shell script (no Docker) to prove the temp-file round trip, the trailing-newline normalization, and that a leaked terminal reply after the settle window is drained rather than replayed as keystrokes |
+| 6 | Value edit — Hash: field/value inline edit, add/remove field | Same preview/diff machinery as String, applied to one field at a time |
+| 7 | Value edit — Set: add/remove member | Membership diff in the preview; no ordering assumptions |
+| 8 | Value edit — List: index-addressed edit, insert, remove | Preview correctly represents index shift on insert/remove |
+| 9 | Value edit — ZSet: edit member's score, add/remove member+score | Preview shows score diff distinctly from membership diff |
+| 10 | TTL editing: set / persist / extend | Local countdown (M1.11) reflects the new TTL immediately post-confirm, no round trip; `PERSIST` clears it (R4.2) |
+| 11 | Rename: `RENAME`, collision handling when target key exists | Preview shows source → target; a colliding target is caught before execute, not as a server error surfacing after |
+| 12 | Copy: `COPY`, collision handling | Same as Rename; TTL carries over per Redis's own `COPY` semantics, not reimplemented |
+| 13 | Bulk operations: multi-select (`Space`, not yet bound) feeding the same chokepoint; bulk delete with typed key-count confirmation on `prod` | Confirmation friction scales with count exactly as DESIGN §6.5 specifies; single-key path (task 3) is untouched — bulk is additive, not a rewrite |
 
 **Parked, not in this pass:** move-across-db (half of R4.3). Redis `MOVE key db` runs over the
 *same* connection to a different numeric db index — it never opens a second connection or lets

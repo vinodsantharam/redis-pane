@@ -102,3 +102,10 @@ _Avoid_: Staleness, last updated, timestamp
 The type-specific rendering of a value — one per Redis type, all sharing a common frame so
 navigation transfers between them.
 _Avoid_: Renderer, panel, inspector, formatter
+
+**Edit buffer**:
+The reader's unsaved text in the value pane, open while an inline edit is in progress. It is
+distinct from the Open key's read value: the buffer is what the reader is typing, never a copy of
+what the server last said, and a live update never touches it while it is open. It becomes a
+Staged mutation only when the reader asks — `Ctrl-S` — never on its own.
+_Avoid_: Draft, scratch value, cache

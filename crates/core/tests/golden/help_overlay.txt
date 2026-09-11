@@ -25,3 +25,5 @@ c       copy
 C       copy redis-cli command
 ⌃→      widen keys
 ⌃←      narrow keys
+d       delete
+y       confirm

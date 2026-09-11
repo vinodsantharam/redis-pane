@@ -240,6 +240,18 @@ pub enum Msg {
         read_only: Option<crate::state::ReadOnlyReason>,
         condition: Option<crate::state::ServerCondition>,
     },
+    /// A staged `DeleteKey` completed — the key is gone, whether it still
+    /// existed at the moment `DEL` ran or was already gone by then. Not a
+    /// read, so it carries no [`crate::command::ReadToken`]; a delete only
+    /// ever follows a confirm the reader just pressed, and there is at most
+    /// one staged at a time (R4.3, R4.4).
+    KeyDeleted {
+        /// The Loaded set row this key was staged from, if one was known —
+        /// same meaning as [`Msg::ValueGone::index`].
+        index: Option<usize>,
+        name: String,
+        at_ms: u64,
+    },
     /// An operation failed. Carries the command that failed (R7.4).
     ///
     /// Errors are never swallowed: a Redis error that produces no visible

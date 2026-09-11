@@ -69,6 +69,14 @@ pub enum Action {
     WidenKeysPane,
     /// Nudge the divider toward the keys pane, widening the Viewer.
     NarrowKeysPane,
+    /// Stage the selected key's delete for confirmation — never executes by
+    /// itself (R4.3, R4.6). Keys-pane-scoped: it acts on the Selected key,
+    /// not the Open key, the same target every other list-scoped action
+    /// takes.
+    Delete,
+    /// Confirm whatever mutation is currently staged and run it, or say why
+    /// not if Read-only Mode refuses it. No-op with nothing staged.
+    ConfirmMutation,
 }
 
 impl Action {
@@ -102,7 +110,8 @@ impl Action {
             | Action::Sort
             | Action::ToggleTree
             | Action::CollapseGroup
-            | Action::Open => state.pane_visible(Pane::Keys),
+            | Action::Open
+            | Action::Delete => state.pane_visible(Pane::Keys),
             // Everything else is the app's, not a pane's: quitting, help, Esc,
             // `Tab` (which is what *changes* which pane is on screen), `r`
             // (already pane-scoped by R2.7 on its own terms), `Enter`
@@ -139,6 +148,8 @@ impl Action {
             Action::CyclePane => "focus",
             Action::WidenKeysPane => "widen keys",
             Action::NarrowKeysPane => "narrow keys",
+            Action::Delete => "delete",
+            Action::ConfirmMutation => "confirm",
         }
     }
 
@@ -315,6 +326,14 @@ impl Default for Keymap {
                     key: KeyPress::ctrl(KeyCode::Left),
                     action: Action::NarrowKeysPane,
                 },
+                Binding {
+                    key: KeyPress::plain(KeyCode::Char('d')),
+                    action: Action::Delete,
+                },
+                Binding {
+                    key: KeyPress::plain(KeyCode::Char('y')),
+                    action: Action::ConfirmMutation,
+                },
             ],
         }
     }
@@ -471,6 +490,8 @@ mod tests {
             Action::EnterValueCursor,
             Action::Copy,
             Action::CopyCommand,
+            Action::Delete,
+            Action::ConfirmMutation,
         ] {
             assert!(k.key_for(action).is_some(), "{action:?} has no binding");
         }

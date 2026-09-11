@@ -201,6 +201,45 @@ impl ReadOnlyReason {
     }
 }
 
+/// A mutation staged for confirmation, not yet sent (R4.4, R4.6).
+///
+/// Every mutation is proposed here first: the preview shows the literal
+/// command before anything runs, and Read-only Mode is checked at the moment
+/// of confirming — never earlier, so the reader learns what they were about
+/// to do before they learn they are not allowed to (DESIGN §6.5) — never at
+/// the keypress that staged it, so the chokepoint has exactly one place that
+/// decides whether a mutation may proceed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingMutation {
+    /// Delete one key outright (`DEL`). `index` is the Loaded set row it came
+    /// from, carried the same way `Msg::ValueGone` carries it, so a rescan
+    /// between staging and confirming cannot make this land on the wrong row.
+    DeleteKey { index: usize, name: Vec<u8> },
+}
+
+impl PendingMutation {
+    /// The literal command this will send, shown at preview (R4.4).
+    pub fn command_text(&self) -> String {
+        match self {
+            PendingMutation::DeleteKey { name, .. } => {
+                format!("DEL {}", String::from_utf8_lossy(name))
+            }
+        }
+    }
+
+    /// The shell work confirming this dispatches. The only place a
+    /// `PendingMutation` turns into a [`crate::Command`] — the chokepoint's
+    /// actual enforcement point, mirrored from how `scan_batch` is the one
+    /// place the Loaded set cap is enforced (ADR-0010).
+    pub fn into_commands(self) -> Vec<crate::Command> {
+        match self {
+            PendingMutation::DeleteKey { index, name } => {
+                vec![crate::Command::DeleteKey { index, name }]
+            }
+        }
+    }
+}
+
 /// A server state that rejects writes or defers them (ADR-0009).
 ///
 /// Detected rather than merely reported, so danger is visible *before* it is
@@ -243,6 +282,8 @@ pub struct State {
     pub link: Link,
     /// Read-only Mode and why, if it is on (R4.5, ADR-0009).
     pub read_only: Option<ReadOnlyReason>,
+    /// A mutation staged for confirmation, if one is in flight (R4.4).
+    pub confirm: Option<PendingMutation>,
     /// A server condition worth a banner, if there is one.
     pub condition: Option<ServerCondition>,
     /// Bindings in force. Hints read from here so they show the effective key.

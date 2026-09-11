@@ -1108,3 +1108,68 @@ async fn a_small_hash_and_set_still_come_back_whole() {
     let _ = client.quit().await;
     let _ = writer.quit().await;
 }
+
+// ── M2.3 — Delete actually deletes ───────────────────────────────────────
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn deleting_a_key_removes_it_from_the_server() {
+    // This is the regression test for a real bug: `client.del(name.to_vec())`
+    // compiled, returned `Ok`, and deleted nothing. `fred`'s `Vec<T> ->
+    // MultipleKeys` conversion treats a `Vec<u8>` as *many* numeric-string
+    // keys (one per byte, since `u8: Into<Key>`) rather than one binary key,
+    // so every call sent `DEL <byte0> <byte1> …` against keys that never
+    // existed. Only a real server catches this — a mocked or unit-level test
+    // would have to fake `del`'s behaviour and would fake it "correctly".
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer.set("k:0", "v", None, None, false).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    redis_pane::redis::delete_key(&client, b"k:0")
+        .await
+        .unwrap();
+
+    let still_there: Option<String> = writer.get("k:0").await.unwrap();
+    assert_eq!(still_there, None, "the key must actually be gone");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn deleting_a_key_with_bytes_that_look_like_small_integers_does_not_delete_the_wrong_thing() {
+    // The bug this guards against is keyed on the *byte values* of the name,
+    // not its length — a short key whose bytes happen to be small integers is
+    // exactly the case the buggy conversion mishandled silently, and exactly
+    // the case a casual re-test with an ordinary ASCII key name would miss.
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let name: &[u8] = &[7, 8];
+    let _: () = writer.set(name, "v", None, None, false).await.unwrap();
+    // A decoy key named after one of those byte values as a *string* — if the
+    // bug were present, deleting `name` would remove this instead.
+    let _: () = writer.set("7", "decoy", None, None, false).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    redis_pane::redis::delete_key(&client, name).await.unwrap();
+
+    let target: Option<Vec<u8>> = writer.get(name).await.unwrap();
+    assert_eq!(target, None, "the intended key must be gone");
+    let decoy: Option<String> = writer.get("7").await.unwrap();
+    assert_eq!(
+        decoy.as_deref(),
+        Some("decoy"),
+        "the decoy must be untouched"
+    );
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}

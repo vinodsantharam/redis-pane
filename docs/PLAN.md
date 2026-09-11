@@ -120,14 +120,49 @@ shared frame whose liveness states are recorded as golden frames.
 **Done when** a 100k-key keyspace is browsable in under a second, every type renders as itself,
 and a key changing on the server updates on screen without anyone pressing anything. — **Met.**
 
-## 5. Explicitly not in M0 or M1
+## 5. M2 — Mutate
 
-Mutation, editing and confirmation (M2). Palette, Console, dashboard, monitor, pub/sub, slowlog
-(M3). Cluster, themes beyond the two defaults, packaging (M4). Keys-pane liveness, and the other
-open questions in [DESIGN §9](DESIGN.md) — all decidable later without rework, which is why they
-are still open.
+Proves: a mutation can be trusted — the reader always sees the real command and its blast radius
+before it runs, Read-only Mode is enforced at exactly one point, and nothing here reopens the
+RedisInsight-shaped bugs M0/M1 were built to make structurally impossible.
 
-## 6. Risk order
+**Progress: in flight.** Task 1 was already done incidentally while building M0's title bar and
+Ctrl-R toggle — `ReadOnlyReason`, its precedence rules, and the DESIGN §6.8 chrome all shipped
+with golden-frame coverage before this table existed. Tasks 2–3 (the chokepoint and Delete) are
+done. The rest is ordered per a grilling session with the user: value edit ships type by type
+(String → Hash → Set → List → ZSet) before TTL editing, single-key confirmation is always one
+keypress regardless of Environment (friction scales with count, not Environment — that is
+Read-only Mode's job), and move-across-db (part of R4.3) is parked — see the note below.
+
+| # | Task | Proves |
+|---|---|---|
+| 1 | Read-only Mode as real state: `State` field, reason (`environment`/`replica`/`user`), `Ctrl-R` toggle, title-bar chrome | Golden frames of all four DESIGN §6.8 readouts; `replica` is never liftable (R4.5, ADR-0004) — **done** |
+| 2 | Mutation chokepoint: `PendingMutation`, `State::confirm`, propose → preview → confirm → execute as `Command`/`Msg` additions | A state-transition test proves Read-only Mode refuses *at confirm*, after composing the real command, never at the keypress that staged it (R4.4, DESIGN §6.5) — **done** |
+| 3 | Delete: single key, `DEL <key>`, preview + one keypress (`d` stages, `y` confirms, `Esc` dismisses) | Confirmed and refused paths both covered by unit tests; a completed delete reuses the existing "gone" badge machinery (`state.keys.set_gone`), so a deleted row behaves exactly like one that expired or was evicted — **done** |
+| 4 | Value edit — String: inline editor in the value pane, commit shows red/green diff preview | A round-trip test: edit, preview, confirm, `GET` reflects the change; canceled edits touch nothing |
+| 5 | Value edit — Hash: field/value inline edit, add/remove field | Same preview/diff machinery as String, applied to one field at a time |
+| 6 | Value edit — Set: add/remove member | Membership diff in the preview; no ordering assumptions |
+| 7 | Value edit — List: index-addressed edit, insert, remove | Preview correctly represents index shift on insert/remove |
+| 8 | Value edit — ZSet: edit member's score, add/remove member+score | Preview shows score diff distinctly from membership diff |
+| 9 | TTL editing: set / persist / extend | Local countdown (M1.11) reflects the new TTL immediately post-confirm, no round trip; `PERSIST` clears it (R4.2) |
+| 10 | Rename: `RENAME`, collision handling when target key exists | Preview shows source → target; a colliding target is caught before execute, not as a server error surfacing after |
+| 11 | Copy: `COPY`, collision handling | Same as Rename; TTL carries over per Redis's own `COPY` semantics, not reimplemented |
+| 12 | Bulk operations: multi-select (`Space`, already bound) feeding the same chokepoint; bulk delete with typed key-count confirmation on `prod` | Confirmation friction scales with count exactly as DESIGN §6.5 specifies; single-key path (task 3) is untouched — bulk is additive, not a rewrite |
+
+**Parked, not in this pass:** move-across-db (half of R4.3). Redis `MOVE key db` runs over the
+*same* connection to a different numeric db index — it never opens a second connection or lets
+the UI browse the destination, so it does not reintroduce the switcher ADR-0005 rejected — but
+there is no daily-use need for it right now. Revisit after the first M2 RC ships. Undo/redo is
+not planned anywhere in M2: the command-preview step (R4.4) is the stated safety net, not a
+history to revert.
+
+## 6. Explicitly not in M0, M1 or M2
+
+Palette, Console, dashboard, monitor, pub/sub, slowlog (M3). Cluster, themes beyond the two
+defaults, packaging (M4). Keys-pane liveness, and the other open questions in
+[DESIGN §9](DESIGN.md) — all decidable later without rework, which is why they are still open.
+
+## 7. Risk order
 
 The tasks most likely to invalidate something already decided, earliest first:
 

@@ -378,6 +378,37 @@ pub async fn run(
                     let at_ms = clock.now_ms();
                     let _ = tx.send(Msg::Noticed { text, at_ms }).await;
                 }
+                Command::DeleteKey { index, name } => {
+                    let client = client.clone();
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let at_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        let name_str = String::from_utf8_lossy(&name).into_owned();
+                        match crate::redis::delete_key(&client, &name).await {
+                            Ok(()) => {
+                                let _ = tx
+                                    .send(Msg::KeyDeleted {
+                                        index: Some(index),
+                                        name: name_str,
+                                        at_ms,
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Msg::Failed {
+                                        command: format!("DEL {name_str}"),
+                                        detail: e.details().to_string(),
+                                        at_ms,
+                                    })
+                                    .await;
+                            }
+                        }
+                    });
+                }
                 Command::Reconnect { after_ms } => {
                     reconnect_attempt += 1;
                     spawn_reconnect_attempt(

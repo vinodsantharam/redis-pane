@@ -140,14 +140,24 @@ impl Action {
                     state.pane_visible(Pane::Value)
                 }
             }
-            // Edits the Open value's body — meaningless without the value
-            // pane on screen to hold it. The editor-scoped actions only ever
-            // matter while that same pane holds an open buffer.
-            Action::Edit
-            | Action::AddField
-            | Action::EditorStage
-            | Action::EditorUndo
-            | Action::EditorRedo => state.pane_visible(Pane::Value),
+            // `e`/`a` are focus-dependent too, like `d` above (PLAN M2 task 6
+            // follow-up, G): with the keys pane focused they act on nothing
+            // (`open_editor`/`begin_add_field` refuse with a notice rather
+            // than acting on whatever key happens to be open), so route them
+            // the same way — following focus, not merely "is the value pane
+            // drawn at all".
+            Action::Edit | Action::AddField => {
+                if state.keys_pane_focused() {
+                    state.pane_visible(Pane::Keys)
+                } else {
+                    state.pane_visible(Pane::Value)
+                }
+            }
+            // The editor-scoped actions only ever matter while the value pane
+            // holds an open buffer, which itself requires that pane focused.
+            Action::EditorStage | Action::EditorUndo | Action::EditorRedo => {
+                state.pane_visible(Pane::Value)
+            }
             // Everything else is the app's, not a pane's: quitting, help, Esc,
             // `Tab` (which is what *changes* which pane is on screen), `r`
             // (already pane-scoped by R2.7 on its own terms), `Enter`

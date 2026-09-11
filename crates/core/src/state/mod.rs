@@ -15,7 +15,7 @@ pub mod value;
 pub mod view;
 
 pub use copy::CopyWhat;
-pub use editor::{EditBuffer, EditTarget};
+pub use editor::{EditBuffer, EditTarget, FieldPart};
 pub use loaded::{KeyKind, LoadedSet};
 pub use open::{Attachment, OpenKey, PendingRead, ReadOutcome};
 pub use scan::ScanState;

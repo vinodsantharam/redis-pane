@@ -182,6 +182,16 @@ pub struct PairValue {
     pub total: usize,
 }
 
+impl PairValue {
+    /// Whether a field of exactly this name is in the fetched window (PLAN M2
+    /// task 6 follow-up, D) — byte-for-byte, not case-folded. A hidden
+    /// duplicate outside the window is not answered here; the `HSETNX` guard
+    /// at write time is what catches those.
+    pub fn has_field(&self, name: &str) -> bool {
+        self.pairs.iter().any(|(f, _)| f == name)
+    }
+}
+
 impl Viewer for PairValue {
     fn measure(&self) -> String {
         plural(self.total, "field")

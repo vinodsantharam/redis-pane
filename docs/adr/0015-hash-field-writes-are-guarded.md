@@ -143,9 +143,15 @@ anything runs. Without an active cursor on a Hash, `e`/`d` give the notice `Ente
   per mutation. A `DeleteHashField` whose `HDEL` finds the field already gone is not an error and
   is not routed through `NotWritten` — there is no buffer to hand back — so it gets its own
   `Msg::HashFieldAlreadyGone`, reported as a notice, then a Refetch.
-- `OpenKey` gains `field_capture: Option<String>` for `a`'s one-line field-name capture, and the
-  keymap gains `Action::AddField` (default `a`). `Action::Delete`'s `pane_is_on_screen` is now
-  focus-dependent, like `Action::Copy`'s existing focus split.
+- The keymap gains `Action::AddField` (default `a`). `Action::Edit`/`Action::AddField`'s
+  `pane_is_on_screen`, like `Action::Delete`'s, is focus-dependent — a follow-up correction (task 6
+  follow-up, G): `e`/`a` used to check only that the value pane was *drawn*, so pressing them from
+  the keys pane acted on whatever key the Viewer happened to hold, not the one under the cursor.
+  `a` opens an `EditBuffer` directly, on a two-part `FIELD`/`VALUE` form (task 6 follow-up, F) —
+  there is no longer a separate one-line field-name capture ahead of it. A shown duplicate (exact
+  byte equality with a field already in the fetched window) blocks `Enter`/`↓`/`Ctrl-S` while
+  typing the name; a hidden one outside the window is still caught only by the `HSETNX` guard
+  below, at write time, exactly as before.
 - The command-preview dialog's `PendingMutation` match, and the render layer's `hint_bar`, both
   grow the three new cases without touching the String/`DeleteKey` ones (D2, D4).
 

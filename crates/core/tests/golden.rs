@@ -1805,11 +1805,14 @@ fn golden_editor_hint_bar() {
 
 #[test]
 fn golden_confirm_diff_after_staging_an_edit() {
-    let state = opened(
+    let mut state = opened(
         "user:8812:session",
         Value::Str(StringValue::new("old value", 65)),
         600,
     );
+    // `e` is focus-gated (G, PLAN M2 task 6 follow-up); `opened()` leaves
+    // focus on the keys pane.
+    state.focus = Pane::Value;
     let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
     let mut state = state;
     let editor = state.open.as_mut().unwrap().editor.as_mut().unwrap();
@@ -1824,28 +1827,52 @@ fn golden_confirm_diff_after_staging_an_edit() {
 use redis_pane_core::state::PendingMutation;
 
 #[test]
-fn golden_editing_a_hash_field_shows_its_name_above_the_editor() {
+fn golden_editing_an_existing_field_shows_it_read_only_above_the_active_value() {
     let mut state = opened("user:8812:session", hash_value(), 2_537);
     let open = state.open.as_mut().unwrap();
     open.cursor_active = true;
     open.cursor = 1; // "device"
     open.editor = Some(EditBuffer::for_hash_field("device".into(), "ios/17.2").unwrap());
     open.editing = true;
-    assert_golden("editor_hash_field", &draw(&state, 130, 22));
+    assert_golden("hash_form_edit_field", &draw(&state, 130, 22));
 }
 
 #[test]
-fn golden_field_name_capture_is_an_input_line_with_an_empty_editor_below() {
+fn golden_hash_add_form_name_part_shows_the_placeholder_on_value() {
     let mut state = opened("user:8812:session", hash_value(), 2_537);
     let open = state.open.as_mut().unwrap();
-    open.field_capture = Some("new_fi".into());
+    open.editor = Some(EditBuffer::new_hash_field());
     open.editing = true;
-    assert_golden("field_name_capture", &draw(&state, 130, 22));
+    let editor = open.editor.as_mut().unwrap();
+    editor.name_push('n');
+    editor.name_push('e');
+    editor.name_push('w');
+    editor.name_push('_');
+    editor.name_push('f');
+    editor.name_push('i');
+    assert_golden("hash_form_add_name", &draw(&state, 130, 22));
+}
+
+#[test]
+fn golden_hash_add_form_duplicate_name_shows_the_warning() {
+    let mut state = opened("user:8812:session", hash_value(), 2_537);
+    let open = state.open.as_mut().unwrap();
+    open.editor = Some(EditBuffer::new_hash_field());
+    open.editing = true;
+    let editor = open.editor.as_mut().unwrap();
+    // "device" is one of `hash_value()`'s fields — a shown duplicate.
+    for c in "device".chars() {
+        editor.name_push(c);
+    }
+    assert_golden("hash_form_add_duplicate", &draw(&state, 130, 22));
 }
 
 #[test]
 fn golden_confirm_set_hash_field_shows_the_effective_command_and_its_guard() {
     let mut state = opened("user:8812:session", hash_value(), 2_537);
+    // `e` is focus-gated (G, PLAN M2 task 6 follow-up); `opened()` leaves
+    // focus on the keys pane.
+    state.focus = Pane::Value;
     let open = state.open.as_mut().unwrap();
     open.cursor_active = true;
     open.cursor = 1; // "device": a plain string, to keep this fixture about
@@ -1860,8 +1887,24 @@ fn golden_confirm_set_hash_field_shows_the_effective_command_and_its_guard() {
 }
 
 #[test]
+fn golden_hash_add_form_value_part_shows_field_above_the_active_editor() {
+    let mut state = opened("user:8812:session", hash_value(), 2_537);
+    state.focus = Pane::Value;
+    let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+    let state = "country".chars().fold(state, |s, c| {
+        update(s, Msg::Key(KeyPress::plain(KeyCode::Char(c)))).0
+    });
+    let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+    let mut state = state;
+    let editor = state.open.as_mut().unwrap().editor.as_mut().unwrap();
+    editor.insert_str("fr");
+    assert_golden("hash_form_add_value", &draw(&state, 130, 22));
+}
+
+#[test]
 fn golden_confirm_add_hash_field_shows_the_guard_and_only_a_plus_side() {
-    let state = opened("user:8812:session", hash_value(), 2_537);
+    let mut state = opened("user:8812:session", hash_value(), 2_537);
+    state.focus = Pane::Value;
     let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
     let state = "country".chars().fold(state, |s, c| {
         update(s, Msg::Key(KeyPress::plain(KeyCode::Char(c)))).0
@@ -2663,11 +2706,12 @@ fn the_open_row_is_underlined_and_the_cursor_row_is_not_merely_that() {
 #[test]
 fn down_moves_by_wrapped_row_in_a_value_with_no_newlines_once_drawn() {
     let token = "x".repeat(400);
-    let state = opened(
+    let mut state = opened(
         "user:8812:token",
         Value::Str(StringValue::new(&token, 65)),
         600,
     );
+    state.focus = Pane::Value;
     let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
     draw(&state, 130, 22);
     let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Down)));
@@ -2695,11 +2739,12 @@ fn the_editor_cursor_is_drawn_with_the_viewers_cursor_colour() {
     use ratatui::style::Modifier;
     use redis_pane_core::theme::Token;
     let token = "x".repeat(400);
-    let state = opened(
+    let mut state = opened(
         "user:8812:token",
         Value::Str(StringValue::new(&token, 65)),
         600,
     );
+    state.focus = Pane::Value;
     let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
     let theme = Theme::new(ColorDepth::TrueColor);
     let buf = render::frame(&state, &theme, &CLOCK, Rect::new(0, 0, 130, 22));

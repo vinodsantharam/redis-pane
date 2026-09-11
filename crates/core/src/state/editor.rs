@@ -32,10 +32,25 @@ pub enum EditTarget {
     /// (M2 task 4's original behaviour, unchanged).
     Value,
     /// One field of the Open Hash, being overwritten (`HSET`, guarded).
+    /// Always on [`FieldPart::Value`] — an existing field's name is read-only
+    /// (renaming is a follow-up).
     HashField { field: String },
     /// A brand-new field of the Open Hash, not yet on the server (`HSETNX`,
-    /// guarded).
-    NewHashField { field: String },
+    /// guarded) — the two-part `FIELD`/`VALUE` add form (PLAN M2 task 6
+    /// follow-up, F). `field` is itself being typed while `part` is
+    /// [`FieldPart::Name`].
+    NewHashField { field: String, part: FieldPart },
+}
+
+/// Which half of the add form (`FIELD`/`VALUE`) is active, while adding a new
+/// Hash field (PLAN M2 task 6 follow-up, F/N). Meaningless for
+/// [`EditTarget::Value`] and [`EditTarget::HashField`] — a String has no
+/// parts, and an existing field's name is never editable, so both are always
+/// "on the value" without needing to say so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldPart {
+    Name,
+    Value,
 }
 
 /// The reader's unsaved text in the value pane.
@@ -171,11 +186,12 @@ impl EditBuffer {
     }
 
     /// An empty buffer for a field that does not exist on the server yet
-    /// (`a`, PLAN M2 task 6, D4). There is no "original" to compare against
-    /// but an empty one — Redis allows an empty field value, so an
-    /// unmodified empty buffer still stages an `HSETNX` with an empty value
-    /// rather than being treated as "nothing to save".
-    pub fn new_hash_field(field: String) -> EditBuffer {
+    /// (`a`, PLAN M2 task 6 follow-up, F). Both the name and the value start
+    /// empty and the form opens on the name part — there is no "original" to
+    /// compare the value against but an empty one, and Redis allows an empty
+    /// field value, so an unmodified empty buffer still stages an `HSETNX`
+    /// with an empty value rather than being treated as "nothing to save".
+    pub fn new_hash_field() -> EditBuffer {
         let mut area = TextArea::new(vec![String::new()]);
         area.set_wrap_mode(WrapMode::WordOrGlyph);
         area.set_cursor_line_style(ratatui::style::Style::default());
@@ -184,13 +200,97 @@ impl EditBuffer {
             original: Vec::new(),
             was_json: false,
             staged: false,
-            target: EditTarget::NewHashField { field },
+            target: EditTarget::NewHashField {
+                field: String::new(),
+                part: FieldPart::Name,
+            },
         }
     }
 
     /// What this buffer writes back when staged.
     pub fn target(&self) -> &EditTarget {
         &self.target
+    }
+
+    /// The Hash field name, being typed ([`EditTarget::NewHashField`]) or
+    /// fixed ([`EditTarget::HashField`]). `None` for a plain String edit,
+    /// which has no field of its own.
+    pub fn field_name(&self) -> Option<&str> {
+        match &self.target {
+            EditTarget::HashField { field } | EditTarget::NewHashField { field, .. } => Some(field),
+            EditTarget::Value => None,
+        }
+    }
+
+    /// Which part of the add form is active. `None` outside
+    /// [`EditTarget::NewHashField`] — editing an existing field, and a plain
+    /// String, both have nothing but the value to be on.
+    pub fn active_part(&self) -> Option<FieldPart> {
+        match &self.target {
+            EditTarget::NewHashField { part, .. } => Some(*part),
+            _ => None,
+        }
+    }
+
+    /// Append to the name being typed. A no-op unless the name part is
+    /// active, so a stray call from the wrong mode can never corrupt it.
+    pub fn name_push(&mut self, c: char) {
+        if let EditTarget::NewHashField {
+            field,
+            part: FieldPart::Name,
+        } = &mut self.target
+        {
+            field.push(c);
+        }
+    }
+
+    /// One paste into the name, already stripped of newlines by the caller
+    /// (`Msg::Paste`'s job, the same as it is for the filter and the old
+    /// field-name capture).
+    pub fn name_push_str(&mut self, s: &str) {
+        if let EditTarget::NewHashField {
+            field,
+            part: FieldPart::Name,
+        } = &mut self.target
+        {
+            field.push_str(s);
+        }
+    }
+
+    pub fn name_pop(&mut self) {
+        if let EditTarget::NewHashField {
+            field,
+            part: FieldPart::Name,
+        } = &mut self.target
+        {
+            field.pop();
+        }
+    }
+
+    /// Move from the name part to the value part (`Enter`/`↓`). The caller
+    /// checks the name is non-empty and not a shown duplicate first (PLAN M2
+    /// task 6 follow-up, D) — this only ever moves a genuinely blank capture
+    /// forward if asked to, so the guard lives once, at the call site.
+    pub fn advance_to_value(&mut self) {
+        if let EditTarget::NewHashField { part, .. } = &mut self.target {
+            *part = FieldPart::Value;
+        }
+    }
+
+    /// Move from the value part back to the name part (`↑` at the top row).
+    /// A no-op outside [`EditTarget::NewHashField`] — there is no name part
+    /// to return to.
+    pub fn return_to_name(&mut self) {
+        if let EditTarget::NewHashField { part, .. } = &mut self.target {
+            *part = FieldPart::Name;
+        }
+    }
+
+    /// The value part's cursor, `(line, column)` — used to tell whether `↑`
+    /// actually moved anything (`crate::update::editor_key`).
+    pub fn cursor(&self) -> (usize, usize) {
+        let c = self.area.cursor();
+        (c.0, c.1)
     }
 
     /// The exact bytes the value had when the buffer was opened.

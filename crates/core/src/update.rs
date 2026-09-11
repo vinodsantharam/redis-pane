@@ -12,7 +12,7 @@ use crate::render::layout::{self, Pane};
 use crate::state::copy::{CopyWhat, redis_cli_command, value_text};
 use crate::state::value::Value;
 use crate::state::{
-    Attachment, EditBuffer, EditTarget, Link, OpenKey, PendingMutation, PendingRead,
+    Attachment, EditBuffer, EditTarget, FieldPart, Link, OpenKey, PendingMutation, PendingRead,
     ReadOnlyReason, ScanState, Tracking,
 };
 use crate::{Command, Msg, State};
@@ -460,18 +460,12 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
                 .and_then(|o| o.editor.as_mut())
                 .filter(|e| !e.is_staged())
             {
-                editor.insert_str(&text);
-                (state, Vec::new())
-            } else if state
-                .open
-                .as_ref()
-                .is_some_and(|o| o.field_capture.is_some())
-            {
-                let stripped: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
-                if let Some(open) = state.open.as_mut()
-                    && let Some(name) = &mut open.field_capture
-                {
-                    name.push_str(&stripped);
+                if editor.active_part() == Some(FieldPart::Name) {
+                    let stripped: String =
+                        text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+                    editor.name_push_str(&stripped);
+                } else {
+                    editor.insert_str(&text);
                 }
                 (state, Vec::new())
             } else if state.filtering {
@@ -586,16 +580,6 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
         .is_some_and(|e| !e.is_staged())
     {
         return editor_key(state, key);
-    }
-    // The field-name capture (`a` on a Hash) is a mode of its own too, the
-    // same rank as the editor above — it precedes an editor buffer rather
-    // than coexisting with one.
-    if state
-        .open
-        .as_ref()
-        .is_some_and(|o| o.field_capture.is_some())
-    {
-        return field_name_key(state, key);
     }
     // While the filter is capturing, ordinary characters are text rather than
     // commands. Only Esc and Enter mean anything else.
@@ -1144,6 +1128,21 @@ fn build_copy(state: State, what: CopyWhat) -> (State, Vec<Command>) {
 /// learning whether they are allowed to run it (DESIGN §6.5).
 fn open_editor(mut state: State) -> (State, Vec<Command>) {
     let notify = |text: &str| vec![Command::Notify { text: text.into() }];
+    // `e`/`a`/`d` are all focus-dependent (G, PLAN M2 task 6 follow-up): with
+    // the keys pane focused, moving the cursor there fetches nothing, so
+    // acting on whatever key happens to be open in the Viewer would be acting
+    // on a key the reader may not even be looking at. `pane_is_on_screen`
+    // still lets this action through in that case (there may be no value pane
+    // to focus at all, below 70 columns) — the notice, not silence, is what
+    // tells the reader to `Tab` over.
+    if state.keys_pane_focused() {
+        let text = if state.open.is_some() {
+            "Tab to the value pane to edit"
+        } else {
+            "open a key first"
+        };
+        return (state, notify(text));
+    }
     let Some(open) = state.open.as_ref() else {
         return (state, notify("nothing open to edit"));
     };
@@ -1193,16 +1192,24 @@ fn open_editor(mut state: State) -> (State, Vec<Command>) {
     }
 }
 
-/// Stages `a`: begins the one-line field-name capture on the Open Hash
-/// (PLAN M2 task 6, D1, D4). No cursor prerequisite — a new field has no row
-/// to have picked yet, unlike `e`.
+/// Stages `a`: opens the two-part `FIELD`/`VALUE` add form on the Open Hash,
+/// on the name part (PLAN M2 task 6 follow-up, F). No cursor prerequisite —
+/// a new field has no row to have picked yet, unlike `e`.
 ///
-/// Emits no command: like [`open_editor`], the capture lives entirely in the
-/// core until Enter turns it into a buffer. `editing` is set from the moment
-/// capture opens, the same R3.8 guard the editor itself relies on once one
-/// exists.
+/// Emits no command: the form lives entirely in the core, the same as every
+/// other inline edit. `editing` is set from the moment it opens — there is no
+/// longer a name-only capture stage before an [`EditBuffer`] exists, so this
+/// is also the moment one is created.
 fn begin_add_field(mut state: State) -> (State, Vec<Command>) {
     let notify = |text: &str| vec![Command::Notify { text: text.into() }];
+    if state.keys_pane_focused() {
+        let text = if state.open.is_some() {
+            "Tab to the value pane to edit"
+        } else {
+            "open a key first"
+        };
+        return (state, notify(text));
+    }
     let Some(open) = state.open.as_ref() else {
         return (state, notify("nothing open to edit"));
     };
@@ -1216,60 +1223,70 @@ fn begin_add_field(mut state: State) -> (State, Vec<Command>) {
         return (state, notify("fields can only be added to a hash"));
     }
     let open = state.open.as_mut().expect("checked above");
-    open.field_capture = Some(String::new());
+    open.editor = Some(EditBuffer::new_hash_field());
     open.editing = true;
     (state, Vec::new())
 }
 
-/// Keys read while `a` is capturing a new field's name (PLAN M2 task 6, D1,
-/// D4) — shaped like `filter_key`: plain characters append, Backspace removes
-/// one, Paste appends with newlines stripped (handled in `update`'s
-/// `Msg::Paste` arm, not here), Esc discards the capture outright, and Enter
-/// tries to continue into the editor.
-fn field_name_key(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
-    let Some(open) = state.open.as_mut() else {
-        return (state, Vec::new());
+/// Whether `Enter`, `↓` and `⌃S` are blocked on the add form's name part
+/// (PLAN M2 task 6 follow-up, D): an empty name, or one already in the
+/// fetched window. `true` with nothing to check at all, so a caller need not
+/// re-verify `open`/`editor` exist first.
+fn hash_add_blocked(state: &State) -> bool {
+    let Some(open) = &state.open else {
+        return true;
     };
-    match key.code {
-        KeyCode::Esc => {
-            open.field_capture = None;
-            open.editing = false;
-            (state, Vec::new())
-        }
-        // An empty name does nothing — still capturing, since there is
-        // nothing yet to open an editor on.
-        KeyCode::Enter if open.field_capture.as_deref().unwrap_or_default().is_empty() => {
-            (state, Vec::new())
-        }
-        KeyCode::Enter => {
-            let name = open.field_capture.clone().unwrap_or_default();
-            let exists = matches!(
-                &open.value,
-                Some(Value::Hash(pairs)) if pairs.pairs.iter().any(|(f, _)| *f == name)
-            );
-            if exists {
-                // Left capturing, so the name can be corrected without
-                // starting over.
-                return (
-                    state,
-                    vec![Command::Notify {
-                        text: "field exists — e to edit".into(),
-                    }],
-                );
+    let Some(name) = open.editor.as_ref().and_then(EditBuffer::field_name) else {
+        return true;
+    };
+    name.is_empty() || open.hash_field_shown_duplicate()
+}
+
+/// Keys read while the add form's name part is active (PLAN M2 task 6
+/// follow-up, F/N) — shaped like the old field-name capture it replaces:
+/// plain characters append, Backspace removes one, Paste appends with
+/// newlines stripped (handled in `update`'s `Msg::Paste` arm, not here).
+/// `Enter`/`↓` advance to the value part and `⌃S` stages directly from here,
+/// all three gated by [`hash_add_blocked`]; `Esc` discards the whole add.
+fn name_part_key(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
+    if let Some(action) = state.keymap.action_for(&key) {
+        match action {
+            Action::EditorStage => {
+                if hash_add_blocked(&state) {
+                    return (state, Vec::new());
+                }
+                return stage_editor(state);
             }
-            open.field_capture = None;
-            open.editor = Some(EditBuffer::new_hash_field(name));
+            // Esc always discards the buffer entirely, the same as every
+            // other Esc in the app — never a return to a prior draft.
+            Action::Cancel => {
+                if let Some(open) = &mut state.open {
+                    open.editor = None;
+                    open.editing = false;
+                }
+                return (state, Vec::new());
+            }
+            _ => {}
+        }
+    }
+    match key.code {
+        KeyCode::Enter | KeyCode::Down => {
+            if !hash_add_blocked(&state)
+                && let Some(editor) = state.open.as_mut().and_then(|o| o.editor.as_mut())
+            {
+                editor.advance_to_value();
+            }
             (state, Vec::new())
         }
         KeyCode::Backspace => {
-            if let Some(name) = &mut open.field_capture {
-                name.pop();
+            if let Some(editor) = state.open.as_mut().and_then(|o| o.editor.as_mut()) {
+                editor.name_pop();
             }
             (state, Vec::new())
         }
         KeyCode::Char(c) if !key.ctrl && !key.alt => {
-            if let Some(name) = &mut open.field_capture {
-                name.push(c);
+            if let Some(editor) = state.open.as_mut().and_then(|o| o.editor.as_mut()) {
+                editor.name_push(c);
             }
             (state, Vec::new())
         }
@@ -1321,7 +1338,7 @@ fn stage_editor(mut state: State) -> (State, Vec<Command>) {
             new,
             was_json,
         },
-        EditTarget::NewHashField { field } => PendingMutation::AddHashField {
+        EditTarget::NewHashField { field, .. } => PendingMutation::AddHashField {
             name,
             field: field.into_bytes(),
             value: new,
@@ -1331,7 +1348,11 @@ fn stage_editor(mut state: State) -> (State, Vec<Command>) {
     (state, Vec::new())
 }
 
-/// Keys read while the inline editor holds a buffer (ADR-0014).
+/// Keys read while the inline editor holds a buffer (ADR-0014), routed first
+/// by which part of the add form is active — the name part is a capture mode
+/// of its own ([`name_part_key`]), and everything else (a plain String, an
+/// existing field's value, or the add form's own value part) shares this
+/// function.
 ///
 /// Keymap-resolved actions (`EditorStage`/`EditorUndo`/`EditorRedo`/`Cancel`)
 /// are checked first, so a rebinding takes effect here too; everything else
@@ -1339,6 +1360,14 @@ fn stage_editor(mut state: State) -> (State, Vec<Command>) {
 /// own capture mode, since a text editor's movement and insertion keys are
 /// not meaningfully "actions" a user would rebind one at a time.
 fn editor_key(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
+    if state
+        .open
+        .as_ref()
+        .and_then(|o| o.editor.as_ref())
+        .is_some_and(|e| e.active_part() == Some(FieldPart::Name))
+    {
+        return name_part_key(state, key);
+    }
     if let Some(action) = state.keymap.action_for(&key) {
         match action {
             Action::EditorStage => return stage_editor(state),
@@ -1370,6 +1399,18 @@ fn editor_key(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
         return (state, Vec::new());
     };
     match key.code {
+        // On the add form's value part, `↑` returns to the name part once the
+        // cursor genuinely has nowhere left to go — the top screen row,
+        // including inside a wrapped first line (PLAN M2 task 6 follow-up,
+        // N). Everywhere else (an existing field, a plain String) `↑` is
+        // ordinary movement with nothing to leave to.
+        KeyCode::Up if editor.active_part() == Some(FieldPart::Value) => {
+            let before = editor.cursor();
+            editor.move_cursor(CursorMove::Up);
+            if editor.cursor() == before {
+                editor.return_to_name();
+            }
+        }
         KeyCode::Up => editor.move_cursor(CursorMove::Up),
         KeyCode::Down => editor.move_cursor(CursorMove::Down),
         KeyCode::Left => editor.move_cursor(CursorMove::Back),
@@ -1451,7 +1492,7 @@ fn edit_command_text(name: &str, target: &EditTarget) -> String {
     match target {
         EditTarget::Value => format!("SET {name}"),
         EditTarget::HashField { field } => format!("HSET {name} {field}"),
-        EditTarget::NewHashField { field } => format!("HSETNX {name} {field}"),
+        EditTarget::NewHashField { field, .. } => format!("HSETNX {name} {field}"),
     }
 }
 
@@ -3099,6 +3140,98 @@ mod tests {
             "from profile staging"
         );
     }
+
+    // ── PLAN M2 task 6 follow-up: focus-gated editing (G) ───────────────────
+
+    #[test]
+    fn e_in_the_keys_pane_gives_the_notice_and_does_not_open() {
+        let mut s = open_with_string("old");
+        s.focus = Pane::Keys;
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let open = s.open.as_ref().unwrap();
+        assert!(open.editor.is_none());
+        assert!(!open.editing);
+        assert!(
+            matches!(cmds.as_slice(), [Command::Notify { text }] if text == "Tab to the value pane to edit")
+        );
+    }
+
+    #[test]
+    fn a_in_the_keys_pane_gives_the_notice_and_does_not_open() {
+        let mut s = open_with_hash_for_gating();
+        s.focus = Pane::Keys;
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        assert!(s.open.as_ref().unwrap().editor.is_none());
+        assert!(
+            matches!(cmds.as_slice(), [Command::Notify { text }] if text == "Tab to the value pane to edit")
+        );
+    }
+
+    #[test]
+    fn d_in_the_keys_pane_stays_delete_key_not_hdel_with_a_hash_open() {
+        let mut s = open_with_hash_for_gating();
+        s.focus = Pane::Keys;
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        assert!(matches!(s.confirm, Some(PendingMutation::DeleteKey { .. })));
+    }
+
+    #[test]
+    fn e_with_nothing_open_in_the_keys_pane_says_open_a_key_first() {
+        let s = State {
+            focus: Pane::Keys,
+            ..State::default()
+        };
+        let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        assert!(
+            matches!(cmds.as_slice(), [Command::Notify { text }] if text == "open a key first")
+        );
+    }
+
+    #[test]
+    fn e_with_nothing_open_in_the_value_pane_says_nothing_open_to_edit() {
+        let s = State {
+            focus: Pane::Value,
+            ..State::default()
+        };
+        let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        assert!(
+            matches!(cmds.as_slice(), [Command::Notify { text }] if text == "nothing open to edit")
+        );
+    }
+
+    #[test]
+    fn e_and_a_refuse_a_key_confirmed_gone_before_it_ever_loaded() {
+        let mut s = State {
+            focus: Pane::Value,
+            ..State::default()
+        };
+        s.open = Some(OpenKey::gone(None, "k".into(), 0));
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        assert!(
+            matches!(cmds.as_slice(), [Command::Notify { text }] if text == "gone — nothing to edit")
+        );
+        let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        assert!(
+            matches!(cmds.as_slice(), [Command::Notify { text }] if text == "gone — nothing to edit")
+        );
+    }
+
+    fn open_with_hash_for_gating() -> State {
+        let value = crate::state::Value::Hash(crate::state::value::PairValue {
+            pairs: vec![("f".into(), "v".into())],
+            total: 1,
+        });
+        let mut state = State {
+            cols: 130,
+            rows: 40,
+            focus: Pane::Value,
+            open: Some(OpenKey::new(Some(0), "k".into(), value, -1, 10, 0)),
+            ..State::default()
+        };
+        state.keys.push(b"k");
+        state.rebuild_list();
+        state
+    }
 }
 
 #[cfg(test)]
@@ -3258,32 +3391,84 @@ mod hash_field_edit_tests {
         assert!(cmds.is_empty());
     }
 
+    // ── PLAN M2 task 6 follow-up: the two-part FIELD/VALUE add form (F, N) ──
+
     #[test]
-    fn a_then_a_name_then_enter_opens_an_editor_then_ctrl_s_stages_add_hash_field() {
+    fn a_opens_a_buffer_on_the_name_part() {
         let s = open_with_hash(&[("f", "v")], 1);
         let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
         assert!(cmds.is_empty());
+        let open = s.open.as_ref().unwrap();
         assert!(
-            s.open.as_ref().unwrap().editing,
-            "R3.8's guard is up from the moment capture opens"
+            open.editing,
+            "R3.8's guard is up from the moment the form opens"
         );
-        assert_eq!(s.open.as_ref().unwrap().field_capture.as_deref(), Some(""));
+        let editor = open.editor.as_ref().unwrap();
+        assert_eq!(editor.active_part(), Some(FieldPart::Name));
+        assert_eq!(editor.field_name(), Some(""));
+        assert_eq!(editor.text(), b"", "the value side starts empty too");
+    }
 
+    #[test]
+    fn typing_and_backspace_edit_the_name() {
+        let s = open_with_hash(&[("f", "v")], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
         let s = type_text(s, "new");
         assert_eq!(
-            s.open.as_ref().unwrap().field_capture.as_deref(),
+            s.open
+                .as_ref()
+                .unwrap()
+                .editor
+                .as_ref()
+                .unwrap()
+                .field_name(),
             Some("new")
         );
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Backspace)));
+        assert_eq!(
+            s.open
+                .as_ref()
+                .unwrap()
+                .editor
+                .as_ref()
+                .unwrap()
+                .field_name(),
+            Some("ne")
+        );
+    }
 
+    #[test]
+    fn enter_on_an_empty_name_does_nothing() {
+        let s = open_with_hash(&[("f", "v")], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
         let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
         assert!(cmds.is_empty());
-        assert!(s.open.as_ref().unwrap().field_capture.is_none());
         let editor = s.open.as_ref().unwrap().editor.as_ref().unwrap();
-        assert!(matches!(
-            editor.target(),
-            EditTarget::NewHashField { field } if field == "new"
-        ));
-        assert_eq!(editor.text(), b"");
+        assert_eq!(
+            editor.active_part(),
+            Some(FieldPart::Name),
+            "still on the name part"
+        );
+    }
+
+    #[test]
+    fn enter_moves_to_the_value_part_then_ctrl_s_stages_add_hash_field() {
+        let s = open_with_hash(&[("f", "v")], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "new");
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+        assert!(cmds.is_empty());
+        assert_eq!(
+            s.open
+                .as_ref()
+                .unwrap()
+                .editor
+                .as_ref()
+                .unwrap()
+                .active_part(),
+            Some(FieldPart::Value),
+            "Enter moved to the value part"
+        );
 
         let s = type_text(s, "value");
         let (s, cmds) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
@@ -3304,59 +3489,177 @@ mod hash_field_edit_tests {
     }
 
     #[test]
-    fn adding_a_field_with_an_empty_value_still_stages_because_redis_allows_it() {
+    fn down_also_moves_to_the_value_part() {
+        let s = open_with_hash(&[("f", "v")], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "new");
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Down)));
+        assert_eq!(
+            s.open
+                .as_ref()
+                .unwrap()
+                .editor
+                .as_ref()
+                .unwrap()
+                .active_part(),
+            Some(FieldPart::Value)
+        );
+    }
+
+    #[test]
+    fn up_on_the_values_top_row_returns_to_the_name_keeping_the_value_text() {
         let s = open_with_hash(&[("f", "v")], 1);
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
         let s = type_text(s, "new");
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
-        // No typing at all: the buffer is empty and unchanged from `original`
-        // (also empty) — unlike an edit, this must still stage.
+        let s = type_text(s, "fr");
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Up)));
+        let editor = s.open.as_ref().unwrap().editor.as_ref().unwrap();
+        assert_eq!(editor.active_part(), Some(FieldPart::Name));
+        assert_eq!(editor.text(), b"fr", "the value text is kept");
+        assert_eq!(editor.field_name(), Some("new"));
+    }
+
+    #[test]
+    fn up_inside_a_multiline_value_moves_up_a_line_and_stays_in_the_value_part() {
+        let s = open_with_hash(&[("f", "v")], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "new");
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+        let s = type_text(s, "line1");
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+        let s = type_text(s, "line2");
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Up)));
+        let editor = s.open.as_ref().unwrap().editor.as_ref().unwrap();
+        assert_eq!(
+            editor.active_part(),
+            Some(FieldPart::Value),
+            "moved up a line, not out of the value part"
+        );
+        assert_eq!(editor.text(), b"line1\nline2");
+
+        // A second `↑`, now genuinely on the top row, does leave.
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Up)));
+        let editor = s.open.as_ref().unwrap().editor.as_ref().unwrap();
+        assert_eq!(editor.active_part(), Some(FieldPart::Name));
+        assert_eq!(editor.text(), b"line1\nline2", "still kept");
+    }
+
+    #[test]
+    fn ctrl_s_from_the_name_part_stages_with_an_empty_value() {
+        let s = open_with_hash(&[("f", "v")], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "new");
+        // Staged straight from the name part — no typed value, no advance.
         let (s, cmds) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
         assert!(cmds.is_empty());
-        assert!(
-            matches!(&s.confirm, Some(PendingMutation::AddHashField { value, .. }) if value.is_empty())
-        );
+        match &s.confirm {
+            Some(PendingMutation::AddHashField { name, field, value }) => {
+                assert_eq!(name, b"k");
+                assert_eq!(field, b"new");
+                assert!(value.is_empty(), "Redis allows an empty field value");
+            }
+            other => panic!("expected a staged AddHashField, got {other:?}"),
+        }
     }
 
     #[test]
-    fn enter_on_an_empty_field_name_does_nothing() {
-        let s = open_with_hash(&[("f", "v")], 1);
-        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
-        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
-        assert!(cmds.is_empty());
-        assert!(
-            s.open.as_ref().unwrap().field_capture.is_some(),
-            "still capturing"
-        );
-        assert!(s.open.as_ref().unwrap().editor.is_none());
-    }
-
-    #[test]
-    fn a_name_already_present_gives_the_notice_and_stays_in_capture() {
-        let s = open_with_hash(&[("f", "v")], 1);
-        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
-        let s = type_text(s, "f");
-        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
-        assert!(
-            matches!(cmds.as_slice(), [Command::Notify { text }] if text == "field exists — e to edit")
-        );
-        assert_eq!(
-            s.open.as_ref().unwrap().field_capture.as_deref(),
-            Some("f"),
-            "left capturing, so the name can be corrected"
-        );
-        assert!(s.open.as_ref().unwrap().editor.is_none());
-    }
-
-    #[test]
-    fn esc_during_capture_discards_it() {
+    fn esc_from_the_name_part_discards_and_clears_editing() {
         let s = open_with_hash(&[("f", "v")], 1);
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
         let s = type_text(s, "new");
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Esc)));
         let open = s.open.unwrap();
-        assert!(open.field_capture.is_none());
+        assert!(open.editor.is_none());
         assert!(!open.editing);
+    }
+
+    #[test]
+    fn esc_from_the_value_part_discards_and_clears_editing() {
+        let s = open_with_hash(&[("f", "v")], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "new");
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+        let s = type_text(s, "value");
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Esc)));
+        let open = s.open.unwrap();
+        assert!(open.editor.is_none());
+        assert!(!open.editing);
+    }
+
+    #[test]
+    fn a_paste_into_the_name_strips_newlines() {
+        let s = open_with_hash(&[("f", "v")], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let (s, _) = update(s, Msg::Paste("new\r\nfield\n".into()));
+        assert_eq!(
+            s.open
+                .as_ref()
+                .unwrap()
+                .editor
+                .as_ref()
+                .unwrap()
+                .field_name(),
+            Some("newfield")
+        );
+    }
+
+    // ── PLAN M2 task 6 follow-up: the shown-duplicate guard (D) ─────────────
+
+    #[test]
+    fn a_shown_duplicate_name_blocks_enter_down_and_ctrl_s() {
+        let s = open_with_hash(&[("dup", "v")], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "dup");
+
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+        assert_eq!(
+            s.open
+                .as_ref()
+                .unwrap()
+                .editor
+                .as_ref()
+                .unwrap()
+                .active_part(),
+            Some(FieldPart::Name),
+            "Enter blocked"
+        );
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Down)));
+        assert_eq!(
+            s.open
+                .as_ref()
+                .unwrap()
+                .editor
+                .as_ref()
+                .unwrap()
+                .active_part(),
+            Some(FieldPart::Name),
+            "Down blocked too"
+        );
+        let (s, cmds) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(cmds.is_empty());
+        assert!(s.confirm.is_none(), "⌃S blocked too");
+    }
+
+    #[test]
+    fn removing_a_character_unblocks_a_duplicate_name() {
+        let s = open_with_hash(&[("dup", "v")], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "dup");
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Backspace)));
+        // "du" is not a shown field.
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+        assert_eq!(
+            s.open
+                .as_ref()
+                .unwrap()
+                .editor
+                .as_ref()
+                .unwrap()
+                .active_part(),
+            Some(FieldPart::Value),
+            "no longer a duplicate, so Enter advances"
+        );
     }
 
     #[test]

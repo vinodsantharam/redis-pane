@@ -176,6 +176,14 @@ pub struct OpenKey {
     /// Set while an editor holds an unsaved buffer. An arriving update never
     /// touches it — that is a bug, not a trade-off.
     pub editing: bool,
+    /// The reader's unsaved text, while the inline editor is open (R3.8).
+    ///
+    /// Distinct from `value`: this is what the reader is typing, never a
+    /// cache of what the server last said. `editing` is the R3.8 guard and
+    /// spans the buffer, the confirm dialog, and the `SET` in flight; this
+    /// field only exists for the middle third of that — it is `None` again
+    /// once the buffer closes, whether by staging or by `Esc`.
+    pub editor: Option<super::EditBuffer>,
     /// An update that arrived while the reader was not at rest.
     pub pending: Option<Pending>,
     /// The server said this key was deleted, expired or evicted. The last read
@@ -208,6 +216,7 @@ impl OpenKey {
             cursor_active: false,
             at_rest: true,
             editing: false,
+            editor: None,
             pending: None,
             deleted_at_ms: None,
             last_read: ReadOutcome::Opened,
@@ -237,6 +246,7 @@ impl OpenKey {
             cursor_active: false,
             at_rest: true,
             editing: false,
+            editor: None,
             pending: None,
             deleted_at_ms: Some(at_ms),
             last_read: ReadOutcome::Opened,

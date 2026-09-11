@@ -68,18 +68,6 @@ pub enum Command {
     /// one point where the chokepoint's decision (allowed, or refused by
     /// Read-only Mode) becomes a command a shell will actually run (R4.4).
     DeleteKey { index: usize, name: Vec<u8> },
-    /// Open the value in `$EDITOR` on a temp file (R3.2, R4.1).
-    ///
-    /// Handled synchronously by the terminal shell — not spawned onto a task
-    /// — because nothing else may draw over the terminal while the editor
-    /// owns it. `is_json` picks the temp file's extension, so the reader's
-    /// own editor applies JSON syntax highlighting automatically for a value
-    /// that reads as JSON.
-    EditInEditor {
-        name: Vec<u8>,
-        current: Vec<u8>,
-        is_json: bool,
-    },
     /// Overwrite a String value (`SET`).
     ///
     /// Only ever issued once the reader has confirmed the preview

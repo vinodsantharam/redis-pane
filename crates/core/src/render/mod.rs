@@ -11,10 +11,11 @@ pub mod layout;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
+use ratatui::widgets::Widget;
 
 use crate::clock::Clock;
 use crate::keymap::{Action, key_label};
-use crate::state::{Attachment, Link, Liveness, PendingMutation, PendingRead, State};
+use crate::state::{Attachment, EditBuffer, Link, Liveness, PendingMutation, PendingRead, State};
 use crate::theme::{Theme, Token, env_token};
 
 /// Render the whole frame into a fresh buffer of the given size.
@@ -308,13 +309,24 @@ fn value_pane(
     // TTL is counted down locally: the most time-sensitive figure on screen
     // costs no round trip (R3.9).
     let ttl = keys::format_ttl(open.ttl_now(now));
-    put(
+    let ttl_end = put(
         buf,
         x0,
         area.y + 2,
         &format!("ttl {ttl}"),
         sty(Token::Muted),
     );
+    // Whether the inline editor's current text still parses as JSON, when
+    // the value being edited was JSON-classified to begin with (ADR-0014) —
+    // the live counterpart to the confirm dialog's `⚠ no longer valid JSON`.
+    if let Some(valid) = open.editor.as_ref().and_then(EditBuffer::json_valid) {
+        let (label, token) = if valid {
+            (" · json ✓", Token::Muted)
+        } else {
+            (" · json ✗", Token::Warn)
+        };
+        put(buf, ttl_end, area.y + 2, label, sty(token));
+    }
 
     // A Refetch of this same key is in flight (invalidation re-arm, reconnect
     // re-arm, manual Refetch, …): the value already on screen stays exactly
@@ -376,6 +388,24 @@ fn value_pane(
     if body_height == 0 {
         return;
     }
+
+    // The inline editor takes over the whole body in place of the viewer's
+    // own rows (ADR-0014) — the same frame, header included, with an
+    // unsaved buffer where the read-only rows would otherwise be. Styled
+    // only from theme tokens, per DESIGN's rule against colour literals; a
+    // clone is unavoidable here because setting style needs `&mut
+    // TextArea`, while `State` — and therefore `EditBuffer` — is only ever
+    // borrowed immutably during render (ADR-0011).
+    if let Some(editor) = &open.editor {
+        let editor_area = Rect::new(x0, body_top, area.width.saturating_sub(2), body_height);
+        let mut widget = editor.widget().clone();
+        widget.set_style(sty(Token::Text));
+        widget.set_cursor_style(sty(Token::Selected));
+        widget.set_cursor_line_style(sty(Token::SurfaceDetached));
+        (&widget).render(editor_area, buf);
+        return;
+    }
+
     let cols = viewer.columns();
     let mut y = body_top;
     let inner = area.width.saturating_sub(2);
@@ -963,6 +993,15 @@ pub fn status_readout(state: &State, clock: &dyn Clock) -> Vec<(String, Token)> 
 pub fn hint_bar(state: &State) -> String {
     if state.filtering {
         return "Esc clear & exit   Enter apply".to_string();
+    }
+    // The inline editor is a mode of its own (ADR-0014), the same way filter
+    // capture is above: hard-coded wording, effective bindings looked up
+    // from the keymap so a rebinding still shows correctly (R7.5).
+    if state.open.as_ref().is_some_and(|o| o.editor.is_some()) {
+        let stage = state.keymap.hint(Action::EditorStage).unwrap_or_default();
+        let undo = state.keymap.hint(Action::EditorUndo).unwrap_or_default();
+        let cancel = state.keymap.hint(Action::Cancel).unwrap_or_default();
+        return format!("{stage} stage   {undo} undo   {cancel} cancel");
     }
     [
         Action::Cancel,

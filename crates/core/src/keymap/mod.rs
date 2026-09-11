@@ -77,10 +77,18 @@ pub enum Action {
     /// Confirm whatever mutation is currently staged and run it, or say why
     /// not if Read-only Mode refuses it. No-op with nothing staged.
     ConfirmMutation,
-    /// Stage an edit of the Open value's whole body in `$EDITOR` (R3.2, R4.1).
-    /// Acts on focus alone, like `Copy` — no cursor-mode prerequisite, since a
-    /// String has exactly one thing to edit, not rows to navigate to first.
+    /// Open the inline value editor on the Open value's whole body (R3.2,
+    /// R4.1, ADR-0014). Acts on focus alone, like `Copy` — no cursor-mode
+    /// prerequisite, since a String has exactly one thing to edit, not rows
+    /// to navigate to first.
     Edit,
+    /// Stage the inline editor's buffer for confirmation, or close it
+    /// silently if nothing changed (ADR-0014).
+    EditorStage,
+    /// Undo the last edit inside the inline editor.
+    EditorUndo,
+    /// Redo the last undone edit inside the inline editor.
+    EditorRedo,
 }
 
 impl Action {
@@ -117,8 +125,11 @@ impl Action {
             | Action::Open
             | Action::Delete => state.pane_visible(Pane::Keys),
             // Edits the Open value's body — meaningless without the value
-            // pane on screen to hold it.
-            Action::Edit => state.pane_visible(Pane::Value),
+            // pane on screen to hold it. The editor-scoped actions only ever
+            // matter while that same pane holds an open buffer.
+            Action::Edit | Action::EditorStage | Action::EditorUndo | Action::EditorRedo => {
+                state.pane_visible(Pane::Value)
+            }
             // Everything else is the app's, not a pane's: quitting, help, Esc,
             // `Tab` (which is what *changes* which pane is on screen), `r`
             // (already pane-scoped by R2.7 on its own terms), `Enter`
@@ -158,6 +169,9 @@ impl Action {
             Action::Delete => "delete",
             Action::ConfirmMutation => "confirm",
             Action::Edit => "edit",
+            Action::EditorStage => "stage",
+            Action::EditorUndo => "undo",
+            Action::EditorRedo => "redo",
         }
     }
 
@@ -204,6 +218,7 @@ pub fn key_label(key: &KeyPress) -> String {
         KeyCode::End => "End".into(),
         KeyCode::PageUp => "PgUp".into(),
         KeyCode::PageDown => "PgDn".into(),
+        KeyCode::Delete => "Del".into(),
     };
     match (key.ctrl, key.alt) {
         (true, _) => format!("⌃{}", base.to_uppercase()),
@@ -345,6 +360,22 @@ impl Default for Keymap {
                 Binding {
                     key: KeyPress::plain(KeyCode::Char('e')),
                     action: Action::Edit,
+                },
+                // Ctrl+S is reliable in raw mode on every platform this ships
+                // for (IXON cleared on Unix, processed input off on Windows).
+                // Ctrl+Enter/Shift+Enter are not, so they are not used here
+                // (ADR-0014).
+                Binding {
+                    key: KeyPress::ctrl(KeyCode::Char('s')),
+                    action: Action::EditorStage,
+                },
+                Binding {
+                    key: KeyPress::ctrl(KeyCode::Char('z')),
+                    action: Action::EditorUndo,
+                },
+                Binding {
+                    key: KeyPress::ctrl(KeyCode::Char('y')),
+                    action: Action::EditorRedo,
                 },
             ],
         }
@@ -505,6 +536,9 @@ mod tests {
             Action::Delete,
             Action::ConfirmMutation,
             Action::Edit,
+            Action::EditorStage,
+            Action::EditorUndo,
+            Action::EditorRedo,
         ] {
             assert!(k.key_for(action).is_some(), "{action:?} has no binding");
         }

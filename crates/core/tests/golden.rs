@@ -1731,6 +1731,93 @@ fn editing_is_visibly_distinct_from_plain_live_in_monochrome_too() {
     assert!(render::to_text(&mono).contains("editing"));
 }
 
+// ── M2 task 4 rework: the inline value editor (ADR-0014) ────────────────────
+
+use redis_pane_core::state::EditBuffer;
+
+#[test]
+fn golden_editor_open_on_a_string() {
+    let mut state = opened(
+        "user:8812:session",
+        Value::Str(StringValue::new("v1", 65)),
+        600,
+    );
+    let editor = EditBuffer::from_value(&Value::Str(StringValue::new(
+        "hello, this is the unsaved buffer",
+        65,
+    )))
+    .unwrap();
+    let open = state.open.as_mut().unwrap();
+    open.editor = Some(editor);
+    open.editing = true;
+    assert_golden("editor_open_on_a_string", &draw(&state, 130, 22));
+}
+
+#[test]
+fn golden_editor_json_invalid_shows_json_cross() {
+    let mut state = opened(
+        "user:8812:session",
+        Value::Json(JsonValue::parse("{\"a\":1}")),
+        600,
+    );
+    let mut editor = EditBuffer::from_value(&Value::Json(JsonValue::parse("{\"a\":1}"))).unwrap();
+    editor.insert_char('x'); // breaks the JSON
+    let open = state.open.as_mut().unwrap();
+    open.editor = Some(editor);
+    open.editing = true;
+    let frame = draw(&state, 130, 22);
+    assert!(
+        frame.contains("json ✗"),
+        "must show the invalid marker:\n{frame}"
+    );
+    assert_golden("editor_json_invalid", &frame);
+}
+
+#[test]
+fn golden_editor_wraps_a_long_line() {
+    let mut state = opened(
+        "user:8812:session",
+        Value::Str(StringValue::new("v1", 65)),
+        600,
+    );
+    let long = "word ".repeat(60);
+    let editor = EditBuffer::from_value(&Value::Str(StringValue::new(&long, 65))).unwrap();
+    let open = state.open.as_mut().unwrap();
+    open.editor = Some(editor);
+    open.editing = true;
+    assert_golden("editor_wraps_a_long_line", &draw(&state, 80, 22));
+}
+
+#[test]
+fn golden_editor_hint_bar() {
+    let mut state = opened(
+        "user:8812:session",
+        Value::Str(StringValue::new("v1", 65)),
+        600,
+    );
+    let editor = EditBuffer::from_value(&Value::Str(StringValue::new("v1", 65))).unwrap();
+    let open = state.open.as_mut().unwrap();
+    open.editor = Some(editor);
+    open.editing = true;
+    assert_eq!(hint_bar(&state), "⌃S stage   ⌃Z undo   Esc cancel");
+}
+
+#[test]
+fn golden_confirm_diff_after_staging_an_edit() {
+    let state = opened(
+        "user:8812:session",
+        Value::Str(StringValue::new("old value", 65)),
+        600,
+    );
+    let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+    let mut state = state;
+    let editor = state.open.as_mut().unwrap().editor.as_mut().unwrap();
+    editor.insert_str("!");
+    let (state, _) = update(state, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+    assert!(state.confirm.is_some());
+    assert_golden("editor_confirm_diff_after_staging", &draw(&state, 130, 22));
+}
+
 // ── UI task: type colour dots and the selection bar (style-verified) ────────
 
 use redis_pane_core::theme::Token;

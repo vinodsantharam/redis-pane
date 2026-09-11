@@ -28,3 +28,6 @@ C       copy redis-cli command
 d       delete
 y       confirm
 e       edit
+⌃S      stage
+⌃Z      undo
+⌃Y      redo

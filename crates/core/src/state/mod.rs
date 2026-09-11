@@ -6,6 +6,7 @@
 //! [`loaded::LoadedSet`].
 
 pub mod copy;
+pub mod editor;
 pub mod loaded;
 pub mod open;
 pub mod scan;
@@ -14,6 +15,7 @@ pub mod value;
 pub mod view;
 
 pub use copy::CopyWhat;
+pub use editor::EditBuffer;
 pub use loaded::{KeyKind, LoadedSet};
 pub use open::{Attachment, OpenKey, PendingRead, ReadOutcome};
 pub use scan::ScanState;

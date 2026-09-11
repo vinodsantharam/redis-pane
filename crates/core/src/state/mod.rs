@@ -241,7 +241,7 @@ impl PendingMutation {
             }
             PendingMutation::SetString { name, new, .. } => {
                 format!(
-                    "SET {} {}",
+                    "SET {} {} KEEPTTL XX",
                     String::from_utf8_lossy(name),
                     String::from_utf8_lossy(new)
                 )

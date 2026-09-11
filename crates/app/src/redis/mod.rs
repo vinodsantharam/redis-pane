@@ -306,13 +306,29 @@ pub async fn delete_key(client: &Client, name: &[u8]) -> Result<(), Error> {
 /// worth the explicit build-a-`Key`-first habit regardless, given fred has
 /// already surprised this module once.
 ///
+/// Sent as `SET name new KEEPTTL XX`, the command the confirm dialog
+/// previews. A plain `SET` clears the key's TTL, which quietly made every
+/// edited key permanent; `KEEPTTL` keeps whatever TTL the key has when the
+/// write lands. `XX` writes only if the key still exists: `Ok(false)` means
+/// it was gone — expired or deleted under the dialog — and nothing was
+/// written. The key is never recreated (ADR-0014).
+///
 /// The caller must not treat a successful call as the value now on screen —
 /// [`crate::terminal`] always re-reads through the one read path afterward
 /// (`Msg::ValueSet`), never trusts what it just wrote (ADR-0006).
-pub async fn set_value(client: &Client, name: &[u8], new: &[u8]) -> Result<(), Error> {
+pub async fn set_value(client: &Client, name: &[u8], new: &[u8]) -> Result<bool, Error> {
     let key = fred::types::Key::from(name);
-    let _: () = client.set(key, new.to_vec(), None, None, false).await?;
-    Ok(())
+    // `XX` answers nil rather than `OK` when it wrote nothing.
+    let reply: Option<String> = client
+        .set(
+            key,
+            new.to_vec(),
+            Some(fred::types::Expiration::KEEPTTL),
+            Some(fred::types::SetOptions::XX),
+            false,
+        )
+        .await?;
+    Ok(reply.is_some())
 }
 
 /// Exponential backoff with a ceiling, so a long outage does not turn into a

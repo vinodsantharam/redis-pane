@@ -107,5 +107,8 @@ _Avoid_: Renderer, panel, inspector, formatter
 The reader's unsaved text in the value pane, open while an inline edit is in progress. It is
 distinct from the Open key's read value: the buffer is what the reader is typing, never a copy of
 what the server last said, and a live update never touches it while it is open. It becomes a
-Staged mutation only when the reader asks — `Ctrl-S` — never on its own.
+Staged mutation only when the reader asks — `Ctrl-S` — never on its own. Once staged it stays on
+screen, taking no more keys, until the write is read back or the edit ends. If the key is gone by
+the time it would be written, nothing is written — the key is never recreated — and the buffer is
+handed back to be typed into.
 _Avoid_: Draft, scratch value, cache

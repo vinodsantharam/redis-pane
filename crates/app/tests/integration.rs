@@ -1244,14 +1244,78 @@ async fn setting_a_json_looking_value_preserves_the_bytes_exactly() {
         .unwrap();
     writer.init().await.unwrap();
     let compact = br#"{"a":1,"b":[1,2,3]}"#;
+    // An edit only ever overwrites a key that exists (`XX`).
+    let _: () = writer.set("cfg:1", "{}", None, None, false).await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    redis_pane::redis::set_value(&client, b"cfg:1", compact)
+    let written = redis_pane::redis::set_value(&client, b"cfg:1", compact)
         .await
         .unwrap();
+    assert!(written);
 
     let stored: Option<Vec<u8>> = writer.get("cfg:1").await.unwrap();
     assert_eq!(stored.as_deref(), Some(compact.as_slice()));
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn setting_a_value_keeps_the_keys_ttl() {
+    // A plain `SET` clears the TTL, which made every edited key permanent —
+    // a session or a lock that was meant to expire, living forever.
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer
+        .set(
+            "session:1",
+            "old",
+            Some(fred::types::Expiration::EX(600)),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let written = redis_pane::redis::set_value(&client, b"session:1", b"new")
+        .await
+        .unwrap();
+
+    assert!(written);
+    let now: Option<String> = writer.get("session:1").await.unwrap();
+    assert_eq!(now.as_deref(), Some("new"));
+    let ttl: i64 = writer.ttl("session:1").await.unwrap();
+    assert!(
+        (1..=600).contains(&ttl),
+        "TTL must survive the edit, got {ttl}"
+    );
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn setting_a_value_on_a_key_that_is_gone_writes_nothing_and_does_not_recreate_it() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let written = redis_pane::redis::set_value(&client, b"expired:1", b"new")
+        .await
+        .unwrap();
+
+    assert!(!written);
+    let exists: i64 = writer.exists("expired:1").await.unwrap();
+    assert_eq!(exists, 0, "the key must not be recreated");
 
     let _ = client.quit().await;
     let _ = writer.quit().await;

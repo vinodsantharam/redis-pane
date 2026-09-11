@@ -53,6 +53,12 @@ dominated by re-wrapping one long logical line at the pane's width, not by the e
 itself; outliers also appeared at 77KB, so they most likely reflect scheduler jitter on the
 machine the spike ran on rather than a size effect.
 
+**Amended after manual testing: the editor wraps with `WrapMode::WordOrGlyph`, not `Word`.** `Word`
+never splits a word wider than the pane, so a value with no spaces — a token, and the spike's own
+minified JSON — rendered as a single row with the cursor off-screen and could not be edited. The
+spike was re-run with `WordOrGlyph`: 200KB p99 5.8ms, 300KB p99 8.4ms, (b) and (c) unchanged. The
+200KB threshold stands.
+
 ## Decision
 
 **`e` opens an embedded editor (`ratatui-textarea`) directly in the value pane**, replacing the
@@ -89,6 +95,15 @@ old rule — *any* non-`y` key dismisses — discarded the whole preview on the 
 in the burst. A confirm dialog is not a place where "do nothing" should be reachable by an
 unrecognized key; only its two real actions should be.
 
+**The edit is written as `SET key value KEEPTTL XX`, and a key that is gone by then is never
+recreated.** A plain `SET` clears the TTL, which silently made every edited key permanent.
+`KEEPTTL` keeps whatever TTL the key has when the write lands, in the same atomic command; it needs
+Redis 6.0, which is the server floor (ADR-0007). `XX` writes only if the key still exists, and
+answers nil when it did not. When the key is gone — expired or deleted while the dialog was up —
+the dialog closes (at once if Liveness reports it gone, otherwise when the `SET` answers nil), the
+key is tombstoned, and the edited text goes back into the buffer, because it is the one thing on
+screen no read can recover. `Esc` still discards it.
+
 ## Alternatives considered
 
 **Keep `$EDITOR` as the default, harden the handoff instead.** Rejected for this change. Hardening
@@ -113,6 +128,18 @@ which is exactly the platform this decision most needs to work on.
 **Single-line prompts only, no multi-line buffer.** Rejected: cannot edit JSON, which is a named
 requirement (R3.2) and the value shape this project's users hit constantly (cached API responses,
 session blobs).
+
+**Recreate a key that expired under the dialog.** Rejected. The reader agreed to edit a key that
+existed; its absence is new information they did not have when they decided. Keys with a TTL are
+usually meant to disappear — sessions, locks, rate-limit counters, one-time tokens — and once one
+has expired its TTL is unrecoverable, so recreating means inventing a TTL or dropping it. Either is
+a silent guess, and on `prod` a resurrected lock or session with no TTL is an incident. Another
+Redis Desktop Manager does this (a plain `SET`, then `EXPIRE` with the TTL last shown on screen). If
+it is ever wanted, it is a separate action with its own confirmation.
+
+**Read the TTL, `SET … XX`, then `EXPIRE`** — RedisInsight's approach, which supports servers older
+than 6.0. Rejected: three round trips with a window where the TTL is lost or out of date, and a TTL
+read before the write rather than kept at it. `KEEPTTL` is available at this project's floor.
 
 ## Consequences
 
@@ -175,3 +202,7 @@ session blobs).
   <https://learn.microsoft.com/en-us/windows/console/createpseudoconsole>
 - kitty keyboard protocol (considered, not adopted, for future keybinding reliability):
   <https://sw.kovidgoyal.net/kitty/keyboard-protocol/>
+- RedisInsight string edit (`TTL`, `SET … XX`, `EXPIRE`):
+  <https://github.com/RedisInsight/RedisInsight/blob/main/redisinsight/api/src/modules/browser/string/string.service.ts>
+- Another Redis Desktop Manager string save (`SET`, then `EXPIRE`):
+  <https://github.com/qishibo/AnotherRedisDesktopManager/blob/master/src/components/contents/KeyContentString.vue>

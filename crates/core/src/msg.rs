@@ -272,6 +272,16 @@ pub enum Msg {
         name: String,
         at_ms: u64,
     },
+    /// A `SET … XX` from `Command::SetValue` wrote nothing: the key was gone
+    /// by the time it landed (R4.1, ADR-0014).
+    ///
+    /// Not a `Failed` — the server did as asked, and the edit is not over.
+    /// The key is tombstoned and the edited text goes back into the buffer,
+    /// since no read can recover it. Guarded by `name`, like `ValueSet`.
+    ValueSetKeyGone {
+        name: String,
+        at_ms: u64,
+    },
     /// An operation failed. Carries the command that failed (R7.4).
     ///
     /// Errors are never swallowed: a Redis error that produces no visible

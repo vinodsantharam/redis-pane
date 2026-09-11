@@ -430,9 +430,17 @@ pub async fn run(
                             .unwrap_or(0);
                         let name_str = String::from_utf8_lossy(&name).into_owned();
                         match crate::redis::set_value(&client, &name, &new).await {
-                            Ok(()) => {
+                            Ok(true) => {
                                 let _ = tx
                                     .send(Msg::ValueSet {
+                                        name: name_str,
+                                        at_ms,
+                                    })
+                                    .await;
+                            }
+                            Ok(false) => {
+                                let _ = tx
+                                    .send(Msg::ValueSetKeyGone {
                                         name: name_str,
                                         at_ms,
                                     })

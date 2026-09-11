@@ -329,11 +329,20 @@ a stray or leaked keystroke can never silently throw away a staged mutation (ADR
 **String values edit inline, in the value pane.** `e` opens an embedded text editor
 (`ratatui-textarea`) directly where the value was, replacing the body rows; the header keeps
 showing `✎ editing · changed · held` and, for a value that reads as JSON, a live `json ✓`/`json ✗`
-indicator next to the TTL. `Ctrl-S` stages the buffer for confirmation — the same command-preview
+indicator next to the TTL. The editor's cursor opens at the start of the line the Viewer's cursor
+was on, so `e` edits what you were looking at. After `y`, the value read back is shown at once,
+even with the cursor below the top row: this session's own write is never held as an update.
+`Ctrl-S` stages the buffer for confirmation — the same command-preview
 dialog every other mutation uses, showing a stacked diff (old value in red, new one in green, not
 a line-by-line diff) capped to a handful of lines so one long value cannot take over the screen —
 and `Esc` discards it outright, with no return to a prior draft. Staging with no actual change
-closes the buffer silently rather than opening an empty preview. `Ctrl-Z`/`Ctrl-Y` undo and redo
+closes the buffer silently rather than opening an empty preview. While the dialog is up, and until
+the write is read back, the pane keeps showing the edited text rather than the value it replaces.
+The write is `SET key value KEEPTTL XX`: it keeps whatever TTL the key has, and writes only if the
+key still exists. A key that is gone by then — expired or deleted under the dialog — is never
+recreated: nothing is written, the dialog closes (at once when Liveness sees the key go, otherwise
+at `y`), the key is badged gone, and the edited text goes back into the buffer rather than being
+lost, where `Esc` still discards it. `Ctrl-Z`/`Ctrl-Y` undo and redo
 inside the buffer. A value that already reads as JSON (R3.2) opens pretty-printed; the confirm
 dialog still warns, without blocking, if the edited text no longer parses — it is still just a
 STRING underneath, and Redis has no opinion on whether its bytes are valid JSON. Collection values
@@ -343,7 +352,7 @@ STRING underneath, and Redis has no opinion on whether its bytes are valid JSON.
 that threshold says so, and mentions that an external-editor escape hatch is planned for values
 too large to hold comfortably in the inline editor — without promising a keybinding, since none
 exists yet. The threshold comes from measuring `ratatui-textarea` 0.9.2 in release, keystroke plus
-full render, at 120×40 with word-wrap on: p99 was clean (≤8.5ms, comfortably inside the 16ms frame
+full render, at 120×40 wrapping at words and splitting any word wider than the pane: p99 was clean (≤8.5ms, comfortably inside the 16ms frame
 budget) at 100KB and 200KB on every run, while 300KB was noisy across runs — the cost is dominated
 by re-wrapping one long logical line, not by the edit operation itself. See
 [ADR-0014](adr/0014-values-are-edited-inline.md) for the full numbers and the rejected

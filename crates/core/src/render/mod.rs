@@ -391,18 +391,30 @@ fn value_pane(
 
     // The inline editor takes over the whole body in place of the viewer's
     // own rows (ADR-0014) — the same frame, header included, with an
-    // unsaved buffer where the read-only rows would otherwise be. Styled
-    // only from theme tokens, per DESIGN's rule against colour literals; a
-    // clone is unavoidable here because setting style needs `&mut
-    // TextArea`, while `State` — and therefore `EditBuffer` — is only ever
-    // borrowed immutably during render (ADR-0011).
+    // unsaved buffer where the read-only rows would otherwise be.
+    //
+    // The stored `TextArea` is drawn itself, never a clone: drawing is where
+    // it learns the pane's width and keeps its scroll position, and without
+    // that width `Up`/`Down` move by whole lines, which in a token is none.
+    // The text colour is painted underneath instead of set on the widget,
+    // since setting a style needs `&mut` and render only borrows `State`.
     if let Some(editor) = &open.editor {
         let editor_area = Rect::new(x0, body_top, area.width.saturating_sub(2), body_height);
-        let mut widget = editor.widget().clone();
-        widget.set_style(sty(Token::Text));
-        widget.set_cursor_style(sty(Token::Selected));
-        widget.set_cursor_line_style(sty(Token::SurfaceDetached));
-        (&widget).render(editor_area, buf);
+        buf.set_style(editor_area, sty(Token::Text));
+        editor.widget().render(editor_area, buf);
+        // The crate draws its cursor in reverse video, and nothing else in
+        // this area uses it, so that one cell is repainted with the token the
+        // Viewer's cursor uses.
+        let reversed = ratatui::style::Modifier::REVERSED;
+        for y in editor_area.top()..editor_area.bottom() {
+            for x in editor_area.left()..editor_area.right() {
+                let cell = &mut buf[(x, y)];
+                if cell.modifier.contains(reversed) {
+                    cell.modifier.remove(reversed);
+                    cell.set_style(sty(Token::Selected));
+                }
+            }
+        }
         return;
     }
 
@@ -735,8 +747,9 @@ fn confirm_overlay(
             lines.push((pending.command_text(), Token::Text));
         }
         PendingMutation::SetString { name, old, new, .. } => {
+            // The value itself is the `+` side of the diff below.
             lines.push((
-                format!("SET {}", String::from_utf8_lossy(name)),
+                format!("SET {} KEEPTTL XX", String::from_utf8_lossy(name)),
                 Token::Text,
             ));
             push_diff_side(&mut lines, "-", old, Token::Danger);
@@ -997,7 +1010,12 @@ pub fn hint_bar(state: &State) -> String {
     // The inline editor is a mode of its own (ADR-0014), the same way filter
     // capture is above: hard-coded wording, effective bindings looked up
     // from the keymap so a rebinding still shows correctly (R7.5).
-    if state.open.as_ref().is_some_and(|o| o.editor.is_some()) {
+    if state
+        .open
+        .as_ref()
+        .and_then(|o| o.editor.as_ref())
+        .is_some_and(|e| !e.is_staged())
+    {
         let stage = state.keymap.hint(Action::EditorStage).unwrap_or_default();
         let undo = state.keymap.hint(Action::EditorUndo).unwrap_or_default();
         let cancel = state.keymap.hint(Action::Cancel).unwrap_or_default();

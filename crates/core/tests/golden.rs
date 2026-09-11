@@ -1742,10 +1742,10 @@ fn golden_editor_open_on_a_string() {
         Value::Str(StringValue::new("v1", 65)),
         600,
     );
-    let editor = EditBuffer::from_value(&Value::Str(StringValue::new(
-        "hello, this is the unsaved buffer",
-        65,
-    )))
+    let editor = EditBuffer::from_value(
+        &Value::Str(StringValue::new("hello, this is the unsaved buffer", 65)),
+        0,
+    )
     .unwrap();
     let open = state.open.as_mut().unwrap();
     open.editor = Some(editor);
@@ -1760,7 +1760,8 @@ fn golden_editor_json_invalid_shows_json_cross() {
         Value::Json(JsonValue::parse("{\"a\":1}")),
         600,
     );
-    let mut editor = EditBuffer::from_value(&Value::Json(JsonValue::parse("{\"a\":1}"))).unwrap();
+    let mut editor =
+        EditBuffer::from_value(&Value::Json(JsonValue::parse("{\"a\":1}")), 0).unwrap();
     editor.insert_char('x'); // breaks the JSON
     let open = state.open.as_mut().unwrap();
     open.editor = Some(editor);
@@ -1781,7 +1782,7 @@ fn golden_editor_wraps_a_long_line() {
         600,
     );
     let long = "word ".repeat(60);
-    let editor = EditBuffer::from_value(&Value::Str(StringValue::new(&long, 65))).unwrap();
+    let editor = EditBuffer::from_value(&Value::Str(StringValue::new(&long, 65)), 0).unwrap();
     let open = state.open.as_mut().unwrap();
     open.editor = Some(editor);
     open.editing = true;
@@ -1795,7 +1796,7 @@ fn golden_editor_hint_bar() {
         Value::Str(StringValue::new("v1", 65)),
         600,
     );
-    let editor = EditBuffer::from_value(&Value::Str(StringValue::new("v1", 65))).unwrap();
+    let editor = EditBuffer::from_value(&Value::Str(StringValue::new("v1", 65)), 0).unwrap();
     let open = state.open.as_mut().unwrap();
     open.editor = Some(editor);
     open.editing = true;
@@ -2282,6 +2283,7 @@ fn golden_viewer_opening() {
         // is genuinely slow, so the placeholder must show.
         issued_at_ms: Some(73_000),
         activate_cursor: false,
+        own_write: false,
     });
     let frame = draw(&state, 130, 22);
     assert!(frame.contains("user:8812:session"), "{frame}");
@@ -2314,6 +2316,7 @@ fn golden_viewer_opening_a_fast_read_shows_nothing_at_all() {
         // 100ms elapsed against `CLOCK` (74_000) — under the 200ms gate.
         issued_at_ms: Some(73_900),
         activate_cursor: false,
+        own_write: false,
     });
     let frame = draw(&too_recent, 130, 22);
     assert_eq!(
@@ -2328,6 +2331,7 @@ fn golden_viewer_opening_a_fast_read_shows_nothing_at_all() {
         index: Some(2),
         issued_at_ms: None,
         activate_cursor: false,
+        own_write: false,
     });
     let frame = draw(&unstamped, 130, 22);
     assert_eq!(
@@ -2351,6 +2355,7 @@ fn golden_viewer_opening_a_different_key_than_the_one_already_shown() {
         index: Some(0),
         issued_at_ms: Some(73_000),
         activate_cursor: false,
+        own_write: false,
     });
     let frame = draw(&state, 130, 22);
     assert!(frame.contains("user:8812:cart"), "{frame}");
@@ -2377,6 +2382,7 @@ fn golden_viewer_refetching() {
         index: state.open.as_ref().unwrap().index,
         issued_at_ms: Some(73_000),
         activate_cursor: false,
+        own_write: false,
     });
     let frame = draw(&state, 130, 22);
     assert!(
@@ -2408,6 +2414,7 @@ fn golden_viewer_refetching_a_fast_reply_shows_nothing_at_all() {
         index: state.open.as_ref().unwrap().index,
         issued_at_ms: Some(73_900),
         activate_cursor: false,
+        own_write: false,
     });
     let frame = draw(&state, 130, 22);
     assert_eq!(
@@ -2541,5 +2548,70 @@ fn the_open_row_is_underlined_and_the_cursor_row_is_not_merely_that() {
             .add_modifier
             .contains(Modifier::UNDERLINED),
         "and the two marks are not the same mark"
+    );
+}
+
+/// Drawing is where the editor learns the pane's width. If the frame drew a
+/// copy, `Down` in a value with no newlines would have no row to go to.
+#[test]
+fn down_moves_by_wrapped_row_in_a_value_with_no_newlines_once_drawn() {
+    let token = "x".repeat(400);
+    let state = opened(
+        "user:8812:token",
+        Value::Str(StringValue::new(&token, 65)),
+        600,
+    );
+    let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+    draw(&state, 130, 22);
+    let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Down)));
+    let cursor = state
+        .open
+        .as_ref()
+        .unwrap()
+        .editor
+        .as_ref()
+        .unwrap()
+        .widget()
+        .cursor();
+    let (line, col) = (cursor.0, cursor.1);
+    assert_eq!(line, 0, "still the one logical line");
+    assert!(
+        col > 0,
+        "moved one wrapped row down, not nowhere: col {col}"
+    );
+}
+
+/// The crate's own cursor is reverse video, which on light text reads as
+/// barely anything. It is repainted with the Viewer's cursor token instead.
+#[test]
+fn the_editor_cursor_is_drawn_with_the_viewers_cursor_colour() {
+    use ratatui::style::Modifier;
+    use redis_pane_core::theme::Token;
+    let token = "x".repeat(400);
+    let state = opened(
+        "user:8812:token",
+        Value::Str(StringValue::new(&token, 65)),
+        600,
+    );
+    let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+    let theme = Theme::new(ColorDepth::TrueColor);
+    let buf = render::frame(&state, &theme, &CLOCK, Rect::new(0, 0, 130, 22));
+    let selected = theme.style(Token::Selected);
+    let cursor_cells = (1..22)
+        .flat_map(|y| (0..130).map(move |x| (x, y)))
+        .filter(|&(x, y)| {
+            let cell = &buf[(x, y)];
+            cell.symbol() == "x" && Some(cell.bg) == selected.bg && Some(cell.fg) == selected.fg
+        })
+        .count();
+    assert_eq!(
+        cursor_cells, 1,
+        "exactly the cursor, on a character of the value"
+    );
+    assert!(
+        !buf.content
+            .iter()
+            .any(|c| c.modifier.contains(Modifier::REVERSED)),
+        "no reverse-video cursor left over"
     );
 }

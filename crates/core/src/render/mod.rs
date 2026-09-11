@@ -1151,7 +1151,8 @@ pub fn hint_bar(state: &State) -> String {
                     .as_ref()
                     .is_some_and(|o| o.hash_field_shown_duplicate());
                 return if duplicate {
-                    "field exists — Esc, then e to edit".to_string()
+                    let edit = state.keymap.hint(Action::Edit).unwrap_or_default();
+                    format!("field exists — {cancel}, then {edit} to edit")
                 } else {
                     format!("Enter value · {cancel} cancel")
                 };

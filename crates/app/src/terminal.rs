@@ -6,9 +6,6 @@
 //! doing, because nothing here waits on the network.
 
 use std::io::{Stdout, stdout};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 use crossterm::event::{
     self, Event, KeyCode as XKeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton,
@@ -41,173 +38,10 @@ impl Drop for Guard {
         let _ = terminal::disable_raw_mode();
         let _ = execute!(
             stdout(),
+            event::DisableBracketedPaste,
             event::DisableMouseCapture,
             terminal::LeaveAlternateScreen
         );
-    }
-}
-
-/// How `Command::EditInEditor`'s `$EDITOR` round trip ended (R3.2, R4.1,
-/// PLAN M2 task 4).
-#[derive(Debug)]
-enum EditorOutcome {
-    /// A real change, ready to stage for confirmation.
-    Committed { old: Vec<u8>, new: Vec<u8> },
-    /// The editor exited non-zero, or the reader's edit produced no change
-    /// once the editor's own trailing-newline habit was normalized away.
-    Discarded,
-    /// The temp file, or the editor process itself, could not be handled.
-    Failed(String),
-}
-
-/// Deletes the temp file on drop, on every path — success, a discard, or a
-/// failure partway through. A Redis value can be a session token or a
-/// credential; leaving it sitting in a world-readable temp directory after
-/// the edit is done would undo the point of `secret.rs` treating passwords
-/// carefully elsewhere in this codebase.
-struct TempFileGuard(std::path::PathBuf);
-
-impl Drop for TempFileGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-/// Write `bytes` to a fresh temp file, `0600` on Unix. `create_new` refuses
-/// to open an existing path rather than silently reuse or truncate one —
-/// there is no reason a name this specific should already exist, and if it
-/// somehow does, that is worth failing loudly over rather than editing
-/// whatever was already there.
-fn write_temp_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    opts.open(path)?.write_all(bytes)
-}
-
-/// Runs the `$EDITOR` round trip for `Command::EditInEditor`: write the temp
-/// file, hand the terminal to the child process, read the result back.
-///
-/// Called inline (never spawned) from the main loop — nothing else may draw
-/// over the terminal while the editor owns it, so this is meant to block
-/// `run`'s loop for exactly as long as the reader is in their editor.
-/// `paused` is the input-reading thread's pause flag (see `run`'s doc
-/// comment on it): set for the span the child process has the terminal, so
-/// that thread is not competing with the child for the same input.
-async fn run_editor(current: Vec<u8>, is_json: bool, paused: &AtomicBool) -> EditorOutcome {
-    run_editor_with(&resolve_editor(), current, is_json, paused).await
-}
-
-/// `$VISUAL`, then `$EDITOR`, then `vi` as a last resort — the same fallback
-/// order most shells and `crontab -e` use.
-fn resolve_editor() -> String {
-    std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| "vi".to_string())
-}
-
-/// [`run_editor`]'s body, taking the editor command as a plain argument
-/// rather than reading it from the environment. Split out for exactly one
-/// reason: `$EDITOR`/`$VISUAL` are process-wide global state, and
-/// `cargo test` runs a crate's tests concurrently in one process — two tests
-/// each setting the env var to their own fake editor would race each other.
-/// Passing the command in directly sidesteps that instead of reaching for
-/// `--test-threads=1` and hoping nobody forgets it.
-async fn run_editor_with(
-    editor: &str,
-    current: Vec<u8>,
-    is_json: bool,
-    paused: &AtomicBool,
-) -> EditorOutcome {
-    let ext = if is_json { "json" } else { "txt" };
-    // A counter alongside the timestamp, not instead of it: `SystemTime`'s
-    // resolution is not guaranteed finer than the gap between two calls to
-    // this function, and only one edit happens at a time in the real app —
-    // but the test suite calls this concurrently, and a collision here would
-    // mean one test's temp file (silently, since names would be identical)
-    // fails to `create_new` under another test that got there first, not a
-    // logic bug in either test.
-    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!(
-        "redis-pane-edit-{}-{nanos}-{id}.{ext}",
-        std::process::id()
-    ));
-
-    if let Err(e) = write_temp_file(&path, &current) {
-        return EditorOutcome::Failed(format!("could not create a temp file to edit: {e}"));
-    }
-    let _cleanup = TempFileGuard(path.clone());
-
-    // Split on whitespace so `EDITOR="code --wait"` works, which is how a
-    // fair number of people configure a GUI editor to block until the file
-    // is closed; this is not a full shell-command parser (quoted arguments
-    // containing spaces will not survive), which matches what most tools
-    // that read `$EDITOR` this way accept as the limit of the convention.
-    let mut parts = editor.split_whitespace();
-    let Some(program) = parts.next() else {
-        return EditorOutcome::Failed("no editor configured — set $EDITOR".into());
-    };
-    let args: Vec<&str> = parts.collect();
-
-    paused.store(true, Ordering::Release);
-    let _ = terminal::disable_raw_mode();
-    let _ = execute!(
-        stdout(),
-        event::DisableMouseCapture,
-        terminal::LeaveAlternateScreen
-    );
-
-    let status = tokio::process::Command::new(program)
-        .args(&args)
-        .arg(&path)
-        .status()
-        .await;
-
-    let _ = terminal::enable_raw_mode();
-    let _ = execute!(
-        stdout(),
-        terminal::EnterAlternateScreen,
-        event::EnableMouseCapture
-    );
-    paused.store(false, Ordering::Release);
-
-    let status = match status {
-        Ok(status) => status,
-        Err(e) => return EditorOutcome::Failed(format!("could not run '{editor}': {e}")),
-    };
-    // Non-zero exit abandons the edit, the same convention `git commit -e`
-    // and `crontab -e` use — `:cq` in vim is the well-known way to do this on
-    // purpose, but any nonzero exit is treated the same.
-    if !status.success() {
-        return EditorOutcome::Discarded;
-    }
-
-    let mut new = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(e) => return EditorOutcome::Failed(format!("could not read the edit back: {e}")),
-    };
-
-    // The editor's own habit — vim, nano and emacs all do this by default —
-    // of appending a trailing newline on save is not something the reader
-    // asked for, and must never be mistaken for their edit.
-    if !current.ends_with(b"\n") && new.ends_with(b"\n") {
-        new.pop();
-    }
-
-    if new == current {
-        EditorOutcome::Discarded
-    } else {
-        EditorOutcome::Committed { old: current, new }
     }
 }
 
@@ -233,6 +67,7 @@ pub fn translate(key: KeyEvent) -> Option<Msg> {
         XKeyCode::End => KeyCode::End,
         XKeyCode::PageUp => KeyCode::PageUp,
         XKeyCode::PageDown => KeyCode::PageDown,
+        XKeyCode::Delete => KeyCode::Delete,
         _ => return None,
     };
     Some(Msg::Key(KeyPress {
@@ -276,7 +111,8 @@ pub async fn run(
     execute!(
         stdout(),
         terminal::EnterAlternateScreen,
-        event::EnableMouseCapture
+        event::EnableMouseCapture,
+        event::EnableBracketedPaste
     )?;
     let _guard = Guard;
 
@@ -286,31 +122,13 @@ pub async fn run(
     let (tx, mut rx) = mpsc::channel::<Msg>(256);
 
     // Keyboard reads block, so they live on their own thread and arrive as
-    // messages like everything else.
-    //
-    // `paused` exists for exactly one reason: `Command::EditInEditor` hands
-    // the terminal to a child process (`$EDITOR`), and that child reads the
-    // same fd this thread does. Two readers blocked on one terminal race for
-    // every byte a keystroke produces — this is what stops that. While
-    // `paused` is true the thread does not call `poll`/`read` at all, so it
-    // is not competing for the fd; a bounded `poll` timeout (rather than a
-    // blocking `read`) is what lets it notice `paused` promptly rather than
-    // sitting inside a `read()` call that will not return until the next
-    // keystroke, which might be the editor's, not ours, to receive.
-    let paused = Arc::new(AtomicBool::new(false));
+    // messages like everything else. A plain blocking `event::read()` —
+    // nothing here ever hands the terminal to a child process the way the
+    // `$EDITOR` escape hatch (Phase 2, `m2-editor-escape-hatch`) will, so
+    // there is no second reader to avoid racing for the same fd.
     let input_tx = tx.clone();
-    let input_paused = Arc::clone(&paused);
     std::thread::spawn(move || {
         loop {
-            if input_paused.load(Ordering::Acquire) {
-                std::thread::sleep(Duration::from_millis(50));
-                continue;
-            }
-            match event::poll(Duration::from_millis(50)) {
-                Ok(true) => {}
-                Ok(false) => continue,
-                Err(_) => return,
-            }
             match event::read() {
                 Ok(Event::Key(k)) => {
                     if let Some(msg) = translate(k)
@@ -328,6 +146,11 @@ pub async fn run(
                 }
                 Ok(Event::Resize(cols, rows)) => {
                     if input_tx.blocking_send(Msg::Resized { cols, rows }).is_err() {
+                        return;
+                    }
+                }
+                Ok(Event::Paste(text)) => {
+                    if input_tx.blocking_send(Msg::Paste(text)).is_err() {
                         return;
                     }
                 }
@@ -596,42 +419,6 @@ pub async fn run(
                             }
                         }
                     });
-                }
-                Command::EditInEditor {
-                    name,
-                    current,
-                    is_json,
-                } => {
-                    let name_str = String::from_utf8_lossy(&name).into_owned();
-                    let outcome = run_editor(current, is_json, &paused).await;
-                    // The editor left the alternate screen in whatever state
-                    // it quit in; nothing on screen is trustworthy until the
-                    // next frame redraws all of it.
-                    term.clear()?;
-                    match outcome {
-                        EditorOutcome::Committed { old, new } => {
-                            let _ = tx
-                                .send(Msg::EditCommitted {
-                                    name: name_str,
-                                    old,
-                                    new,
-                                })
-                                .await;
-                        }
-                        EditorOutcome::Discarded => {
-                            let _ = tx.send(Msg::EditDiscarded { name: name_str }).await;
-                        }
-                        EditorOutcome::Failed(detail) => {
-                            let at_ms = clock.now_ms();
-                            let _ = tx
-                                .send(Msg::Failed {
-                                    command: format!("editing {name_str}"),
-                                    detail,
-                                    at_ms,
-                                })
-                                .await;
-                        }
-                    }
                 }
                 Command::SetValue { name, new } => {
                     let client = client.clone();
@@ -1114,149 +901,5 @@ mod tests {
         }
         assert!(state.quitting);
         assert_eq!(commands, vec![Command::Quit]);
-    }
-
-    /// The `$EDITOR` round trip (PLAN M2 task 4), exercised with a real child
-    /// process — a tiny shell script standing in for the reader's editor —
-    /// rather than mocked, since the whole point is to prove the temp-file
-    /// and exit-status handling actually works. No Docker, no Redis: this
-    /// needs nothing `cargo test`'s default run doesn't already have.
-    mod editor_tests {
-        use super::*;
-
-        /// A disposable, executable shell script whose body is `body`,
-        /// deleted when the returned guard drops. Passed to
-        /// [`run_editor_with`] as the "editor" command directly — see that
-        /// function's doc comment for why this never touches `$EDITOR`
-        /// itself.
-        fn script(body: &str) -> TempFileGuard {
-            // A counter, not just a timestamp: these tests run concurrently
-            // (`#[tokio::test]`), and `SystemTime`'s resolution is not
-            // guaranteed finer than the gap between two tests calling this —
-            // a collision here would mean one test's script silently
-            // overwrites another's mid-run, which is exactly the kind of
-            // flake that looks like a bug in whichever test loses the race,
-            // not in this helper.
-            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let n = NEXT.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "redis-pane-test-editor-{}-{n}.sh",
-                std::process::id()
-            ));
-            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write fake editor");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-                    .expect("chmod fake editor");
-            }
-            TempFileGuard(path)
-        }
-
-        #[tokio::test]
-        async fn a_real_edit_is_committed() {
-            let editor = script(r#"printf 'new value' > "$1""#);
-            let paused = AtomicBool::new(false);
-            let outcome = run_editor_with(
-                editor.0.to_str().unwrap(),
-                b"old value".to_vec(),
-                false,
-                &paused,
-            )
-            .await;
-            match outcome {
-                EditorOutcome::Committed { old, new } => {
-                    assert_eq!(old, b"old value");
-                    assert_eq!(new, b"new value");
-                }
-                _ => panic!("expected a commit"),
-            }
-        }
-
-        #[tokio::test]
-        async fn saving_with_no_change_discards() {
-            let editor = script("true"); // exits 0 without touching the file
-            let paused = AtomicBool::new(false);
-            let outcome =
-                run_editor_with(editor.0.to_str().unwrap(), b"same".to_vec(), false, &paused).await;
-            assert!(matches!(outcome, EditorOutcome::Discarded));
-        }
-
-        /// The one rule the user was explicit about: an editor's own default
-        /// habit is never mistaken for something the reader typed.
-        #[tokio::test]
-        async fn a_trailing_newline_the_editor_added_on_its_own_is_not_a_change() {
-            let editor = script(r#"printf '%s\n' "$(cat "$1")" > "$1""#);
-            let paused = AtomicBool::new(false);
-            let outcome = run_editor_with(
-                editor.0.to_str().unwrap(),
-                b"no newline here".to_vec(),
-                false,
-                &paused,
-            )
-            .await;
-            assert!(
-                matches!(outcome, EditorOutcome::Discarded),
-                "an editor-added trailing newline must not count as an edit, got {outcome:?}"
-            );
-        }
-
-        /// A newline the reader actually typed — as opposed to one the
-        /// editor appended on save — still counts (only *exactly one*
-        /// editor-added trailing `\n` is normalized away).
-        #[tokio::test]
-        async fn a_deliberate_second_newline_still_commits() {
-            let editor = script(r#"printf '%s\n\n' "$(cat "$1")" > "$1""#);
-            let paused = AtomicBool::new(false);
-            let outcome = run_editor_with(
-                editor.0.to_str().unwrap(),
-                b"no newline here".to_vec(),
-                false,
-                &paused,
-            )
-            .await;
-            match outcome {
-                EditorOutcome::Committed { new, .. } => {
-                    assert_eq!(new, b"no newline here\n");
-                }
-                EditorOutcome::Discarded => panic!("expected a commit, got a discard"),
-                EditorOutcome::Failed(detail) => {
-                    panic!("expected a commit, got a failure: {detail}")
-                }
-            }
-        }
-
-        #[tokio::test]
-        async fn a_nonzero_exit_discards_even_if_the_file_was_touched() {
-            let editor = script(r#"printf 'changed' > "$1"; exit 1"#);
-            let paused = AtomicBool::new(false);
-            let outcome =
-                run_editor_with(editor.0.to_str().unwrap(), b"old".to_vec(), false, &paused).await;
-            assert!(matches!(outcome, EditorOutcome::Discarded));
-        }
-
-        #[tokio::test]
-        async fn a_missing_editor_fails_loudly_not_silently() {
-            let paused = AtomicBool::new(false);
-            let outcome = run_editor_with(
-                "/no/such/editor/binary-redis-pane-test",
-                b"old".to_vec(),
-                false,
-                &paused,
-            )
-            .await;
-            assert!(matches!(outcome, EditorOutcome::Failed(_)));
-        }
-
-        #[tokio::test]
-        async fn no_editor_configured_at_all_fails_loudly() {
-            let paused = AtomicBool::new(false);
-            // Whitespace-only: `split_whitespace` yields no program at all,
-            // the same shape `resolve_editor()` would never itself produce
-            // (its own fallback is `"vi"`) but `run_editor_with` must still
-            // handle since it takes the command as a plain string.
-            let outcome = run_editor_with("   ", b"old".to_vec(), false, &paused).await;
-            assert!(matches!(outcome, EditorOutcome::Failed(_)));
-        }
     }
 }

@@ -7,11 +7,13 @@ use crate::keymap::Action;
 use crate::msg::KeyCode;
 use crate::msg::KeyPress;
 use crate::msg::MouseAction;
+use crate::msg::NotWritten;
 use crate::render::layout::{self, Pane};
 use crate::state::copy::{CopyWhat, redis_cli_command, value_text};
+use crate::state::value::Value;
 use crate::state::{
-    Attachment, EditBuffer, Link, OpenKey, PendingMutation, PendingRead, ReadOnlyReason, ScanState,
-    Tracking,
+    Attachment, EditBuffer, EditTarget, Link, OpenKey, PendingMutation, PendingRead,
+    ReadOnlyReason, ScanState, Tracking,
 };
 use crate::{Command, Msg, State};
 
@@ -460,6 +462,18 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             {
                 editor.insert_str(&text);
                 (state, Vec::new())
+            } else if state
+                .open
+                .as_ref()
+                .is_some_and(|o| o.field_capture.is_some())
+            {
+                let stripped: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+                if let Some(open) = state.open.as_mut()
+                    && let Some(name) = &mut open.field_capture
+                {
+                    name.push_str(&stripped);
+                }
+                (state, Vec::new())
             } else if state.filtering {
                 let stripped: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
                 state.list.filter.push_str(&stripped);
@@ -484,37 +498,14 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             }
             (state, vec![Command::RefetchOpenKey { token }])
         }
-        Msg::ValueSetKeyGone { name, at_ms } => {
-            let Some(open) = state.open.as_mut().filter(|o| o.name == name) else {
+        Msg::NotWritten { name, why, at_ms } => not_written(state, name, why, at_ms),
+        Msg::HashFieldAlreadyGone { name, field, at_ms } => {
+            if !state.open.as_ref().is_some_and(|o| o.name == name) {
                 return (state, Vec::new());
-            };
-            // `XX` found no key, so nothing was written — and nothing is
-            // retried. The key is gone as surely as if a read had said so, and
-            // is tombstoned the same way; without Liveness this reply is the
-            // first thing to say so. It is never recreated: its TTL went with
-            // it, and a key that was meant to expire is not this edit's to
-            // bring back (ADR-0014).
-            open.deleted_at_ms = Some(at_ms);
-            open.pending = None;
-            // The edited text goes back into the buffer rather than being
-            // dropped: no read can recover it. `Esc` still discards it.
-            let kept = open.editor.is_some();
-            if kept {
-                open.unstage_buffer();
-            } else {
-                open.editing = false;
             }
-            if let Some(index) = open.index
-                && state.keys.name(index) == Some(name.as_bytes())
-            {
-                state.keys.set_gone(index);
-            }
-            let tail = if kept { ", edit kept" } else { "" };
-            state.error = Some((
-                format!("SET {name}: key no longer exists — nothing written{tail}"),
-                at_ms,
-            ));
-            (state, Vec::new())
+            state.notice = Some((format!("HDEL {name} {field}: field already gone"), at_ms));
+            let token = issue_refetch(&mut state);
+            (state, vec![Command::RefetchOpenKey { token }])
         }
         Msg::Quit => quit(state),
     }
@@ -595,6 +586,16 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
         .is_some_and(|e| !e.is_staged())
     {
         return editor_key(state, key);
+    }
+    // The field-name capture (`a` on a Hash) is a mode of its own too, the
+    // same rank as the editor above — it precedes an editor buffer rather
+    // than coexisting with one.
+    if state
+        .open
+        .as_ref()
+        .is_some_and(|o| o.field_capture.is_some())
+    {
+        return field_name_key(state, key);
     }
     // While the filter is capturing, ordinary characters are text rather than
     // commands. Only Esc and Enter mean anything else.
@@ -733,7 +734,10 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             }
             (state, Vec::new())
         }
-        Action::Delete => {
+        // `d` is focus-dependent (D4, PLAN M2 task 6), like `c`: the keys
+        // pane's Selected-key delete below is unchanged; the Viewer's
+        // Hash-field delete is new.
+        Action::Delete if state.keys_pane_focused() => {
             // The Selected key, not the Open key — the same target every
             // other keys-pane action takes. A gone row has nothing left to
             // delete.
@@ -747,6 +751,29 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
                 return (state, Vec::new());
             };
             state.confirm = Some(PendingMutation::DeleteKey { index, name });
+            (state, Vec::new())
+        }
+        Action::Delete => {
+            let notify = |text: &str| vec![Command::Notify { text: text.into() }];
+            let Some(open) = state.open.as_ref() else {
+                return (state, notify("nothing to remove here"));
+            };
+            let Some(Value::Hash(pairs)) = &open.value else {
+                return (state, notify("nothing to remove here"));
+            };
+            if !open.cursor_active {
+                return (state, notify("Enter to pick a field"));
+            }
+            let Some((field, _)) = pairs.pairs.get(open.cursor).cloned() else {
+                return (state, notify("Enter to pick a field"));
+            };
+            let last_field = pairs.total == 1;
+            let name = open.name.clone().into_bytes();
+            state.confirm = Some(PendingMutation::DeleteHashField {
+                name,
+                field: field.into_bytes(),
+                last_field,
+            });
             (state, Vec::new())
         }
         // Nothing is staged — `key_press` intercepts every keypress before
@@ -913,9 +940,10 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
         }
         Action::CopyCommand => build_copy(state, CopyWhat::Command),
         Action::Edit => open_editor(state),
+        Action::AddField => begin_add_field(state),
         // Nothing is open to edit: `key_press` intercepts every keypress
-        // before this match while an editor buffer exists, so these only
-        // ever reach here with no buffer to act on.
+        // before this match while an editor buffer or a field-name capture
+        // exists, so these only ever reach here with neither to act on.
         Action::EditorStage | Action::EditorUndo | Action::EditorRedo => (state, Vec::new()),
         Action::Filter => {
             state.filtering = true;
@@ -1130,6 +1158,27 @@ fn open_editor(mut state: State) -> (State, Vec<Command>) {
     let Some(value) = open.value.as_ref() else {
         return (state, notify("nothing open to edit"));
     };
+    // A Hash has no "whole value" to edit in place — `e` picks the field the
+    // value cursor is on instead (D4, PLAN M2 task 6). `Enter`
+    // (`Action::EnterValueCursor`) is what puts a cursor on a row at all, so
+    // without one there is nothing to have picked.
+    if let Value::Hash(pairs) = value {
+        if !open.cursor_active {
+            return (state, notify("Enter to pick a field"));
+        }
+        let Some((field, field_value)) = pairs.pairs.get(open.cursor).cloned() else {
+            return (state, notify("Enter to pick a field"));
+        };
+        return match EditBuffer::for_hash_field(field, &field_value) {
+            Ok(buffer) => {
+                let open = state.open.as_mut().expect("checked above");
+                open.editor = Some(buffer);
+                open.editing = true;
+                (state, Vec::new())
+            }
+            Err(text) => (state, notify(text)),
+        };
+    }
     match EditBuffer::from_value(value, open.cursor) {
         Ok(buffer) => {
             let open = state.open.as_mut().expect("checked above");
@@ -1144,6 +1193,90 @@ fn open_editor(mut state: State) -> (State, Vec<Command>) {
     }
 }
 
+/// Stages `a`: begins the one-line field-name capture on the Open Hash
+/// (PLAN M2 task 6, D1, D4). No cursor prerequisite — a new field has no row
+/// to have picked yet, unlike `e`.
+///
+/// Emits no command: like [`open_editor`], the capture lives entirely in the
+/// core until Enter turns it into a buffer. `editing` is set from the moment
+/// capture opens, the same R3.8 guard the editor itself relies on once one
+/// exists.
+fn begin_add_field(mut state: State) -> (State, Vec<Command>) {
+    let notify = |text: &str| vec![Command::Notify { text: text.into() }];
+    let Some(open) = state.open.as_ref() else {
+        return (state, notify("nothing open to edit"));
+    };
+    if open.deleted_at_ms.is_some() {
+        return (state, notify("gone — nothing to edit"));
+    }
+    if open.editing {
+        return (state, notify("still saving the last edit"));
+    }
+    if !matches!(open.value, Some(Value::Hash(_))) {
+        return (state, notify("fields can only be added to a hash"));
+    }
+    let open = state.open.as_mut().expect("checked above");
+    open.field_capture = Some(String::new());
+    open.editing = true;
+    (state, Vec::new())
+}
+
+/// Keys read while `a` is capturing a new field's name (PLAN M2 task 6, D1,
+/// D4) — shaped like `filter_key`: plain characters append, Backspace removes
+/// one, Paste appends with newlines stripped (handled in `update`'s
+/// `Msg::Paste` arm, not here), Esc discards the capture outright, and Enter
+/// tries to continue into the editor.
+fn field_name_key(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
+    let Some(open) = state.open.as_mut() else {
+        return (state, Vec::new());
+    };
+    match key.code {
+        KeyCode::Esc => {
+            open.field_capture = None;
+            open.editing = false;
+            (state, Vec::new())
+        }
+        // An empty name does nothing — still capturing, since there is
+        // nothing yet to open an editor on.
+        KeyCode::Enter if open.field_capture.as_deref().unwrap_or_default().is_empty() => {
+            (state, Vec::new())
+        }
+        KeyCode::Enter => {
+            let name = open.field_capture.clone().unwrap_or_default();
+            let exists = matches!(
+                &open.value,
+                Some(Value::Hash(pairs)) if pairs.pairs.iter().any(|(f, _)| *f == name)
+            );
+            if exists {
+                // Left capturing, so the name can be corrected without
+                // starting over.
+                return (
+                    state,
+                    vec![Command::Notify {
+                        text: "field exists — e to edit".into(),
+                    }],
+                );
+            }
+            open.field_capture = None;
+            open.editor = Some(EditBuffer::new_hash_field(name));
+            (state, Vec::new())
+        }
+        KeyCode::Backspace => {
+            if let Some(name) = &mut open.field_capture {
+                name.pop();
+            }
+            (state, Vec::new())
+        }
+        KeyCode::Char(c) if !key.ctrl && !key.alt => {
+            if let Some(name) = &mut open.field_capture {
+                name.push(c);
+            }
+            (state, Vec::new())
+        }
+        _ => (state, Vec::new()),
+    }
+}
+
 /// `⌃S`: stage the inline editor's buffer for confirmation, or close it
 /// silently if nothing changed (ADR-0014).
 ///
@@ -1155,22 +1288,44 @@ fn stage_editor(mut state: State) -> (State, Vec<Command>) {
     let Some(open) = state.open.as_mut() else {
         return (state, Vec::new());
     };
-    let Some(editor) = open.editor.as_mut() else {
+    let Some(editor) = open.editor.as_ref() else {
         return (state, Vec::new());
     };
-    if !editor.is_dirty() {
+    // A brand-new field has no prior value to be unchanged from — an empty
+    // value is a real value Redis allows, not "nothing to save" (D1).
+    let is_new_field = matches!(editor.target(), EditTarget::NewHashField { .. });
+    if !is_new_field && !editor.is_dirty() {
         open.editor = None;
         open.editing = false;
         return (state, Vec::new());
     }
     // Staged, not closed: the pane keeps showing what is about to be
     // written under the dialog, instead of the value it replaces.
+    let editor = open.editor.as_mut().expect("checked above");
     editor.stage();
-    let mutation = PendingMutation::SetString {
-        name: open.name.clone().into_bytes(),
-        old: editor.original().to_vec(),
-        new: editor.text(),
-        was_json: editor.was_json(),
+    let name = open.name.clone().into_bytes();
+    let original = editor.original().to_vec();
+    let new = editor.text();
+    let was_json = editor.was_json();
+    let mutation = match editor.target().clone() {
+        EditTarget::Value => PendingMutation::SetString {
+            name,
+            old: original,
+            new,
+            was_json,
+        },
+        EditTarget::HashField { field } => PendingMutation::SetHashField {
+            name,
+            field: field.into_bytes(),
+            old: original,
+            new,
+            was_json,
+        },
+        EditTarget::NewHashField { field } => PendingMutation::AddHashField {
+            name,
+            field: field.into_bytes(),
+            value: new,
+        },
     };
     state.confirm = Some(mutation);
     (state, Vec::new())
@@ -1289,18 +1444,104 @@ fn confirm_key(mut state: State, pending: PendingMutation, key: KeyPress) -> (St
     }
 }
 
+/// The command an [`EditBuffer`] is about to write, for a `Msg::NotWritten`
+/// error's text. Derived from the target rather than carried in the message —
+/// the buffer already knows (PLAN M2 task 6, D2).
+fn edit_command_text(name: &str, target: &EditTarget) -> String {
+    match target {
+        EditTarget::Value => format!("SET {name}"),
+        EditTarget::HashField { field } => format!("HSET {name} {field}"),
+        EditTarget::NewHashField { field } => format!("HSETNX {name} {field}"),
+    }
+}
+
+/// `Msg::NotWritten`: a guarded write's precondition was no longer true by
+/// the time it reached the server (PLAN M2 task 6, D1, ADR-0014, ADR-0015).
+///
+/// `KeyGone` is exactly the String path's old behaviour: tombstone the key,
+/// as surely as a read saying so would, and hand the edited text back to the
+/// buffer since no read can recover it. `FieldGone`/`FieldExists` are not a
+/// tombstone — the key is still there — so instead of ending the edit this
+/// hands the buffer back and re-reads: R3.8 holds the reply, because the
+/// buffer is open again by the time it lands.
+fn not_written(
+    mut state: State,
+    name: String,
+    why: NotWritten,
+    at_ms: u64,
+) -> (State, Vec<Command>) {
+    let Some(open) = state.open.as_ref().filter(|o| o.name == name) else {
+        return (state, Vec::new());
+    };
+    let command = open
+        .editor
+        .as_ref()
+        .map(|e| edit_command_text(&name, e.target()))
+        .unwrap_or_else(|| format!("SET {name}"));
+    match why {
+        NotWritten::KeyGone => {
+            let open = state.open.as_mut().expect("checked above");
+            open.deleted_at_ms = Some(at_ms);
+            open.pending = None;
+            let kept = open.editor.is_some();
+            if kept {
+                open.unstage_buffer();
+            } else {
+                open.editing = false;
+            }
+            if let Some(index) = open.index
+                && state.keys.name(index) == Some(name.as_bytes())
+            {
+                state.keys.set_gone(index);
+            }
+            let tail = if kept { ", edit kept" } else { "" };
+            state.error = Some((
+                format!("{command}: key no longer exists — nothing written{tail}"),
+                at_ms,
+            ));
+            (state, Vec::new())
+        }
+        NotWritten::FieldGone | NotWritten::FieldExists => {
+            if let Some(open) = state.open.as_mut() {
+                open.unstage_buffer();
+            }
+            let reason = if why == NotWritten::FieldGone {
+                "field no longer exists"
+            } else {
+                "field already exists"
+            };
+            state.error = Some((
+                format!("{command}: {reason} — nothing written, edit kept"),
+                at_ms,
+            ));
+            let token = issue_refetch(&mut state);
+            (state, vec![Command::RefetchOpenKey { token }])
+        }
+    }
+}
+
 /// The Open key came back gone while an edit of it may be staged (ADR-0014).
 ///
 /// Under the confirm dialog there is no key left for `SET … XX` to write to,
 /// so the dialog closes and the buffer is handed back to be typed into: the
 /// reader's text is the one thing on screen no read can recover. With the
 /// `SET` already sent, its own reply decides (`Msg::ValueSet` or
-/// `Msg::ValueSetKeyGone`). Once the write has landed, a staged buffer was
+/// `Msg::NotWritten`). Once the write has landed, a staged buffer was
 /// only standing in for the read back, and goes.
 fn staged_edit_found_key_gone(state: &mut State, name: &str, at_ms: u64) {
+    // Every mutation that names this key, not just `SetString` — a
+    // `SetHashField`/`AddHashField` dialog closes and hands its buffer back
+    // exactly the same way; a `DeleteHashField` dialog simply closes with the
+    // notice, since it never had a buffer to hand back (`unstage_buffer` is a
+    // no-op with none).
     let dialog_up = matches!(
         &state.confirm,
-        Some(PendingMutation::SetString { name: staged, .. }) if staged == name.as_bytes()
+        Some(
+            PendingMutation::SetString { name: staged, .. }
+            | PendingMutation::SetHashField { name: staged, .. }
+            | PendingMutation::AddHashField { name: staged, .. }
+            | PendingMutation::DeleteHashField { name: staged, .. }
+        ) if staged == name.as_bytes()
     );
     let Some(open) = state.open.as_mut().filter(|o| o.name == name) else {
         return;
@@ -2518,8 +2759,9 @@ mod tests {
         );
         let (s, cmds) = update(
             s,
-            Msg::ValueSetKeyGone {
+            Msg::NotWritten {
                 name: "k".into(),
+                why: NotWritten::KeyGone,
                 at_ms: 9_100,
             },
         );
@@ -2537,8 +2779,9 @@ mod tests {
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
         let (s, cmds) = update(
             s,
-            Msg::ValueSetKeyGone {
+            Msg::NotWritten {
                 name: "k".into(),
+                why: NotWritten::KeyGone,
                 at_ms: 9_100,
             },
         );
@@ -2590,8 +2833,9 @@ mod tests {
         let s = open_with_string("old");
         let (s, cmds) = update(
             s,
-            Msg::ValueSetKeyGone {
+            Msg::NotWritten {
                 name: "some other key".into(),
+                why: NotWritten::KeyGone,
                 at_ms: 9_000,
             },
         );
@@ -2853,6 +3097,555 @@ mod tests {
         assert_eq!(
             Source::Profile("staging".into()).label(),
             "from profile staging"
+        );
+    }
+}
+
+#[cfg(test)]
+mod hash_field_edit_tests {
+    //! `e`/`a`/`d` on a Hash field (PLAN M2 task 6, D1–D4): editing a field,
+    //! adding one, removing one, all through the same mutation chokepoint and
+    //! R3.8 guard the String editor already proved.
+
+    use super::*;
+    use crate::msg::KeyCode;
+    use crate::state::value::PairValue;
+
+    fn open_with_hash(pairs: &[(&str, &str)], total: usize) -> State {
+        let value = crate::state::Value::Hash(PairValue {
+            pairs: pairs
+                .iter()
+                .map(|(f, v)| (f.to_string(), v.to_string()))
+                .collect(),
+            total,
+        });
+        let mut state = State {
+            cols: 130,
+            rows: 40,
+            focus: Pane::Value,
+            open: Some(OpenKey::new(Some(0), "k".into(), value, -1, 10, 0)),
+            ..State::default()
+        };
+        state.keys.push(b"k");
+        state.rebuild_list();
+        state
+    }
+
+    /// The value cursor's row (`Enter` first) is what `e`/`a`/`d` act on.
+    fn with_cursor(mut s: State, row: usize) -> State {
+        let open = s.open.as_mut().unwrap();
+        open.cursor_active = true;
+        open.cursor = row;
+        s
+    }
+
+    fn type_text(mut s: State, text: &str) -> State {
+        for c in text.chars() {
+            (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char(c))));
+        }
+        s
+    }
+
+    #[test]
+    fn e_without_a_cursor_gives_the_notice() {
+        let s = open_with_hash(&[("f", "v")], 1);
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        assert!(!s.open.unwrap().editing);
+        assert!(
+            matches!(cmds.as_slice(), [Command::Notify { text }] if text == "Enter to pick a field")
+        );
+    }
+
+    #[test]
+    fn e_on_a_row_opens_the_raw_field_value_not_reformatted_json() {
+        let s = with_cursor(open_with_hash(&[("a", "1"), ("b", "{\"x\":1}")], 2), 1);
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        assert!(cmds.is_empty());
+        let open = s.open.as_ref().unwrap();
+        assert!(open.editing);
+        let editor = open.editor.as_ref().unwrap();
+        assert_eq!(editor.text(), b"{\"x\":1}", "raw, not pretty-printed");
+        assert!(
+            editor.was_json(),
+            "still classified, for the dialog's warning"
+        );
+        assert!(matches!(
+            editor.target(),
+            EditTarget::HashField { field } if field == "b"
+        ));
+    }
+
+    #[test]
+    fn ctrl_s_stages_set_hash_field_with_the_right_field_old_new_and_command_text() {
+        let s = with_cursor(open_with_hash(&[("f", "old")], 1), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let s = type_text(s, "!");
+        let (s, cmds) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(cmds.is_empty());
+        match &s.confirm {
+            Some(PendingMutation::SetHashField {
+                name,
+                field,
+                old,
+                new,
+                was_json,
+            }) => {
+                assert_eq!(name, b"k");
+                assert_eq!(field, b"f");
+                assert_eq!(old, b"old");
+                assert_eq!(new, b"!old");
+                assert!(!was_json);
+            }
+            other => panic!("expected a staged SetHashField, got {other:?}"),
+        }
+        assert_eq!(s.confirm.as_ref().unwrap().command_text(), "HSET k f");
+        assert_eq!(
+            s.confirm.as_ref().unwrap().guard_text(),
+            Some("only if the field still exists · keeps its TTL")
+        );
+        let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        assert_eq!(
+            cmds,
+            vec![Command::SetHashField {
+                name: b"k".to_vec(),
+                field: b"f".to_vec(),
+                value: b"!old".to_vec(),
+            }]
+        );
+    }
+
+    #[test]
+    fn ctrl_s_with_no_change_to_a_hash_field_closes_silently() {
+        let s = with_cursor(open_with_hash(&[("f", "v")], 1), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let (s, cmds) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        let open = s.open.unwrap();
+        assert!(!open.editing);
+        assert!(open.editor.is_none());
+        assert!(s.confirm.is_none());
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn a_then_a_name_then_enter_opens_an_editor_then_ctrl_s_stages_add_hash_field() {
+        let s = open_with_hash(&[("f", "v")], 1);
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        assert!(cmds.is_empty());
+        assert!(
+            s.open.as_ref().unwrap().editing,
+            "R3.8's guard is up from the moment capture opens"
+        );
+        assert_eq!(s.open.as_ref().unwrap().field_capture.as_deref(), Some(""));
+
+        let s = type_text(s, "new");
+        assert_eq!(
+            s.open.as_ref().unwrap().field_capture.as_deref(),
+            Some("new")
+        );
+
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+        assert!(cmds.is_empty());
+        assert!(s.open.as_ref().unwrap().field_capture.is_none());
+        let editor = s.open.as_ref().unwrap().editor.as_ref().unwrap();
+        assert!(matches!(
+            editor.target(),
+            EditTarget::NewHashField { field } if field == "new"
+        ));
+        assert_eq!(editor.text(), b"");
+
+        let s = type_text(s, "value");
+        let (s, cmds) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(cmds.is_empty());
+        match &s.confirm {
+            Some(PendingMutation::AddHashField { name, field, value }) => {
+                assert_eq!(name, b"k");
+                assert_eq!(field, b"new");
+                assert_eq!(value, b"value");
+            }
+            other => panic!("expected a staged AddHashField, got {other:?}"),
+        }
+        assert_eq!(s.confirm.as_ref().unwrap().command_text(), "HSETNX k new");
+        assert_eq!(
+            s.confirm.as_ref().unwrap().guard_text(),
+            Some("only if the key still exists · never overwrites a field")
+        );
+    }
+
+    #[test]
+    fn adding_a_field_with_an_empty_value_still_stages_because_redis_allows_it() {
+        let s = open_with_hash(&[("f", "v")], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "new");
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+        // No typing at all: the buffer is empty and unchanged from `original`
+        // (also empty) — unlike an edit, this must still stage.
+        let (s, cmds) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(cmds.is_empty());
+        assert!(
+            matches!(&s.confirm, Some(PendingMutation::AddHashField { value, .. }) if value.is_empty())
+        );
+    }
+
+    #[test]
+    fn enter_on_an_empty_field_name_does_nothing() {
+        let s = open_with_hash(&[("f", "v")], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+        assert!(cmds.is_empty());
+        assert!(
+            s.open.as_ref().unwrap().field_capture.is_some(),
+            "still capturing"
+        );
+        assert!(s.open.as_ref().unwrap().editor.is_none());
+    }
+
+    #[test]
+    fn a_name_already_present_gives_the_notice_and_stays_in_capture() {
+        let s = open_with_hash(&[("f", "v")], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "f");
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+        assert!(
+            matches!(cmds.as_slice(), [Command::Notify { text }] if text == "field exists — e to edit")
+        );
+        assert_eq!(
+            s.open.as_ref().unwrap().field_capture.as_deref(),
+            Some("f"),
+            "left capturing, so the name can be corrected"
+        );
+        assert!(s.open.as_ref().unwrap().editor.is_none());
+    }
+
+    #[test]
+    fn esc_during_capture_discards_it() {
+        let s = open_with_hash(&[("f", "v")], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "new");
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Esc)));
+        let open = s.open.unwrap();
+        assert!(open.field_capture.is_none());
+        assert!(!open.editing);
+    }
+
+    #[test]
+    fn d_in_the_value_pane_stages_delete_hash_field_and_marks_the_last_field() {
+        let s = with_cursor(open_with_hash(&[("f", "v")], 1), 0);
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        assert!(cmds.is_empty());
+        match &s.confirm {
+            Some(PendingMutation::DeleteHashField {
+                name,
+                field,
+                last_field,
+            }) => {
+                assert_eq!(name, b"k");
+                assert_eq!(field, b"f");
+                assert!(*last_field);
+            }
+            other => panic!("expected a staged DeleteHashField, got {other:?}"),
+        }
+        assert_eq!(s.confirm.as_ref().unwrap().command_text(), "HDEL k f");
+    }
+
+    #[test]
+    fn d_with_more_than_one_field_left_is_not_marked_as_the_last() {
+        let s = with_cursor(open_with_hash(&[("a", "1"), ("b", "2")], 2), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        match &s.confirm {
+            Some(PendingMutation::DeleteHashField { last_field, .. }) => assert!(!last_field),
+            other => panic!("expected a staged DeleteHashField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn d_without_a_cursor_in_the_value_pane_gives_the_notice() {
+        let s = open_with_hash(&[("f", "v")], 1);
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        assert!(s.confirm.is_none());
+        assert!(
+            matches!(cmds.as_slice(), [Command::Notify { text }] if text == "Enter to pick a field")
+        );
+    }
+
+    #[test]
+    fn d_in_the_keys_pane_still_stages_delete_key() {
+        let mut s = open_with_hash(&[("f", "v")], 1);
+        s.focus = Pane::Keys;
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        assert!(matches!(s.confirm, Some(PendingMutation::DeleteKey { .. })));
+    }
+
+    #[test]
+    fn read_only_refuses_all_three_hash_mutations_at_confirm() {
+        let mutations = [
+            PendingMutation::SetHashField {
+                name: b"k".to_vec(),
+                field: b"f".to_vec(),
+                old: b"o".to_vec(),
+                new: b"n".to_vec(),
+                was_json: false,
+            },
+            PendingMutation::AddHashField {
+                name: b"k".to_vec(),
+                field: b"f".to_vec(),
+                value: b"v".to_vec(),
+            },
+            PendingMutation::DeleteHashField {
+                name: b"k".to_vec(),
+                field: b"f".to_vec(),
+                last_field: false,
+            },
+        ];
+        for mutation in mutations {
+            let s = State {
+                read_only: Some(ReadOnlyReason::User),
+                confirm: Some(mutation.clone()),
+                ..State::default()
+            };
+            let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+            assert!(s.confirm.is_none(), "{mutation:?}");
+            assert!(
+                matches!(cmds.as_slice(), [Command::Notify { text }] if text.contains("read-only")),
+                "{mutation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn not_written_field_gone_hands_the_buffer_back_and_refetches() {
+        let s = with_cursor(open_with_hash(&[("f", "old")], 1), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let s = type_text(s, "!");
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        let (s, cmds) = update(
+            s,
+            Msg::NotWritten {
+                name: "k".into(),
+                why: NotWritten::FieldGone,
+                at_ms: 5_000,
+            },
+        );
+        assert!(matches!(cmds.as_slice(), [Command::RefetchOpenKey { .. }]));
+        let open = s.open.as_ref().unwrap();
+        assert!(open.editing, "held under R3.8 — the buffer is open again");
+        let editor = open.editor.as_ref().unwrap();
+        assert_eq!(editor.text(), b"!old");
+        assert!(!editor.is_staged());
+        let (text, _) = s.error.as_ref().unwrap();
+        assert!(text.contains("HSET k f"), "{text}");
+        assert!(text.contains("field no longer exists"), "{text}");
+        assert!(text.contains("edit kept"), "{text}");
+    }
+
+    #[test]
+    fn not_written_field_exists_names_hsetnx_and_hands_the_buffer_back() {
+        let s = open_with_hash(&[("f", "v")], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "new");
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+        let s = type_text(s, "value");
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        let (s, cmds) = update(
+            s,
+            Msg::NotWritten {
+                name: "k".into(),
+                why: NotWritten::FieldExists,
+                at_ms: 5_000,
+            },
+        );
+        assert!(matches!(cmds.as_slice(), [Command::RefetchOpenKey { .. }]));
+        let (text, _) = s.error.as_ref().unwrap();
+        assert!(text.contains("HSETNX k new"), "{text}");
+        assert!(text.contains("field already exists"), "{text}");
+    }
+
+    #[test]
+    fn not_written_key_gone_tombstones_and_hands_the_hash_edit_back() {
+        let s = with_cursor(open_with_hash(&[("f", "old")], 1), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let s = type_text(s, "!");
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        let (s, cmds) = update(
+            s,
+            Msg::NotWritten {
+                name: "k".into(),
+                why: NotWritten::KeyGone,
+                at_ms: 6_000,
+            },
+        );
+        assert!(cmds.is_empty(), "never retried, never recreated");
+        let open = s.open.as_ref().unwrap();
+        assert_eq!(open.deleted_at_ms, Some(6_000));
+        assert!(open.editing, "the buffer is open again");
+        assert_eq!(open.editor.as_ref().unwrap().text(), b"!old");
+        let (text, _) = s.error.as_ref().unwrap();
+        assert!(text.contains("HSET k f"), "{text}");
+        assert!(text.contains("key no longer exists"), "{text}");
+    }
+
+    #[test]
+    fn key_gone_under_a_staged_set_hash_field_dialog_closes_and_hands_the_buffer_back() {
+        let s = with_cursor(open_with_hash(&[("f", "old")], 1), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let s = type_text(s, "!");
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(s.confirm.is_some());
+        let token = s.read_token;
+        let (s, _) = update(
+            s,
+            Msg::ValueGone {
+                token,
+                index: None,
+                name: "k".into(),
+                at_ms: 7_000,
+            },
+        );
+        assert!(s.confirm.is_none());
+        assert!(s.notice.is_some());
+        let open = s.open.as_ref().unwrap();
+        assert_eq!(open.deleted_at_ms, Some(7_000));
+        assert!(open.editing);
+        let editor = open.editor.as_ref().unwrap();
+        assert_eq!(editor.text(), b"!old");
+        assert!(!editor.is_staged());
+    }
+
+    #[test]
+    fn key_gone_under_a_staged_add_hash_field_dialog_closes_and_hands_the_buffer_back() {
+        let s = open_with_hash(&[("f", "v")], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "new");
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+        let s = type_text(s, "value");
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(s.confirm.is_some());
+        let token = s.read_token;
+        let (s, _) = update(
+            s,
+            Msg::ValueGone {
+                token,
+                index: None,
+                name: "k".into(),
+                at_ms: 7_000,
+            },
+        );
+        assert!(s.confirm.is_none());
+        let open = s.open.as_ref().unwrap();
+        assert_eq!(open.deleted_at_ms, Some(7_000));
+        assert_eq!(open.editor.as_ref().unwrap().text(), b"value");
+    }
+
+    #[test]
+    fn key_gone_under_a_staged_delete_hash_field_dialog_simply_closes() {
+        let s = with_cursor(open_with_hash(&[("f", "v")], 1), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        assert!(s.confirm.is_some());
+        let token = s.read_token;
+        let (s, _) = update(
+            s,
+            Msg::ValueGone {
+                token,
+                index: None,
+                name: "k".into(),
+                at_ms: 7_000,
+            },
+        );
+        assert!(s.confirm.is_none());
+        assert!(s.notice.is_some());
+        let open = s.open.as_ref().unwrap();
+        assert_eq!(open.deleted_at_ms, Some(7_000));
+        assert!(open.editor.is_none(), "delete never had a buffer");
+    }
+
+    #[test]
+    fn a_delete_hash_field_hdel_returning_false_is_a_notice_not_an_error() {
+        let s = open_with_hash(&[("f", "v")], 1);
+        let (s, cmds) = update(
+            s,
+            Msg::HashFieldAlreadyGone {
+                name: "k".into(),
+                field: "f".into(),
+                at_ms: 5_000,
+            },
+        );
+        assert!(matches!(cmds.as_slice(), [Command::RefetchOpenKey { .. }]));
+        assert!(s.error.is_none(), "not an error");
+        let (text, _) = s.notice.as_ref().unwrap();
+        assert!(text.contains("HDEL k f"), "{text}");
+        assert!(text.contains("already gone"), "{text}");
+    }
+
+    #[test]
+    fn an_update_arriving_while_a_field_is_edited_is_held() {
+        let s = with_cursor(open_with_hash(&[("f", "old")], 1), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        assert!(s.open.as_ref().unwrap().editing);
+        let (s, _) = update(
+            s,
+            Msg::ValueLoaded {
+                token: crate::command::ReadToken::default(),
+                index: Some(0),
+                name: "k".into(),
+                value: crate::state::Value::Hash(PairValue {
+                    pairs: vec![("f".into(), "changed-under-the-editor".into())],
+                    total: 1,
+                }),
+                ttl_seconds: -1,
+                size_bytes: 10,
+                at_ms: 9_000,
+            },
+        );
+        let open = s.open.as_ref().unwrap();
+        assert!(open.pending.is_some(), "held, not applied");
+        assert_eq!(
+            open.editor.as_ref().unwrap().text(),
+            b"old",
+            "the buffer is never touched (R3.8)"
+        );
+    }
+
+    #[test]
+    fn the_cursor_is_clamped_after_a_delete_reads_back_fewer_fields() {
+        let s = with_cursor(open_with_hash(&[("a", "1"), ("b", "2")], 2), 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        assert_eq!(
+            cmds,
+            vec![Command::DeleteHashField {
+                name: b"k".to_vec(),
+                field: b"b".to_vec(),
+            }]
+        );
+        let (s, _) = update(
+            s,
+            Msg::ValueSet {
+                name: "k".into(),
+                at_ms: 9_000,
+            },
+        );
+        let token = s.read_token;
+        let (s, _) = update(
+            s,
+            Msg::ValueLoaded {
+                token,
+                index: Some(0),
+                name: "k".into(),
+                value: crate::state::Value::Hash(PairValue {
+                    pairs: vec![("a".into(), "1".into())],
+                    total: 1,
+                }),
+                ttl_seconds: -1,
+                size_bytes: 5,
+                at_ms: 9_100,
+            },
+        );
+        assert_eq!(
+            s.open.as_ref().unwrap().cursor,
+            0,
+            "clamped once the row it was on disappeared"
         );
     }
 }

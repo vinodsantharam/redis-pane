@@ -191,6 +191,13 @@ pub struct OpenKey {
     /// and is `None` again once a newer read reaches the screen or the edit
     /// ends (`Esc`, a refusal, a failure, the key gone).
     pub editor: Option<super::EditBuffer>,
+    /// The reader's unsaved field name, while `a` (`Action::AddField`) is
+    /// capturing one on a Hash (PLAN M2 task 6, D4) — before an
+    /// [`OpenKey::editor`] exists to hold the new field's value. `editing` is
+    /// set for the whole time this is `Some`, the same R3.8 guard the editor
+    /// itself relies on: a live update landing mid-capture would be just as
+    /// disruptive as one landing mid-edit.
+    pub field_capture: Option<String>,
     /// An update that arrived while the reader was not at rest.
     pub pending: Option<Pending>,
     /// The server said this key was deleted, expired or evicted. The last read
@@ -224,6 +231,7 @@ impl OpenKey {
             at_rest: true,
             editing: false,
             editor: None,
+            field_capture: None,
             pending: None,
             deleted_at_ms: None,
             last_read: ReadOutcome::Opened,
@@ -254,6 +262,7 @@ impl OpenKey {
             at_rest: true,
             editing: false,
             editor: None,
+            field_capture: None,
             pending: None,
             deleted_at_ms: Some(at_ms),
             last_read: ReadOutcome::Opened,

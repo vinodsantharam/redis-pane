@@ -19,7 +19,7 @@ use fred::interfaces::EventInterface;
 use fred::prelude::Client;
 use redis_pane_core::clock::Clock;
 use redis_pane_core::command::ReadToken;
-use redis_pane_core::msg::{KeyCode, KeyPress, MouseAction};
+use redis_pane_core::msg::{KeyCode, KeyPress, MouseAction, NotWritten};
 use redis_pane_core::resolve::Credentials;
 use redis_pane_core::theme::{ColorDepth, Theme};
 use redis_pane_core::{Command, Msg, State, render, update};
@@ -440,8 +440,9 @@ pub async fn run(
                             }
                             Ok(false) => {
                                 let _ = tx
-                                    .send(Msg::ValueSetKeyGone {
+                                    .send(Msg::NotWritten {
                                         name: name_str,
+                                        why: NotWritten::KeyGone,
                                         at_ms,
                                     })
                                     .await;
@@ -450,6 +451,144 @@ pub async fn run(
                                 let _ = tx
                                     .send(Msg::Failed {
                                         command: format!("SET {name_str}"),
+                                        detail: e.details().to_string(),
+                                        at_ms,
+                                    })
+                                    .await;
+                            }
+                        }
+                    });
+                }
+                Command::SetHashField { name, field, value } => {
+                    let client = client.clone();
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let at_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        let name_str = String::from_utf8_lossy(&name).into_owned();
+                        let field_str = String::from_utf8_lossy(&field).into_owned();
+                        match crate::redis::set_hash_field(&client, &name, &field, &value).await {
+                            Ok(crate::redis::FieldWrite::Written) => {
+                                let _ = tx
+                                    .send(Msg::ValueSet {
+                                        name: name_str,
+                                        at_ms,
+                                    })
+                                    .await;
+                            }
+                            Ok(crate::redis::FieldWrite::FieldGone) => {
+                                let _ = tx
+                                    .send(Msg::NotWritten {
+                                        name: name_str,
+                                        why: NotWritten::FieldGone,
+                                        at_ms,
+                                    })
+                                    .await;
+                            }
+                            Ok(crate::redis::FieldWrite::KeyGone) => {
+                                let _ = tx
+                                    .send(Msg::NotWritten {
+                                        name: name_str,
+                                        why: NotWritten::KeyGone,
+                                        at_ms,
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Msg::Failed {
+                                        command: format!("HSET {name_str} {field_str}"),
+                                        detail: e.details().to_string(),
+                                        at_ms,
+                                    })
+                                    .await;
+                            }
+                        }
+                    });
+                }
+                Command::AddHashField { name, field, value } => {
+                    let client = client.clone();
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let at_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        let name_str = String::from_utf8_lossy(&name).into_owned();
+                        let field_str = String::from_utf8_lossy(&field).into_owned();
+                        match crate::redis::add_hash_field(&client, &name, &field, &value).await {
+                            Ok(crate::redis::FieldAdd::Added) => {
+                                let _ = tx
+                                    .send(Msg::ValueSet {
+                                        name: name_str,
+                                        at_ms,
+                                    })
+                                    .await;
+                            }
+                            Ok(crate::redis::FieldAdd::FieldExists) => {
+                                let _ = tx
+                                    .send(Msg::NotWritten {
+                                        name: name_str,
+                                        why: NotWritten::FieldExists,
+                                        at_ms,
+                                    })
+                                    .await;
+                            }
+                            Ok(crate::redis::FieldAdd::KeyGone) => {
+                                let _ = tx
+                                    .send(Msg::NotWritten {
+                                        name: name_str,
+                                        why: NotWritten::KeyGone,
+                                        at_ms,
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Msg::Failed {
+                                        command: format!("HSETNX {name_str} {field_str}"),
+                                        detail: e.details().to_string(),
+                                        at_ms,
+                                    })
+                                    .await;
+                            }
+                        }
+                    });
+                }
+                Command::DeleteHashField { name, field } => {
+                    let client = client.clone();
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let at_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        let name_str = String::from_utf8_lossy(&name).into_owned();
+                        let field_str = String::from_utf8_lossy(&field).into_owned();
+                        match crate::redis::delete_hash_field(&client, &name, &field).await {
+                            Ok(true) => {
+                                let _ = tx
+                                    .send(Msg::ValueSet {
+                                        name: name_str,
+                                        at_ms,
+                                    })
+                                    .await;
+                            }
+                            Ok(false) => {
+                                let _ = tx
+                                    .send(Msg::HashFieldAlreadyGone {
+                                        name: name_str,
+                                        field: field_str,
+                                        at_ms,
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Msg::Failed {
+                                        command: format!("HDEL {name_str} {field_str}"),
                                         detail: e.details().to_string(),
                                         at_ms,
                                     })

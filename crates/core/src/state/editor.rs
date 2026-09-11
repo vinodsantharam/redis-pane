@@ -20,6 +20,24 @@ use super::value::{StringValue, Value};
 /// re-wrapping one long logical line, not by the edit operation itself.
 pub const MAX_EDIT_BYTES: usize = 200 * 1024;
 
+/// What an [`EditBuffer`] writes back, when staged (PLAN M2 task 6, D1, D3).
+///
+/// Distinct from the value being edited, which is always plain text in the
+/// buffer either way — this is what `EditorStage` builds a
+/// [`crate::state::PendingMutation`] out of, and what a `Msg::NotWritten`
+/// reply is about when it asks the buffer what command it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditTarget {
+    /// The Open value's whole body — a String or a JSON-classified String
+    /// (M2 task 4's original behaviour, unchanged).
+    Value,
+    /// One field of the Open Hash, being overwritten (`HSET`, guarded).
+    HashField { field: String },
+    /// A brand-new field of the Open Hash, not yet on the server (`HSETNX`,
+    /// guarded).
+    NewHashField { field: String },
+}
+
 /// The reader's unsaved text in the value pane.
 ///
 /// `TextArea` is `Clone`/`Debug`/`Default` but not `PartialEq`/`Send`; a
@@ -42,6 +60,8 @@ pub struct EditBuffer {
     /// about to be written rather than the value it replaces, but it takes no
     /// more keys.
     staged: bool,
+    /// What this buffer writes back when staged (PLAN M2 task 6, D3).
+    target: EditTarget,
 }
 
 impl PartialEq for EditBuffer {
@@ -51,6 +71,7 @@ impl PartialEq for EditBuffer {
             && self.original == other.original
             && self.was_json == other.was_json
             && self.staged == other.staged
+            && self.target == other.target
     }
 }
 
@@ -108,7 +129,60 @@ impl EditBuffer {
             original: text.into_bytes(),
             was_json,
             staged: false,
+            target: EditTarget::Value,
         })
+    }
+
+    /// Build a buffer on one Hash field's raw value, to overwrite it (`e` on
+    /// a Hash row, PLAN M2 task 6, D4).
+    ///
+    /// The **raw** field value, never reformatted — unlike [`Value::Json`]'s
+    /// pretty-printing, a hash field is shown and edited exactly as read.
+    /// `was_json` is still classified, so the dialog can warn if a
+    /// JSON-shaped field stops parsing, the same courtesy `SetString`
+    /// extends a String. The cursor opens at the start: a field has no
+    /// viewer row of its own to map back from, the way a String's rows do.
+    pub fn for_hash_field(field: String, value: &str) -> Result<EditBuffer, &'static str> {
+        if value.len() > MAX_EDIT_BYTES {
+            return Err(
+                "too large to edit inline (over 200KB) — an external-editor escape hatch is planned",
+            );
+        }
+        let was_json = serde_json::from_str::<serde_json::Value>(value).is_ok();
+        let lines: Vec<String> = value.split('\n').map(str::to_string).collect();
+        let mut area = TextArea::new(lines);
+        area.set_wrap_mode(WrapMode::WordOrGlyph);
+        area.set_cursor_line_style(ratatui::style::Style::default());
+        Ok(EditBuffer {
+            area,
+            original: value.as_bytes().to_vec(),
+            was_json,
+            staged: false,
+            target: EditTarget::HashField { field },
+        })
+    }
+
+    /// An empty buffer for a field that does not exist on the server yet
+    /// (`a`, PLAN M2 task 6, D4). There is no "original" to compare against
+    /// but an empty one — Redis allows an empty field value, so an
+    /// unmodified empty buffer still stages an `HSETNX` with an empty value
+    /// rather than being treated as "nothing to save".
+    pub fn new_hash_field(field: String) -> EditBuffer {
+        let mut area = TextArea::new(vec![String::new()]);
+        area.set_wrap_mode(WrapMode::WordOrGlyph);
+        area.set_cursor_line_style(ratatui::style::Style::default());
+        EditBuffer {
+            area,
+            original: Vec::new(),
+            was_json: false,
+            staged: false,
+            target: EditTarget::NewHashField { field },
+        }
+    }
+
+    /// What this buffer writes back when staged.
+    pub fn target(&self) -> &EditTarget {
+        &self.target
     }
 
     /// The exact bytes the value had when the buffer was opened.

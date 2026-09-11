@@ -15,7 +15,10 @@ use ratatui::widgets::Widget;
 
 use crate::clock::Clock;
 use crate::keymap::{Action, key_label};
-use crate::state::{Attachment, EditBuffer, Link, Liveness, PendingMutation, PendingRead, State};
+use crate::state::value::Value;
+use crate::state::{
+    Attachment, EditBuffer, EditTarget, Link, Liveness, PendingMutation, PendingRead, State,
+};
 use crate::theme::{Theme, Token, env_token};
 
 /// Render the whole frame into a fresh buffer of the given size.
@@ -399,7 +402,27 @@ fn value_pane(
     // The text colour is painted underneath instead of set on the widget,
     // since setting a style needs `&mut` and render only borrows `State`.
     if let Some(editor) = &open.editor {
-        let editor_area = Rect::new(x0, body_top, area.width.saturating_sub(2), body_height);
+        // Editing one Hash field (D4, PLAN M2 task 6): the field name is not
+        // itself editable here — renaming is a follow-up (D3) — so it sits on
+        // its own row above the editor, muted label and plain name, the same
+        // pairing the body's own FIELD/VALUE columns use.
+        let field = match editor.target() {
+            EditTarget::HashField { field } | EditTarget::NewHashField { field } => Some(field),
+            EditTarget::Value => None,
+        };
+        let (editor_top, editor_height) = if field.is_some() {
+            (body_top + 1, body_height.saturating_sub(1))
+        } else {
+            (body_top, body_height)
+        };
+        if let Some(field) = field {
+            let x1 = put(buf, x0, body_top, "field ", sty(Token::Muted));
+            put(buf, x1, body_top, field, sty(Token::Text));
+        }
+        if editor_height == 0 {
+            return;
+        }
+        let editor_area = Rect::new(x0, editor_top, area.width.saturating_sub(2), editor_height);
         buf.set_style(editor_area, sty(Token::Text));
         editor.widget().render(editor_area, buf);
         // The crate draws its cursor in reverse video, and nothing else in
@@ -414,6 +437,21 @@ fn value_pane(
                     cell.set_style(sty(Token::Selected));
                 }
             }
+        }
+        return;
+    }
+
+    // The one-line field-name capture (`a` on a Hash, D1, D4): the same row
+    // an editing field's name would sit on, but as an input line with a
+    // cursor — the editor area stays empty below, since there is no value
+    // yet to hold one.
+    if let Some(name) = &open.field_capture {
+        let x1 = put(buf, x0, body_top, "field ", sty(Token::Muted));
+        let x2 = put(buf, x1, body_top, name, sty(Token::Text));
+        if x2 < area.x + area.width {
+            let cell = &mut buf[(x2, body_top)];
+            cell.set_symbol(" ");
+            cell.set_style(sty(Token::Selected));
         }
         return;
     }
@@ -758,6 +796,38 @@ fn confirm_overlay(
                 lines.push(("⚠ no longer valid JSON".to_string(), Token::Warn));
             }
         }
+        // Guarded Hash writes (D1, D2, ADR-0015): the command line is the
+        // effective command, never the `EVAL "<script>" …` it is actually
+        // sent as — unreadable in the dialog — followed by the one muted
+        // guard line naming what the script checks before it writes.
+        PendingMutation::SetHashField { old, new, .. } => {
+            lines.push((pending.command_text(), Token::Text));
+            if let Some(guard) = pending.guard_text() {
+                lines.push((guard.to_string(), Token::Muted));
+            }
+            push_diff_side(&mut lines, "-", old, Token::Danger);
+            push_diff_side(&mut lines, "+", new, Token::Ok);
+            if pending.json_warning() == Some(true) {
+                lines.push(("⚠ no longer valid JSON".to_string(), Token::Warn));
+            }
+        }
+        PendingMutation::AddHashField { value, .. } => {
+            lines.push((pending.command_text(), Token::Text));
+            if let Some(guard) = pending.guard_text() {
+                lines.push((guard.to_string(), Token::Muted));
+            }
+            // `+` side only: there is no prior value to diff against.
+            push_diff_side(&mut lines, "+", value, Token::Ok);
+        }
+        PendingMutation::DeleteHashField { last_field, .. } => {
+            lines.push((pending.command_text(), Token::Text));
+            if *last_field {
+                lines.push((
+                    "last field — the key will be deleted".to_string(),
+                    Token::Warn,
+                ));
+            }
+        }
     }
     let hint_token = if refused.is_some() {
         Token::Danger
@@ -1020,6 +1090,28 @@ pub fn hint_bar(state: &State) -> String {
         let undo = state.keymap.hint(Action::EditorUndo).unwrap_or_default();
         let cancel = state.keymap.hint(Action::Cancel).unwrap_or_default();
         return format!("{stage} stage   {undo} undo   {cancel} cancel");
+    }
+    // The field-name capture (`a` on a Hash) is a mode of its own too
+    // (PLAN M2 task 6, D1, D4) — hard-coded wording for the same reason
+    // filter capture's is above: it bypasses the keymap the same way.
+    if state
+        .open
+        .as_ref()
+        .is_some_and(|o| o.field_capture.is_some())
+    {
+        return "Enter next · Esc cancel".to_string();
+    }
+    // A Hash with the value cursor on a row: `e`/`a`/`d` all mean something
+    // (D4), and the hint names the effective binding for each (R7.5).
+    if state
+        .open
+        .as_ref()
+        .is_some_and(|o| o.cursor_active && matches!(o.value, Some(Value::Hash(_))))
+    {
+        let edit = state.keymap.hint(Action::Edit).unwrap_or_default();
+        let add = state.keymap.hint(Action::AddField).unwrap_or_default();
+        let remove = state.keymap.hint(Action::Delete).unwrap_or_default();
+        return format!("{edit} edit · {add} add · {remove} remove");
     }
     [
         Action::Cancel,

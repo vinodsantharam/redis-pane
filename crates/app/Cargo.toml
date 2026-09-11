@@ -21,7 +21,7 @@ workspace = true
 anyhow = "1.0.104"
 clap = { version = "4.6.6", features = ["derive"] }
 crossterm = "0.29.0"
-fred = { version = "10.1", features = ["i-server", "i-keys", "i-tracking", "i-memory", "i-hashes", "i-lists", "i-sets", "i-sorted-sets", "i-streams", "enable-rustls-ring"] }
+fred = { version = "10.1", features = ["i-server", "i-keys", "i-tracking", "i-memory", "i-hashes", "i-lists", "i-sets", "i-sorted-sets", "i-streams", "i-scripts", "enable-rustls-ring"] }
 futures = "0.3.34"
 ratatui = { version = "0.30", features = ["crossterm"] }
 redis-pane-core = { path = "../core" }

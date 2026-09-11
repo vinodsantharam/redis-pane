@@ -176,6 +176,122 @@ async fn an_unarmed_read_is_not_tracked_so_optin_really_scopes() {
     let _ = writer.quit().await;
 }
 
+/// Wait for an invalidation naming `key`, ignoring pushes about other keys.
+async fn invalidated(
+    rx: &mut tokio::sync::broadcast::Receiver<fred::types::client::Invalidation>,
+    key: &str,
+) {
+    loop {
+        match rx.recv().await {
+            Ok(push) if push.keys.iter().any(|k| k.as_bytes() == key.as_bytes()) => return,
+            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                std::future::pending::<()>().await
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn any_command_between_the_arming_and_the_read_takes_the_arming() {
+    // `CLIENT CACHING YES` arms the next command on the connection, whatever
+    // it is — not the next read of the key we meant. This is why the arming
+    // and the read must reach the wire as one unit.
+    let (_c, url) = start("redis", "7-alpine").await;
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let mut invalidations = fred::interfaces::TrackingInterface::invalidation_rx(&client);
+
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer.set("k", "v1", None, None, false).await.unwrap();
+    let _: () = writer.set("other", "o1", None, None, false).await.unwrap();
+
+    let _: () = client.client_caching(true).await.unwrap();
+    let _: Option<String> = client.get("other").await.unwrap();
+    let _: Option<String> = client.get("k").await.unwrap();
+
+    let _: () = writer.set("k", "v2", None, None, false).await.unwrap();
+    let got = tokio::time::timeout(
+        Duration::from_millis(800),
+        invalidated(&mut invalidations, "k"),
+    )
+    .await;
+    assert!(
+        got.is_err(),
+        "the command in between took the arming, so `k` must not be tracked"
+    );
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn a_read_armed_while_other_commands_share_the_connection_is_still_tracked() {
+    // The app sends keys-pane metadata, SCAN pages and writes on the same
+    // client as the Viewer's read. If one of them lands between
+    // `CLIENT CACHING YES` and the read, the header says live over a key
+    // nothing will ever invalidate (ADR-0006).
+    let (_c, url) = start("redis", "7-alpine").await;
+    let (client, est) = redis_pane::redis::connect(&url).await.unwrap();
+    assert!(est.tracking_supported);
+    let mut invalidations = fred::interfaces::TrackingInterface::invalidation_rx(&client);
+
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer.set("k", "v0", None, None, false).await.unwrap();
+
+    const ROUNDS: usize = 25;
+    let mut missed = 0;
+    for round in 0..ROUNDS {
+        let noise: Vec<_> = (0..20)
+            .map(|i| {
+                let client = client.clone();
+                tokio::spawn(async move {
+                    let _: Result<String, _> = client.r#type(format!("noise:{i}")).await;
+                })
+            })
+            .collect();
+        let read = redis_pane::redis::read::read_value(
+            &client,
+            b"k",
+            80,
+            redis_pane::redis::read::Arming::Enabled,
+        )
+        .await
+        .unwrap();
+        assert!(read.is_some());
+        for task in noise {
+            task.await.unwrap();
+        }
+
+        let _: () = writer
+            .set("k", format!("v{}", round + 1), None, None, false)
+            .await
+            .unwrap();
+        let got = tokio::time::timeout(
+            Duration::from_millis(500),
+            invalidated(&mut invalidations, "k"),
+        )
+        .await;
+        if got.is_err() {
+            missed += 1;
+        }
+    }
+    assert_eq!(
+        missed, 0,
+        "{missed} of {ROUNDS} reads were not tracked: another command took the arming"
+    );
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
 #[tokio::test]
 #[ignore = "needs docker"]
 async fn a_reconnect_loses_tracking_which_is_why_it_must_be_re_armed() {

@@ -255,8 +255,11 @@ async fn probe_tracking(client: &Client) -> bool {
 /// read that skipped arming would leave the Viewer dark while the header still
 /// said live (ADR-0006).
 pub async fn refetch_and_rearm(client: &Client, key: &str) -> Result<Option<String>, Error> {
-    // `CLIENT CACHING YES` applies to the next read-only command on this
-    // connection, which under OPTIN is what arms exactly this one read.
+    // `CLIENT CACHING YES` arms the next command on this connection, whatever
+    // it is — not the next read of this key. Other tasks share the client, so
+    // the arming and the read go out as one pipeline, which fred writes with
+    // nothing in between; sent separately, a command from another task can
+    // land between them and take the arming.
     //
     // Note: fred's `Options { caching: Some(true) }` looks like it should do
     // this, and it compiles — but in fred 10.1.0 that field is copied onto the
@@ -264,8 +267,11 @@ pub async fn refetch_and_rearm(client: &Client, key: &str) -> Result<Option<Stri
     // Using it yields a connection that reports tracking as enabled while
     // silently arming nothing: this project's characteristic bug wearing a
     // library's clothes. The explicit call is deliberate; do not "simplify" it.
-    let _: () = client.client_caching(true).await?;
-    client.get(key).await
+    let pipeline = client.pipeline();
+    let _: () = pipeline.client_caching(true).await?;
+    let _: () = pipeline.get(key).await?;
+    let (_, value): (String, Option<String>) = pipeline.all().await?;
+    Ok(value)
 }
 
 /// Delete one key outright (`DEL`, R4.3, PLAN M2.3).

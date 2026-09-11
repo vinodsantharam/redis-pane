@@ -47,7 +47,9 @@ ADR-0006 made one level down: *"ambiguity is the actual defect being designed ag
    a technicality (R7.4).
 6. **Reads are serialised in the shell.** `CLIENT CACHING YES` arms *the next command on the
    connection*, so two concurrent reads can interleave and leave the server tracking a key the
-   Viewer is not showing.
+   Viewer is not showing. Serialising reads is not enough by itself: keys-pane metadata, `SCAN`
+   pages and writes share the connection, so the arming and the first read of the key also go out
+   as one pipeline (ADR-0006).
 7. **`OpenKey::index` does not survive a rescan.** `SCAN` has no stable order, so the number
    addresses a different key once the set refills. It is `None` until the name is scanned again;
    `OpenKey::name` is the identity that never goes stale.

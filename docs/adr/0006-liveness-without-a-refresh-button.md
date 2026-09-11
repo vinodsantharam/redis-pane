@@ -137,6 +137,15 @@ one: after every invalidation, and after every reconnect.
   it reports tracking as enabled while arming nothing, which is this project's characteristic bug
   wearing a library's clothes. Arming goes through an explicit `client_caching(true)` call, and
   the integration suite is what catches a regression here.
+- **Another command could take the arming.** `CLIENT CACHING YES` arms the next command on the
+  connection, whatever it is, and Redis clears it after that command unless a transaction is open.
+  `read_value` sent the arming and `TYPE` as two separate commands. Reads took turns with each
+  other, but keys-pane metadata, `SCAN` pages and writes share the same client, and any of them
+  could land in between: that command was tracked, the open key was not, and the header said
+  `● live` over a key nothing would ever invalidate. Reproduced against Redis 7 with 20 concurrent
+  reads per round: 25 of 25 reads went untracked. Fixed by sending the arming and the first read
+  as one fred pipeline, which fred's router writes with nothing in between. Covered by
+  `a_read_armed_while_other_commands_share_the_connection_is_still_tracked`.
 - The Refetch path is the *only* place a value is read, precisely so the arming step cannot be
   forgotten on one of several paths. This is the same chokepoint argument as mutations.
 - Reversing this means reintroducing a cache, which is where the original bug lives. Treat the

@@ -444,7 +444,7 @@ pub struct State {
     /// exactly as it always did.
     ///
     /// Session-only for now — restoring it across a relaunch needs the
-    /// session-state file `state_file.rs` does not implement yet (ADR-0003).
+    /// session-state file ADR-0003 describes, which is not implemented yet.
     pub split_adjust: i16,
     /// Set between a mouse-down that grabbed the divider and the matching
     /// mouse-up (R7.3, drag-to-resize). While true, `Drag` events move

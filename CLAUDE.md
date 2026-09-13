@@ -82,9 +82,10 @@ the functional core plus golden-frame snapshots and needs no Docker; the integra
 reconnect, capability probing where `CLIENT TRACKING` is refused, and error mapping for
 `-LOADING`, `-OOM`, `-MISCONF` and `-READONLY`.
 
-The integration suite **exists** — 24 tests in `crates/app/tests/integration.rs`, every one
-`#[ignore]`d so the default run stays Docker-free. CI runs `cargo test --workspace`, which skips
-all of them, so they only ever run when someone asks:
+The integration suite **exists** — 51 tests in `crates/app/tests/integration.rs`, every one
+`#[ignore]`d so the default run stays Docker-free. The default `cargo test --workspace` skips
+all of them; a separate `integration` CI job runs them on every push, every pull request, and
+nightly:
 
 ```bash
 cargo test -p redis-pane -- --ignored --test-threads=1   # needs Docker

@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}
 
 env:
   CARGO_TERM_COLOR: always
@@ -39,3 +42,14 @@ jobs:
             exit 1
           fi
           echo "boundary intact"
+
+  # The re-arm invariants (ADR-0006, ADR-0009) are only provable against a real
+  # server, and unit tests cannot see the shell side that does the arming.
+  integration:
+    name: integration · real Redis (Docker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p redis-pane -- --ignored --test-threads=1

@@ -115,7 +115,6 @@ async fn an_armed_key_receives_an_invalidation_and_the_arming_is_consumed() {
     let got = redis_pane::redis::read::read_value(
         &client,
         b"k",
-        40,
         redis_pane::redis::read::Arming::Enabled,
     )
     .await
@@ -147,7 +146,6 @@ async fn an_armed_key_receives_an_invalidation_and_the_arming_is_consumed() {
     let _ = redis_pane::redis::read::read_value(
         &client,
         b"k",
-        40,
         redis_pane::redis::read::Arming::Enabled,
     )
     .await
@@ -274,7 +272,6 @@ async fn a_read_armed_while_other_commands_share_the_connection_is_still_tracked
         let read = redis_pane::redis::read::read_value(
             &client,
             b"k",
-            80,
             redis_pane::redis::read::Arming::Enabled,
         )
         .await
@@ -320,7 +317,6 @@ async fn a_reconnect_loses_tracking_which_is_why_it_must_be_re_armed() {
     let _ = redis_pane::redis::read::read_value(
         &client,
         b"k",
-        40,
         redis_pane::redis::read::Arming::Enabled,
     )
     .await
@@ -390,7 +386,6 @@ async fn tracking_round_trip_when_a_server_url_is_supplied() {
     let got = redis_pane::redis::read::read_value(
         &client,
         b"rp:it",
-        40,
         redis_pane::redis::read::Arming::Enabled,
     )
     .await
@@ -424,7 +419,6 @@ async fn tracking_round_trip_when_a_server_url_is_supplied() {
     let _ = redis_pane::redis::read::read_value(
         &client,
         b"rp:it",
-        40,
         redis_pane::redis::read::Arming::Enabled,
     )
     .await
@@ -917,7 +911,6 @@ async fn a_key_opens_on_a_server_that_refuses_tracking() {
     let read = redis_pane::redis::read::read_value(
         &client,
         b"readable",
-        50,
         redis_pane::redis::read::Arming::Unsupported,
     )
     .await
@@ -929,7 +922,6 @@ async fn a_key_opens_on_a_server_that_refuses_tracking() {
     let armed = redis_pane::redis::read::read_value(
         &client,
         b"readable",
-        50,
         redis_pane::redis::read::Arming::Enabled,
     )
     .await
@@ -969,7 +961,7 @@ async fn opening_a_key_on_a_tracking_capable_server_reaches_live_state() {
     );
 
     let arming = redis_pane::redis::read::Arming::Enabled;
-    let read = redis_pane::redis::read::read_value(&client, b"k", 40, arming)
+    let read = redis_pane::redis::read::read_value(&client, b"k", arming)
         .await
         .unwrap();
     assert!(read.is_some(), "arming happens inside a successful read");
@@ -1020,7 +1012,6 @@ async fn a_stream_is_read_newest_first_not_oldest_first() {
     let value = redis_pane::redis::read::read_value(
         &client,
         b"orders",
-        40,
         redis_pane::redis::read::Arming::Unsupported,
     )
     .await
@@ -1059,7 +1050,6 @@ async fn a_freshly_added_entry_reads_as_just_added() {
     let value = redis_pane::redis::read::read_value(
         &client,
         b"events",
-        40,
         redis_pane::redis::read::Arming::Unsupported,
     )
     .await
@@ -1127,10 +1117,8 @@ async fn back_to_back_opens_leave_the_second_key_armed_not_the_first() {
     let a = gate.begin();
     let b = gate.begin();
     let (ca, cb) = (client.clone(), client.clone());
-    let ha =
-        tokio::spawn(async move { a.run(read_value(&ca, b"first", 40, Arming::Enabled)).await });
-    let hb =
-        tokio::spawn(async move { b.run(read_value(&cb, b"second", 40, Arming::Enabled)).await });
+    let ha = tokio::spawn(async move { a.run(read_value(&ca, b"first", Arming::Enabled)).await });
+    let hb = tokio::spawn(async move { b.run(read_value(&cb, b"second", Arming::Enabled)).await });
     let (ra, rb) = (ha.await.unwrap(), hb.await.unwrap());
 
     assert!(
@@ -1150,7 +1138,7 @@ async fn back_to_back_opens_leave_the_second_key_armed_not_the_first() {
 
     // And not `first`. Re-arm on `second` so the consumed arming cannot be
     // mistaken for the absence of one, then write to `first`.
-    let _ = read_value(&client, b"second", 40, Arming::Enabled)
+    let _ = read_value(&client, b"second", Arming::Enabled)
         .await
         .unwrap();
     let _: () = writer.set("first", "a2", None, None, false).await.unwrap();
@@ -1189,7 +1177,6 @@ async fn a_large_hash_is_windowed_not_pulled_whole() {
     let read = redis_pane::redis::read::read_value(
         &client,
         b"bighash",
-        40,
         redis_pane::redis::read::Arming::Enabled,
     )
     .await
@@ -1239,7 +1226,6 @@ async fn a_large_set_is_windowed_not_pulled_whole() {
     let read = redis_pane::redis::read::read_value(
         &client,
         b"bigset",
-        40,
         redis_pane::redis::read::Arming::Enabled,
     )
     .await
@@ -1281,7 +1267,7 @@ async fn a_small_hash_and_set_still_come_back_whole() {
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
     let arming = redis_pane::redis::read::Arming::Enabled;
 
-    let hash = redis_pane::redis::read::read_value(&client, b"smallhash", 40, arming)
+    let hash = redis_pane::redis::read::read_value(&client, b"smallhash", arming)
         .await
         .unwrap()
         .unwrap();
@@ -1292,7 +1278,7 @@ async fn a_small_hash_and_set_still_come_back_whole() {
     assert_eq!(h.total, 3);
     assert_eq!(h.window(), None, "nothing was withheld");
 
-    let set = redis_pane::redis::read::read_value(&client, b"smallset", 40, arming)
+    let set = redis_pane::redis::read::read_value(&client, b"smallset", arming)
         .await
         .unwrap()
         .unwrap();
@@ -1545,7 +1531,7 @@ async fn a_hash_with_non_utf8_field_and_value_reads_as_bytes_rather_than_failing
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
     let arming = redis_pane::redis::read::Arming::Enabled;
-    let result = redis_pane::redis::read::read_value(&client, b"bytey-hash", 40, arming).await;
+    let result = redis_pane::redis::read::read_value(&client, b"bytey-hash", arming).await;
 
     match result.map(|read| read.map(|r| r.value)) {
         Ok(Some(redis_pane_core::state::value::Value::Hash(hash))) => {
@@ -1598,7 +1584,7 @@ async fn every_collection_type_reads_non_utf8_members_as_bytes() {
     let read = |name: &'static [u8]| {
         let client = client.clone();
         async move {
-            redis_pane::redis::read::read_value(&client, name, 40, arming)
+            redis_pane::redis::read::read_value(&client, name, arming)
                 .await
                 .map(|read| read.map(|r| r.value))
         }

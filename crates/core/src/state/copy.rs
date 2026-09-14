@@ -40,6 +40,11 @@ impl CopyWhat {
 /// of what was read, not a live view (and `update()`, where every copy is
 /// built, is pure and has no clock of its own — ADR-0011).
 pub fn value_text(value: &Value, now_ms: u64) -> String {
+    // A String copies as the text it is. Its rows are wrapped to the pane, and
+    // joining them would paste line breaks the value never had.
+    if let Value::Str(s) = value {
+        return s.raw.clone();
+    }
     let viewer = value.viewer();
     (0..viewer.row_count())
         .map(|i| viewer.row(i, now_ms).join("\t"))
@@ -133,6 +138,12 @@ mod tests {
     fn a_string_copies_as_its_text() {
         let v = Value::Str(StringValue::new("hello", 40));
         assert_eq!(value_text(&v, 0), "hello");
+    }
+
+    #[test]
+    fn a_wrapped_string_copies_without_the_wrap_breaks() {
+        let v = Value::Str(StringValue::new("abcdefghij\nk", 8));
+        assert_eq!(value_text(&v, 0), "abcdefghij\nk");
     }
 
     #[test]

@@ -149,7 +149,7 @@ async fn main() {
     } else {
         redis_pane::redis::read::Arming::Unsupported
     };
-    let read_result = redis_pane::redis::read::read_value(&client, &name, 50, arming).await;
+    let read_result = redis_pane::redis::read::read_value(&client, &name, arming).await;
     let read_ms = t3.elapsed();
     // This is exactly what terminal.rs's open_key must also do: Ok(_) after
     // Arming::Enabled means CLIENT CACHING YES already succeeded on the wire.

@@ -562,6 +562,26 @@ impl State {
         self.pane_visible(crate::render::layout::Pane::Value)
     }
 
+    /// How many characters a String value's row holds: the Viewer body's text
+    /// width at this terminal size and divider position, exactly as the value
+    /// pane draws it (review M4).
+    pub fn value_wrap_width(&self) -> usize {
+        let area = ratatui::layout::Rect::new(0, 0, self.cols, self.rows);
+        crate::render::layout::layout(area, crate::render::layout::Pane::Value, self.split_adjust)
+            .value
+            // One column for each side's margin, and one the row clip keeps
+            // clear (`render::value_pane`).
+            .map_or(0, |pane| pane.width.saturating_sub(3) as usize)
+    }
+
+    /// Re-wrap the Open key's value after the terminal or the divider moved.
+    pub(crate) fn rewrap_open(&mut self) {
+        let width = self.value_wrap_width();
+        if let Some(open) = &mut self.open {
+            open.rewrap(width);
+        }
+    }
+
     /// Whether there are two panes on screen for `⌃←`/`⌃→` to divide.
     ///
     /// Below 70 columns exactly one pane is drawn (DESIGN §2, stack

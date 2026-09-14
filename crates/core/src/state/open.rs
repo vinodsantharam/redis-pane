@@ -289,6 +289,25 @@ impl OpenKey {
         self.at_rest && !self.is_editing() && self.cursor == 0
     }
 
+    /// Re-wrap the value, and any held one, to `width`, keeping the cursor
+    /// inside the rows that now exist.
+    ///
+    /// Wrapping is a fact about the pane, not about the value, so it is redone
+    /// whenever the pane changes. The shell used to wrap a String once, at
+    /// half the terminal's width whatever the pane actually was, and it stayed
+    /// that way through every resize and divider drag (review M4).
+    pub fn rewrap(&mut self, width: usize) {
+        if let Some(value) = &mut self.value {
+            value.rewrap(width);
+            let last = value.viewer().row_count().saturating_sub(1);
+            self.cursor = self.cursor.min(last);
+            self.offset = self.offset.min(self.cursor);
+        }
+        if let Some(pending) = &mut self.pending {
+            pending.value.rewrap(width);
+        }
+    }
+
     /// How long the header states what the last read found before falling back
     /// to its resting phrase.
     ///

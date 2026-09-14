@@ -310,7 +310,7 @@ impl Shell {
                 index,
                 token,
                 arm,
-            } => self.read_key(key, index, token, arm, area_width(term)),
+            } => self.read_key(key, index, token, arm),
             Command::Execute { mutation, index } => self.mutate(mutation, index),
             Command::CopyToClipboard { text, label } => self.copy(text, label, term).await,
             Command::Notify { text } => {
@@ -385,14 +385,7 @@ impl Shell {
     /// read `○ manual` forever, on every server, including local Redis with
     /// tracking fully working. The core's invariant was airtight; the shell simply
     /// never told it the truth.
-    fn read_key(
-        &mut self,
-        key: KeyName,
-        index: Option<usize>,
-        token: ReadToken,
-        arm: bool,
-        pane_width: usize,
-    ) {
+    fn read_key(&mut self, key: KeyName, index: Option<usize>, token: ReadToken, arm: bool) {
         // Supersede whatever was in flight. The core would ignore its reply anyway
         // — every reply carries the token of the read it answers — but ignoring a
         // reply does not un-send the `CLIENT CACHING YES` that came with it, and
@@ -422,7 +415,6 @@ impl Shell {
                 .run(crate::redis::read::read_value(
                     &client,
                     key.as_bytes(),
-                    pane_width,
                     arming,
                 ))
                 .await
@@ -725,12 +717,6 @@ impl Reconnect {
             }
         });
     }
-}
-
-fn area_width(term: &Term) -> usize {
-    term.size()
-        .map(|s| (s.width / 2).max(20) as usize)
-        .unwrap_or(40)
 }
 
 /// What the terminal can display. A real probe belongs in M0.3's follow-up;

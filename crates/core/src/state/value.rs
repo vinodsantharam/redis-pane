@@ -69,6 +69,13 @@ impl Value {
         }
     }
 
+    /// Re-wrap to a pane `width`. Only a String's rows depend on it.
+    pub fn rewrap(&mut self, width: usize) {
+        if let Value::Str(s) = self {
+            s.rewrap(width);
+        }
+    }
+
     pub fn kind(&self) -> KeyKind {
         match self {
             Value::Str(_) => KeyKind::String,
@@ -128,8 +135,8 @@ pub struct StringValue {
     pub bytes: usize,
     /// The text exactly as read, before wrapping.
     ///
-    /// `lines` is a *display* artifact — wrapped at whatever the pane's width
-    /// happened to be when this was built, with wrap-inserted breaks and real
+    /// `lines` is a *display* artifact — wrapped to the pane it is drawn in,
+    /// and re-wrapped whenever that pane changes, with wrap-inserted breaks and real
     /// `\n`s flattened into the same `Vec<String>` and therefore no longer
     /// distinguishable from each other. That makes `lines` a one-way
     /// transform: there is no rejoining it back into the original text
@@ -143,25 +150,37 @@ impl StringValue {
     /// Wrap at the pane width. Long values are common and horizontal scrolling
     /// is worse than wrapping for something you are reading rather than editing.
     pub fn new(text: &str, width: usize) -> Self {
-        let width = width.max(8);
-        let mut lines = Vec::new();
-        for raw in text.split('\n') {
-            if raw.is_empty() {
-                lines.push(String::new());
-            }
-            let mut rest: Vec<char> = raw.chars().collect();
-            while !rest.is_empty() {
-                let take = width.min(rest.len());
-                lines.push(rest[..take].iter().collect());
-                rest.drain(..take);
-            }
-        }
         Self {
-            lines,
+            lines: wrap(text, width),
             bytes: text.len(),
             raw: text.to_string(),
         }
     }
+
+    /// Wrap the same text to a different width.
+    pub fn rewrap(&mut self, width: usize) {
+        self.lines = wrap(&self.raw, width);
+    }
+}
+
+/// Cut `text` into rows no wider than `width` characters, keeping its own
+/// line breaks. A floor of 8 keeps a very narrow pane from producing
+/// one-character rows.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(8);
+    let mut lines = Vec::new();
+    for raw in text.split('\n') {
+        if raw.is_empty() {
+            lines.push(String::new());
+        }
+        let mut rest: Vec<char> = raw.chars().collect();
+        while !rest.is_empty() {
+            let take = width.min(rest.len());
+            lines.push(rest[..take].iter().collect());
+            rest.drain(..take);
+        }
+    }
+    lines
 }
 
 impl Viewer for StringValue {

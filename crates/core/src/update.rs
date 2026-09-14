@@ -81,6 +81,7 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
         Msg::Resized { cols, rows } => {
             state.cols = cols;
             state.rows = rows;
+            state.rewrap_open();
             // A filter being typed must stay where it can be seen. Narrowing
             // the terminal past two panes with the Viewer focused would
             // otherwise leave the capture running inside a pane that is no
@@ -273,7 +274,7 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             token,
             index,
             name,
-            value,
+            mut value,
             ttl_seconds,
             size_bytes,
             at_ms,
@@ -286,6 +287,9 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             if token != state.read_token {
                 return (state, Vec::new());
             }
+            // Wrapped to the pane it is about to be drawn in; the shell does not
+            // know that width, and should not (review M4).
+            value.rewrap(state.value_wrap_width());
             // The question this reply answers is the one currently in
             // flight, so it is no longer in flight. Whether `Enter` asked
             // for the cursor the moment this landed travels with it — read
@@ -652,6 +656,7 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
                 state.split_adjust = state
                     .split_adjust
                     .saturating_add(crate::render::layout::SPLIT_STEP as i16);
+                state.rewrap_open();
             }
             (state, Vec::new())
         }
@@ -660,6 +665,7 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
                 state.split_adjust = state
                     .split_adjust
                     .saturating_sub(crate::render::layout::SPLIT_STEP as i16);
+                state.rewrap_open();
             }
             (state, Vec::new())
         }
@@ -1728,6 +1734,7 @@ fn mouse_action(mut state: State, action: MouseAction) -> (State, Vec<Command>) 
                 // landing on top of a drag that came before it.
                 let base = layout::layout(area, state.focus, 0).keys.width;
                 state.split_adjust = i32::from(col) as i16 - base as i16;
+                state.rewrap_open();
             }
             (state, Vec::new())
         }
@@ -1915,6 +1922,48 @@ mod tests {
     fn read_completion_records_the_clock_reading_it_was_given() {
         let (s, _) = update(State::default(), Msg::ReadCompleted { at_ms: 9_000 });
         assert_eq!(s.last_read_ms, Some(9_000));
+    }
+
+    /// Review M4: a String was wrapped once, by the shell, at half the
+    /// terminal's width, whatever the pane actually was, and stayed that way
+    /// through a resize or a divider drag.
+    #[test]
+    fn a_string_is_wrapped_to_its_pane_and_rewrapped_when_the_pane_changes() {
+        use crate::state::value::{StringValue, Value};
+        let first_row = |s: &State| match &s.open.as_ref().unwrap().value {
+            Some(Value::Str(v)) => v.lines[0].chars().count(),
+            other => panic!("expected a string, got {other:?}"),
+        };
+        let state = State {
+            cols: 130,
+            rows: 40,
+            ..State::default()
+        };
+        let token = state.read_token;
+        let (state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token,
+                index: None,
+                name: "k".into(),
+                // As the shell builds it: not wrapped at all.
+                value: Value::Str(StringValue::new(&"x".repeat(500), usize::MAX)),
+                ttl_seconds: -1,
+                size_bytes: 500,
+                at_ms: 0,
+            },
+        );
+        let wide = state.value_wrap_width();
+        assert_eq!(first_row(&state), wide, "wrapped to the pane on arrival");
+
+        let (state, _) = update(state, Msg::Resized { cols: 90, rows: 40 });
+        let narrow = state.value_wrap_width();
+        assert!(narrow < wide);
+        assert_eq!(
+            first_row(&state),
+            narrow,
+            "and again when the terminal narrows"
+        );
     }
 
     #[test]

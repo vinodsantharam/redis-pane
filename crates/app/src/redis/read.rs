@@ -134,7 +134,6 @@ pub struct ReadValue {
 pub async fn read_value(
     client: &Client,
     name: &[u8],
-    pane_width: usize,
     arming: Arming,
 ) -> Result<Option<ReadValue>, Error> {
     let key: Key = name.into();
@@ -215,10 +214,7 @@ pub async fn read_value(
     let size: i64 = next()?.convert::<Option<i64>>()?.unwrap_or(0);
 
     let value = match kind.as_str() {
-        "string" => string_value(
-            next()?.convert::<Option<Vec<u8>>>()?.unwrap_or_default(),
-            pane_width,
-        ),
+        "string" => string_value(next()?.convert::<Option<Vec<u8>>>()?.unwrap_or_default()),
         "hash" => Value::Hash(PairValue {
             total: length(next()?)?,
             pairs: hscan_window(client, &key).await?,
@@ -335,10 +331,11 @@ async fn sscan_window(client: &Client, key: &Key) -> Result<Vec<Vec<u8>>, Error>
 
 /// Strings are the one type whose *shape* is not given by its Redis type: it
 /// may be JSON, text, or arbitrary bytes, and each wants a different viewer.
-fn string_value(bytes: Vec<u8>, width: usize) -> Value {
+fn string_value(bytes: Vec<u8>) -> Value {
     match String::from_utf8(bytes) {
         Ok(text) if looks_like_json(&text) => Value::Json(JsonValue::parse(&text)),
-        Ok(text) => Value::Str(StringValue::new(&text, width)),
+        // Unwrapped: the core wraps it to the pane it lands in (review M4).
+        Ok(text) => Value::Str(StringValue::new(&text, usize::MAX)),
         // Not valid UTF-8, so it is a blob. A hex dump is honest; mojibake is not.
         Err(e) => Value::Binary(BinaryValue {
             bytes: e.into_bytes(),

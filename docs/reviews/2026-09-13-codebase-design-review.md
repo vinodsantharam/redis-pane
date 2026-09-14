@@ -586,6 +586,46 @@ Ordered by blast radius and by what each fix unblocks, not strictly by severity:
 
 ---
 
+## 9. Status on branch `design-review-fixes` (2026-09-14)
+
+| Finding | Status | Commit |
+|---|---|---|
+| C1, H3 | Fixed: `KeyName`, and one `Command::ReadKey { key, index, token, arm }` | `94822e8` |
+| C2 | Fixed: collection cells are bytes, shown as text or `\xHH` | `c48df0c` |
+| M7, L2 | Fixed: `integration` CI job; empty `state_file` module removed | `59f5e71` |
+| H1, H4, L5 | Fixed: `Command::Execute(Mutation)`, `Msg::MutationSettled`, `redis::mutate::execute`, `Shell`; one `Arc<dyn Clock>`, `now_epoch_ms` | `37e5cdb` |
+| H2 (part), L1 | Fixed: core-minted `ReadToken`, `State::new(Startup)` | `7a70ced` |
+| M6 | Fixed: `TYPE` plus one pipeline; every failure surfaces | `dce6494` |
+| H2 (part) | Fixed: `EditPhase` replaces `editing` + `editor` + `EditBuffer::staged` | `59a56b0` |
+| M1, M5 | Fixed: `INFO` failure reported; test-only read path removed | `af22b37` |
+| M8 | Fixed: `connect_or_exit`, `readout` | `ff49f67` |
+| L4 | Fixed: `RowCtx`/`RowAt`; no `too_many_arguments` allows remain | `3333ec1` |
+| M4 | Fixed: the core wraps to the pane and re-wraps on resize and divider moves | `effa1d1` |
+| M2 | **Deferred.** Splitting `update.rs` is a pure move of ~6,600 lines; landed in the same change, it would bury every behaviour change above it. It is cheapest as its own change now that the seams have settled. | — |
+| M3 | **Deferred, as recommended:** until a second collection type becomes editable. | — |
+| L3 | No change; still worth watching on a `ratatui-textarea` bump. | — |
+
+**Corrections to the review, found while fixing:**
+
+- **M1 was overstated.** An ACL that denies `INFO` never reached `server_conditions`: the version check
+  in `connect_with` also runs `INFO` and fails the connection first, so that case failed closed. The
+  silent fall-through was real only for an `INFO` failure after the version check or on reconnect,
+  which is what the fix now reports.
+- **H2's `cursor: Option<usize>` was not done.** The cursor's position deliberately outlives leaving
+  cursor mode, and `OpenKey::may_apply` reads it to decide whether to hold an update. Folding the two
+  fields into an `Option` would change behaviour rather than encode it.
+- **H2's `pub(crate)` fields were not done.** The golden-frame suite in `crates/core/tests` builds
+  `State` and `OpenKey` directly. The invariants that mattered — who mints a `ReadToken`, how a session
+  starts, what an edit's states are — are now carried by types instead.
+
+**Defects found while fixing, and fixed:**
+
+- `Msg::Failed` cleared `editing` while the reader was still typing, so any unrelated failure — a
+  metadata fetch, a clipboard error — switched R3.8's guard off under unsaved text (`59a56b0`).
+- Copying a wrapped String pasted the wrap's line breaks into the clipboard (`effa1d1`).
+
+---
+
 ## Sources
 
 - Ratatui, *The Elm Architecture (TEA)*: https://ratatui.rs/concepts/application-patterns/the-elm-architecture/

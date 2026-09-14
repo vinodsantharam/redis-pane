@@ -73,6 +73,8 @@ The key the Viewer is showing. Opening is explicit, so the Open key is frequentl
 Selected key — the user moves the cursor without opening, and the Viewer goes on holding what it
 was given. That divergence is legal and useful, and it is the app's job to say when it applies:
 both panes state the relationship rather than leaving the two names to be compared by eye.
+A key is identified by its exact bytes, which need not be valid UTF-8. The name shown on screen
+is for reading only: every read and write names the key by its bytes, never by what is displayed.
 _Avoid_: Current key, active key, focused key, previewed key
 
 **Palette**:

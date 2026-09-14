@@ -957,9 +957,9 @@ async fn a_stream_is_read_newest_first_not_oldest_first() {
     assert_eq!(stream.total, 10);
     // First entry back must be seq=9 (the most recently added), not seq=0.
     let first_fields = &stream.entries[0].1;
-    assert_eq!(first_fields[0], ("seq".to_string(), "9".to_string()));
+    assert_eq!(first_fields[0], (b"seq".to_vec(), b"9".to_vec()));
     let last_fields = &stream.entries[9].1;
-    assert_eq!(last_fields[0], ("seq".to_string(), "0".to_string()));
+    assert_eq!(last_fields[0], (b"seq".to_vec(), b"0".to_vec()));
 
     let _ = client.quit().await;
     let _ = writer.quit().await;
@@ -1133,8 +1133,13 @@ async fn a_large_hash_is_windowed_not_pulled_whole() {
     let names: std::collections::HashSet<_> = hash.pairs.iter().map(|(k, _)| k.clone()).collect();
     assert_eq!(names.len(), 500, "no duplicate fields from re-scanning");
     for (k, v) in &hash.pairs {
+        let k = std::str::from_utf8(k).unwrap();
         let n: usize = k.strip_prefix('f').unwrap().parse().unwrap();
-        assert_eq!(*v, format!("v{n}"), "field and value must still agree");
+        assert_eq!(
+            *v,
+            format!("v{n}").into_bytes(),
+            "field and value must still agree"
+        );
     }
 
     let _ = client.quit().await;
@@ -1442,15 +1447,11 @@ async fn setting_a_value_on_a_key_that_is_gone_writes_nothing_and_does_not_recre
 
 #[tokio::test]
 #[ignore = "needs docker"]
-async fn a_hash_with_non_utf8_field_and_value_fails_to_read_rather_than_reading_lossily() {
-    // `hscan_window` asks fred for `Vec<String>`, and fred's `FromValue for
-    // String` goes through `Value::into_string`, which for a `Bytes` reply is
-    // `String::from_utf8(bytes).ok()` — `None`, not a replacement-character
-    // fallback, on invalid UTF-8. So a field name or value that isn't valid
-    // UTF-8 must make `read_value` return `Err`, not a lossily-decoded pair.
-    // This test exists to pin that finding down against a real server before
-    // any editing code is written on top of it: Phase 1 does not fix this,
-    // only reports it, per the task 6 plan step 0.
+async fn a_hash_with_non_utf8_field_and_value_reads_as_bytes_rather_than_failing() {
+    // Pinned in M2 task 6 step 0 as a known gap: `hscan_window` asked fred for
+    // `Vec<String>`, and fred's `FromValue for String` refuses invalid UTF-8,
+    // so one binary field failed the whole read. Members are read as bytes
+    // now, and the exact bytes must come back (review C2).
     let (_c, url) = start("redis", "7-alpine").await;
     let writer = Builder::from_config(Config::from_url(&url).unwrap())
         .build()
@@ -1467,14 +1468,90 @@ async fn a_hash_with_non_utf8_field_and_value_fails_to_read_rather_than_reading_
     let arming = redis_pane::redis::read::Arming::Enabled;
     let result = redis_pane::redis::read::read_value(&client, b"bytey-hash", 40, arming).await;
 
-    match result {
-        Err(e) => {
-            // Report the exact shape of the failure for the checkpoint.
-            eprintln!("non-UTF-8 hash field/value read failed as expected: {e}");
+    match result.map(|read| read.map(|r| r.value)) {
+        Ok(Some(redis_pane_core::state::value::Value::Hash(hash))) => {
+            assert_eq!(hash.pairs, vec![(bad_field.to_vec(), bad_value.to_vec())]);
         }
-        Ok(_) => panic!(
-            "expected fred's String conversion to reject invalid UTF-8 with an error, but the read succeeded"
+        other => panic!("expected the hash, read as bytes; got {other:?}"),
+    }
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn every_collection_type_reads_non_utf8_members_as_bytes() {
+    use fred::types::{CustomCommand, Value as Wire};
+    use redis_pane_core::state::value::{IndexedValue, MemberValue, ScoredValue, Value};
+
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let raw: &[u8] = &[b'm', 0xff, 0x80];
+    for (cmd, args) in [
+        ("RPUSH", vec![Wire::from("bytey-list"), Wire::from(raw)]),
+        ("SADD", vec![Wire::from("bytey-set"), Wire::from(raw)]),
+        (
+            "ZADD",
+            vec![Wire::from("bytey-zset"), Wire::from("1"), Wire::from(raw)],
         ),
+        (
+            "XADD",
+            vec![
+                Wire::from("bytey-stream"),
+                Wire::from("*"),
+                Wire::from(raw),
+                Wire::from(raw),
+            ],
+        ),
+    ] {
+        let _: Wire = writer
+            .custom(CustomCommand::new(cmd, None, false), args)
+            .await
+            .unwrap();
+    }
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let arming = redis_pane::redis::read::Arming::Enabled;
+    let read = |name: &'static [u8]| {
+        let client = client.clone();
+        async move {
+            redis_pane::redis::read::read_value(&client, name, 40, arming)
+                .await
+                .map(|read| read.map(|r| r.value))
+        }
+    };
+
+    assert_eq!(
+        read(b"bytey-list").await.unwrap(),
+        Some(Value::List(IndexedValue {
+            items: vec![raw.to_vec()],
+            total: 1,
+        }))
+    );
+    assert_eq!(
+        read(b"bytey-set").await.unwrap(),
+        Some(Value::Set(MemberValue {
+            members: vec![raw.to_vec()],
+            total: 1,
+        }))
+    );
+    assert_eq!(
+        read(b"bytey-zset").await.unwrap(),
+        Some(Value::ZSet(ScoredValue {
+            entries: vec![(raw.to_vec(), 1.0)],
+            total: 1,
+        }))
+    );
+    match read(b"bytey-stream").await.unwrap() {
+        Some(Value::Stream(stream)) => {
+            assert_eq!(stream.entries.len(), 1);
+            assert_eq!(stream.entries[0].1, vec![(raw.to_vec(), raw.to_vec())]);
+        }
+        other => panic!("expected the stream, read as bytes; got {other:?}"),
     }
 
     let _ = client.quit().await;

@@ -165,7 +165,14 @@ impl EditBuffer {
     /// "JSON" in any sense either caller means, and classifying it as such
     /// warned `⚠ no longer valid JSON` on every edit that turned it into
     /// plain text.
-    pub fn for_hash_field(field: String, value: &str) -> Result<EditBuffer, &'static str> {
+    pub fn for_hash_field(field: &[u8], value: &[u8]) -> Result<EditBuffer, &'static str> {
+        // A text editor cannot round-trip arbitrary bytes, and a lossy field
+        // name would write to a different field, so a field whose name or
+        // value is not UTF-8 is refused the way `Value::Binary` is (review C2).
+        let (Ok(field), Ok(value)) = (std::str::from_utf8(field), std::str::from_utf8(value))
+        else {
+            return Err("binary fields aren't editable here yet");
+        };
         if value.len() > MAX_EDIT_BYTES {
             return Err(
                 "too large to edit inline (over 200KB) — an external-editor escape hatch is planned",
@@ -181,7 +188,9 @@ impl EditBuffer {
             original: value.as_bytes().to_vec(),
             was_json,
             staged: false,
-            target: EditTarget::HashField { field },
+            target: EditTarget::HashField {
+                field: field.to_string(),
+            },
         })
     }
 
@@ -516,6 +525,19 @@ mod tests {
         });
         let err = EditBuffer::from_value(&value, 0).unwrap_err();
         assert_eq!(err, "binary values aren't editable here yet");
+    }
+
+    #[test]
+    fn a_hash_field_that_is_not_utf8_refuses_with_a_notice() {
+        let refused = "binary fields aren't editable here yet";
+        assert_eq!(
+            EditBuffer::for_hash_field(b"\xff", b"v").unwrap_err(),
+            refused
+        );
+        assert_eq!(
+            EditBuffer::for_hash_field(b"f", b"\x80").unwrap_err(),
+            refused
+        );
     }
 
     #[test]

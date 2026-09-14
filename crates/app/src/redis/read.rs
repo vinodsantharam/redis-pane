@@ -12,13 +12,17 @@
 //! therefore driven by the capability probe, and by nothing else, which is what
 //! [`Arming`] exists to make explicit. A bare `bool` here would invite a caller
 //! to pass `false` for convenience, and that caller would silently go dark.
+//!
+//! Every collection member is read as bytes, never as `String`: fred refuses
+//! to decode invalid UTF-8 into a `String`, so one binary field used to fail
+//! the whole read. The Viewer decides how a cell is shown (review C2).
 
 use fred::prelude::*;
 use fred::types::CustomCommand;
 use fred::types::Value as RedisValue;
 use redis_pane_core::state::value::{
-    BinaryValue, IndexedValue, JsonValue, MemberValue, PairValue, ScoredValue, StreamValue,
-    StringValue, Value, looks_like_json,
+    BinaryValue, IndexedValue, JsonValue, MemberValue, PairValue, ScoredValue, StreamEntry,
+    StreamValue, StringValue, Value, looks_like_json,
 };
 
 /// How much of a large collection to fetch. The Viewer is for reading, not for
@@ -174,7 +178,7 @@ pub async fn read_value(
         }
         "list" => {
             let total: i64 = client.llen(key.clone()).await.unwrap_or(0);
-            let items: Vec<String> = client.lrange(key, 0, WINDOW - 1).await?;
+            let items: Vec<Vec<u8>> = client.lrange(key, 0, WINDOW - 1).await?;
             Value::List(IndexedValue {
                 items,
                 total: total.max(0) as usize,
@@ -190,7 +194,7 @@ pub async fn read_value(
         }
         "zset" => {
             let total: i64 = client.zcard(key.clone()).await.unwrap_or(0);
-            let entries: Vec<(String, f64)> = client
+            let entries: Vec<(Vec<u8>, f64)> = client
                 .zrange(key, 0, WINDOW - 1, None, false, None, true)
                 .await?;
             Value::ZSet(ScoredValue {
@@ -230,11 +234,11 @@ pub async fn read_value(
 /// background command this project's read path does not otherwise have (see
 /// `ReadGate` above). A hand-rolled loop with an explicit stopping condition
 /// has no such edge to remember.
-async fn hscan_window(client: &Client, key: &Key) -> Result<Vec<(String, String)>, Error> {
+async fn hscan_window(client: &Client, key: &Key) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error> {
     let mut pairs = Vec::new();
     let mut cursor = "0".to_string();
     for _ in 0..SCAN_ROUNDS {
-        let (next, flat): (String, Vec<String>) = client
+        let (next, flat): (String, Vec<Vec<u8>>) = client
             .custom(
                 CustomCommand::new("HSCAN", key.as_bytes(), false),
                 vec![
@@ -269,11 +273,11 @@ async fn hscan_window(client: &Client, key: &Key) -> Result<Vec<(String, String)
 
 /// `SSCAN`'s half of [`hscan_window`] — see its comment for why this is a
 /// hand-rolled loop rather than `Client::sscan`'s stream.
-async fn sscan_window(client: &Client, key: &Key) -> Result<Vec<String>, Error> {
+async fn sscan_window(client: &Client, key: &Key) -> Result<Vec<Vec<u8>>, Error> {
     let mut members = Vec::new();
     let mut cursor = "0".to_string();
     for _ in 0..SCAN_ROUNDS {
-        let (next, page): (String, Vec<String>) = client
+        let (next, page): (String, Vec<Vec<u8>>) = client
             .custom(
                 CustomCommand::new("SSCAN", key.as_bytes(), false),
                 vec![
@@ -321,10 +325,7 @@ async fn stream_value(client: &Client, key: Key) -> Result<Value, Error> {
     // *oldest* COUNT entries — on a stream past the window size, that was the
     // ancient history, not the recent activity a triage view actually needs.
     // XREVRANGE("+", "-", COUNT) takes the most recent COUNT, newest first.
-    let entries: Vec<(String, Vec<(String, String)>)> = client
-        .xrevrange(key, "+", "-", Some(WINDOW as u64))
-        .await
-        .unwrap_or_default();
+    let entries: Vec<StreamEntry> = client.xrevrange(key, "+", "-", Some(WINDOW as u64)).await?;
     Ok(Value::Stream(StreamValue {
         entries,
         total: total.max(0) as usize,

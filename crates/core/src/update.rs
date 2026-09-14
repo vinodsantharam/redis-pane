@@ -768,7 +768,7 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             let name = open.name.clone();
             state.confirm = Some(PendingMutation::DeleteHashField {
                 name,
-                field: field.into_bytes(),
+                field,
                 last_field,
             });
             (state, Vec::new())
@@ -1175,7 +1175,7 @@ fn open_editor(mut state: State) -> (State, Vec<Command>) {
         let Some((field, field_value)) = pairs.pairs.get(open.cursor).cloned() else {
             return (state, notify("Enter to pick a field"));
         };
-        return match EditBuffer::for_hash_field(field, &field_value) {
+        return match EditBuffer::for_hash_field(&field, &field_value) {
             Ok(buffer) => {
                 let open = state.open.as_mut().expect("checked above");
                 open.editor = Some(buffer);
@@ -2349,7 +2349,7 @@ mod tests {
             Some(0),
             "k".into(),
             Value::Set(MemberValue {
-                members: (0..50).map(|i| format!("m{i}")).collect(),
+                members: (0..50).map(|i| format!("m{i}").into_bytes()).collect(),
                 total: 50,
             }),
             -1,
@@ -3255,7 +3255,7 @@ mod hash_field_edit_tests {
         let value = crate::state::Value::Hash(PairValue {
             pairs: pairs
                 .iter()
-                .map(|(f, v)| (f.to_string(), v.to_string()))
+                .map(|(f, v)| (f.as_bytes().to_vec(), v.as_bytes().to_vec()))
                 .collect(),
             total,
         });
@@ -6281,7 +6281,9 @@ mod cursor_mode_tests {
     /// opposite case, where Enter has to open the Selected key first.
     fn open_with(pairs: usize) -> State {
         let value = Value::Hash(PairValue {
-            pairs: (0..pairs).map(|i| (format!("f{i}"), "v".into())).collect(),
+            pairs: (0..pairs)
+                .map(|i| (format!("f{i}").into_bytes(), "v".into()))
+                .collect(),
             total: pairs,
         });
         let mut state = State {
@@ -6586,7 +6588,7 @@ mod viewer_scroll_tests {
 
     fn open_with(n: usize) -> State {
         let value = Value::Set(MemberValue {
-            members: (0..n).map(|i| format!("m{i}")).collect(),
+            members: (0..n).map(|i| format!("m{i}").into_bytes()).collect(),
             total: n,
         });
         let mut state = State {

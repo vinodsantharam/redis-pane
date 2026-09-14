@@ -139,7 +139,9 @@ mod tests {
     fn the_whole_value_is_copied_even_when_the_viewer_is_scrolled() {
         // A partial copy is a trap: it looks complete in the paste buffer.
         let v = Value::ZSet(ScoredValue {
-            entries: (0..100).map(|i| (format!("m{i}"), i as f64)).collect(),
+            entries: (0..100)
+                .map(|i| (format!("m{i}").into_bytes(), i as f64))
+                .collect(),
             total: 100,
         });
         assert_eq!(value_text(&v, 0).lines().count(), 100);

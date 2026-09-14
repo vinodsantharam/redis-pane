@@ -1618,7 +1618,7 @@ fn copying_a_value_with_nothing_open_says_so_instead_of_copying_nothing() {
 #[test]
 fn copying_a_windowed_value_says_how_much_it_took() {
     let windowed = Value::List(IndexedValue {
-        items: (0..500).map(|i| format!("item-{i}")).collect(),
+        items: (0..500).map(|i| format!("item-{i}").into_bytes()).collect(),
         total: 12_000,
     });
     let mut state = opened("feed:global:hot", windowed, 600);
@@ -1832,7 +1832,7 @@ fn golden_editing_an_existing_field_shows_it_read_only_above_the_active_value() 
     let open = state.open.as_mut().unwrap();
     open.cursor_active = true;
     open.cursor = 1; // "device"
-    open.editor = Some(EditBuffer::for_hash_field("device".into(), "ios/17.2").unwrap());
+    open.editor = Some(EditBuffer::for_hash_field(b"device", b"ios/17.2").unwrap());
     open.editing = true;
     assert_golden("hash_form_edit_field", &draw(&state, 130, 22));
 }

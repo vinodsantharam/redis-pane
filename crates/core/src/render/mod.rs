@@ -58,7 +58,6 @@ pub fn frame(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect) -> Buf
 
 /// The value pane. Viewers land in M1.8; until then it states what is selected
 /// so the two-pane layout is real rather than a promise.
-#[allow(clippy::too_many_arguments)]
 fn value_pane(
     state: &State,
     theme: &Theme,

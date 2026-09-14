@@ -60,7 +60,7 @@ fred 10.1.0's source (`src/types/args.rs`, `src/modules/response.rs`).
 | M4 | Medium | Wrap width is computed by the shell at read time and goes stale | `terminal.rs:721` | CONFIRMED |
 | M5 | Medium | A second, test-only read path contradicts "one read path" | `redis/mod.rs:257` | CONFIRMED |
 | M6 | Medium | `read_value` makes 4–6 serial round trips and swallows errors | `redis/read.rs:158–327` | CONFIRMED |
-| M7 | Medium | CI never runs the 52-test integration suite that guards the re-arm invariants | `.github/workflows/ci.yml` | CONFIRMED |
+| M7 | Medium | CI never runs the 51-test integration suite that guards the re-arm invariants | `.github/workflows/ci.yml` | CONFIRMED |
 | M8 | Medium | Startup flow is duplicated between `probe()` and `main()` | `main.rs:87–205` | CONFIRMED |
 | L1–L5 | Low | Misplaced doc, empty module, widget in `State`, argument sprawl, empty version | §6 | CONFIRMED |
 
@@ -522,7 +522,7 @@ where a partial result is still worth showing.
 
 ### M7 — CI never runs the integration suite
 
-All 52 integration tests in `crates/app/tests/integration.rs` are `#[ignore]`, and CI runs
+All 51 integration tests in `crates/app/tests/integration.rs` are `#[ignore]`, and CI runs
 `cargo test --workspace`. CLAUDE.md still says "24 tests", which is stale and should be corrected in
 the same change. CLAUDE.md calls the
 two re-arm invariants "the invariant most likely to rot silently" and says *"only these prove the

@@ -1,6 +1,7 @@
 //! `Command` — everything the shells must do (PLAN M0.4).
 
 use crate::key::KeyName;
+use crate::mutation::Mutation;
 
 /// Which read a reply belongs to.
 ///
@@ -67,55 +68,23 @@ pub enum Command {
     /// keyspace would be `KEYS *` with extra steps, and it would compete with
     /// `SCAN` for the connection while the list is still filling.
     FetchMetadata { indices: Vec<usize> },
-    /// Delete a key outright (`DEL`).
+    /// Execute a confirmed write (R4.4).
     ///
-    /// Only ever issued once the reader has confirmed the preview
-    /// [`crate::state::PendingMutation::DeleteKey`] described — this is the
+    /// Only ever issued by confirming a [`crate::state::PendingMutation`]: the
     /// one point where the chokepoint's decision (allowed, or refused by
-    /// Read-only Mode) becomes a command a shell will actually run (R4.4).
-    DeleteKey { index: usize, name: KeyName },
-    /// Overwrite a String value (`SET`).
+    /// Read-only Mode) becomes work a shell will actually do. The shell answers
+    /// with [`crate::Msg::MutationSettled`], never with a value read off the
+    /// write's own reply — the core's only path for a value to reach the Viewer
+    /// is a real read (ADR-0006).
     ///
-    /// Only ever issued once the reader has confirmed the preview
-    /// [`crate::state::PendingMutation::SetString`] described — the same
-    /// chokepoint [`Command::DeleteKey`] goes through (R4.4). On success the
-    /// shell must send [`crate::Msg::ValueSet`], **never** a value read
-    /// straight off this call's own reply — the core's only path for a value
-    /// to reach the Viewer is a real read (ADR-0006), and `ValueSet`'s job is
-    /// only to ask for one.
-    SetValue { name: KeyName, new: Vec<u8> },
-    /// Overwrite one Hash field's value, keeping the field's own TTL
-    /// (guarded `HSET`, sent as `EVAL`, PLAN M2 task 6, D1, ADR-0015).
-    ///
-    /// Only ever issued once the reader has confirmed the preview
-    /// [`crate::state::PendingMutation::SetHashField`] described — the same
-    /// chokepoint every other mutation goes through (R4.4). On success the
-    /// shell sends [`crate::Msg::ValueSet`], never a value read straight off
-    /// this call's own reply, for the same reason [`Command::SetValue`]
-    /// does not (ADR-0006).
-    SetHashField {
-        name: KeyName,
-        field: Vec<u8>,
-        value: Vec<u8>,
+    /// One variant for every write (review H1): adding a mutation adds a
+    /// [`Mutation`] variant, not a command, a shell arm and a reply message.
+    Execute {
+        mutation: Mutation,
+        /// The Loaded set row a `DeleteKey` was staged from, echoed back in
+        /// the reply so the tombstone lands on it. `None` for every other write.
+        index: Option<usize>,
     },
-    /// Add a Hash field that does not exist yet, never overwriting one that
-    /// does (guarded `HSETNX`, sent as `EVAL`, PLAN M2 task 6, D1, ADR-0015).
-    ///
-    /// Only ever issued once the reader has confirmed the preview
-    /// [`crate::state::PendingMutation::AddHashField`] described (R4.4).
-    /// Success is reported the same way [`Command::SetHashField`] is.
-    AddHashField {
-        name: KeyName,
-        field: Vec<u8>,
-        value: Vec<u8>,
-    },
-    /// Remove one Hash field (`HDEL`, PLAN M2 task 6, D3, D4).
-    ///
-    /// Only ever issued once the reader has confirmed the preview
-    /// [`crate::state::PendingMutation::DeleteHashField`] described (R4.4).
-    /// Deleting the last field deletes the key itself — Redis's own
-    /// behaviour, not something this command arranges.
-    DeleteHashField { name: KeyName, field: Vec<u8> },
     /// Put text on the clipboard.
     ///
     /// The core builds the text; how it reaches a clipboard is the shell's

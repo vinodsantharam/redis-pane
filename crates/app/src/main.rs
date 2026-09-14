@@ -204,7 +204,6 @@ fn main() {
             }
         };
 
-    let clock = SystemClock;
     // `prod` and `unknown` start guarded (R4.5, ADR-0004). A replica outranks
     // the Environment: that reason cannot be lifted, so claiming the weaker one
     // would offer a toggle the server will refuse (R1.15, ADR-0009).
@@ -228,13 +227,12 @@ fn main() {
     };
     let theme = Theme::new(terminal::detect_color_depth());
 
-    let tracking = established.tracking_supported;
     if let Err(err) = runtime.block_on(terminal::run(
         state,
         theme,
-        &clock,
+        std::sync::Arc::new(SystemClock),
         client,
-        tracking,
+        established,
         dial.to_string(),
         resolution.credentials.clone(),
     )) {

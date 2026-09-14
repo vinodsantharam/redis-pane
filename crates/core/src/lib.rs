@@ -14,6 +14,7 @@ pub mod config;
 pub mod key;
 pub mod keymap;
 pub mod msg;
+pub mod mutation;
 pub mod render;
 pub mod resolve;
 pub mod server;

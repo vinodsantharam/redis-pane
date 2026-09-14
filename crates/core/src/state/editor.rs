@@ -24,8 +24,7 @@ pub const MAX_EDIT_BYTES: usize = 200 * 1024;
 ///
 /// Distinct from the value being edited, which is always plain text in the
 /// buffer either way — this is what `EditorStage` builds a
-/// [`crate::state::PendingMutation`] out of, and what a `Msg::NotWritten`
-/// reply is about when it asks the buffer what command it was.
+/// [`crate::state::PendingMutation`] out of.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditTarget {
     /// The Open value's whole body — a String or a JSON-classified String

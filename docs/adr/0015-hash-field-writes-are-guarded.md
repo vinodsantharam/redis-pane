@@ -143,6 +143,13 @@ anything runs. Without an active cursor on a Hash, `e`/`d` give the notice `Ente
   per mutation. A `DeleteHashField` whose `HDEL` finds the field already gone is not an error and
   is not routed through `NotWritten` — there is no buffer to hand back — so it gets its own
   `Msg::HashFieldAlreadyGone`, reported as a notice, then a Refetch.
+- **Superseded in shape, not in behaviour** (docs/reviews/2026-09-13-codebase-design-review.md,
+  H1): the per-write `Command` variants and reply messages above became one
+  `Command::Execute { mutation: Mutation, .. }` and one `Msg::MutationSettled { mutation, result,
+  .. }`, with `MutationOutcome::{Done, NotWritten(NotWritten), NothingToRemove}` in
+  `crates/core/src/mutation.rs`. The shell's one `redis::mutate::execute` maps a server reply onto
+  an outcome; what each outcome means — tombstone, refetch, hand the buffer back, notice — is
+  still decided once, in `update()`. The guards, scripts and user-visible text are unchanged.
 - The keymap gains `Action::AddField` (default `a`). `Action::Edit`/`Action::AddField`'s
   `pane_is_on_screen`, like `Action::Delete`'s, is focus-dependent — a follow-up correction (task 6
   follow-up, G): `e`/`a` used to check only that the value pane was *drawn*, so pressing them from

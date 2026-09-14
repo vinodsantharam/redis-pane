@@ -327,34 +327,47 @@ impl PendingMutation {
         }
     }
 
-    /// The shell work confirming this dispatches. The only place a
-    /// `PendingMutation` turns into a [`crate::Command`] — the chokepoint's
-    /// actual enforcement point, mirrored from how `scan_batch` is the one
-    /// place the Loaded set cap is enforced (ADR-0010).
-    pub fn into_commands(self) -> Vec<crate::Command> {
-        match self {
+    /// The shell work confirming this dispatches: the write, without what the
+    /// dialog showed about it. The only place a `PendingMutation` becomes a
+    /// [`crate::Command`] — the chokepoint's actual enforcement point, mirrored
+    /// from how `scan_batch` is the one place the Loaded set cap is enforced
+    /// (ADR-0010).
+    pub fn into_command(self) -> crate::Command {
+        use crate::mutation::Mutation;
+        let (mutation, index) = match self {
             PendingMutation::DeleteKey { index, name } => {
-                vec![crate::Command::DeleteKey { index, name }]
+                (Mutation::DeleteKey { key: name }, Some(index))
             }
-            PendingMutation::SetString { name, new, .. } => {
-                vec![crate::Command::SetValue { name, new }]
-            }
+            PendingMutation::SetString { name, new, .. } => (
+                Mutation::SetString {
+                    key: name,
+                    value: new,
+                },
+                None,
+            ),
             PendingMutation::SetHashField {
                 name, field, new, ..
-            } => {
-                vec![crate::Command::SetHashField {
-                    name,
+            } => (
+                Mutation::SetHashField {
+                    key: name,
                     field,
                     value: new,
-                }]
-            }
-            PendingMutation::AddHashField { name, field, value } => {
-                vec![crate::Command::AddHashField { name, field, value }]
-            }
+                },
+                None,
+            ),
+            PendingMutation::AddHashField { name, field, value } => (
+                Mutation::AddHashField {
+                    key: name,
+                    field,
+                    value,
+                },
+                None,
+            ),
             PendingMutation::DeleteHashField { name, field, .. } => {
-                vec![crate::Command::DeleteHashField { name, field }]
+                (Mutation::DeleteHashField { key: name, field }, None)
             }
-        }
+        };
+        crate::Command::Execute { mutation, index }
     }
 }
 

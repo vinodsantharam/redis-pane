@@ -1250,7 +1250,7 @@ async fn deleting_a_key_removes_it_from_the_server() {
     let _: () = writer.set("k:0", "v", None, None, false).await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    redis_pane::redis::delete_key(&client, b"k:0")
+    redis_pane::redis::mutate::delete_key(&client, b"k:0")
         .await
         .unwrap();
 
@@ -1280,7 +1280,9 @@ async fn deleting_a_key_with_bytes_that_look_like_small_integers_does_not_delete
     let _: () = writer.set("7", "decoy", None, None, false).await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    redis_pane::redis::delete_key(&client, name).await.unwrap();
+    redis_pane::redis::mutate::delete_key(&client, name)
+        .await
+        .unwrap();
 
     let target: Option<Vec<u8>> = writer.get(name).await.unwrap();
     assert_eq!(target, None, "the intended key must be gone");
@@ -1308,7 +1310,7 @@ async fn setting_a_value_overwrites_it_on_the_server() {
     let _: () = writer.set("k:0", "old", None, None, false).await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    redis_pane::redis::set_value(&client, b"k:0", b"new")
+    redis_pane::redis::mutate::set_value(&client, b"k:0", b"new")
         .await
         .unwrap();
 
@@ -1336,7 +1338,7 @@ async fn setting_a_value_with_bytes_that_look_like_small_integers_does_not_touch
     let _: () = writer.set("7", "decoy", None, None, false).await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    redis_pane::redis::set_value(&client, name, b"new")
+    redis_pane::redis::mutate::set_value(&client, name, b"new")
         .await
         .unwrap();
 
@@ -1369,7 +1371,7 @@ async fn setting_a_json_looking_value_preserves_the_bytes_exactly() {
     let _: () = writer.set("cfg:1", "{}", None, None, false).await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let written = redis_pane::redis::set_value(&client, b"cfg:1", compact)
+    let written = redis_pane::redis::mutate::set_value(&client, b"cfg:1", compact)
         .await
         .unwrap();
     assert!(written);
@@ -1403,7 +1405,7 @@ async fn setting_a_value_keeps_the_keys_ttl() {
         .unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let written = redis_pane::redis::set_value(&client, b"session:1", b"new")
+    let written = redis_pane::redis::mutate::set_value(&client, b"session:1", b"new")
         .await
         .unwrap();
 
@@ -1430,7 +1432,7 @@ async fn setting_a_value_on_a_key_that_is_gone_writes_nothing_and_does_not_recre
     writer.init().await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let written = redis_pane::redis::set_value(&client, b"expired:1", b"new")
+    let written = redis_pane::redis::mutate::set_value(&client, b"expired:1", b"new")
         .await
         .unwrap();
 
@@ -1558,6 +1560,77 @@ async fn every_collection_type_reads_non_utf8_members_as_bytes() {
     let _ = writer.quit().await;
 }
 
+/// Review H1: `mutate::execute` is the shell's whole write interface, so each
+/// outcome the core gives meaning to is pinned here against a real server.
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn execute_reports_how_each_write_settled() {
+    use redis_pane::redis::mutate::execute;
+    use redis_pane_core::mutation::{Mutation, MutationOutcome, NotWritten};
+
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer.set("s", "old", None, None, false).await.unwrap();
+    let _: () = writer.hset("h", [("f", "v")]).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let cases = [
+        (
+            Mutation::SetString {
+                key: "s".into(),
+                value: b"new".to_vec(),
+            },
+            MutationOutcome::Done,
+        ),
+        (
+            Mutation::SetString {
+                key: "missing".into(),
+                value: b"new".to_vec(),
+            },
+            MutationOutcome::NotWritten(NotWritten::KeyGone),
+        ),
+        (
+            Mutation::SetHashField {
+                key: "h".into(),
+                field: b"nope".to_vec(),
+                value: b"x".to_vec(),
+            },
+            MutationOutcome::NotWritten(NotWritten::FieldGone),
+        ),
+        (
+            Mutation::AddHashField {
+                key: "h".into(),
+                field: b"f".to_vec(),
+                value: b"x".to_vec(),
+            },
+            MutationOutcome::NotWritten(NotWritten::FieldExists),
+        ),
+        (
+            Mutation::DeleteHashField {
+                key: "h".into(),
+                field: b"nope".to_vec(),
+            },
+            MutationOutcome::NothingToRemove,
+        ),
+        (
+            Mutation::DeleteKey { key: "s".into() },
+            MutationOutcome::Done,
+        ),
+    ];
+    for (mutation, expected) in cases {
+        let got = execute(&client, &mutation).await.unwrap();
+        assert_eq!(got, expected, "{mutation:?}");
+    }
+    let exists: i64 = writer.exists("missing").await.unwrap();
+    assert_eq!(exists, 0, "a SET on a gone key never recreates it");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
 // ── M2 task 6 — guarded Hash field writes (D1, ADR-0015) ─────────────────
 
 #[tokio::test]
@@ -1572,10 +1645,10 @@ async fn editing_a_hash_field_overwrites_it_and_keeps_the_keys_ttl() {
     let _: () = writer.expire("h:1", 600, None).await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let outcome = redis_pane::redis::set_hash_field(&client, b"h:1", b"token", b"new")
+    let outcome = redis_pane::redis::mutate::set_hash_field(&client, b"h:1", b"token", b"new")
         .await
         .unwrap();
-    assert_eq!(outcome, redis_pane::redis::FieldWrite::Written);
+    assert_eq!(outcome, redis_pane::redis::mutate::FieldWrite::Written);
 
     let now: Option<String> = writer.hget("h:1", "token").await.unwrap();
     assert_eq!(now.as_deref(), Some("new"));
@@ -1617,10 +1690,10 @@ async fn field_ttl_survives_an_edit(image: &str, tag: &str) {
     assert_eq!(field_ttl, vec![1], "HEXPIRE must have set the field TTL");
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let outcome = redis_pane::redis::set_hash_field(&client, b"h:2", b"token", b"new")
+    let outcome = redis_pane::redis::mutate::set_hash_field(&client, b"h:2", b"token", b"new")
         .await
         .unwrap();
-    assert_eq!(outcome, redis_pane::redis::FieldWrite::Written);
+    assert_eq!(outcome, redis_pane::redis::mutate::FieldWrite::Written);
 
     let now: Option<String> = writer.hget("h:2", "token").await.unwrap();
     assert_eq!(now.as_deref(), Some("new"));
@@ -1656,10 +1729,10 @@ async fn the_edit_script_still_works_on_redis_6_2_where_hpexpiretime_does_not_ex
     let _: () = writer.hset("h:3", [("token", "old")]).await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let outcome = redis_pane::redis::set_hash_field(&client, b"h:3", b"token", b"new")
+    let outcome = redis_pane::redis::mutate::set_hash_field(&client, b"h:3", b"token", b"new")
         .await
         .unwrap();
-    assert_eq!(outcome, redis_pane::redis::FieldWrite::Written);
+    assert_eq!(outcome, redis_pane::redis::mutate::FieldWrite::Written);
 
     let now: Option<String> = writer.hget("h:3", "token").await.unwrap();
     assert_eq!(now.as_deref(), Some("new"));
@@ -1679,10 +1752,10 @@ async fn editing_a_gone_field_writes_nothing() {
     let _: () = writer.hset("h:4", [("a", "1")]).await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let outcome = redis_pane::redis::set_hash_field(&client, b"h:4", b"missing", b"new")
+    let outcome = redis_pane::redis::mutate::set_hash_field(&client, b"h:4", b"missing", b"new")
         .await
         .unwrap();
-    assert_eq!(outcome, redis_pane::redis::FieldWrite::FieldGone);
+    assert_eq!(outcome, redis_pane::redis::mutate::FieldWrite::FieldGone);
 
     let still_absent: Option<String> = writer.hget("h:4", "missing").await.unwrap();
     assert_eq!(still_absent, None, "nothing must have been written");
@@ -1707,10 +1780,10 @@ async fn editing_a_field_on_a_gone_key_does_not_recreate_it() {
     writer.init().await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let outcome = redis_pane::redis::set_hash_field(&client, b"h:gone", b"token", b"new")
+    let outcome = redis_pane::redis::mutate::set_hash_field(&client, b"h:gone", b"token", b"new")
         .await
         .unwrap();
-    assert_eq!(outcome, redis_pane::redis::FieldWrite::KeyGone);
+    assert_eq!(outcome, redis_pane::redis::mutate::FieldWrite::KeyGone);
 
     let exists: i64 = writer.exists("h:gone").await.unwrap();
     assert_eq!(exists, 0, "the key must not be recreated");
@@ -1730,10 +1803,10 @@ async fn adding_a_new_hash_field_creates_it() {
     let _: () = writer.hset("h:5", [("a", "1")]).await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let outcome = redis_pane::redis::add_hash_field(&client, b"h:5", b"b", b"2")
+    let outcome = redis_pane::redis::mutate::add_hash_field(&client, b"h:5", b"b", b"2")
         .await
         .unwrap();
-    assert_eq!(outcome, redis_pane::redis::FieldAdd::Added);
+    assert_eq!(outcome, redis_pane::redis::mutate::FieldAdd::Added);
 
     let value: Option<String> = writer.hget("h:5", "b").await.unwrap();
     assert_eq!(value.as_deref(), Some("2"));
@@ -1753,10 +1826,10 @@ async fn adding_a_field_that_already_exists_leaves_it_unchanged() {
     let _: () = writer.hset("h:6", [("a", "1")]).await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let outcome = redis_pane::redis::add_hash_field(&client, b"h:6", b"a", b"clobbered")
+    let outcome = redis_pane::redis::mutate::add_hash_field(&client, b"h:6", b"a", b"clobbered")
         .await
         .unwrap();
-    assert_eq!(outcome, redis_pane::redis::FieldAdd::FieldExists);
+    assert_eq!(outcome, redis_pane::redis::mutate::FieldAdd::FieldExists);
 
     let value: Option<String> = writer.hget("h:6", "a").await.unwrap();
     assert_eq!(value.as_deref(), Some("1"), "must not be overwritten");
@@ -1775,10 +1848,10 @@ async fn adding_a_field_to_a_gone_key_does_not_recreate_it() {
     writer.init().await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let outcome = redis_pane::redis::add_hash_field(&client, b"h:gone2", b"a", b"1")
+    let outcome = redis_pane::redis::mutate::add_hash_field(&client, b"h:gone2", b"a", b"1")
         .await
         .unwrap();
-    assert_eq!(outcome, redis_pane::redis::FieldAdd::KeyGone);
+    assert_eq!(outcome, redis_pane::redis::mutate::FieldAdd::KeyGone);
 
     let exists: i64 = writer.exists("h:gone2").await.unwrap();
     assert_eq!(exists, 0, "the key must not be recreated");
@@ -1798,7 +1871,7 @@ async fn deleting_a_hash_field_removes_only_that_field() {
     let _: () = writer.hset("h:7", [("a", "1"), ("b", "2")]).await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let removed = redis_pane::redis::delete_hash_field(&client, b"h:7", b"a")
+    let removed = redis_pane::redis::mutate::delete_hash_field(&client, b"h:7", b"a")
         .await
         .unwrap();
     assert!(removed);
@@ -1823,7 +1896,7 @@ async fn deleting_an_already_gone_field_reports_false() {
     let _: () = writer.hset("h:8", [("a", "1")]).await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let removed = redis_pane::redis::delete_hash_field(&client, b"h:8", b"missing")
+    let removed = redis_pane::redis::mutate::delete_hash_field(&client, b"h:8", b"missing")
         .await
         .unwrap();
     assert!(!removed);
@@ -1846,7 +1919,7 @@ async fn deleting_the_last_field_deletes_the_key() {
     let _: () = writer.hset("h:9", [("only", "1")]).await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let removed = redis_pane::redis::delete_hash_field(&client, b"h:9", b"only")
+    let removed = redis_pane::redis::mutate::delete_hash_field(&client, b"h:9", b"only")
         .await
         .unwrap();
     assert!(removed);
@@ -1883,7 +1956,7 @@ async fn deleting_a_field_with_bytes_that_look_like_small_integers_touches_only_
         .unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let removed = redis_pane::redis::delete_hash_field(&client, b"h:10", field)
+    let removed = redis_pane::redis::mutate::delete_hash_field(&client, b"h:10", field)
         .await
         .unwrap();
     assert!(removed);
@@ -1917,10 +1990,10 @@ async fn a_bytey_field_name_can_be_edited_without_touching_a_decoy() {
     let _: () = writer.hset("h:11", [("7", "decoy")]).await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let outcome = redis_pane::redis::set_hash_field(&client, b"h:11", field, b"new")
+    let outcome = redis_pane::redis::mutate::set_hash_field(&client, b"h:11", field, b"new")
         .await
         .unwrap();
-    assert_eq!(outcome, redis_pane::redis::FieldWrite::Written);
+    assert_eq!(outcome, redis_pane::redis::mutate::FieldWrite::Written);
 
     let target: Option<String> = writer.hget("h:11", field).await.unwrap();
     assert_eq!(target.as_deref(), Some("new"));

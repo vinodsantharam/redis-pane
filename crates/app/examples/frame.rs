@@ -118,7 +118,7 @@ async fn main() {
             Msg::MetadataBatch {
                 entries,
                 gone,
-                at_ms: clock.now_ms(),
+                at_ms: clock.now_epoch_ms(),
             },
         );
     }
@@ -169,7 +169,7 @@ async fn main() {
                 value: read.value,
                 ttl_seconds: read.ttl_seconds,
                 size_bytes: read.size_bytes,
-                at_ms: clock.now_ms(),
+                at_ms: clock.now_epoch_ms(),
             },
         );
     }

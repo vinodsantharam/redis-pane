@@ -8,7 +8,7 @@ use crate::keymap::Action;
 use crate::msg::KeyCode;
 use crate::msg::KeyPress;
 use crate::msg::MouseAction;
-use crate::msg::NotWritten;
+use crate::mutation::{Mutation, MutationOutcome, NotWritten};
 use crate::render::layout::{self, Pane};
 use crate::state::copy::{CopyWhat, redis_cli_command, value_text};
 use crate::state::value::Value;
@@ -393,30 +393,6 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             }
             (state, Vec::new())
         }
-        Msg::KeyDeleted { index, name, at_ms } => {
-            // A completed delete is exactly the "gone" state ADR-0006 already
-            // has words and a badge for — the row `set_gone`, and if this was
-            // the Open key, its last read value stays on screen, tombstoned,
-            // never silently cleared. Guarded by name for the same reason
-            // `ValueGone` is: a rescan between staging and confirming
-            // renumbers the Loaded set, and an unguarded index would then
-            // tombstone an unrelated key.
-            if let Some(index) = index
-                && state.keys.name(index) == Some(name.as_bytes())
-            {
-                state.keys.set_gone(index);
-            }
-            match &mut state.open {
-                Some(open) if open.name == name => {
-                    open.deleted_at_ms = Some(at_ms);
-                    open.pending = None;
-                    staged_edit_found_key_gone(&mut state, &name, at_ms);
-                }
-                _ => {}
-            }
-            state.notice = Some((format!("deleted {name}"), at_ms));
-            (state, Vec::new())
-        }
         Msg::Copied { label, at_ms } => {
             state.notice = Some((format!("copied {label}"), at_ms));
             (state, Vec::new())
@@ -449,23 +425,7 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             command,
             detail,
             at_ms,
-        } => {
-            // A failed read is still a read that answered — its loading
-            // indicator would otherwise read `⟳ fetching…` forever, which is
-            // exactly the "operation vanishes, nothing on screen explains it"
-            // defect the error toast below exists to prevent.
-            state.open_pending = None;
-            // Any failure while an edit is in flight (the editor could not be
-            // spawned, the `SET` was refused) ends the edit — never leaves
-            // `editing` stuck on, which would hold R3.8's live-update guard
-            // long after there is anything left to protect.
-            if let Some(open) = &mut state.open {
-                open.editing = false;
-                open.drop_staged_buffer();
-            }
-            state.error = Some((format!("{command}: {detail}"), at_ms));
-            (state, Vec::new())
-        }
+        } => failed(state, command, detail, at_ms),
         Msg::Paste(text) => {
             if let Some(editor) = state
                 .open
@@ -490,30 +450,12 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
                 (state, Vec::new())
             }
         }
-        Msg::ValueSet { name, .. } => {
-            if !state.open.as_ref().is_some_and(|o| o.name == name) {
-                return (state, Vec::new());
-            }
-            // Clear *before* minting the Refetch, not after its reply lands —
-            // `refetch`'s own `Command::ReadKey` is answered by
-            // `Msg::ValueLoaded`, which applies immediately only if
-            // `may_apply()` is already true by the time it arrives.
-            state.open.as_mut().expect("checked above").editing = false;
-            let commands = refetch(&mut state);
-            if let Some(pending) = &mut state.open_pending {
-                pending.own_write = true;
-            }
-            (state, commands)
-        }
-        Msg::NotWritten { name, why, at_ms } => not_written(state, name, why, at_ms),
-        Msg::HashFieldAlreadyGone { name, field, at_ms } => {
-            if !state.open.as_ref().is_some_and(|o| o.name == name) {
-                return (state, Vec::new());
-            }
-            state.notice = Some((format!("HDEL {name} {field}: field already gone"), at_ms));
-            let commands = refetch(&mut state);
-            (state, commands)
-        }
+        Msg::MutationSettled {
+            mutation,
+            index,
+            result,
+            at_ms,
+        } => mutation_settled(state, mutation, index, result, at_ms),
         Msg::Quit => quit(state),
     }
 }
@@ -1305,7 +1247,7 @@ fn name_part_key(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
 /// silently if nothing changed (ADR-0014).
 ///
 /// `editing` stays true when something is staged — R3.8's guard needs to hold
-/// until `Msg::ValueSet` clears it, not just until the buffer closes, or this
+/// until the write settles, not just until the buffer closes, or this
 /// very `SET`'s own Refetch would find `editing` false and apply its own
 /// reply immediately instead of going through the confirm dialog first.
 fn stage_editor(mut state: State) -> (State, Vec<Command>) {
@@ -1466,12 +1408,12 @@ fn confirm_key(mut state: State, pending: PendingMutation, key: KeyPress) -> (St
                 return (state, vec![Command::Notify { text: notice }]);
             }
             // A confirmed `SetString` stays `editing` on purpose: R3.8's
-            // guard needs to hold until `Msg::ValueSet` clears it (see that
-            // handler below), not just until the dialog closes — otherwise
+            // guard needs to hold until the write settles (`write_landed`
+            // clears it), not just until the dialog closes — otherwise
             // this very `SET`'s own Refetch would find `editing` still true
             // and hold its own reply instead of applying it. Delete never
             // sets `editing` in the first place, so this is a no-op for it.
-            (state, pending.into_commands())
+            (state, vec![pending.into_command()])
         }
         KeyCode::Esc => {
             // A deliberate full discard, never a return to the editor —
@@ -1492,19 +1434,123 @@ fn confirm_key(mut state: State, pending: PendingMutation, key: KeyPress) -> (St
     }
 }
 
-/// The command an [`EditBuffer`] is about to write, for a `Msg::NotWritten`
-/// error's text. Derived from the target rather than carried in the message —
-/// the buffer already knows (PLAN M2 task 6, D2).
-fn edit_command_text(name: &KeyName, target: &EditTarget) -> String {
-    match target {
-        EditTarget::Value => format!("SET {name}"),
-        EditTarget::HashField { field } => format!("HSET {name} {field}"),
-        EditTarget::NewHashField { field, .. } => format!("HSETNX {name} {field}"),
+/// `Msg::MutationSettled`: the one place a write's outcome is given meaning
+/// (review H1). The shell only reports what the server said.
+fn mutation_settled(
+    state: State,
+    mutation: Mutation,
+    index: Option<usize>,
+    result: Result<MutationOutcome, String>,
+    at_ms: u64,
+) -> (State, Vec<Command>) {
+    match result {
+        Err(detail) => failed(state, mutation.command_label(), detail, at_ms),
+        Ok(MutationOutcome::Done) => match mutation {
+            Mutation::DeleteKey { key } => key_deleted(state, index, key, at_ms),
+            written => write_landed(state, written.key()),
+        },
+        Ok(MutationOutcome::NotWritten(why)) => not_written(state, &mutation, why, at_ms),
+        Ok(MutationOutcome::NothingToRemove) => nothing_to_remove(state, &mutation, at_ms),
     }
 }
 
-/// `Msg::NotWritten`: a guarded write's precondition was no longer true by
-/// the time it reached the server (PLAN M2 task 6, D1, ADR-0014, ADR-0015).
+/// A delete completed: the key is gone, whether it still existed at the
+/// moment `DEL` ran or was already gone by then (R4.3).
+///
+/// Exactly the "gone" state ADR-0006 already has words and a badge for — the
+/// row `set_gone`, and if this was the Open key, its last read value stays on
+/// screen, tombstoned, never silently cleared. Guarded by name for the same
+/// reason `ValueGone` is: a rescan between staging and confirming renumbers
+/// the Loaded set, and an unguarded index would then tombstone an unrelated
+/// key.
+fn key_deleted(
+    mut state: State,
+    index: Option<usize>,
+    name: KeyName,
+    at_ms: u64,
+) -> (State, Vec<Command>) {
+    if let Some(index) = index
+        && state.keys.name(index) == Some(name.as_bytes())
+    {
+        state.keys.set_gone(index);
+    }
+    match &mut state.open {
+        Some(open) if open.name == name => {
+            open.deleted_at_ms = Some(at_ms);
+            open.pending = None;
+            staged_edit_found_key_gone(&mut state, &name, at_ms);
+        }
+        _ => {}
+    }
+    state.notice = Some((format!("deleted {name}"), at_ms));
+    (state, Vec::new())
+}
+
+/// A write landed (R4.1).
+///
+/// What follows is the same Refetch every other change to the open key goes
+/// through: the reply is what reaches the Viewer, never the bytes this session
+/// already knew it sent (ADR-0006: no value cache, not even a
+/// one-message-long one). Guarded by the key: the reader may have moved on to
+/// a different key by the time this lands.
+fn write_landed(mut state: State, key: &KeyName) -> (State, Vec<Command>) {
+    if !state.open.as_ref().is_some_and(|o| o.name == *key) {
+        return (state, Vec::new());
+    }
+    // Clear *before* minting the Refetch, not after its reply lands —
+    // `refetch`'s own `Command::ReadKey` is answered by `Msg::ValueLoaded`,
+    // which applies immediately only if `may_apply()` is already true by the
+    // time it arrives.
+    state.open.as_mut().expect("checked above").editing = false;
+    let commands = refetch(&mut state);
+    if let Some(pending) = &mut state.open_pending {
+        pending.own_write = true;
+    }
+    (state, commands)
+}
+
+/// `HDEL` found the field already gone (PLAN M2 task 6, D1, D4).
+///
+/// Not an error, and not a refusal: `HDEL` did exactly what was asked and
+/// found nothing to remove, and there is no buffer to hand anything back to —
+/// `Delete` never opens one. Reported as a notice, then a Refetch, the same way
+/// every other change to the open key is (ADR-0006).
+fn nothing_to_remove(mut state: State, mutation: &Mutation, at_ms: u64) -> (State, Vec<Command>) {
+    if !state
+        .open
+        .as_ref()
+        .is_some_and(|o| o.name == *mutation.key())
+    {
+        return (state, Vec::new());
+    }
+    state.notice = Some((
+        format!("{}: field already gone", mutation.command_label()),
+        at_ms,
+    ));
+    let commands = refetch(&mut state);
+    (state, commands)
+}
+
+/// An operation failed, shown with the command that failed (R7.4).
+fn failed(mut state: State, command: String, detail: String, at_ms: u64) -> (State, Vec<Command>) {
+    // A failed read is still a read that answered — its loading indicator
+    // would otherwise read `⟳ fetching…` forever, which is exactly the
+    // "operation vanishes, nothing on screen explains it" defect the error
+    // toast below exists to prevent.
+    state.open_pending = None;
+    // Any failure while an edit is in flight (the `SET` was refused) ends the
+    // edit — never leaves `editing` stuck on, which would hold R3.8's
+    // live-update guard long after there is anything left to protect.
+    if let Some(open) = &mut state.open {
+        open.editing = false;
+        open.drop_staged_buffer();
+    }
+    state.error = Some((format!("{command}: {detail}"), at_ms));
+    (state, Vec::new())
+}
+
+/// A guarded write's precondition was no longer true by the time it reached
+/// the server (PLAN M2 task 6, D1, ADR-0014, ADR-0015).
 ///
 /// `KeyGone` is exactly the String path's old behaviour: tombstone the key,
 /// as surely as a read saying so would, and hand the edited text back to the
@@ -1514,18 +1560,17 @@ fn edit_command_text(name: &KeyName, target: &EditTarget) -> String {
 /// buffer is open again by the time it lands.
 fn not_written(
     mut state: State,
-    name: KeyName,
+    mutation: &Mutation,
     why: NotWritten,
     at_ms: u64,
 ) -> (State, Vec<Command>) {
-    let Some(open) = state.open.as_ref().filter(|o| o.name == name) else {
+    let name = mutation.key();
+    if !state.open.as_ref().is_some_and(|o| o.name == *name) {
         return (state, Vec::new());
-    };
-    let command = open
-        .editor
-        .as_ref()
-        .map(|e| edit_command_text(&name, e.target()))
-        .unwrap_or_else(|| format!("SET {name}"));
+    }
+    // The mutation names its own command, so the error cannot disagree with
+    // what was actually sent (review H1).
+    let command = mutation.command_label();
     match why {
         NotWritten::KeyGone => {
             let open = state.open.as_mut().expect("checked above");
@@ -1573,8 +1618,8 @@ fn not_written(
 /// Under the confirm dialog there is no key left for `SET … XX` to write to,
 /// so the dialog closes and the buffer is handed back to be typed into: the
 /// reader's text is the one thing on screen no read can recover. With the
-/// `SET` already sent, its own reply decides (`Msg::ValueSet` or
-/// `Msg::NotWritten`). Once the write has landed, a staged buffer was
+/// `SET` already sent, its own `Msg::MutationSettled` decides. Once the
+/// write has landed, a staged buffer was
 /// only standing in for the read back, and goes.
 fn staged_edit_found_key_gone(state: &mut State, name: &KeyName, at_ms: u64) {
     // Every mutation that names this key, not just `SetString` — a
@@ -2483,9 +2528,9 @@ mod tests {
         assert!(s.confirm.is_none(), "the dialog closes on confirm");
         assert_eq!(
             cmds,
-            vec![Command::DeleteKey {
-                index: 0,
-                name: b"k:0".to_vec().into()
+            vec![Command::Execute {
+                mutation: Mutation::DeleteKey { key: "k:0".into() },
+                index: Some(0),
             }]
         );
     }
@@ -2516,7 +2561,13 @@ mod tests {
         let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
         assert!(s.confirm.is_none(), "the dialog still closes");
         assert!(
-            !cmds.iter().any(|c| matches!(c, Command::DeleteKey { .. })),
+            !cmds.iter().any(|c| matches!(
+                c,
+                Command::Execute {
+                    mutation: Mutation::DeleteKey { .. },
+                    ..
+                }
+            )),
             "but nothing was actually sent to the server"
         );
     }
@@ -2527,9 +2578,10 @@ mod tests {
         assert!(!s.keys.is_gone(0));
         let (s, _) = update(
             s,
-            Msg::KeyDeleted {
+            Msg::MutationSettled {
+                mutation: Mutation::DeleteKey { key: "k:0".into() },
                 index: Some(0),
-                name: "k:0".into(),
+                result: Ok(MutationOutcome::Done),
                 at_ms: 1_000,
             },
         );
@@ -2696,9 +2748,12 @@ mod tests {
         let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
         assert_eq!(
             cmds,
-            vec![Command::SetValue {
-                name: b"k".to_vec().into(),
-                new: b"!old".to_vec(),
+            vec![Command::Execute {
+                mutation: Mutation::SetString {
+                    key: "k".into(),
+                    value: b"!old".to_vec()
+                },
+                index: None,
             }]
         );
     }
@@ -2807,9 +2862,13 @@ mod tests {
         );
         let (s, cmds) = update(
             s,
-            Msg::NotWritten {
-                name: "k".into(),
-                why: NotWritten::KeyGone,
+            Msg::MutationSettled {
+                mutation: Mutation::SetString {
+                    key: "k".into(),
+                    value: b"!old".to_vec(),
+                },
+                index: None,
+                result: Ok(MutationOutcome::NotWritten(NotWritten::KeyGone)),
                 at_ms: 9_100,
             },
         );
@@ -2827,9 +2886,13 @@ mod tests {
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
         let (s, cmds) = update(
             s,
-            Msg::NotWritten {
-                name: "k".into(),
-                why: NotWritten::KeyGone,
+            Msg::MutationSettled {
+                mutation: Mutation::SetString {
+                    key: "k".into(),
+                    value: b"!old".to_vec(),
+                },
+                index: None,
+                result: Ok(MutationOutcome::NotWritten(NotWritten::KeyGone)),
                 at_ms: 9_100,
             },
         );
@@ -2856,8 +2919,13 @@ mod tests {
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
         let (s, _) = update(
             s,
-            Msg::ValueSet {
-                name: "k".into(),
+            Msg::MutationSettled {
+                mutation: Mutation::SetString {
+                    key: "k".into(),
+                    value: b"!old".to_vec(),
+                },
+                index: None,
+                result: Ok(MutationOutcome::Done),
                 at_ms: 9_000,
             },
         );
@@ -2881,9 +2949,13 @@ mod tests {
         let s = open_with_string("old");
         let (s, cmds) = update(
             s,
-            Msg::NotWritten {
-                name: "some other key".into(),
-                why: NotWritten::KeyGone,
+            Msg::MutationSettled {
+                mutation: Mutation::SetString {
+                    key: "some other key".into(),
+                    value: b"!old".to_vec(),
+                },
+                index: None,
+                result: Ok(MutationOutcome::NotWritten(NotWritten::KeyGone)),
                 at_ms: 9_000,
             },
         );
@@ -3020,8 +3092,13 @@ mod tests {
 
         let (s, cmds) = update(
             s,
-            Msg::ValueSet {
-                name: "k".into(),
+            Msg::MutationSettled {
+                mutation: Mutation::SetString {
+                    key: "k".into(),
+                    value: b"!old".to_vec(),
+                },
+                index: None,
+                result: Ok(MutationOutcome::Done),
                 at_ms: 5_000,
             },
         );
@@ -3037,8 +3114,13 @@ mod tests {
         let s = open_with_string("old");
         let (s, cmds) = update(
             s,
-            Msg::ValueSet {
-                name: "some other key".into(),
+            Msg::MutationSettled {
+                mutation: Mutation::SetString {
+                    key: "some other key".into(),
+                    value: b"!old".to_vec(),
+                },
+                index: None,
+                result: Ok(MutationOutcome::Done),
                 at_ms: 5_000,
             },
         );
@@ -3067,8 +3149,13 @@ mod tests {
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
         let (s, cmds) = update(
             s,
-            Msg::ValueSet {
-                name: "k".into(),
+            Msg::MutationSettled {
+                mutation: Mutation::SetString {
+                    key: "k".into(),
+                    value: b"!old".to_vec(),
+                },
+                index: None,
+                result: Ok(MutationOutcome::Done),
                 at_ms: 5_000,
             },
         );
@@ -3113,7 +3200,13 @@ mod tests {
         assert!(s.confirm.is_some(), "the preview is composed anyway");
         let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
         assert!(
-            !cmds.iter().any(|c| matches!(c, Command::SetValue { .. })),
+            !cmds.iter().any(|c| matches!(
+                c,
+                Command::Execute {
+                    mutation: Mutation::SetString { .. },
+                    ..
+                }
+            )),
             "but nothing was actually sent to the server"
         );
     }
@@ -3378,10 +3471,13 @@ mod hash_field_edit_tests {
         let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
         assert_eq!(
             cmds,
-            vec![Command::SetHashField {
-                name: b"k".to_vec().into(),
-                field: b"f".to_vec(),
-                value: b"!old".to_vec(),
+            vec![Command::Execute {
+                mutation: Mutation::SetHashField {
+                    key: "k".into(),
+                    field: b"f".to_vec(),
+                    value: b"!old".to_vec()
+                },
+                index: None,
             }]
         );
     }
@@ -3762,9 +3858,14 @@ mod hash_field_edit_tests {
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
         let (s, cmds) = update(
             s,
-            Msg::NotWritten {
-                name: "k".into(),
-                why: NotWritten::FieldGone,
+            Msg::MutationSettled {
+                mutation: Mutation::SetHashField {
+                    key: "k".into(),
+                    field: b"f".to_vec(),
+                    value: b"!old".to_vec(),
+                },
+                index: None,
+                result: Ok(MutationOutcome::NotWritten(NotWritten::FieldGone)),
                 at_ms: 5_000,
             },
         );
@@ -3791,9 +3892,14 @@ mod hash_field_edit_tests {
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
         let (s, cmds) = update(
             s,
-            Msg::NotWritten {
-                name: "k".into(),
-                why: NotWritten::FieldExists,
+            Msg::MutationSettled {
+                mutation: Mutation::AddHashField {
+                    key: "k".into(),
+                    field: b"new".to_vec(),
+                    value: b"value".to_vec(),
+                },
+                index: None,
+                result: Ok(MutationOutcome::NotWritten(NotWritten::FieldExists)),
                 at_ms: 5_000,
             },
         );
@@ -3812,9 +3918,14 @@ mod hash_field_edit_tests {
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
         let (s, cmds) = update(
             s,
-            Msg::NotWritten {
-                name: "k".into(),
-                why: NotWritten::KeyGone,
+            Msg::MutationSettled {
+                mutation: Mutation::SetHashField {
+                    key: "k".into(),
+                    field: b"f".to_vec(),
+                    value: b"!old".to_vec(),
+                },
+                index: None,
+                result: Ok(MutationOutcome::NotWritten(NotWritten::KeyGone)),
                 at_ms: 6_000,
             },
         );
@@ -3907,9 +4018,13 @@ mod hash_field_edit_tests {
         let s = open_with_hash(&[("f", "v")], 1);
         let (s, cmds) = update(
             s,
-            Msg::HashFieldAlreadyGone {
-                name: "k".into(),
-                field: "f".into(),
+            Msg::MutationSettled {
+                mutation: Mutation::DeleteHashField {
+                    key: "k".into(),
+                    field: b"f".to_vec(),
+                },
+                index: None,
+                result: Ok(MutationOutcome::NothingToRemove),
                 at_ms: 5_000,
             },
         );
@@ -3956,15 +4071,23 @@ mod hash_field_edit_tests {
         let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
         assert_eq!(
             cmds,
-            vec![Command::DeleteHashField {
-                name: b"k".to_vec().into(),
-                field: b"b".to_vec(),
+            vec![Command::Execute {
+                mutation: Mutation::DeleteHashField {
+                    key: "k".into(),
+                    field: b"b".to_vec()
+                },
+                index: None,
             }]
         );
         let (s, _) = update(
             s,
-            Msg::ValueSet {
-                name: "k".into(),
+            Msg::MutationSettled {
+                mutation: Mutation::DeleteHashField {
+                    key: "k".into(),
+                    field: b"b".to_vec(),
+                },
+                index: None,
+                result: Ok(MutationOutcome::Done),
                 at_ms: 9_000,
             },
         );

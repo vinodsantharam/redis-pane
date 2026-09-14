@@ -146,7 +146,7 @@ pub fn render(
     // Read once per frame, not once per row: `LoadedSet::ttl_now` is what
     // turns each row's TTL into a countdown (R3.9, extended here from the
     // Viewer), and every visible row this frame should read the same instant.
-    let now_s = (clock.now_ms() / 1000) as u32;
+    let now_s = (clock.now_epoch_ms() / 1000) as u32;
     let cols = Columns::for_pane(area.width, density);
     let mut y = area.y;
 

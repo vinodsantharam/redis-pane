@@ -71,7 +71,7 @@ fn value_pane(
     if area.height == 0 || area.width < 6 {
         return;
     }
-    let now = clock.now_ms();
+    let now = clock.now_epoch_ms();
 
     // A read is in flight for a key that isn't (yet) what's on screen — a
     // first Open, or a switch to a different key while another's value was
@@ -693,7 +693,7 @@ fn status_bar(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect, buf: 
     let readout = state.scan.readout();
     let quiet = readout.is_empty()
         && state.list.sort_readout().is_none()
-        && state.notice_now(clock.now_ms()).is_none()
+        && state.notice_now(clock.now_epoch_ms()).is_none()
         && state.error_text().is_none();
     if quiet || area.height < 2 {
         return;
@@ -701,7 +701,7 @@ fn status_bar(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect, buf: 
     let y = area.height - if area.height >= 24 { 2 } else { 1 };
     let token = if state.error_text().is_some() {
         Token::Danger
-    } else if state.notice_now(clock.now_ms()).is_some() {
+    } else if state.notice_now(clock.now_epoch_ms()).is_some() {
         Token::Ok
     } else {
         match state.scan {
@@ -718,7 +718,7 @@ fn status_bar(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect, buf: 
     // A copy confirmation displaces the scan readout for a moment rather than
     // claiming another row (G7). A failure outranks both and stays until it is
     // dismissed, because an error nobody read is an error nobody handled.
-    if let Some(notice) = state.notice_now(clock.now_ms()) {
+    if let Some(notice) = state.notice_now(clock.now_epoch_ms()) {
         line = notice.to_string();
     }
     if let Some(error) = state.error_text() {
@@ -1235,7 +1235,7 @@ pub fn read_age(state: &State, clock: &dyn Clock) -> String {
     match state.last_read_ms {
         None => "never read".to_string(),
         Some(then) => {
-            let secs = clock.now_ms().saturating_sub(then) / 1000;
+            let secs = clock.now_epoch_ms().saturating_sub(then) / 1000;
             if secs < 1 {
                 "read just now".to_string()
             } else if secs < 60 {

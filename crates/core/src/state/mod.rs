@@ -17,7 +17,7 @@ pub mod view;
 pub use copy::CopyWhat;
 pub use editor::{EditBuffer, EditTarget, FieldPart};
 pub use loaded::{KeyKind, LoadedSet};
-pub use open::{Attachment, OpenKey, PendingRead, ReadOutcome};
+pub use open::{Attachment, EditPhase, OpenKey, PendingRead, ReadOutcome};
 pub use scan::ScanState;
 pub use tree::Tree;
 pub use value::{Value, Viewer, looks_like_json};

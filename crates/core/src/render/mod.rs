@@ -328,7 +328,7 @@ fn value_pane(
     // Whether the inline editor's current text still parses as JSON, when
     // the value being edited was JSON-classified to begin with (ADR-0014) —
     // the live counterpart to the confirm dialog's `⚠ no longer valid JSON`.
-    if let Some(valid) = open.editor.as_ref().and_then(EditBuffer::json_valid) {
+    if let Some(valid) = open.editor().and_then(EditBuffer::json_valid) {
         let (label, token) = if valid {
             (" · json ✓", Token::Muted)
         } else {
@@ -358,7 +358,7 @@ fn value_pane(
     };
     let token = if open.deleted_at_ms.is_some() {
         Token::Danger
-    } else if open.pending.is_some() || open.editing {
+    } else if open.pending.is_some() || open.is_editing() {
         // Editing shares Warn with a held update: something to pay attention
         // to, nothing broken. Checked before the plain `●` case below, or an
         // idle edit with no pending change would render as plain green live.
@@ -407,7 +407,7 @@ fn value_pane(
     // that width `Up`/`Down` move by whole lines, which in a token is none.
     // The text colour is painted underneath instead of set on the widget,
     // since setting a style needs `&mut` and render only borrows `State`.
-    if let Some(editor) = &open.editor {
+    if let Some(editor) = open.editor() {
         if let Some(name) = editor.field_name() {
             // The two-part FIELD/VALUE form (PLAN M2 task 6 follow-up, F):
             // adding a field shows both, name first; editing an existing one
@@ -421,7 +421,7 @@ fn value_pane(
             // read as "the one taking keys right now".
             let name_part = editor.active_part() == Some(FieldPart::Name);
             let value_part = !name_part;
-            let show_marker = !editor.is_staged();
+            let show_marker = open.typing().is_some();
             let name_active = show_marker && name_part;
             let value_active = show_marker && value_part;
             // "FIELD"/"VALUE" are both five characters, so one constant
@@ -1146,12 +1146,7 @@ pub fn hint_bar(state: &State) -> String {
     // form's two parts each get their own wording (PLAN M2 task 6
     // follow-up, F/N) — the name part shares the editor's rank but not its
     // vocabulary, since `⌃S`/`↑` mean nothing there yet.
-    if let Some(editor) = state
-        .open
-        .as_ref()
-        .and_then(|o| o.editor.as_ref())
-        .filter(|e| !e.is_staged())
-    {
+    if let Some(editor) = state.open.as_ref().and_then(crate::state::OpenKey::typing) {
         let cancel = state.keymap.hint(Action::Cancel).unwrap_or_default();
         match editor.active_part() {
             Some(FieldPart::Name) => {

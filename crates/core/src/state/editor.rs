@@ -70,10 +70,6 @@ pub struct EditBuffer {
     /// staged `SetString` can warn if the edit no longer parses (mirrors
     /// `PendingMutation::SetString::was_json`).
     was_json: bool,
-    /// Handed to the confirm dialog. Still drawn, so the pane shows what is
-    /// about to be written rather than the value it replaces, but it takes no
-    /// more keys.
-    staged: bool,
     /// What this buffer writes back when staged (PLAN M2 task 6, D3).
     target: EditTarget,
 }
@@ -84,7 +80,6 @@ impl PartialEq for EditBuffer {
             && self.area.cursor() == other.area.cursor()
             && self.original == other.original
             && self.was_json == other.was_json
-            && self.staged == other.staged
             && self.target == other.target
     }
 }
@@ -142,7 +137,6 @@ impl EditBuffer {
             area,
             original: text.into_bytes(),
             was_json,
-            staged: false,
             target: EditTarget::Value,
         })
     }
@@ -186,7 +180,6 @@ impl EditBuffer {
             area,
             original: value.as_bytes().to_vec(),
             was_json,
-            staged: false,
             target: EditTarget::HashField {
                 field: field.to_string(),
             },
@@ -207,7 +200,6 @@ impl EditBuffer {
             area,
             original: Vec::new(),
             was_json: false,
-            staged: false,
             target: EditTarget::NewHashField {
                 field: String::new(),
                 part: FieldPart::Name,
@@ -322,21 +314,6 @@ impl EditBuffer {
     pub fn json_valid(&self) -> Option<bool> {
         self.was_json
             .then(|| serde_json::from_slice::<serde_json::Value>(&self.text()).is_ok())
-    }
-
-    /// Hand the buffer to the confirm dialog: it stays on screen but takes no
-    /// more keys.
-    pub fn stage(&mut self) {
-        self.staged = true;
-    }
-
-    /// Take the buffer back from the confirm dialog, to be typed into again.
-    pub fn unstage(&mut self) {
-        self.staged = false;
-    }
-
-    pub fn is_staged(&self) -> bool {
-        self.staged
     }
 
     /// Whether the text has changed from what the buffer was opened with.

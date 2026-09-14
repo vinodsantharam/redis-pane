@@ -427,12 +427,7 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             at_ms,
         } => failed(state, command, detail, at_ms),
         Msg::Paste(text) => {
-            if let Some(editor) = state
-                .open
-                .as_mut()
-                .and_then(|o| o.editor.as_mut())
-                .filter(|e| !e.is_staged())
-            {
+            if let Some(editor) = state.open.as_mut().and_then(OpenKey::typing_mut) {
                 if editor.active_part() == Some(FieldPart::Name) {
                     let stripped: String =
                         text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
@@ -528,12 +523,7 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
     // filter: both capture ordinary characters as text, and a key open for
     // editing outranks a filter that could only have been left running in
     // the background.
-    if state
-        .open
-        .as_ref()
-        .and_then(|o| o.editor.as_ref())
-        .is_some_and(|e| !e.is_staged())
-    {
+    if state.open.as_ref().and_then(OpenKey::typing).is_some() {
         return editor_key(state, key);
     }
     // While the filter is capturing, ordinary characters are text rather than
@@ -1100,7 +1090,7 @@ fn open_editor(mut state: State) -> (State, Vec<Command>) {
     }
     // The previous edit's `SET` has not been read back yet; a new buffer
     // opened now would be replaced by that read the moment it lands.
-    if open.editing {
+    if open.is_editing() {
         return (state, notify("still saving the last edit"));
     }
     let Some(value) = open.value.as_ref() else {
@@ -1119,9 +1109,9 @@ fn open_editor(mut state: State) -> (State, Vec<Command>) {
         };
         return match EditBuffer::for_hash_field(&field, &field_value) {
             Ok(buffer) => {
-                let open = state.open.as_mut().expect("checked above");
-                open.editor = Some(buffer);
-                open.editing = true;
+                if let Some(open) = state.open.as_mut() {
+                    open.begin_edit(buffer);
+                }
                 (state, Vec::new())
             }
             Err(text) => (state, notify(text)),
@@ -1129,12 +1119,9 @@ fn open_editor(mut state: State) -> (State, Vec<Command>) {
     }
     match EditBuffer::from_value(value, open.cursor) {
         Ok(buffer) => {
-            let open = state.open.as_mut().expect("checked above");
-            open.editor = Some(buffer);
-            // Set before the shell has done anything: R3.8's "an open editor
-            // is never touched" has to hold from the moment the reader asked
-            // to edit, not from whenever a later message gets around to it.
-            open.editing = true;
+            if let Some(open) = state.open.as_mut() {
+                open.begin_edit(buffer);
+            }
             (state, Vec::new())
         }
         Err(text) => (state, notify(text)),
@@ -1165,15 +1152,15 @@ fn begin_add_field(mut state: State) -> (State, Vec<Command>) {
     if open.deleted_at_ms.is_some() {
         return (state, notify("gone — nothing to edit"));
     }
-    if open.editing {
+    if open.is_editing() {
         return (state, notify("still saving the last edit"));
     }
     if !matches!(open.value, Some(Value::Hash(_))) {
         return (state, notify("fields can only be added to a hash"));
     }
-    let open = state.open.as_mut().expect("checked above");
-    open.editor = Some(EditBuffer::new_hash_field());
-    open.editing = true;
+    if let Some(open) = state.open.as_mut() {
+        open.begin_edit(EditBuffer::new_hash_field());
+    }
     (state, Vec::new())
 }
 
@@ -1185,7 +1172,7 @@ fn hash_add_blocked(state: &State) -> bool {
     let Some(open) = &state.open else {
         return true;
     };
-    let Some(name) = open.editor.as_ref().and_then(EditBuffer::field_name) else {
+    let Some(name) = open.editor().and_then(EditBuffer::field_name) else {
         return true;
     };
     name.is_empty() || open.hash_field_shown_duplicate()
@@ -1210,8 +1197,7 @@ fn name_part_key(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             // other Esc in the app — never a return to a prior draft.
             Action::Cancel => {
                 if let Some(open) = &mut state.open {
-                    open.editor = None;
-                    open.editing = false;
+                    open.end_edit();
                 }
                 return (state, Vec::new());
             }
@@ -1221,20 +1207,20 @@ fn name_part_key(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
     match key.code {
         KeyCode::Enter | KeyCode::Down => {
             if !hash_add_blocked(&state)
-                && let Some(editor) = state.open.as_mut().and_then(|o| o.editor.as_mut())
+                && let Some(editor) = state.open.as_mut().and_then(OpenKey::typing_mut)
             {
                 editor.advance_to_value();
             }
             (state, Vec::new())
         }
         KeyCode::Backspace => {
-            if let Some(editor) = state.open.as_mut().and_then(|o| o.editor.as_mut()) {
+            if let Some(editor) = state.open.as_mut().and_then(OpenKey::typing_mut) {
                 editor.name_pop();
             }
             (state, Vec::new())
         }
         KeyCode::Char(c) if !key.ctrl && !key.alt => {
-            if let Some(editor) = state.open.as_mut().and_then(|o| o.editor.as_mut()) {
+            if let Some(editor) = state.open.as_mut().and_then(OpenKey::typing_mut) {
                 editor.name_push(c);
             }
             (state, Vec::new())
@@ -1254,22 +1240,22 @@ fn stage_editor(mut state: State) -> (State, Vec<Command>) {
     let Some(open) = state.open.as_mut() else {
         return (state, Vec::new());
     };
-    let Some(editor) = open.editor.as_ref() else {
+    let Some(editor) = open.typing() else {
         return (state, Vec::new());
     };
     // A brand-new field has no prior value to be unchanged from — an empty
     // value is a real value Redis allows, not "nothing to save" (D1).
     let is_new_field = matches!(editor.target(), EditTarget::NewHashField { .. });
     if !is_new_field && !editor.is_dirty() {
-        open.editor = None;
-        open.editing = false;
+        open.end_edit();
         return (state, Vec::new());
     }
+    let name = open.name.clone();
     // Staged, not closed: the pane keeps showing what is about to be
     // written under the dialog, instead of the value it replaces.
-    let editor = open.editor.as_mut().expect("checked above");
-    editor.stage();
-    let name = open.name.clone();
+    let Some(editor) = open.stage_edit() else {
+        return (state, Vec::new());
+    };
     let original = editor.original().to_vec();
     let new = editor.text();
     let was_json = editor.was_json();
@@ -1312,7 +1298,7 @@ fn editor_key(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
     if state
         .open
         .as_ref()
-        .and_then(|o| o.editor.as_ref())
+        .and_then(OpenKey::typing)
         .is_some_and(|e| e.active_part() == Some(FieldPart::Name))
     {
         return name_part_key(state, key);
@@ -1321,13 +1307,13 @@ fn editor_key(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
         match action {
             Action::EditorStage => return stage_editor(state),
             Action::EditorUndo => {
-                if let Some(editor) = state.open.as_mut().and_then(|o| o.editor.as_mut()) {
+                if let Some(editor) = state.open.as_mut().and_then(OpenKey::typing_mut) {
                     editor.undo();
                 }
                 return (state, Vec::new());
             }
             Action::EditorRedo => {
-                if let Some(editor) = state.open.as_mut().and_then(|o| o.editor.as_mut()) {
+                if let Some(editor) = state.open.as_mut().and_then(OpenKey::typing_mut) {
                     editor.redo();
                 }
                 return (state, Vec::new());
@@ -1336,15 +1322,14 @@ fn editor_key(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             // prior draft, consistent with every other Esc in the app.
             Action::Cancel => {
                 if let Some(open) = &mut state.open {
-                    open.editor = None;
-                    open.editing = false;
+                    open.end_edit();
                 }
                 return (state, Vec::new());
             }
             _ => {}
         }
     }
-    let Some(editor) = state.open.as_mut().and_then(|o| o.editor.as_mut()) else {
+    let Some(editor) = state.open.as_mut().and_then(OpenKey::typing_mut) else {
         return (state, Vec::new());
     };
     match key.code {
@@ -1501,7 +1486,9 @@ fn write_landed(mut state: State, key: &KeyName) -> (State, Vec<Command>) {
     // `refetch`'s own `Command::ReadKey` is answered by `Msg::ValueLoaded`,
     // which applies immediately only if `may_apply()` is already true by the
     // time it arrives.
-    state.open.as_mut().expect("checked above").editing = false;
+    if let Some(open) = state.open.as_mut() {
+        open.write_landed();
+    }
     let commands = refetch(&mut state);
     if let Some(pending) = &mut state.open_pending {
         pending.own_write = true;
@@ -1538,12 +1525,15 @@ fn failed(mut state: State, command: String, detail: String, at_ms: u64) -> (Sta
     // "operation vanishes, nothing on screen explains it" defect the error
     // toast below exists to prevent.
     state.open_pending = None;
-    // Any failure while an edit is in flight (the `SET` was refused) ends the
-    // edit — never leaves `editing` stuck on, which would hold R3.8's
-    // live-update guard long after there is anything left to protect.
-    if let Some(open) = &mut state.open {
-        open.editing = false;
-        open.drop_staged_buffer();
+    // A failure while a write is in flight (the `SET` was refused) ends the
+    // edit, so R3.8's guard is not held long after there is anything left to
+    // protect. A buffer still being typed into is not discarded by a failure
+    // that has nothing to do with it — a metadata fetch, a clipboard error —
+    // which used to switch the guard off under unsaved text (review H2).
+    if let Some(open) = &mut state.open
+        && open.typing().is_none()
+    {
+        open.end_edit();
     }
     state.error = Some((format!("{command}: {detail}"), at_ms));
     (state, Vec::new())
@@ -1576,11 +1566,11 @@ fn not_written(
             let open = state.open.as_mut().expect("checked above");
             open.deleted_at_ms = Some(at_ms);
             open.pending = None;
-            let kept = open.editor.is_some();
+            let kept = open.editor().is_some();
             if kept {
                 open.unstage_buffer();
             } else {
-                open.editing = false;
+                open.end_edit();
             }
             if let Some(index) = open.index
                 && state.keys.name(index) == Some(name.as_bytes())
@@ -1646,19 +1636,17 @@ fn staged_edit_found_key_gone(state: &mut State, name: &KeyName, at_ms: u64) {
             format!("{name} is gone — nothing written, edit kept"),
             at_ms,
         ));
-    } else if !open.editing {
+    } else if !open.is_editing() {
         open.drop_staged_buffer();
     }
 }
 
-/// Clears `OpenKey::editing` and drops a staged buffer, if either is there.
-/// Harmless (and a no-op) for mutations that never touch them, such as
-/// `DeleteKey` — safe to call unconditionally from both of `confirm_key`'s
-/// non-executing branches.
+/// Ends the edit a dialog was confirming, if there is one. Harmless (and a
+/// no-op) for mutations that never open an edit, such as `DeleteKey` — safe to
+/// call unconditionally from both of `confirm_key`'s non-executing branches.
 fn clear_editing(state: &mut State) {
     if let Some(open) = &mut state.open {
-        open.editing = false;
-        open.drop_staged_buffer();
+        open.end_edit();
     }
 }
 
@@ -2633,10 +2621,10 @@ mod tests {
         let s = open_with_string(&text);
         let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
         assert!(
-            s.open.as_ref().unwrap().editing,
+            s.open.as_ref().unwrap().is_editing(),
             "R3.8's guard must be up immediately"
         );
-        let editor = s.open.as_ref().unwrap().editor.as_ref().unwrap();
+        let editor = s.open.as_ref().unwrap().editor().unwrap();
         assert_eq!(editor.text(), text.into_bytes());
         assert!(cmds.is_empty(), "opening the editor emits no command");
     }
@@ -2645,7 +2633,7 @@ mod tests {
     fn e_opens_json_with_pretty_printed_lines_and_was_json_set() {
         let s = open_with_json("{\"a\":1}");
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
-        let editor = s.open.as_ref().unwrap().editor.as_ref().unwrap();
+        let editor = s.open.as_ref().unwrap().editor().unwrap();
         assert!(editor.was_json());
         // Pretty-printed, not the compact original — editing opens the
         // already-pretty form on purpose.
@@ -2657,20 +2645,11 @@ mod tests {
         let s = open_with_string("old");
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
         let s = type_text(s, "!");
-        assert_eq!(
-            s.open.as_ref().unwrap().editor.as_ref().unwrap().text(),
-            b"!old"
-        );
+        assert_eq!(s.open.as_ref().unwrap().editor().unwrap().text(), b"!old");
         let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('z'))));
-        assert_eq!(
-            s.open.as_ref().unwrap().editor.as_ref().unwrap().text(),
-            b"old"
-        );
+        assert_eq!(s.open.as_ref().unwrap().editor().unwrap().text(), b"old");
         let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('y'))));
-        assert_eq!(
-            s.open.as_ref().unwrap().editor.as_ref().unwrap().text(),
-            b"!old"
-        );
+        assert_eq!(s.open.as_ref().unwrap().editor().unwrap().text(), b"!old");
     }
 
     #[test]
@@ -2688,8 +2667,8 @@ mod tests {
         s.rebuild_list();
         let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
         let open = s.open.unwrap();
-        assert!(!open.editing);
-        assert!(open.editor.is_none());
+        assert!(!open.is_editing());
+        assert!(open.editor().is_none());
         assert!(matches!(cmds.as_slice(), [Command::Notify { .. }]));
     }
 
@@ -2699,8 +2678,8 @@ mod tests {
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
         let (s, cmds) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
         let open = s.open.unwrap();
-        assert!(!open.editing);
-        assert!(open.editor.is_none());
+        assert!(!open.is_editing());
+        assert!(open.editor().is_none());
         assert!(s.confirm.is_none());
         assert!(cmds.is_empty());
     }
@@ -2712,16 +2691,14 @@ mod tests {
         let s = type_text(s, "!");
         let (s, cmds) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
         assert!(
-            s.open.as_ref().unwrap().editing,
+            s.open.as_ref().unwrap().is_editing(),
             "still mid-edit at preview"
         );
         assert!(
-            s.open
-                .as_ref()
-                .unwrap()
-                .editor
-                .as_ref()
-                .is_some_and(|e| e.is_staged()),
+            matches!(
+                s.open.as_ref().unwrap().edit,
+                crate::state::EditPhase::Staged(_)
+            ),
             "staged, still on screen under the dialog"
         );
         assert!(cmds.is_empty(), "staging emits no command of its own");
@@ -2759,8 +2736,9 @@ mod tests {
     }
 
     fn staged_text(s: &State) -> Option<(Vec<u8>, bool)> {
-        let editor = s.open.as_ref()?.editor.as_ref()?;
-        Some((editor.text(), editor.is_staged()))
+        let open = s.open.as_ref()?;
+        let editor = open.editor()?;
+        Some((editor.text(), open.typing().is_none()))
     }
 
     #[test]
@@ -2791,8 +2769,8 @@ mod tests {
         let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Esc)));
         let open = s.open.unwrap();
-        assert!(!open.editing);
-        assert!(open.editor.is_none());
+        assert!(!open.is_editing());
+        assert!(open.editor().is_none());
     }
 
     #[test]
@@ -2828,7 +2806,7 @@ mod tests {
         assert!(s.notice.is_some());
         let open = s.open.as_ref().unwrap();
         assert_eq!(open.deleted_at_ms, Some(9_000));
-        assert!(open.editing, "the buffer is open again");
+        assert!(open.is_editing(), "the buffer is open again");
         assert_eq!(staged_text(&s), Some((b"!old".to_vec(), false)));
         let s = type_text(s, "?");
         assert_eq!(
@@ -2874,7 +2852,7 @@ mod tests {
         );
         assert!(cmds.is_empty(), "never retried");
         assert_eq!(staged_text(&s), Some((b"!old".to_vec(), false)));
-        assert!(s.open.as_ref().unwrap().editing);
+        assert!(s.open.as_ref().unwrap().is_editing());
     }
 
     #[test]
@@ -2899,15 +2877,15 @@ mod tests {
         assert!(cmds.is_empty(), "never retried, never recreated");
         let open = s.open.as_ref().unwrap();
         assert_eq!(open.deleted_at_ms, Some(9_100));
-        assert!(open.editing);
+        assert!(open.is_editing());
         assert_eq!(staged_text(&s), Some((b"!old".to_vec(), false)));
         let (text, _) = s.error.as_ref().unwrap();
         assert!(text.contains("nothing written, edit kept"), "{text}");
 
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Esc)));
         let open = s.open.unwrap();
-        assert!(open.editor.is_none(), "Esc still discards it");
-        assert!(!open.editing);
+        assert!(open.editor().is_none(), "Esc still discards it");
+        assert!(!open.is_editing());
     }
 
     #[test]
@@ -2940,8 +2918,8 @@ mod tests {
             },
         );
         let open = s.open.unwrap();
-        assert!(open.editor.is_none());
-        assert!(!open.editing);
+        assert!(open.editor().is_none());
+        assert!(!open.is_editing());
     }
 
     #[test]
@@ -2986,8 +2964,8 @@ mod tests {
         let s = type_text(s, "!");
         let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Esc)));
         let open = s.open.unwrap();
-        assert!(!open.editing);
-        assert!(open.editor.is_none());
+        assert!(!open.is_editing());
+        assert!(open.editor().is_none());
         assert!(cmds.is_empty());
         assert!(s.confirm.is_none());
     }
@@ -3021,7 +2999,10 @@ mod tests {
             "the screen must not change under an open editor"
         );
         assert!(open.pending.is_some(), "held for later instead");
-        assert!(open.editor.is_some(), "and the buffer itself is untouched");
+        assert!(
+            open.editor().is_some(),
+            "and the buffer itself is untouched"
+        );
     }
 
     #[test]
@@ -3046,25 +3027,61 @@ mod tests {
         let s = type_text(s, "!");
         let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
         let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Esc)));
-        assert!(!s.open.unwrap().editing);
+        assert!(!s.open.unwrap().is_editing());
         assert!(cmds.is_empty());
         assert!(s.confirm.is_none());
     }
 
     #[test]
-    fn a_failure_while_editing_always_clears_the_flag() {
+    fn a_failed_write_ends_the_edit() {
         let s = open_with_string("old");
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
-        assert!(s.open.as_ref().unwrap().editing);
+        let s = type_text(s, "!");
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        assert!(s.open.as_ref().unwrap().is_editing());
         let (s, _) = update(
             s,
-            Msg::Failed {
-                command: "SET k".into(),
-                detail: "READONLY".into(),
+            Msg::MutationSettled {
+                mutation: Mutation::SetString {
+                    key: "k".into(),
+                    value: b"!old".to_vec(),
+                },
+                index: None,
+                result: Err("READONLY You can't write against a read only replica.".into()),
                 at_ms: 0,
             },
         );
-        assert!(!s.open.unwrap().editing);
+        let (text, _) = s.error.as_ref().unwrap();
+        assert!(text.starts_with("SET k: READONLY"), "{text}");
+        let open = s.open.unwrap();
+        assert!(
+            !open.is_editing(),
+            "R3.8's guard does not outlive the write"
+        );
+        assert!(open.editor().is_none());
+    }
+
+    /// Review H2: an unrelated failure — a metadata fetch, a clipboard error —
+    /// used to switch R3.8's guard off under a buffer still being typed into,
+    /// so the next live update could land beneath unsaved text.
+    #[test]
+    fn an_unrelated_failure_never_ends_an_edit_being_typed() {
+        let s = open_with_string("old");
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let s = type_text(s, "!");
+        let (s, _) = update(
+            s,
+            Msg::Failed {
+                command: "fetching metadata".into(),
+                detail: "timed out".into(),
+                at_ms: 0,
+            },
+        );
+        assert!(s.error.is_some(), "the failure is still shown");
+        let open = s.open.as_ref().unwrap();
+        assert!(open.is_editing(), "the guard still holds");
+        assert_eq!(open.typing().unwrap().text(), b"!old");
     }
 
     #[test]
@@ -3072,10 +3089,7 @@ mod tests {
         let s = open_with_string("old");
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
         let (s, _) = update(s, Msg::Paste("!!!".to_string()));
-        assert_eq!(
-            s.open.as_ref().unwrap().editor.as_ref().unwrap().text(),
-            b"!!!old"
-        );
+        assert_eq!(s.open.as_ref().unwrap().editor().unwrap().text(), b"!!!old");
     }
 
     #[test]
@@ -3086,7 +3100,7 @@ mod tests {
         let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
         assert!(
-            s.open.as_ref().unwrap().editing,
+            s.open.as_ref().unwrap().is_editing(),
             "still true until ValueSet"
         );
 
@@ -3102,7 +3116,7 @@ mod tests {
                 at_ms: 5_000,
             },
         );
-        assert!(!s.open.as_ref().unwrap().editing);
+        assert!(!s.open.as_ref().unwrap().is_editing());
         assert!(
             matches!(cmds.as_slice(), [Command::ReadKey { .. }]),
             "the reply, not this message, is what the Viewer will show (ADR-0006)"
@@ -3124,7 +3138,7 @@ mod tests {
                 at_ms: 5_000,
             },
         );
-        assert!(!s.open.unwrap().editing, "was never true here");
+        assert!(!s.open.unwrap().is_editing(), "was never true here");
         assert!(cmds.is_empty());
     }
 
@@ -3133,7 +3147,7 @@ mod tests {
         let mut s = open_with_json(r#"{"a":1,"b":2}"#);
         s.open.as_mut().unwrap().cursor = 2;
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
-        let editor = s.open.as_ref().unwrap().editor.as_ref().unwrap();
+        let editor = s.open.as_ref().unwrap().editor().unwrap();
         assert_eq!(editor.widget().cursor(), (2, 0));
     }
 
@@ -3180,7 +3194,10 @@ mod tests {
         assert_eq!(open.value.as_ref(), Some(&written), "not held (ADR-0006)");
         assert!(open.pending.is_none());
         assert_eq!(open.cursor, 0, "clamped to the shorter value");
-        assert!(open.editor.is_none(), "the read replaced the staged buffer");
+        assert!(
+            open.editor().is_none(),
+            "the read replaced the staged buffer"
+        );
     }
 
     #[test]
@@ -3191,7 +3208,7 @@ mod tests {
         };
         let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
         assert!(
-            s.open.as_ref().unwrap().editor.is_some(),
+            s.open.as_ref().unwrap().editor().is_some(),
             "opening is never refused"
         );
         assert!(cmds.is_empty());
@@ -3249,8 +3266,8 @@ mod tests {
         s.focus = Pane::Keys;
         let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
         let open = s.open.as_ref().unwrap();
-        assert!(open.editor.is_none());
-        assert!(!open.editing);
+        assert!(open.editor().is_none());
+        assert!(!open.is_editing());
         assert!(
             matches!(cmds.as_slice(), [Command::Notify { text }] if text == "Tab to the value pane to edit")
         );
@@ -3261,7 +3278,7 @@ mod tests {
         let mut s = open_with_hash_for_gating();
         s.focus = Pane::Keys;
         let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
-        assert!(s.open.as_ref().unwrap().editor.is_none());
+        assert!(s.open.as_ref().unwrap().editor().is_none());
         assert!(
             matches!(cmds.as_slice(), [Command::Notify { text }] if text == "Tab to the value pane to edit")
         );
@@ -3383,7 +3400,7 @@ mod hash_field_edit_tests {
     fn e_without_a_cursor_gives_the_notice() {
         let s = open_with_hash(&[("f", "v")], 1);
         let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
-        assert!(!s.open.unwrap().editing);
+        assert!(!s.open.unwrap().is_editing());
         assert!(
             matches!(cmds.as_slice(), [Command::Notify { text }] if text == "Enter to pick a field")
         );
@@ -3395,8 +3412,8 @@ mod hash_field_edit_tests {
         let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
         assert!(cmds.is_empty());
         let open = s.open.as_ref().unwrap();
-        assert!(open.editing);
-        let editor = open.editor.as_ref().unwrap();
+        assert!(open.is_editing());
+        let editor = open.editor().unwrap();
         assert_eq!(editor.text(), b"{\"x\":1}", "raw, not pretty-printed");
         assert!(
             editor.was_json(),
@@ -3418,7 +3435,7 @@ mod hash_field_edit_tests {
         let s = with_cursor(open_with_hash(&[("id", "8812")], 1), 0);
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
         assert!(
-            !s.open.as_ref().unwrap().editor.as_ref().unwrap().was_json(),
+            !s.open.as_ref().unwrap().editor().unwrap().was_json(),
             "a bare number is not JSON-shaped"
         );
         let s = type_text(s, "x");
@@ -3434,7 +3451,7 @@ mod hash_field_edit_tests {
     fn a_json_object_field_edited_into_something_invalid_warns() {
         let s = with_cursor(open_with_hash(&[("f", "{\"a\":1}")], 1), 0);
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
-        assert!(s.open.as_ref().unwrap().editor.as_ref().unwrap().was_json());
+        assert!(s.open.as_ref().unwrap().editor().unwrap().was_json());
         let s = type_text(s, "x"); // breaks the JSON
         let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
         assert_eq!(s.confirm.as_ref().unwrap().json_warning(), Some(true));
@@ -3488,8 +3505,8 @@ mod hash_field_edit_tests {
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
         let (s, cmds) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
         let open = s.open.unwrap();
-        assert!(!open.editing);
-        assert!(open.editor.is_none());
+        assert!(!open.is_editing());
+        assert!(open.editor().is_none());
         assert!(s.confirm.is_none());
         assert!(cmds.is_empty());
     }
@@ -3503,10 +3520,10 @@ mod hash_field_edit_tests {
         assert!(cmds.is_empty());
         let open = s.open.as_ref().unwrap();
         assert!(
-            open.editing,
+            open.is_editing(),
             "R3.8's guard is up from the moment the form opens"
         );
-        let editor = open.editor.as_ref().unwrap();
+        let editor = open.editor().unwrap();
         assert_eq!(editor.active_part(), Some(FieldPart::Name));
         assert_eq!(editor.field_name(), Some(""));
         assert_eq!(editor.text(), b"", "the value side starts empty too");
@@ -3518,24 +3535,12 @@ mod hash_field_edit_tests {
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
         let s = type_text(s, "new");
         assert_eq!(
-            s.open
-                .as_ref()
-                .unwrap()
-                .editor
-                .as_ref()
-                .unwrap()
-                .field_name(),
+            s.open.as_ref().unwrap().editor().unwrap().field_name(),
             Some("new")
         );
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Backspace)));
         assert_eq!(
-            s.open
-                .as_ref()
-                .unwrap()
-                .editor
-                .as_ref()
-                .unwrap()
-                .field_name(),
+            s.open.as_ref().unwrap().editor().unwrap().field_name(),
             Some("ne")
         );
     }
@@ -3546,7 +3551,7 @@ mod hash_field_edit_tests {
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
         let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
         assert!(cmds.is_empty());
-        let editor = s.open.as_ref().unwrap().editor.as_ref().unwrap();
+        let editor = s.open.as_ref().unwrap().editor().unwrap();
         assert_eq!(
             editor.active_part(),
             Some(FieldPart::Name),
@@ -3562,13 +3567,7 @@ mod hash_field_edit_tests {
         let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
         assert!(cmds.is_empty());
         assert_eq!(
-            s.open
-                .as_ref()
-                .unwrap()
-                .editor
-                .as_ref()
-                .unwrap()
-                .active_part(),
+            s.open.as_ref().unwrap().editor().unwrap().active_part(),
             Some(FieldPart::Value),
             "Enter moved to the value part"
         );
@@ -3598,13 +3597,7 @@ mod hash_field_edit_tests {
         let s = type_text(s, "new");
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Down)));
         assert_eq!(
-            s.open
-                .as_ref()
-                .unwrap()
-                .editor
-                .as_ref()
-                .unwrap()
-                .active_part(),
+            s.open.as_ref().unwrap().editor().unwrap().active_part(),
             Some(FieldPart::Value)
         );
     }
@@ -3617,7 +3610,7 @@ mod hash_field_edit_tests {
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
         let s = type_text(s, "fr");
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Up)));
-        let editor = s.open.as_ref().unwrap().editor.as_ref().unwrap();
+        let editor = s.open.as_ref().unwrap().editor().unwrap();
         assert_eq!(editor.active_part(), Some(FieldPart::Name));
         assert_eq!(editor.text(), b"fr", "the value text is kept");
         assert_eq!(editor.field_name(), Some("new"));
@@ -3633,7 +3626,7 @@ mod hash_field_edit_tests {
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
         let s = type_text(s, "line2");
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Up)));
-        let editor = s.open.as_ref().unwrap().editor.as_ref().unwrap();
+        let editor = s.open.as_ref().unwrap().editor().unwrap();
         assert_eq!(
             editor.active_part(),
             Some(FieldPart::Value),
@@ -3643,7 +3636,7 @@ mod hash_field_edit_tests {
 
         // A second `↑`, now genuinely on the top row, does leave.
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Up)));
-        let editor = s.open.as_ref().unwrap().editor.as_ref().unwrap();
+        let editor = s.open.as_ref().unwrap().editor().unwrap();
         assert_eq!(editor.active_part(), Some(FieldPart::Name));
         assert_eq!(editor.text(), b"line1\nline2", "still kept");
     }
@@ -3673,8 +3666,8 @@ mod hash_field_edit_tests {
         let s = type_text(s, "new");
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Esc)));
         let open = s.open.unwrap();
-        assert!(open.editor.is_none());
-        assert!(!open.editing);
+        assert!(open.editor().is_none());
+        assert!(!open.is_editing());
     }
 
     #[test]
@@ -3686,8 +3679,8 @@ mod hash_field_edit_tests {
         let s = type_text(s, "value");
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Esc)));
         let open = s.open.unwrap();
-        assert!(open.editor.is_none());
-        assert!(!open.editing);
+        assert!(open.editor().is_none());
+        assert!(!open.is_editing());
     }
 
     #[test]
@@ -3696,13 +3689,7 @@ mod hash_field_edit_tests {
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
         let (s, _) = update(s, Msg::Paste("new\r\nfield\n".into()));
         assert_eq!(
-            s.open
-                .as_ref()
-                .unwrap()
-                .editor
-                .as_ref()
-                .unwrap()
-                .field_name(),
+            s.open.as_ref().unwrap().editor().unwrap().field_name(),
             Some("newfield")
         );
     }
@@ -3717,25 +3704,13 @@ mod hash_field_edit_tests {
 
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
         assert_eq!(
-            s.open
-                .as_ref()
-                .unwrap()
-                .editor
-                .as_ref()
-                .unwrap()
-                .active_part(),
+            s.open.as_ref().unwrap().editor().unwrap().active_part(),
             Some(FieldPart::Name),
             "Enter blocked"
         );
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Down)));
         assert_eq!(
-            s.open
-                .as_ref()
-                .unwrap()
-                .editor
-                .as_ref()
-                .unwrap()
-                .active_part(),
+            s.open.as_ref().unwrap().editor().unwrap().active_part(),
             Some(FieldPart::Name),
             "Down blocked too"
         );
@@ -3753,13 +3728,7 @@ mod hash_field_edit_tests {
         // "du" is not a shown field.
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
         assert_eq!(
-            s.open
-                .as_ref()
-                .unwrap()
-                .editor
-                .as_ref()
-                .unwrap()
-                .active_part(),
+            s.open.as_ref().unwrap().editor().unwrap().active_part(),
             Some(FieldPart::Value),
             "no longer a duplicate, so Enter advances"
         );
@@ -3871,10 +3840,13 @@ mod hash_field_edit_tests {
         );
         assert!(matches!(cmds.as_slice(), [Command::ReadKey { .. }]));
         let open = s.open.as_ref().unwrap();
-        assert!(open.editing, "held under R3.8 — the buffer is open again");
-        let editor = open.editor.as_ref().unwrap();
+        assert!(
+            open.is_editing(),
+            "held under R3.8 — the buffer is open again"
+        );
+        let editor = open.editor().unwrap();
         assert_eq!(editor.text(), b"!old");
-        assert!(!editor.is_staged());
+        assert!(open.typing().is_some(), "typing again, not staged");
         let (text, _) = s.error.as_ref().unwrap();
         assert!(text.contains("HSET k f"), "{text}");
         assert!(text.contains("field no longer exists"), "{text}");
@@ -3932,8 +3904,8 @@ mod hash_field_edit_tests {
         assert!(cmds.is_empty(), "never retried, never recreated");
         let open = s.open.as_ref().unwrap();
         assert_eq!(open.deleted_at_ms, Some(6_000));
-        assert!(open.editing, "the buffer is open again");
-        assert_eq!(open.editor.as_ref().unwrap().text(), b"!old");
+        assert!(open.is_editing(), "the buffer is open again");
+        assert_eq!(open.editor().unwrap().text(), b"!old");
         let (text, _) = s.error.as_ref().unwrap();
         assert!(text.contains("HSET k f"), "{text}");
         assert!(text.contains("key no longer exists"), "{text}");
@@ -3960,10 +3932,10 @@ mod hash_field_edit_tests {
         assert!(s.notice.is_some());
         let open = s.open.as_ref().unwrap();
         assert_eq!(open.deleted_at_ms, Some(7_000));
-        assert!(open.editing);
-        let editor = open.editor.as_ref().unwrap();
+        assert!(open.is_editing());
+        let editor = open.editor().unwrap();
         assert_eq!(editor.text(), b"!old");
-        assert!(!editor.is_staged());
+        assert!(open.typing().is_some(), "typing again, not staged");
     }
 
     #[test]
@@ -3988,7 +3960,7 @@ mod hash_field_edit_tests {
         assert!(s.confirm.is_none());
         let open = s.open.as_ref().unwrap();
         assert_eq!(open.deleted_at_ms, Some(7_000));
-        assert_eq!(open.editor.as_ref().unwrap().text(), b"value");
+        assert_eq!(open.editor().unwrap().text(), b"value");
     }
 
     #[test]
@@ -4010,7 +3982,7 @@ mod hash_field_edit_tests {
         assert!(s.notice.is_some());
         let open = s.open.as_ref().unwrap();
         assert_eq!(open.deleted_at_ms, Some(7_000));
-        assert!(open.editor.is_none(), "delete never had a buffer");
+        assert!(open.editor().is_none(), "delete never had a buffer");
     }
 
     #[test]
@@ -4039,7 +4011,7 @@ mod hash_field_edit_tests {
     fn an_update_arriving_while_a_field_is_edited_is_held() {
         let s = with_cursor(open_with_hash(&[("f", "old")], 1), 0);
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
-        assert!(s.open.as_ref().unwrap().editing);
+        assert!(s.open.as_ref().unwrap().is_editing());
         let (s, _) = update(
             s,
             Msg::ValueLoaded {
@@ -4058,7 +4030,7 @@ mod hash_field_edit_tests {
         let open = s.open.as_ref().unwrap();
         assert!(open.pending.is_some(), "held, not applied");
         assert_eq!(
-            open.editor.as_ref().unwrap().text(),
+            open.editor().unwrap().text(),
             b"old",
             "the buffer is never touched (R3.8)"
         );

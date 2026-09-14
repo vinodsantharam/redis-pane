@@ -15,7 +15,17 @@ use crate::mutation::Mutation;
 /// A's reply matches by name while answering a question two reads out of date.
 /// Only an identity that changes on *every* read is sufficient.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ReadToken(pub u64);
+pub struct ReadToken(u64);
+
+impl ReadToken {
+    /// The identity for the next read. Crate-private: only
+    /// [`crate::update::update`] mints tokens, so a shell cannot invent one and
+    /// resurrect a superseded read. A shell only ever holds tokens it was handed
+    /// in a [`Command::ReadKey`] (review H2).
+    pub(crate) fn next(self) -> Self {
+        Self(self.0.wrapping_add(1))
+    }
+}
 
 /// Work the core cannot perform itself. A shell executes these and reports back
 /// as a [`crate::Msg`].

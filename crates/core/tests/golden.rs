@@ -2427,7 +2427,7 @@ fn golden_viewer_opening() {
     let mut state = many_keys();
     state.open_pending = Some(PendingRead {
         name: "user:8812:session".into(),
-        token: ReadToken(1),
+        token: ReadToken::default(),
         index: Some(2),
         // Well past `APPEAR_DELAY_MS` relative to `CLOCK` (74_000): this read
         // is genuinely slow, so the placeholder must show.
@@ -2461,7 +2461,7 @@ fn golden_viewer_opening_a_fast_read_shows_nothing_at_all() {
     let mut too_recent = many_keys();
     too_recent.open_pending = Some(PendingRead {
         name: "user:8812:session".into(),
-        token: ReadToken(1),
+        token: ReadToken::default(),
         index: Some(2),
         // 100ms elapsed against `CLOCK` (74_000) — under the 200ms gate.
         issued_at_ms: Some(73_900),
@@ -2477,7 +2477,7 @@ fn golden_viewer_opening_a_fast_read_shows_nothing_at_all() {
     let mut unstamped = many_keys();
     unstamped.open_pending = Some(PendingRead {
         name: "user:8812:session".into(),
-        token: ReadToken(1),
+        token: ReadToken::default(),
         index: Some(2),
         issued_at_ms: None,
         activate_cursor: false,
@@ -2501,7 +2501,7 @@ fn golden_viewer_opening_a_different_key_than_the_one_already_shown() {
     let mut state = opened("user:8812:session", hash_value(), 2_537);
     state.open_pending = Some(PendingRead {
         name: "user:8812:cart".into(),
-        token: ReadToken(2),
+        token: ReadToken::default(),
         index: Some(0),
         issued_at_ms: Some(73_000),
         activate_cursor: false,
@@ -2528,7 +2528,7 @@ fn golden_viewer_refetching() {
     let mut state = opened("user:8812:session", hash_value(), 2_537);
     state.open_pending = Some(PendingRead {
         name: "user:8812:session".into(),
-        token: ReadToken(3),
+        token: ReadToken::default(),
         index: state.open.as_ref().unwrap().index,
         issued_at_ms: Some(73_000),
         activate_cursor: false,
@@ -2560,7 +2560,7 @@ fn golden_viewer_refetching_a_fast_reply_shows_nothing_at_all() {
     let mut state = opened("user:8812:session", hash_value(), 2_537);
     state.open_pending = Some(PendingRead {
         name: "user:8812:session".into(),
-        token: ReadToken(3),
+        token: ReadToken::default(),
         index: state.open.as_ref().unwrap().index,
         issued_at_ms: Some(73_900),
         activate_cursor: false,

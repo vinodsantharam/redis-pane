@@ -481,7 +481,47 @@ pub struct State {
     pub error: Option<(String, u64)>,
 }
 
+/// What the shell has learned by the time the core starts: the resolved
+/// Connection, and what connecting found out about the server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Startup {
+    pub connection: Connection,
+    /// Read-only Mode the *server* imposes: a replica (R1.15).
+    pub server_read_only: Option<ReadOnlyReason>,
+    pub condition: Option<ServerCondition>,
+}
+
 impl State {
+    /// The state a session starts in (review H2).
+    ///
+    /// The shell used to assemble this field by field in `main.rs`, including
+    /// the rule for which Read-only reason wins. That rule is the core's, and
+    /// now it is tested here: `prod` and `unknown` start guarded (R4.5,
+    /// ADR-0004), and a replica outranks the Environment, because that reason
+    /// cannot be lifted and claiming the weaker one would offer a toggle the
+    /// server will refuse (R1.15, ADR-0009).
+    pub fn new(startup: Startup) -> Self {
+        let read_only = startup.server_read_only.or_else(|| {
+            startup
+                .connection
+                .environment
+                .read_only_by_default()
+                .then_some(ReadOnlyReason::Environment)
+        });
+        State {
+            connection: startup.connection,
+            read_only,
+            condition: startup.condition,
+            // Tree is the default view (DESIGN §9, resolved): it shows fewer
+            // rows at rest, and `t` is one keypress from flat for anyone who
+            // wants it. Set here rather than on `State::default()`: a great many
+            // tests use that as a blank-slate baseline and rely on tree_mode
+            // being false unless a test opts in explicitly.
+            tree_mode: true,
+            ..State::default()
+        }
+    }
+
     /// Whether a pane-scoped key belongs to the keys pane rather than the
     /// Viewer (R2.7).
     ///
@@ -532,12 +572,6 @@ impl State {
         self.cols >= crate::render::layout::TWO_PANE_MIN_COLS
     }
 
-    /// What the header may claim about currency.
-    ///
-    /// There is deliberately no setter for this. Liveness is *derived* from the
-    /// link and the tracking state, so no code path can set the header to
-    /// `live` without the server having actually armed — which is the failure
-    /// ADR-0009 exists to prevent, and the one most likely to rot silently.
     /// Whether Read-only Mode can be lifted right now. A replica cannot, so the
     /// hint must read `locked` rather than offering a key that will not work.
     pub fn read_only_liftable(&self) -> bool {
@@ -721,6 +755,12 @@ impl State {
         )
     }
 
+    /// What the header may claim about currency.
+    ///
+    /// There is deliberately no setter for this. Liveness is *derived* from the
+    /// link and the tracking state, so no code path can set the header to
+    /// `live` without the server having actually armed — which is the failure
+    /// ADR-0009 exists to prevent, and the one most likely to rot silently.
     pub fn liveness(&self) -> Liveness {
         match &self.link {
             Link::Connecting | Link::Reconnecting { .. } => Liveness::Disconnected,
@@ -733,5 +773,53 @@ impl State {
                 Tracking::Unsupported => Liveness::Manual,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn startup(environment: Environment, server_read_only: Option<ReadOnlyReason>) -> Startup {
+        Startup {
+            connection: Connection {
+                environment,
+                ..Connection::default()
+            },
+            server_read_only,
+            condition: None,
+        }
+    }
+
+    #[test]
+    fn a_session_starts_guarded_exactly_where_the_environment_says() {
+        let cases = [
+            (Environment::Local, None),
+            (Environment::Staging, None),
+            (Environment::Prod, Some(ReadOnlyReason::Environment)),
+            (Environment::Unknown, Some(ReadOnlyReason::Environment)),
+        ];
+        for (environment, expected) in cases {
+            let state = State::new(startup(environment, None));
+            assert_eq!(state.read_only, expected, "{environment:?}");
+        }
+    }
+
+    #[test]
+    fn a_replica_outranks_the_environment_guard_from_the_first_frame() {
+        for environment in [Environment::Local, Environment::Prod] {
+            let state = State::new(startup(environment, Some(ReadOnlyReason::Replica)));
+            assert_eq!(
+                state.read_only,
+                Some(ReadOnlyReason::Replica),
+                "{environment:?}"
+            );
+            assert!(!state.read_only_liftable());
+        }
+    }
+
+    #[test]
+    fn a_session_starts_in_tree_mode() {
+        assert!(State::new(startup(Environment::Local, None)).tree_mode);
     }
 }

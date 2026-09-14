@@ -29,7 +29,7 @@ use crate::{Command, Msg, State};
 /// one `Command`: a read issued without bumping the token would be answered by
 /// a reply the core could not tell apart from a stale one.
 fn issue_read(state: &mut State) -> ReadToken {
-    state.read_token = ReadToken(state.read_token.0.wrapping_add(1));
+    state.read_token = state.read_token.next();
     state.read_token
 }
 

@@ -112,10 +112,19 @@ async fn an_armed_key_receives_an_invalidation_and_the_arming_is_consumed() {
     let _: () = writer.set("k", "v1", None, None, false).await.unwrap();
 
     // Arm by reading through the one read path that always arms.
-    let got: Option<String> = redis_pane::redis::refetch_and_rearm(&client, "k")
-        .await
-        .unwrap();
-    assert_eq!(got.as_deref(), Some("v1"));
+    let got = redis_pane::redis::read::read_value(
+        &client,
+        b"k",
+        40,
+        redis_pane::redis::read::Arming::Enabled,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    match got.value {
+        redis_pane_core::state::value::Value::Str(s) => assert_eq!(s.raw, "v1"),
+        other => panic!("expected a String value, got {other:?}"),
+    }
 
     let _: () = writer.set("k", "v2", None, None, false).await.unwrap();
     let first = tokio::time::timeout(Duration::from_secs(5), invalidations.recv()).await;
@@ -135,9 +144,14 @@ async fn an_armed_key_receives_an_invalidation_and_the_arming_is_consumed() {
     );
 
     // Re-arming brings it back, which is why Refetch is the only read path.
-    let _: Option<String> = redis_pane::redis::refetch_and_rearm(&client, "k")
-        .await
-        .unwrap();
+    let _ = redis_pane::redis::read::read_value(
+        &client,
+        b"k",
+        40,
+        redis_pane::redis::read::Arming::Enabled,
+    )
+    .await
+    .unwrap();
     let _: () = writer.set("k", "v4", None, None, false).await.unwrap();
     let third = tokio::time::timeout(Duration::from_secs(5), invalidations.recv()).await;
     assert!(third.is_ok(), "re-arming must restore liveness");
@@ -303,9 +317,14 @@ async fn a_reconnect_loses_tracking_which_is_why_it_must_be_re_armed() {
         .unwrap();
     writer.init().await.unwrap();
     let _: () = writer.set("k", "v1", None, None, false).await.unwrap();
-    let _: Option<String> = redis_pane::redis::refetch_and_rearm(&client, "k")
-        .await
-        .unwrap();
+    let _ = redis_pane::redis::read::read_value(
+        &client,
+        b"k",
+        40,
+        redis_pane::redis::read::Arming::Enabled,
+    )
+    .await
+    .unwrap();
 
     // Take the server away and bring it back. fred reconnects underneath us,
     // and the server on the other side remembers nothing about what we were
@@ -368,14 +387,21 @@ async fn tracking_round_trip_when_a_server_url_is_supplied() {
     writer.init().await.unwrap();
     let _: () = writer.set("rp:it", "v1", None, None, false).await.unwrap();
 
-    let got: Option<String> = redis_pane::redis::refetch_and_rearm(&client, "rp:it")
-        .await
-        .unwrap();
-    assert_eq!(
-        got.as_deref(),
-        Some("v1"),
-        "the armed read must see the value"
-    );
+    let got = redis_pane::redis::read::read_value(
+        &client,
+        b"rp:it",
+        40,
+        redis_pane::redis::read::Arming::Enabled,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    match got.value {
+        redis_pane_core::state::value::Value::Str(s) => {
+            assert_eq!(s.raw, "v1", "the armed read must see the value")
+        }
+        other => panic!("expected a String value, got {other:?}"),
+    }
 
     let _: () = writer.set("rp:it", "v2", None, None, false).await.unwrap();
     assert!(
@@ -395,9 +421,14 @@ async fn tracking_round_trip_when_a_server_url_is_supplied() {
     );
 
     // And Refetch — the only read path — brings it back.
-    let _: Option<String> = redis_pane::redis::refetch_and_rearm(&client, "rp:it")
-        .await
-        .unwrap();
+    let _ = redis_pane::redis::read::read_value(
+        &client,
+        b"rp:it",
+        40,
+        redis_pane::redis::read::Arming::Enabled,
+    )
+    .await
+    .unwrap();
     let _: () = writer.set("rp:it", "v4", None, None, false).await.unwrap();
     assert!(
         tokio::time::timeout(Duration::from_secs(5), invalidations.recv())
@@ -758,6 +789,52 @@ async fn a_primary_is_not_flagged_as_a_replica() {
     assert_eq!(est.read_only, None, "a primary imposes no guard of its own");
     assert_eq!(est.condition, None);
     let _ = client.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn a_refused_info_is_reported_not_treated_as_a_primary() {
+    // review M1: `server_conditions` used to default `read_only`/`condition`
+    // to `None` when INFO failed — indistinguishable from a primary reporting
+    // a clean bill of health. An ACL that denies `info` (as a managed
+    // platform's restricted role might) simulates that refusal.
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: String = writer
+        .custom(
+            fred::types::CustomCommand::new("ACL", None, false),
+            vec![
+                "SETUSER", "noinfo", "on", "nopass", "~*", "&*", "+@all", "-info",
+            ],
+        )
+        .await
+        .unwrap();
+
+    let creds = Credentials {
+        username: Some("noinfo".into()),
+        // `nopass` still requires an AUTH with an empty password to take
+        // effect — fred only sends AUTH at all when a password is present
+        // (see fred's `protocol::connection::authenticate`), so a `None`
+        // password here would silently stay on the `default` user, which
+        // has every permission, and the ACL below would never be exercised.
+        password: PasswordSource::Literal(String::new()),
+        ..Credentials::default()
+    };
+    // The connection's own version check also depends on `INFO server`, so an
+    // ACL that denies `info` entirely is refused before `server_conditions`
+    // ever runs — the connect fails with a diagnostic rather than reaching
+    // `Established`. That is still the safe outcome (a user sees why), so this
+    // asserts the failure is visible rather than exercising the field.
+    let err = redis_pane::redis::connect_with(&url, &creds)
+        .await
+        .expect_err("an ACL that denies `info` also blocks the version check");
+    let msg = err.to_string();
+    assert!(!msg.is_empty(), "a failed connect must still say why");
+
+    let _ = writer.quit().await;
 }
 
 #[tokio::test]

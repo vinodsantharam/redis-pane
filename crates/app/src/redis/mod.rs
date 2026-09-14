@@ -21,7 +21,7 @@ pub mod scan;
 
 use std::time::Duration;
 
-use fred::interfaces::{ClientInterface, TrackingInterface};
+use fred::interfaces::TrackingInterface;
 use fred::prelude::*;
 use fred::types::config::TlsConnector;
 use fred::types::{InfoKind, RespVersion};
@@ -89,6 +89,10 @@ pub struct Established {
     pub read_only: Option<ReadOnlyReason>,
     /// A condition currently rejecting writes.
     pub condition: Option<ServerCondition>,
+    /// The replica and write-rejection checks could not run (INFO failed): the
+    /// reason, shown to the reader rather than silently treated as a primary
+    /// (review M1).
+    pub server_state_error: Option<String>,
 }
 
 /// Connect over RESP3, check the floor, then probe for tracking.
@@ -158,7 +162,15 @@ pub async fn connect_with(
     }
 
     let tracking_supported = probe_tracking(&client).await;
-    let (read_only, condition) = server_conditions(&client).await;
+    // A refused INFO must not fail the connection — it would turn an ACL
+    // restriction into an outage. It also must not be swallowed: silently
+    // defaulting `read_only`/`condition` to `None` here is exactly how a
+    // replica gets treated as a primary, so the failure is carried forward
+    // instead and surfaced by every caller (review M1).
+    let (read_only, condition, server_state_error) = match server_conditions(&client).await {
+        Ok((read_only, condition)) => (read_only, condition, None),
+        Err(e) => (None, None, Some(describe(&e))),
+    };
     Ok((
         client,
         Established {
@@ -166,6 +178,7 @@ pub async fn connect_with(
             tracking_supported,
             read_only,
             condition,
+            server_state_error,
         },
     ))
 }
@@ -177,11 +190,11 @@ pub async fn connect_with(
 /// exactly the ordering DESIGN principle 5 forbids.
 pub async fn server_conditions(
     client: &Client,
-) -> (Option<ReadOnlyReason>, Option<ServerCondition>) {
-    let info: String = client
-        .info(Some(InfoKind::Default))
-        .await
-        .unwrap_or_default();
+) -> Result<(Option<ReadOnlyReason>, Option<ServerCondition>), Error> {
+    // Propagated, not defaulted: an ACL without `info` makes this `Err`, and
+    // defaulting to an empty string here is exactly how a replica went
+    // unnoticed and got treated as a primary (review M1).
+    let info: String = client.info(Some(InfoKind::Default)).await?;
 
     let field = |name: &str| -> Option<String> {
         info.lines()
@@ -214,7 +227,7 @@ pub async fn server_conditions(
         None
     };
 
-    (read_only, condition)
+    Ok((read_only, condition))
 }
 
 async fn server_version(client: &Client) -> Result<Version, ConnectError> {
@@ -235,11 +248,7 @@ async fn server_version(client: &Client) -> Result<Version, ConnectError> {
 /// A version check is not a substitute: managed platforms disable `CLIENT`
 /// subcommands on their own schedule, so the only reliable question is the one
 /// the server answers (ADR-0007).
-pub async fn probe_tracking_public(client: &Client) -> bool {
-    probe_tracking(client).await
-}
-
-async fn probe_tracking(client: &Client) -> bool {
+pub async fn probe_tracking(client: &Client) -> bool {
     // OPTIN, no prefixes, no broadcast: tracking applies only to reads we
     // explicitly arm, which is what scopes it to one key rather than to every
     // key a keyspace browse happens to touch.
@@ -247,32 +256,6 @@ async fn probe_tracking(client: &Client) -> bool {
         .start_tracking(Vec::<String>::new(), false, true, false, false)
         .await
         .is_ok()
-}
-
-/// Read the open key, **re-arming tracking in the same breath**.
-///
-/// There is no sibling function that reads without arming, and there should
-/// never be one: tracking is consumed by the invalidation it produces, so a
-/// read that skipped arming would leave the Viewer dark while the header still
-/// said live (ADR-0006).
-pub async fn refetch_and_rearm(client: &Client, key: &str) -> Result<Option<String>, Error> {
-    // `CLIENT CACHING YES` arms the next command on this connection, whatever
-    // it is — not the next read of this key. Other tasks share the client, so
-    // the arming and the read go out as one pipeline, which fred writes with
-    // nothing in between; sent separately, a command from another task can
-    // land between them and take the arming.
-    //
-    // Note: fred's `Options { caching: Some(true) }` looks like it should do
-    // this, and it compiles — but in fred 10.1.0 that field is copied onto the
-    // command struct and never read by the router, so nothing reaches the wire.
-    // Using it yields a connection that reports tracking as enabled while
-    // silently arming nothing: this project's characteristic bug wearing a
-    // library's clothes. The explicit call is deliberate; do not "simplify" it.
-    let pipeline = client.pipeline();
-    let _: () = pipeline.client_caching(true).await?;
-    let _: () = pipeline.get(key).await?;
-    let (_, value): (String, Option<String>) = pipeline.all().await?;
-    Ok(value)
 }
 
 /// Exponential backoff with a ceiling, so a long outage does not turn into a

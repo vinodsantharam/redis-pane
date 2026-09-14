@@ -108,6 +108,9 @@ fn probe(connection: &Connection, credentials: &Credentials, dial: &str) -> i32 
             if let Some(condition) = established.condition {
                 println!("condition: {}", condition.readout());
             }
+            if let Some(e) = &established.server_state_error {
+                println!("replica/condition checks failed: {e}");
+            }
             println!(
                 "liveness: {}",
                 if established.tracking_supported {

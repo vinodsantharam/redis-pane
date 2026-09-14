@@ -175,6 +175,18 @@ pub async fn run(
             tracking_supported: established.tracking_supported,
         },
     );
+    // A refused INFO at startup must be as visible as one after a reconnect
+    // (review M1) — the replica guard failing open is silent otherwise.
+    if let Some(detail) = established.server_state_error.clone() {
+        (state, _) = update(
+            state,
+            Msg::Failed {
+                command: "INFO (replica and write-rejection checks)".into(),
+                detail,
+                at_ms: clock.now_epoch_ms(),
+            },
+        );
+    }
     (state, _) = update(
         state,
         Msg::Resized {
@@ -551,18 +563,34 @@ impl Shell {
             let mut reconnects = self.client.reconnect_rx();
             let tx = self.tx.clone();
             let probe = self.client.clone();
+            let clock = self.clock.clone();
             tokio::spawn(async move {
                 while reconnects.recv().await.is_ok() {
                     // A fresh connection tracks nothing, so capability must be
                     // re-probed rather than remembered.
-                    let tracking = crate::redis::probe_tracking_public(&probe).await;
-                    let (read_only, condition) = crate::redis::server_conditions(&probe).await;
-                    let _ = tx
-                        .send(Msg::ServerState {
-                            read_only,
-                            condition,
-                        })
-                        .await;
+                    let tracking = crate::redis::probe_tracking(&probe).await;
+                    // A refused INFO here must be as visible as any other
+                    // failure — defaulting to "not a replica" is the silent
+                    // failure ADR-0009 exists to prevent (review M1).
+                    match crate::redis::server_conditions(&probe).await {
+                        Ok((read_only, condition)) => {
+                            let _ = tx
+                                .send(Msg::ServerState {
+                                    read_only,
+                                    condition,
+                                })
+                                .await;
+                        }
+                        Err(e) => {
+                            let _ = tx
+                                .send(Msg::Failed {
+                                    command: "INFO (replica and write-rejection checks)".into(),
+                                    detail: e.details().to_string(),
+                                    at_ms: clock.now_epoch_ms(),
+                                })
+                                .await;
+                        }
+                    }
                     if tx
                         .send(Msg::Connected {
                             version: String::new(),
@@ -650,12 +678,29 @@ impl Reconnect {
                     tokio::time::sleep(std::time::Duration::from_millis(after_ms)).await;
                     match crate::redis::connect_with(&dial, &credentials).await {
                         Ok((client, established)) => {
-                            let _ = tx
-                                .send(Msg::ServerState {
-                                    read_only: established.read_only,
-                                    condition: established.condition,
-                                })
-                                .await;
+                            // A refused INFO on this connection must be as
+                            // visible as it is at startup (review M1); it must
+                            // not be quietly presented as a clean ServerState.
+                            match &established.server_state_error {
+                                None => {
+                                    let _ = tx
+                                        .send(Msg::ServerState {
+                                            read_only: established.read_only,
+                                            condition: established.condition,
+                                        })
+                                        .await;
+                                }
+                                Some(detail) => {
+                                    let _ = tx
+                                        .send(Msg::Failed {
+                                            command: "INFO (replica and write-rejection checks)"
+                                                .into(),
+                                            detail: detail.clone(),
+                                            at_ms: clock.now_epoch_ms(),
+                                        })
+                                        .await;
+                                }
+                            }
                             let _ = landed.send((client, established)).await;
                         }
                         Err(err) => {

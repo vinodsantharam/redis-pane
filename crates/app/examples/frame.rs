@@ -165,7 +165,7 @@ async fn main() {
                 // command loop, so it stamps the token the core is holding.
                 token,
                 index: Some(target),
-                name: String::from_utf8_lossy(&name).into_owned(),
+                name: name.clone().into(),
                 value: read.value,
                 ttl_seconds: read.ttl_seconds,
                 size_bytes: read.size_bytes,

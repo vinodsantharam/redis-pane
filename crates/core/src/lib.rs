@@ -11,6 +11,7 @@
 pub mod clock;
 pub mod command;
 pub mod config;
+pub mod key;
 pub mod keymap;
 pub mod msg;
 pub mod render;
@@ -21,6 +22,7 @@ pub mod theme;
 pub mod update;
 
 pub use command::Command;
+pub use key::KeyName;
 pub use msg::Msg;
 pub use state::State;
 pub use update::update;

@@ -123,9 +123,17 @@ one: after every invalidation, and after every reconnect.
   integration suite asserted the *server* pushed an invalidation without checking that the *shell*
   ever reported the arming that made the read live in the first place. Found only by running the
   real binary against Redis Cloud and asking why a server that accepts `CLIENT TRACKING` still
-  showed manual. Fixed by sending `TrackingArmed` from the one place both `OpenKey` and
-  `RefetchOpenKey` funnel through, whenever `Arming::Enabled` and the read succeeds — which is
-  exactly when arming is known to have happened on the wire.
+  showed manual. Fixed by sending `TrackingArmed` from the one place every `Command::ReadKey`
+  funnels through, whenever the read armed and succeeded — which is exactly when arming is known
+  to have happened on the wire.
+- **The shell kept its own copy of the capability, and rebuilt the key from display text.**
+  Opening and refetching were two commands, and a Refetch's key was looked up by the shell from
+  the Open key's name — a lossy `String`. A key that was not valid UTF-8 refetched a different
+  key, came back `✕ deleted`, and armed tracking on that other key. Separately, the shell decided
+  whether to arm from a local that a fred-level reconnect's re-probe could not reach. Both are now
+  one command, `Command::ReadKey { key, index, token, arm }`: the key is exact bytes
+  (`KeyName`), and `arm` is derived by the core from the same `Link` the header's liveness is
+  (docs/reviews/2026-09-13-codebase-design-review.md, C1 and H3).
 - **There is nothing to arm on a server that refuses tracking.** Arming unconditionally makes
   every read fail on such a server — Upstash rejects `CLIENT CACHING` outright, so the app could
   browse a keyspace and open nothing in it. Arming is driven by the capability probe and by

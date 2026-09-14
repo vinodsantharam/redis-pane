@@ -75,9 +75,9 @@ pub struct PendingRead {
     /// The key this read is about — compared against the Open key's name at
     /// render time to tell a first Open (no name match, or nothing open yet)
     /// from a Refetch (name matches the Open key).
-    pub name: String,
+    pub name: crate::key::KeyName,
     pub token: crate::command::ReadToken,
-    /// Mirrors `Command::OpenKey`'s index, for header context on a first Open.
+    /// Mirrors `Command::ReadKey`'s index, for header context on a first Open.
     pub index: Option<usize>,
     /// When the read was actually issued, per the shell's clock. `None` until
     /// `Msg::ReadIssued` stamps it — the render layer treats an unstamped
@@ -148,7 +148,7 @@ pub struct OpenKey {
     /// the row list is rebuilt rather than searched for per frame — moving the
     /// cursor never changes it, so the render path needs no reverse lookup.
     pub row: Option<usize>,
-    pub name: String,
+    pub name: crate::key::KeyName,
     /// `None` means exactly one thing: no value has ever been read for this
     /// key. That is a real, distinct state from "read, then deleted" — a key
     /// requested and found gone before ever loading has no "what was in it"
@@ -204,7 +204,7 @@ pub struct OpenKey {
 impl OpenKey {
     pub fn new(
         index: Option<usize>,
-        name: String,
+        name: crate::key::KeyName,
         value: Value,
         ttl_seconds: i32,
         size_bytes: u32,
@@ -239,7 +239,7 @@ impl OpenKey {
     /// Viewer renders that as a single line — the name, and that it is gone —
     /// rather than reaching for chrome that describes a value that was never
     /// read.
-    pub fn gone(index: Option<usize>, name: String, at_ms: u64) -> Self {
+    pub fn gone(index: Option<usize>, name: crate::key::KeyName, at_ms: u64) -> Self {
         Self {
             index,
             row: None,

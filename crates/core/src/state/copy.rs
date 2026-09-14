@@ -55,7 +55,7 @@ pub fn value_text(value: &Value, now_ms: u64) -> String {
 /// itself: there is no type to match when a key was confirmed gone before
 /// ever loading, and a function that cannot be called for that case is safer
 /// than one that has to be taught not to unwrap a `None`.
-pub fn redis_cli_command(target: &str, name: &str, value: &Value) -> String {
+pub fn redis_cli_command(target: &str, name: &crate::key::KeyName, value: &Value) -> String {
     let connection = if target.contains("://") {
         format!("-u {}", shell_quote(target))
     } else {
@@ -64,7 +64,12 @@ pub fn redis_cli_command(target: &str, name: &str, value: &Value) -> String {
         let (host, port) = address.rsplit_once(':').unwrap_or((address, "6379"));
         format!("-h {host} -p {port} -n {db}")
     };
-    let key = shell_quote(name);
+    // A key that is not valid UTF-8 has no exact text, and a lossy one names a
+    // different key; ANSI-C quoting writes its real bytes (review C1).
+    let key = match name.as_str() {
+        Some(text) => shell_quote(text),
+        None => ansi_c_quote(name.as_bytes()),
+    };
     let verb = match value {
         Value::Str(_) | Value::Json(_) | Value::Binary(_) => format!("GET {key}"),
         Value::Hash(_) => format!("HGETALL {key}"),
@@ -89,6 +94,22 @@ fn shell_quote(s: &str) -> String {
         return s.to_string();
     }
     format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// Quote arbitrary bytes for bash/zsh as `$'…'`, escaping everything that is
+/// not printable ASCII as `\xHH`.
+fn ansi_c_quote(bytes: &[u8]) -> String {
+    let mut out = String::from("$'");
+    for &b in bytes {
+        match b {
+            b'\\' => out.push_str("\\\\"),
+            b'\'' => out.push_str("\\'"),
+            0x20..=0x7e => out.push(b as char),
+            _ => out.push_str(&format!("\\x{b:02x}")),
+        }
+    }
+    out.push('\'');
+    out
 }
 
 #[cfg(test)]
@@ -128,28 +149,28 @@ mod tests {
     fn the_command_matches_the_type_so_it_actually_runs() {
         let target = "cache-01:6379/0";
         assert!(
-            redis_cli_command(target, "k", &hash()).ends_with("HGETALL k"),
+            redis_cli_command(target, &"k".into(), &hash()).ends_with("HGETALL k"),
             "GET on a hash is an error"
         );
         assert!(
-            redis_cli_command(target, "k", &Value::Str(StringValue::new("v", 8)))
+            redis_cli_command(target, &"k".into(), &Value::Str(StringValue::new("v", 8)))
                 .ends_with("GET k")
         );
         assert!(
-            redis_cli_command(target, "k", &Value::ZSet(ScoredValue::default()))
+            redis_cli_command(target, &"k".into(), &Value::ZSet(ScoredValue::default()))
                 .ends_with("ZRANGE k 0 -1 WITHSCORES")
         );
     }
 
     #[test]
     fn the_command_carries_the_host_port_and_database() {
-        let cmd = redis_cli_command("cache-01:6380/3", "k", &hash());
+        let cmd = redis_cli_command("cache-01:6380/3", &"k".into(), &hash());
         assert_eq!(cmd, "redis-cli -h cache-01 -p 6380 -n 3 HGETALL k");
     }
 
     #[test]
     fn a_url_target_is_passed_through_as_a_url() {
-        let cmd = redis_cli_command("redis://cache-01.eu-w1:6379", "k", &hash());
+        let cmd = redis_cli_command("redis://cache-01.eu-w1:6379", &"k".into(), &hash());
         assert!(
             cmd.starts_with("redis-cli -u redis://cache-01.eu-w1:6379"),
             "{cmd}"
@@ -158,22 +179,28 @@ mod tests {
 
     #[test]
     fn keys_that_need_quoting_get_it() {
-        let cmd = redis_cli_command("h:6379/0", "key with space", &hash());
+        let cmd = redis_cli_command("h:6379/0", &"key with space".into(), &hash());
         assert!(cmd.ends_with("HGETALL 'key with space'"), "{cmd}");
 
-        let cmd = redis_cli_command("h:6379/0", "it's", &hash());
+        let cmd = redis_cli_command("h:6379/0", &"it's".into(), &hash());
         assert!(cmd.ends_with(r"HGETALL 'it'\''s'"), "{cmd}");
     }
 
     #[test]
     fn ordinary_keys_are_left_unquoted_because_quoting_them_is_noise() {
-        let cmd = redis_cli_command("h:6379/0", "user:8812:session", &hash());
+        let cmd = redis_cli_command("h:6379/0", &"user:8812:session".into(), &hash());
         assert!(cmd.ends_with("HGETALL user:8812:session"), "{cmd}");
     }
 
     #[test]
+    fn a_key_that_is_not_utf8_is_quoted_by_its_real_bytes() {
+        let cmd = redis_cli_command("h:6379/0", &b"\xff\xfe:s'".as_slice().into(), &hash());
+        assert!(cmd.ends_with(r"HGETALL $'\xff\xfe:s\''"), "{cmd}");
+    }
+
+    #[test]
     fn a_glob_in_a_key_name_is_quoted_so_the_shell_does_not_eat_it() {
-        let cmd = redis_cli_command("h:6379/0", "cache:*:tmp", &hash());
+        let cmd = redis_cli_command("h:6379/0", &"cache:*:tmp".into(), &hash());
         assert!(cmd.ends_with("HGETALL 'cache:*:tmp'"), "{cmd}");
     }
 }

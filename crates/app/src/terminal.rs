@@ -19,6 +19,7 @@ use fred::interfaces::EventInterface;
 use fred::prelude::Client;
 use redis_pane_core::clock::Clock;
 use redis_pane_core::command::ReadToken;
+use redis_pane_core::key::KeyName;
 use redis_pane_core::msg::{KeyCode, KeyPress, MouseAction, NotWritten};
 use redis_pane_core::resolve::Credentials;
 use redis_pane_core::theme::{ColorDepth, Theme};
@@ -103,7 +104,7 @@ pub async fn run(
     theme: Theme,
     clock: &dyn Clock,
     mut client: Client,
-    mut tracking: bool,
+    tracking: bool,
     dial: String,
     credentials: Credentials,
 ) -> std::io::Result<()> {
@@ -176,16 +177,6 @@ pub async fn run(
         },
     );
 
-    // Driven by the capability probe, never by preference (ADR-0007).
-    // Mutable: a reconnect re-probes tracking (a fresh connection may find a
-    // different server, or the same server in a different mood), and every
-    // read after that must arm — or not — accordingly.
-    let mut arming = if tracking {
-        crate::redis::read::Arming::Enabled
-    } else {
-        crate::redis::read::Arming::Unsupported
-    };
-
     let mut scan_cancel: Option<CancellationToken> = None;
     // Reads take turns, and superseded ones never reach the wire. See
     // `redis::read::ReadGate` for why that is a liveness invariant and not a
@@ -219,7 +210,7 @@ pub async fn run(
     // after every successful reconnect (below), against the new client, since
     // subscriptions are tied to the `Client` instance they were opened on —
     // one that has been replaced no longer delivers anything.
-    spawn_link_watchers(&client, &tx, tracking);
+    spawn_link_watchers(&client, &tx);
 
     loop {
         term.draw(|f| {
@@ -239,9 +230,9 @@ pub async fn run(
             msg = rx.recv() => msg,
             // A reconnect that landed. Swapped in here, in the same task as
             // everything else in this loop, rather than inside the spawned
-            // task that found it — so `client`/`arming` are current *before*
+            // task that found it — so `client` is current *before*
             // the `Msg::Connected` this constructs is ever handed to
-            // `update()`, and so `Command::RefetchOpenKey` (which
+            // `update()`, and so `Command::ReadKey` (which
             // `Msg::Connected` already asks for when tracking is supported)
             // reads the new connection rather than the dead one. Ordering
             // here is not incidental: the same guarantee through `tx`/`rx`
@@ -250,17 +241,11 @@ pub async fn run(
             // promise about which is drained first.
             Some((new_client, established)) = reconnected_rx.recv() => {
                 client = new_client;
-                tracking = established.tracking_supported;
-                arming = if tracking {
-                    crate::redis::read::Arming::Enabled
-                } else {
-                    crate::redis::read::Arming::Unsupported
-                };
                 reconnect_attempt = 0;
-                spawn_link_watchers(&client, &tx, tracking);
+                spawn_link_watchers(&client, &tx);
                 Some(Msg::Connected {
                     version: established.version.to_string(),
-                    tracking_supported: tracking,
+                    tracking_supported: established.tracking_supported,
                 })
             },
             () = tokio::time::sleep(std::time::Duration::from_secs(1)) => continue,
@@ -322,30 +307,21 @@ pub async fn run(
                         }
                     });
                 }
-                Command::OpenKey { index, name, token } => open_key(
+                Command::ReadKey {
+                    key,
+                    index,
+                    token,
+                    arm,
+                } => open_key(
                     &client,
-                    Some(index),
-                    name,
+                    index,
+                    key,
                     token,
                     &tx,
                     area_width(&term),
-                    arming,
+                    arm,
                     &mut read_gate,
                 ),
-                Command::RefetchOpenKey { token } => {
-                    if let Some(open) = &state.open {
-                        open_key(
-                            &client,
-                            open.index,
-                            open.name.as_bytes().to_vec(),
-                            token,
-                            &tx,
-                            area_width(&term),
-                            arming,
-                            &mut read_gate,
-                        );
-                    }
-                }
                 Command::CopyToClipboard { text, label } => {
                     let method = crate::clipboard::detect_method();
                     // Truncation is an OSC-52-only concern (native has no
@@ -397,13 +373,12 @@ pub async fn run(
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis() as u64)
                             .unwrap_or(0);
-                        let name_str = String::from_utf8_lossy(&name).into_owned();
-                        match crate::redis::delete_key(&client, &name).await {
+                        match crate::redis::delete_key(&client, name.as_bytes()).await {
                             Ok(()) => {
                                 let _ = tx
                                     .send(Msg::KeyDeleted {
                                         index: Some(index),
-                                        name: name_str,
+                                        name: name.clone(),
                                         at_ms,
                                     })
                                     .await;
@@ -411,7 +386,7 @@ pub async fn run(
                             Err(e) => {
                                 let _ = tx
                                     .send(Msg::Failed {
-                                        command: format!("DEL {name_str}"),
+                                        command: format!("DEL {name}"),
                                         detail: e.details().to_string(),
                                         at_ms,
                                     })
@@ -428,12 +403,11 @@ pub async fn run(
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis() as u64)
                             .unwrap_or(0);
-                        let name_str = String::from_utf8_lossy(&name).into_owned();
-                        match crate::redis::set_value(&client, &name, &new).await {
+                        match crate::redis::set_value(&client, name.as_bytes(), &new).await {
                             Ok(true) => {
                                 let _ = tx
                                     .send(Msg::ValueSet {
-                                        name: name_str,
+                                        name: name.clone(),
                                         at_ms,
                                     })
                                     .await;
@@ -441,7 +415,7 @@ pub async fn run(
                             Ok(false) => {
                                 let _ = tx
                                     .send(Msg::NotWritten {
-                                        name: name_str,
+                                        name: name.clone(),
                                         why: NotWritten::KeyGone,
                                         at_ms,
                                     })
@@ -450,7 +424,7 @@ pub async fn run(
                             Err(e) => {
                                 let _ = tx
                                     .send(Msg::Failed {
-                                        command: format!("SET {name_str}"),
+                                        command: format!("SET {name}"),
                                         detail: e.details().to_string(),
                                         at_ms,
                                     })
@@ -467,13 +441,14 @@ pub async fn run(
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis() as u64)
                             .unwrap_or(0);
-                        let name_str = String::from_utf8_lossy(&name).into_owned();
                         let field_str = String::from_utf8_lossy(&field).into_owned();
-                        match crate::redis::set_hash_field(&client, &name, &field, &value).await {
+                        match crate::redis::set_hash_field(&client, name.as_bytes(), &field, &value)
+                            .await
+                        {
                             Ok(crate::redis::FieldWrite::Written) => {
                                 let _ = tx
                                     .send(Msg::ValueSet {
-                                        name: name_str,
+                                        name: name.clone(),
                                         at_ms,
                                     })
                                     .await;
@@ -481,7 +456,7 @@ pub async fn run(
                             Ok(crate::redis::FieldWrite::FieldGone) => {
                                 let _ = tx
                                     .send(Msg::NotWritten {
-                                        name: name_str,
+                                        name: name.clone(),
                                         why: NotWritten::FieldGone,
                                         at_ms,
                                     })
@@ -490,7 +465,7 @@ pub async fn run(
                             Ok(crate::redis::FieldWrite::KeyGone) => {
                                 let _ = tx
                                     .send(Msg::NotWritten {
-                                        name: name_str,
+                                        name: name.clone(),
                                         why: NotWritten::KeyGone,
                                         at_ms,
                                     })
@@ -499,7 +474,7 @@ pub async fn run(
                             Err(e) => {
                                 let _ = tx
                                     .send(Msg::Failed {
-                                        command: format!("HSET {name_str} {field_str}"),
+                                        command: format!("HSET {name} {field_str}"),
                                         detail: e.details().to_string(),
                                         at_ms,
                                     })
@@ -516,13 +491,14 @@ pub async fn run(
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis() as u64)
                             .unwrap_or(0);
-                        let name_str = String::from_utf8_lossy(&name).into_owned();
                         let field_str = String::from_utf8_lossy(&field).into_owned();
-                        match crate::redis::add_hash_field(&client, &name, &field, &value).await {
+                        match crate::redis::add_hash_field(&client, name.as_bytes(), &field, &value)
+                            .await
+                        {
                             Ok(crate::redis::FieldAdd::Added) => {
                                 let _ = tx
                                     .send(Msg::ValueSet {
-                                        name: name_str,
+                                        name: name.clone(),
                                         at_ms,
                                     })
                                     .await;
@@ -530,7 +506,7 @@ pub async fn run(
                             Ok(crate::redis::FieldAdd::FieldExists) => {
                                 let _ = tx
                                     .send(Msg::NotWritten {
-                                        name: name_str,
+                                        name: name.clone(),
                                         why: NotWritten::FieldExists,
                                         at_ms,
                                     })
@@ -539,7 +515,7 @@ pub async fn run(
                             Ok(crate::redis::FieldAdd::KeyGone) => {
                                 let _ = tx
                                     .send(Msg::NotWritten {
-                                        name: name_str,
+                                        name: name.clone(),
                                         why: NotWritten::KeyGone,
                                         at_ms,
                                     })
@@ -548,7 +524,7 @@ pub async fn run(
                             Err(e) => {
                                 let _ = tx
                                     .send(Msg::Failed {
-                                        command: format!("HSETNX {name_str} {field_str}"),
+                                        command: format!("HSETNX {name} {field_str}"),
                                         detail: e.details().to_string(),
                                         at_ms,
                                     })
@@ -565,13 +541,14 @@ pub async fn run(
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis() as u64)
                             .unwrap_or(0);
-                        let name_str = String::from_utf8_lossy(&name).into_owned();
                         let field_str = String::from_utf8_lossy(&field).into_owned();
-                        match crate::redis::delete_hash_field(&client, &name, &field).await {
+                        match crate::redis::delete_hash_field(&client, name.as_bytes(), &field)
+                            .await
+                        {
                             Ok(true) => {
                                 let _ = tx
                                     .send(Msg::ValueSet {
-                                        name: name_str,
+                                        name: name.clone(),
                                         at_ms,
                                     })
                                     .await;
@@ -579,7 +556,7 @@ pub async fn run(
                             Ok(false) => {
                                 let _ = tx
                                     .send(Msg::HashFieldAlreadyGone {
-                                        name: name_str,
+                                        name: name.clone(),
                                         field: field_str,
                                         at_ms,
                                     })
@@ -588,7 +565,7 @@ pub async fn run(
                             Err(e) => {
                                 let _ = tx
                                     .send(Msg::Failed {
-                                        command: format!("HDEL {name_str} {field_str}"),
+                                        command: format!("HDEL {name} {field_str}"),
                                         detail: e.details().to_string(),
                                         at_ms,
                                     })
@@ -617,9 +594,11 @@ pub async fn run(
 /// Read a key and send the result in. The one read path: it always re-arms,
 /// so there is no branch on which liveness can be silently lost (ADR-0006).
 ///
-/// Both `Command::OpenKey` and `Command::RefetchOpenKey` — including the one
-/// an invalidation push triggers — call this, which is what unifies both
-/// re-arm invariants (ADR-0006, ADR-0009) into one place instead of two.
+/// Every `Command::ReadKey` lands here: an Open, a manual Refetch, and the
+/// one an invalidation push triggers. That is what unifies both re-arm
+/// invariants (ADR-0006, ADR-0009) into one place instead of two. Whether to
+/// arm is the command's `arm`, decided by the core (review H3); the key is the
+/// command's exact bytes, never rebuilt from display text (review C1).
 ///
 /// **Found by testing against real managed servers, not by any test in the
 /// suite:** `CLIENT CACHING YES` was sent and awaited inside `read_value`, but
@@ -633,11 +612,11 @@ pub async fn run(
 fn open_key(
     client: &Client,
     index: Option<usize>,
-    name: Vec<u8>,
+    name: KeyName,
     token: ReadToken,
     tx: &mpsc::Sender<Msg>,
     pane_width: usize,
-    arming: crate::redis::read::Arming,
+    arm: bool,
     gate: &mut crate::redis::read::ReadGate,
 ) {
     // Supersede whatever was in flight. The core would ignore its reply anyway
@@ -645,6 +624,11 @@ fn open_key(
     // reply does not un-send the `CLIENT CACHING YES` that came with it, and
     // that is the half which decides what the server tracks.
     let permit = gate.begin();
+    let arming = if arm {
+        crate::redis::read::Arming::Enabled
+    } else {
+        crate::redis::read::Arming::Unsupported
+    };
     let client = client.clone();
     let tx = tx.clone();
 
@@ -670,7 +654,10 @@ fn open_key(
             .unwrap_or(0);
         let Some(result) = permit
             .run(crate::redis::read::read_value(
-                &client, &name, pane_width, arming,
+                &client,
+                name.as_bytes(),
+                pane_width,
+                arming,
             ))
             .await
         else {
@@ -689,7 +676,7 @@ fn open_key(
             Ok(Some(read)) => Msg::ValueLoaded {
                 token,
                 index,
-                name: String::from_utf8_lossy(&name).into_owned(),
+                name: name.clone(),
                 value: read.value,
                 ttl_seconds: read.ttl_seconds,
                 size_bytes: read.size_bytes,
@@ -698,7 +685,7 @@ fn open_key(
             Ok(None) => Msg::ValueGone {
                 token,
                 index,
-                name: String::from_utf8_lossy(&name).into_owned(),
+                name: name.clone(),
                 at_ms,
             },
             // Never swallowed: a Redis error that produces no visible effect is
@@ -709,7 +696,7 @@ fn open_key(
             // suppressing it because the reader has moved on would be swallowing
             // an error on a technicality (R7.4).
             Err(e) => Msg::Failed {
-                command: format!("reading {}", String::from_utf8_lossy(&name)),
+                command: format!("reading {name}"),
                 detail: e.details().to_string(),
                 at_ms,
             },
@@ -743,11 +730,11 @@ fn start_scan(
 }
 
 /// Subscribe to a client's link-level streams: reconnect notifications, wire
-/// errors, and (while tracking is supported) invalidation pushes. Tied to the
+/// errors, and invalidation pushes. Tied to the
 /// `Client` instance passed in, so this has to be called again after every
 /// successful reconnect — a subscription opened on the old, now-dead client
 /// delivers nothing about the new one.
-fn spawn_link_watchers(client: &Client, tx: &mpsc::Sender<Msg>, tracking: bool) {
+fn spawn_link_watchers(client: &Client, tx: &mpsc::Sender<Msg>) {
     // fred reconnects underneath us on its own schedule if it has a
     // `ReconnectPolicy` (this app sets none, so in practice this fires only
     // if that ever changes) — and the server on the other side remembers
@@ -807,8 +794,10 @@ fn spawn_link_watchers(client: &Client, tx: &mpsc::Sender<Msg>, tracking: bool) 
 
     // Invalidation pushes arrive on their own task and become messages like
     // everything else. This is what makes a value update with no keypress —
-    // and it is the whole reason this project exists (ADR-0006).
-    if tracking {
+    // and it is the whole reason this project exists (ADR-0006). Subscribed
+    // whether or not the server tracks: a connection that never arms never
+    // receives a push, and the capability is the core's to know (review H3).
+    {
         let mut invalidations = fred::interfaces::TrackingInterface::invalidation_rx(client);
         let tx = tx.clone();
         tokio::spawn(async move {

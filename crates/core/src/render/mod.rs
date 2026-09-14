@@ -86,7 +86,7 @@ fn value_pane(
     // indicator used to flash on and off within a frame or two on almost
     // every keypress, reading as a glitch rather than feedback.
     if let Some(pending) = &state.open_pending
-        && state.open.as_ref().map(|o| o.name.as_str()) != Some(pending.name.as_str())
+        && state.open.as_ref().map(|o| &o.name) != Some(&pending.name)
         && pending
             .issued_at_ms
             .is_some_and(|t| now.saturating_sub(t) >= PendingRead::APPEAR_DELAY_MS)
@@ -134,7 +134,13 @@ fn value_pane(
                 theme.style(Token::Muted),
             );
             let x1 = put(buf, x1, area.y, "  ·  ", theme.style(Token::Border));
-            put(buf, x1, area.y, &open.name, theme.style(Token::Text));
+            put(
+                buf,
+                x1,
+                area.y,
+                &open.name.display(),
+                theme.style(Token::Text),
+            );
             put(
                 buf,
                 area.x + 1,
@@ -147,7 +153,7 @@ fn value_pane(
                 buf,
                 area.x + 1,
                 area.y,
-                &open.name,
+                &open.name.display(),
                 theme.style(Token::Text),
             );
             put_right(
@@ -226,7 +232,7 @@ fn value_pane(
             .unwrap_or_default();
         let x1 = put(buf, x0, area.y, &format!("{hint} back"), sty(Token::Muted));
         put(buf, x1, area.y, "  ·  ", sty(Token::Border));
-        put(buf, x1 + 5, area.y, &open.name, sty(Token::Text))
+        put(buf, x1 + 5, area.y, &open.name.display(), sty(Token::Text))
     } else {
         // The key name is this pane's header, and like the keys pane's column
         // header it carries the focus (DESIGN §4): `r` refetches here and
@@ -238,7 +244,7 @@ fn value_pane(
         } else {
             Token::Text
         });
-        put(buf, x0, area.y, &open.name, name_style)
+        put(buf, x0, area.y, &open.name.display(), name_style)
     };
 
     // The chip. The wash says *that* the Viewer is off the cursor; this says it
@@ -591,7 +597,13 @@ fn opening_placeholder(
             theme.style(Token::Muted),
         );
         let x1 = put(buf, x1, area.y, "  ·  ", theme.style(Token::Border));
-        put(buf, x1, area.y, &pending.name, theme.style(Token::Text));
+        put(
+            buf,
+            x1,
+            area.y,
+            &pending.name.display(),
+            theme.style(Token::Text),
+        );
         put(
             buf,
             area.x + 1,
@@ -605,7 +617,7 @@ fn opening_placeholder(
             buf,
             area.x + 1,
             area.y,
-            &pending.name,
+            &pending.name.display(),
             theme.style(Token::Text),
         );
         put_right(
@@ -840,10 +852,7 @@ fn confirm_overlay(
         }
         PendingMutation::SetString { name, old, new, .. } => {
             // The value itself is the `+` side of the diff below.
-            lines.push((
-                format!("SET {} KEEPTTL XX", String::from_utf8_lossy(name)),
-                Token::Text,
-            ));
+            lines.push((format!("SET {} KEEPTTL XX", name.display()), Token::Text));
             push_diff_side(&mut lines, "-", old, Token::Danger);
             push_diff_side(&mut lines, "+", new, Token::Ok);
             if pending.json_warning() == Some(true) {

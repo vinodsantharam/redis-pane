@@ -201,7 +201,7 @@ pub enum Msg {
         /// after a rescan took it away — the value is still the value, but
         /// there is no row it may be written back to.
         index: Option<usize>,
-        name: String,
+        name: crate::key::KeyName,
         value: crate::state::Value,
         ttl_seconds: i32,
         size_bytes: u32,
@@ -225,7 +225,7 @@ pub enum Msg {
         /// The Loaded set row this key was read from, if one was known —
         /// same meaning as [`Msg::ValueLoaded::index`].
         index: Option<usize>,
-        name: String,
+        name: crate::key::KeyName,
         at_ms: u64,
     },
     /// Something was copied. Drives a notice that fades on its own.
@@ -266,7 +266,7 @@ pub enum Msg {
         /// The Loaded set row this key was staged from, if one was known —
         /// same meaning as [`Msg::ValueGone::index`].
         index: Option<usize>,
-        name: String,
+        name: crate::key::KeyName,
         at_ms: u64,
     },
     /// The terminal reported a bracketed paste (ADR-0014).
@@ -279,13 +279,13 @@ pub enum Msg {
     ///
     /// Carries no value of its own: what follows is the same Refetch every
     /// other change to the open key goes through
-    /// (`crate::update::issue_refetch`) — the reply is what actually reaches
+    /// (`crate::update::refetch`) — the reply is what actually reaches
     /// the Viewer, never the bytes this message's own sender already knew
     /// (ADR-0006: no value cache, not even a one-message-long one). Guarded
     /// by `name`, the same way `ValueGone`/`KeyDeleted` are: the reader may
     /// have moved on to a different key by the time this lands.
     ValueSet {
-        name: String,
+        name: crate::key::KeyName,
         at_ms: u64,
     },
     /// A guarded write refused to write, because its precondition was no
@@ -305,7 +305,7 @@ pub enum Msg {
     /// `EditBuffer::target`, so the core derives it rather than trusting a
     /// second copy the shell could get out of sync with the first.
     NotWritten {
-        name: String,
+        name: crate::key::KeyName,
         why: NotWritten,
         at_ms: u64,
     },
@@ -318,7 +318,7 @@ pub enum Msg {
     /// notice, then a Refetch, the same way every other change to the open
     /// key is (ADR-0006).
     HashFieldAlreadyGone {
-        name: String,
+        name: crate::key::KeyName,
         field: String,
         at_ms: u64,
     },

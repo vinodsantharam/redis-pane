@@ -3,6 +3,7 @@
 use ratatui_textarea::CursorMove;
 
 use crate::command::ReadToken;
+use crate::key::KeyName;
 use crate::keymap::Action;
 use crate::msg::KeyCode;
 use crate::msg::KeyPress;
@@ -32,24 +33,38 @@ fn issue_read(state: &mut State) -> ReadToken {
     state.read_token
 }
 
-/// Issue a Refetch of the Open key: mints its token and records it as the
-/// pending read, so the frame can say a read is in flight (loading
-/// indicator) until the reply lands. Every `Command::RefetchOpenKey` site has
-/// an Open key by construction — refetching nothing is a no-op handled
-/// before this is ever called.
-fn issue_refetch(state: &mut State) -> ReadToken {
+/// Issue a Refetch of the Open key: mint its token, record it as the pending
+/// read so the frame can say a read is in flight until the reply lands, and
+/// return the one [`Command::ReadKey`] that asks for it.
+///
+/// With nothing open there is nothing to refetch: no command, and no token
+/// spent superseding a read nobody issued.
+fn refetch(state: &mut State) -> Vec<Command> {
+    let Some(open) = &state.open else {
+        return Vec::new();
+    };
+    let (key, index) = (open.name.clone(), open.index);
     let token = issue_read(state);
-    if let Some(open) = &state.open {
-        state.open_pending = Some(PendingRead {
-            name: open.name.clone(),
-            token,
-            index: open.index,
-            issued_at_ms: None,
-            activate_cursor: false,
-            own_write: false,
-        });
+    state.open_pending = Some(PendingRead {
+        name: key.clone(),
+        token,
+        index,
+        issued_at_ms: None,
+        activate_cursor: false,
+        own_write: false,
+    });
+    vec![read_key(state, key, index, token)]
+}
+
+/// The one read command, with the arming decision filled in from the core's
+/// own view of the link (ADR-0006, review H3). Every read is built here.
+fn read_key(state: &State, key: KeyName, index: Option<usize>, token: ReadToken) -> Command {
+    Command::ReadKey {
+        key,
+        index,
+        token,
+        arm: state.read_arms_tracking(),
     }
-    token
 }
 
 /// The epoch-seconds reading [`crate::state::loaded::LoadedSet::set_ttl`]
@@ -109,9 +124,7 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
                 },
             };
             let commands = if tracking_supported {
-                vec![Command::RefetchOpenKey {
-                    token: issue_refetch(&mut state),
-                }]
+                refetch(&mut state)
             } else {
                 Vec::new()
             };
@@ -164,8 +177,8 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             {
                 *tracking = Tracking::Consumed;
             }
-            let token = issue_refetch(&mut state);
-            (state, vec![Command::RefetchOpenKey { token }])
+            let commands = refetch(&mut state);
+            (state, commands)
         }
         Msg::ScanStarted { estimated_total } => {
             state.keys.clear();
@@ -229,8 +242,8 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
                 .as_ref()
                 .is_some_and(|open| open.deleted_at_ms.is_some());
             if (row_says_alive && viewer_says_gone) || (row_says_gone && !viewer_says_gone) {
-                let token = issue_refetch(&mut state);
-                return (state, vec![Command::RefetchOpenKey { token }]);
+                let commands = refetch(&mut state);
+                return (state, commands);
             }
             (state, Vec::new())
         }
@@ -482,15 +495,15 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
                 return (state, Vec::new());
             }
             // Clear *before* minting the Refetch, not after its reply lands —
-            // `issue_refetch`'s own `Command::RefetchOpenKey` is answered by
+            // `refetch`'s own `Command::ReadKey` is answered by
             // `Msg::ValueLoaded`, which applies immediately only if
             // `may_apply()` is already true by the time it arrives.
             state.open.as_mut().expect("checked above").editing = false;
-            let token = issue_refetch(&mut state);
+            let commands = refetch(&mut state);
             if let Some(pending) = &mut state.open_pending {
                 pending.own_write = true;
             }
-            (state, vec![Command::RefetchOpenKey { token }])
+            (state, commands)
         }
         Msg::NotWritten { name, why, at_ms } => not_written(state, name, why, at_ms),
         Msg::HashFieldAlreadyGone { name, field, at_ms } => {
@@ -498,8 +511,8 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
                 return (state, Vec::new());
             }
             state.notice = Some((format!("HDEL {name} {field}: field already gone"), at_ms));
-            let token = issue_refetch(&mut state);
-            (state, vec![Command::RefetchOpenKey { token }])
+            let commands = refetch(&mut state);
+            (state, commands)
         }
         Msg::Quit => quit(state),
     }
@@ -528,7 +541,7 @@ fn scan_batch(mut state: State, keys: Vec<Vec<u8>>) -> (State, Vec<Command>) {
         }
         // Only after the push succeeded: a key the cap refused has no index,
         // and claiming one would point the Open key at a row that is not there.
-        if looking_for.as_deref().map(str::as_bytes) == Some(key.as_slice())
+        if looking_for.as_ref().map(KeyName::as_bytes) == Some(key.as_slice())
             && let Some(open) = &mut state.open
         {
             open.index = Some(index);
@@ -683,8 +696,8 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
                 open.at_rest = true;
                 return (state, Vec::new());
             }
-            let token = issue_refetch(&mut state);
-            (state, vec![Command::RefetchOpenKey { token }])
+            let commands = refetch(&mut state);
+            (state, commands)
         }
         Action::CyclePane => {
             // Focus only ever moves to a pane there is something to focus.
@@ -731,7 +744,7 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             if state.keys.is_gone(index) {
                 return (state, Vec::new());
             }
-            let Some(name) = state.keys.name(index).map(<[u8]>::to_vec) else {
+            let Some(name) = state.keys.name(index).map(KeyName::from) else {
                 return (state, Vec::new());
             };
             state.confirm = Some(PendingMutation::DeleteKey { index, name });
@@ -752,7 +765,7 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
                 return (state, notify("Enter to pick a field"));
             };
             let last_field = pairs.total == 1;
-            let name = open.name.clone().into_bytes();
+            let name = open.name.clone();
             state.confirm = Some(PendingMutation::DeleteHashField {
                 name,
                 field: field.into_bytes(),
@@ -824,7 +837,7 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             let Some(index) = state.selected_key() else {
                 return (state, Vec::new());
             };
-            let Some(name) = state.keys.name(index).map(|n| n.to_vec()) else {
+            let Some(name) = state.keys.name(index).map(KeyName::from) else {
                 return (state, Vec::new());
             };
             // Opening a key moves focus onto it, at every width. Below 70
@@ -836,18 +849,15 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             state.focus = Pane::Value;
             let token = issue_read(&mut state);
             state.open_pending = Some(PendingRead {
-                name: state
-                    .keys
-                    .name_str(index)
-                    .map(|n| n.into_owned())
-                    .unwrap_or_default(),
+                name: name.clone(),
                 token,
                 index: Some(index),
                 issued_at_ms: None,
                 activate_cursor: false,
                 own_write: false,
             });
-            (state, vec![Command::OpenKey { index, name, token }])
+            let command = read_key(&state, name, Some(index), token);
+            (state, vec![command])
         }
         Action::EnterValueCursor => {
             // A no-op on a group row: Enter only ever means "put a cursor in
@@ -893,24 +903,21 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             // same as `Action::Open`: the previous value stays on screen,
             // correctly badged detached, rather than being blanked out for
             // the read's duration.
-            let Some(name) = state.keys.name(index).map(|n| n.to_vec()) else {
+            let Some(name) = state.keys.name(index).map(KeyName::from) else {
                 return (state, Vec::new());
             };
             state.focus = Pane::Value;
             let token = issue_read(&mut state);
             state.open_pending = Some(PendingRead {
-                name: state
-                    .keys
-                    .name_str(index)
-                    .map(|n| n.into_owned())
-                    .unwrap_or_default(),
+                name: name.clone(),
                 token,
                 index: Some(index),
                 issued_at_ms: None,
                 activate_cursor: true,
                 own_write: false,
             });
-            (state, vec![Command::OpenKey { index, name, token }])
+            let command = read_key(&state, name, Some(index), token);
+            (state, vec![command])
         }
         Action::Copy => {
             // Which pane the reader is looking at decides what `y` copies —
@@ -1076,7 +1083,7 @@ fn build_copy(state: State, what: CopyWhat) -> (State, Vec<Command>) {
     };
     let mut label = what.label().to_string();
     let text = match what {
-        CopyWhat::Key => match state.open.as_ref().map(|o| o.name.clone()) {
+        CopyWhat::Key => match state.open.as_ref().map(|o| o.name.display().into_owned()) {
             Some(name) => name,
             None => match state.selected_key().and_then(|i| state.keys.name_str(i)) {
                 Some(name) => name.into_owned(),
@@ -1320,7 +1327,7 @@ fn stage_editor(mut state: State) -> (State, Vec<Command>) {
     // written under the dialog, instead of the value it replaces.
     let editor = open.editor.as_mut().expect("checked above");
     editor.stage();
-    let name = open.name.clone().into_bytes();
+    let name = open.name.clone();
     let original = editor.original().to_vec();
     let new = editor.text();
     let was_json = editor.was_json();
@@ -1488,7 +1495,7 @@ fn confirm_key(mut state: State, pending: PendingMutation, key: KeyPress) -> (St
 /// The command an [`EditBuffer`] is about to write, for a `Msg::NotWritten`
 /// error's text. Derived from the target rather than carried in the message —
 /// the buffer already knows (PLAN M2 task 6, D2).
-fn edit_command_text(name: &str, target: &EditTarget) -> String {
+fn edit_command_text(name: &KeyName, target: &EditTarget) -> String {
     match target {
         EditTarget::Value => format!("SET {name}"),
         EditTarget::HashField { field } => format!("HSET {name} {field}"),
@@ -1507,7 +1514,7 @@ fn edit_command_text(name: &str, target: &EditTarget) -> String {
 /// buffer is open again by the time it lands.
 fn not_written(
     mut state: State,
-    name: String,
+    name: KeyName,
     why: NotWritten,
     at_ms: u64,
 ) -> (State, Vec<Command>) {
@@ -1555,8 +1562,8 @@ fn not_written(
                 format!("{command}: {reason} — nothing written, edit kept"),
                 at_ms,
             ));
-            let token = issue_refetch(&mut state);
-            (state, vec![Command::RefetchOpenKey { token }])
+            let commands = refetch(&mut state);
+            (state, commands)
         }
     }
 }
@@ -1569,7 +1576,7 @@ fn not_written(
 /// `SET` already sent, its own reply decides (`Msg::ValueSet` or
 /// `Msg::NotWritten`). Once the write has landed, a staged buffer was
 /// only standing in for the read back, and goes.
-fn staged_edit_found_key_gone(state: &mut State, name: &str, at_ms: u64) {
+fn staged_edit_found_key_gone(state: &mut State, name: &KeyName, at_ms: u64) {
     // Every mutation that names this key, not just `SetString` — a
     // `SetHashField`/`AddHashField` dialog closes and hands its buffer back
     // exactly the same way; a `DeleteHashField` dialog simply closes with the
@@ -1582,9 +1589,9 @@ fn staged_edit_found_key_gone(state: &mut State, name: &str, at_ms: u64) {
             | PendingMutation::SetHashField { name: staged, .. }
             | PendingMutation::AddHashField { name: staged, .. }
             | PendingMutation::DeleteHashField { name: staged, .. }
-        ) if staged == name.as_bytes()
+        ) if staged == name
     );
-    let Some(open) = state.open.as_mut().filter(|o| o.name == name) else {
+    let Some(open) = state.open.as_mut().filter(|o| o.name == *name) else {
         return;
     };
     if dialog_up {
@@ -1965,13 +1972,13 @@ mod tests {
     fn r_in_the_viewer_asks_for_a_refetch_which_is_the_only_read_path() {
         assert!(matches!(
             press_r(viewing()).as_slice(),
-            [Command::RefetchOpenKey { .. }]
+            [Command::ReadKey { .. }]
         ));
     }
 
     /// R2.7: `r` acts on the focused pane and nothing else. This half was
-    /// documented from the start and never wired up — the core emitted
-    /// `RefetchOpenKey` unconditionally, so `StartScan` was unreachable.
+    /// documented from the start and never wired up — the core emitted a
+    /// Refetch unconditionally, so `StartScan` was unreachable.
     #[test]
     fn r_in_the_keys_pane_rescans_the_keyspace() {
         let state = State {
@@ -2032,7 +2039,7 @@ mod tests {
             assert!(
                 matches!(
                     press_r(focused_value.clone()).as_slice(),
-                    [Command::RefetchOpenKey { .. }]
+                    [Command::ReadKey { .. }]
                 ),
                 "at {cols} columns, a focused Viewer owns `r`"
             );
@@ -2478,7 +2485,7 @@ mod tests {
             cmds,
             vec![Command::DeleteKey {
                 index: 0,
-                name: b"k:0".to_vec()
+                name: b"k:0".to_vec().into()
             }]
         );
     }
@@ -2522,7 +2529,7 @@ mod tests {
             s,
             Msg::KeyDeleted {
                 index: Some(0),
-                name: "k:0".to_string(),
+                name: "k:0".into(),
                 at_ms: 1_000,
             },
         );
@@ -2690,7 +2697,7 @@ mod tests {
         assert_eq!(
             cmds,
             vec![Command::SetValue {
-                name: b"k".to_vec(),
+                name: b"k".to_vec().into(),
                 new: b"!old".to_vec(),
             }]
         );
@@ -3020,7 +3027,7 @@ mod tests {
         );
         assert!(!s.open.as_ref().unwrap().editing);
         assert!(
-            matches!(cmds.as_slice(), [Command::RefetchOpenKey { .. }]),
+            matches!(cmds.as_slice(), [Command::ReadKey { .. }]),
             "the reply, not this message, is what the Viewer will show (ADR-0006)"
         );
     }
@@ -3065,7 +3072,7 @@ mod tests {
                 at_ms: 5_000,
             },
         );
-        let [Command::RefetchOpenKey { token }] = cmds.as_slice() else {
+        let [Command::ReadKey { token, .. }] = cmds.as_slice() else {
             panic!("expected a Refetch, got {cmds:?}");
         };
         use crate::state::value::{StringValue, Value};
@@ -3372,7 +3379,7 @@ mod hash_field_edit_tests {
         assert_eq!(
             cmds,
             vec![Command::SetHashField {
-                name: b"k".to_vec(),
+                name: b"k".to_vec().into(),
                 field: b"f".to_vec(),
                 value: b"!old".to_vec(),
             }]
@@ -3714,19 +3721,19 @@ mod hash_field_edit_tests {
     fn read_only_refuses_all_three_hash_mutations_at_confirm() {
         let mutations = [
             PendingMutation::SetHashField {
-                name: b"k".to_vec(),
+                name: b"k".to_vec().into(),
                 field: b"f".to_vec(),
                 old: b"o".to_vec(),
                 new: b"n".to_vec(),
                 was_json: false,
             },
             PendingMutation::AddHashField {
-                name: b"k".to_vec(),
+                name: b"k".to_vec().into(),
                 field: b"f".to_vec(),
                 value: b"v".to_vec(),
             },
             PendingMutation::DeleteHashField {
-                name: b"k".to_vec(),
+                name: b"k".to_vec().into(),
                 field: b"f".to_vec(),
                 last_field: false,
             },
@@ -3761,7 +3768,7 @@ mod hash_field_edit_tests {
                 at_ms: 5_000,
             },
         );
-        assert!(matches!(cmds.as_slice(), [Command::RefetchOpenKey { .. }]));
+        assert!(matches!(cmds.as_slice(), [Command::ReadKey { .. }]));
         let open = s.open.as_ref().unwrap();
         assert!(open.editing, "held under R3.8 — the buffer is open again");
         let editor = open.editor.as_ref().unwrap();
@@ -3790,7 +3797,7 @@ mod hash_field_edit_tests {
                 at_ms: 5_000,
             },
         );
-        assert!(matches!(cmds.as_slice(), [Command::RefetchOpenKey { .. }]));
+        assert!(matches!(cmds.as_slice(), [Command::ReadKey { .. }]));
         let (text, _) = s.error.as_ref().unwrap();
         assert!(text.contains("HSETNX k new"), "{text}");
         assert!(text.contains("field already exists"), "{text}");
@@ -3906,7 +3913,7 @@ mod hash_field_edit_tests {
                 at_ms: 5_000,
             },
         );
-        assert!(matches!(cmds.as_slice(), [Command::RefetchOpenKey { .. }]));
+        assert!(matches!(cmds.as_slice(), [Command::ReadKey { .. }]));
         assert!(s.error.is_none(), "not an error");
         let (text, _) = s.notice.as_ref().unwrap();
         assert!(text.contains("HDEL k f"), "{text}");
@@ -3950,7 +3957,7 @@ mod hash_field_edit_tests {
         assert_eq!(
             cmds,
             vec![Command::DeleteHashField {
-                name: b"k".to_vec(),
+                name: b"k".to_vec().into(),
                 field: b"b".to_vec(),
             }]
         );
@@ -3995,9 +4002,25 @@ mod liveness_invariants {
     use super::*;
     use crate::state::Liveness;
 
+    /// A key open in the Viewer, so a Refetch has something to read. With
+    /// nothing open there is nothing to refetch, and no read is issued.
+    fn viewing() -> State {
+        State {
+            open: Some(OpenKey::new(
+                Some(0),
+                "k".into(),
+                crate::state::value::Value::Str(crate::state::value::StringValue::new("v", 40)),
+                -1,
+                1,
+                0,
+            )),
+            ..State::default()
+        }
+    }
+
     fn connected(tracking_supported: bool) -> State {
         let (s, _) = update(
-            State::default(),
+            viewing(),
             Msg::Connected {
                 version: "8.4.0".into(),
                 tracking_supported,
@@ -4025,13 +4048,13 @@ mod liveness_invariants {
     #[test]
     fn connecting_emits_a_refetch_which_is_the_only_thing_that_arms() {
         let (_, cmds) = update(
-            State::default(),
+            viewing(),
             Msg::Connected {
                 version: "8.4.0".into(),
                 tracking_supported: true,
             },
         );
-        assert!(matches!(cmds.as_slice(), [Command::RefetchOpenKey { .. }]));
+        assert!(matches!(cmds.as_slice(), [Command::ReadKey { .. }]));
     }
 
     /// ADR-0009: a reconnect that does not re-arm must not present as live.
@@ -4057,7 +4080,7 @@ mod liveness_invariants {
             Liveness::Live,
             "reconnected but not re-armed"
         );
-        assert!(matches!(cmds.as_slice(), [Command::RefetchOpenKey { .. }]));
+        assert!(matches!(cmds.as_slice(), [Command::ReadKey { .. }]));
 
         let (rearmed, _) = update(back, Msg::TrackingArmed);
         assert_eq!(rearmed.liveness(), Liveness::Live);
@@ -4069,7 +4092,7 @@ mod liveness_invariants {
     #[test]
     fn an_invalidation_consumes_the_arming_and_forces_a_refetch() {
         let (after, cmds) = update(armed(), Msg::Invalidated);
-        assert!(matches!(cmds.as_slice(), [Command::RefetchOpenKey { .. }]));
+        assert!(matches!(cmds.as_slice(), [Command::ReadKey { .. }]));
 
         let (rearmed, _) = update(after, Msg::TrackingArmed);
         assert_eq!(rearmed.liveness(), Liveness::Live);
@@ -4115,6 +4138,72 @@ mod liveness_invariants {
             }
         );
         assert_eq!(cmds, vec![Command::Reconnect { after_ms: 4_000 }]);
+    }
+
+    /// With nothing open there is nothing to refetch: connecting issues no
+    /// read, and spends no token superseding one that might be in flight.
+    #[test]
+    fn connecting_with_nothing_open_issues_no_read() {
+        let (s, cmds) = update(
+            State::default(),
+            Msg::Connected {
+                version: "8.4.0".into(),
+                tracking_supported: true,
+            },
+        );
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert_eq!(s.read_token, ReadToken::default());
+    }
+
+    /// Review H3: whether a read arms travels on the command, decided from the
+    /// same link state the header's liveness is derived from — so a shell can
+    /// no longer hold a stale copy of the capability.
+    #[test]
+    fn every_read_arms_exactly_when_the_connection_tracks() {
+        let up = |tracking| Link::Up {
+            version: "8.4.0".into(),
+            tracking,
+        };
+        let cases = [
+            (up(Tracking::Available), true),
+            (up(Tracking::Armed), true),
+            (up(Tracking::Consumed), true),
+            (up(Tracking::Unsupported), false),
+            (
+                Link::Reconnecting {
+                    attempt: 1,
+                    retry_in_ms: None,
+                },
+                false,
+            ),
+            (Link::Connecting, false),
+        ];
+        for (link, arm) in cases {
+            // A Refetch of the Open key…
+            let state = State {
+                link: link.clone(),
+                ..viewing()
+            };
+            let (_, cmds) = update(state, Msg::Invalidated);
+            assert!(
+                matches!(cmds.as_slice(), [Command::ReadKey { arm: a, .. }] if *a == arm),
+                "refetch under {link:?}: {cmds:?}"
+            );
+            // …and opening a key from the list.
+            let mut state = State {
+                cols: 130,
+                rows: 40,
+                link: link.clone(),
+                ..State::default()
+            };
+            state.keys.push(b"other");
+            state.rebuild_list();
+            let (_, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+            assert!(
+                matches!(cmds.as_slice(), [Command::ReadKey { arm: a, .. }] if *a == arm),
+                "open under {link:?}: {cmds:?}"
+            );
+        }
     }
 
     /// The exhaustive statement of the rule: across every reachable link and
@@ -4483,6 +4572,89 @@ mod metadata_tests {
         state
     }
 
+    /// Review C1: a key that is not valid UTF-8 opened correctly once, then
+    /// refetched a *different* key — its replacement-character display text —
+    /// came back gone, and armed tracking on that other key.
+    #[test]
+    fn a_key_that_is_not_utf8_is_refetched_and_tombstoned_by_its_exact_bytes() {
+        use crate::state::value::{StringValue, Value};
+        const RAW: &[u8] = b"\xff\xfe:session";
+
+        let mut state = State {
+            cols: 130,
+            rows: 30,
+            link: Link::Up {
+                version: "8.4.0".into(),
+                tracking: Tracking::Available,
+            },
+            ..State::default()
+        };
+        (state, _) = update(state, Msg::ScanStarted { estimated_total: 1 });
+        (state, _) = update(
+            state,
+            Msg::ScanBatch {
+                keys: vec![RAW.to_vec()],
+            },
+        );
+
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(Command::ReadKey {
+            key, token, index, ..
+        }) = cmds.into_iter().next()
+        else {
+            panic!("expected an open");
+        };
+        assert_eq!(key.as_bytes(), RAW);
+        let (state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token,
+                index,
+                name: key,
+                value: Value::Str(StringValue::new("v", 40)),
+                ttl_seconds: -1,
+                size_bytes: 1,
+                at_ms: 1_000,
+            },
+        );
+        assert_eq!(state.open.as_ref().unwrap().name.as_bytes(), RAW);
+        assert!(
+            state.keys.kind(0).is_some(),
+            "the row learned its type, so the name guard matched"
+        );
+
+        let (state, cmds) = update(state, Msg::Invalidated);
+        let Some(Command::ReadKey {
+            key,
+            token,
+            index,
+            arm,
+        }) = cmds.into_iter().next()
+        else {
+            panic!("expected a refetch");
+        };
+        assert_eq!(
+            key.as_bytes(),
+            RAW,
+            "refetched by its bytes, not its display text"
+        );
+        assert!(arm, "and armed for that same key");
+
+        let (state, _) = update(
+            state,
+            Msg::ValueGone {
+                token,
+                index,
+                name: key,
+                at_ms: 2_000,
+            },
+        );
+        assert!(
+            state.keys.is_gone(0),
+            "the tombstone lands on the right row"
+        );
+    }
+
     use crate::state::Attachment;
 
     // ── Which key is the Viewer showing? (CONTEXT.md: Open key) ────────────
@@ -4501,13 +4673,13 @@ mod metadata_tests {
         // Open row 3 …
         state.view.selected = 3;
         let (mut state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
-        let Some(&Command::OpenKey { token: slow, .. }) = cmds.first() else {
+        let Some(&Command::ReadKey { token: slow, .. }) = cmds.first() else {
             panic!("expected an open, got {cmds:?}");
         };
         // … then change your mind and open row 5 before the first came back.
         state.view.selected = 5;
         let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
-        let Some(&Command::OpenKey { token: fast, .. }) = cmds.first() else {
+        let Some(&Command::ReadKey { token: fast, .. }) = cmds.first() else {
             panic!("expected an open, got {cmds:?}");
         };
         assert_ne!(slow, fast, "two reads, two identities");
@@ -4558,12 +4730,12 @@ mod metadata_tests {
         let mut state = browsing(10);
         state.view.selected = 3;
         let (mut state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
-        let Some(&Command::OpenKey { token: doomed, .. }) = cmds.first() else {
+        let Some(&Command::ReadKey { token: doomed, .. }) = cmds.first() else {
             panic!("expected an open");
         };
         state.view.selected = 5;
         let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
-        let Some(&Command::OpenKey { token: current, .. }) = cmds.first() else {
+        let Some(&Command::ReadKey { token: current, .. }) = cmds.first() else {
             panic!("expected an open");
         };
         let (state, _) = update(
@@ -4609,7 +4781,7 @@ mod metadata_tests {
         let mut state = browsing(10);
         state.view.selected = 3;
         let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
-        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+        let Some(&Command::ReadKey { token, .. }) = cmds.first() else {
             panic!("expected an open");
         };
         let (mut state, _) = update(
@@ -4628,7 +4800,7 @@ mod metadata_tests {
         // — and B turns out to be gone.
         state.view.selected = 5;
         let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
-        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+        let Some(&Command::ReadKey { token, .. }) = cmds.first() else {
             panic!("expected an open");
         };
         let (state, _) = update(
@@ -4666,7 +4838,7 @@ mod metadata_tests {
 
         state.view.selected = 2;
         let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
-        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+        let Some(&Command::ReadKey { token, .. }) = cmds.first() else {
             panic!("expected an open");
         };
         let (state, _) = update(
@@ -4697,7 +4869,7 @@ mod metadata_tests {
         let mut state = browsing(10);
         state.view.selected = 4;
         let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
-        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+        let Some(&Command::ReadKey { token, .. }) = cmds.first() else {
             panic!("expected an open");
         };
         let (state, _) = update(
@@ -4710,7 +4882,7 @@ mod metadata_tests {
             },
         );
         let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('r'))));
-        let Some(&Command::RefetchOpenKey { token }) = cmds.first() else {
+        let Some(&Command::ReadKey { token, .. }) = cmds.first() else {
             panic!("expected a refetch, got {cmds:?}");
         };
         let (state, _) = update(
@@ -4755,7 +4927,7 @@ mod metadata_tests {
         let mut state = browsing(10);
         state.view.selected = 3;
         let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
-        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+        let Some(&Command::ReadKey { token, .. }) = cmds.first() else {
             panic!("expected an open");
         };
         let (state, _) = update(
@@ -4813,7 +4985,7 @@ mod metadata_tests {
         let mut state = browsing(10);
         state.view.selected = 3;
         let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
-        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+        let Some(&Command::ReadKey { token, .. }) = cmds.first() else {
             panic!("expected an open");
         };
         // The rescan refills row 3 with a different key.
@@ -4857,7 +5029,7 @@ mod metadata_tests {
 
         state.view.selected = 3;
         let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
-        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+        let Some(&Command::ReadKey { token, .. }) = cmds.first() else {
             panic!("expected an open");
         };
         let (mut state, _) = update(
@@ -4902,7 +5074,7 @@ mod metadata_tests {
         let mut state = browsing(10);
         state.view.selected = 3;
         let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
-        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+        let Some(&Command::ReadKey { token, .. }) = cmds.first() else {
             panic!("expected an open");
         };
         let (mut state, _) = update(
@@ -4962,7 +5134,7 @@ mod metadata_tests {
         let mut state = browsing(10);
         state.view.selected = 3;
         let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
-        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+        let Some(&Command::ReadKey { token, .. }) = cmds.first() else {
             panic!("expected an open");
         };
         let (state, _) = update(
@@ -5005,7 +5177,7 @@ mod metadata_tests {
             },
         );
         assert!(
-            matches!(cmds.as_slice(), [Command::RefetchOpenKey { .. }]),
+            matches!(cmds.as_slice(), [Command::ReadKey { .. }]),
             "the panes disagree, so ask the server rather than guess: {cmds:?}"
         );
         assert!(
@@ -5023,7 +5195,7 @@ mod metadata_tests {
         let mut state = browsing(10);
         state.view.selected = 3;
         let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
-        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+        let Some(&Command::ReadKey { token, .. }) = cmds.first() else {
             panic!("expected an open");
         };
         let (state, _) = update(
@@ -5047,7 +5219,7 @@ mod metadata_tests {
             },
         );
         assert!(
-            matches!(cmds.as_slice(), [Command::RefetchOpenKey { .. }]),
+            matches!(cmds.as_slice(), [Command::ReadKey { .. }]),
             "{cmds:?}"
         );
     }
@@ -5483,8 +5655,19 @@ mod honesty_tests {
     /// liveness claim when it does.
     #[test]
     fn a_reported_reconnect_drops_the_liveness_claim_until_re_armed() {
+        let viewing = State {
+            open: Some(OpenKey::new(
+                Some(0),
+                "k".into(),
+                crate::state::value::Value::Str(crate::state::value::StringValue::new("v", 40)),
+                -1,
+                1,
+                0,
+            )),
+            ..State::default()
+        };
         let (state, _) = update(
-            State::default(),
+            viewing,
             Msg::Connected {
                 version: "8.4.0".into(),
                 tracking_supported: true,
@@ -5505,10 +5688,7 @@ mod honesty_tests {
             },
         );
         assert_ne!(state.liveness(), Liveness::Live);
-        assert!(
-            cmds.iter()
-                .any(|c| matches!(c, Command::RefetchOpenKey { .. }))
-        );
+        assert!(cmds.iter().any(|c| matches!(c, Command::ReadKey { .. })));
     }
 
     /// R1.15: a replica outranks an Environment guard, and cannot be lifted.
@@ -5825,7 +6005,7 @@ mod tree_fold_tests {
 
         let (_, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
         assert!(
-            matches!(cmds.as_slice(), [Command::OpenKey { .. }]),
+            matches!(cmds.as_slice(), [Command::ReadKey { .. }]),
             "expected an open, got {cmds:?}"
         );
     }
@@ -5834,7 +6014,7 @@ mod tree_fold_tests {
 #[cfg(test)]
 mod loading_indicator_tests {
     //! `state.open_pending` — the loading indicator's state. Set the moment a
-    //! read is issued (`Command::OpenKey`/`RefetchOpenKey`), cleared the
+    //! read is issued (`Command::ReadKey`), cleared the
     //! moment its reply lands, whatever that reply turns out to be.
 
     use super::*;
@@ -5863,7 +6043,7 @@ mod loading_indicator_tests {
         let mut state = browsing(10);
         state.view.selected = 3;
         let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
-        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+        let Some(&Command::ReadKey { token, .. }) = cmds.first() else {
             panic!("expected an open, got {cmds:?}");
         };
         let pending = state.open_pending.expect("a read was just issued");
@@ -5876,7 +6056,7 @@ mod loading_indicator_tests {
         let mut state = browsing(10);
         state.view.selected = 3;
         let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
-        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+        let Some(&Command::ReadKey { token, .. }) = cmds.first() else {
             panic!("expected an open, got {cmds:?}");
         };
         let (state, _) = update(
@@ -5899,7 +6079,7 @@ mod loading_indicator_tests {
         let mut state = browsing(10);
         state.view.selected = 3;
         let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
-        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+        let Some(&Command::ReadKey { token, .. }) = cmds.first() else {
             panic!("expected an open, got {cmds:?}");
         };
         let (state, _) = update(
@@ -5922,12 +6102,12 @@ mod loading_indicator_tests {
         let mut state = browsing(10);
         state.view.selected = 3;
         let (mut state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
-        let Some(&Command::OpenKey { token: stale, .. }) = cmds.first() else {
+        let Some(&Command::ReadKey { token: stale, .. }) = cmds.first() else {
             panic!("expected an open");
         };
         state.view.selected = 5;
         let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
-        let Some(&Command::OpenKey { token: current, .. }) = cmds.first() else {
+        let Some(&Command::ReadKey { token: current, .. }) = cmds.first() else {
             panic!("expected an open");
         };
         let (state, _) = update(
@@ -5984,7 +6164,7 @@ mod loading_indicator_tests {
         let mut state = browsing(10);
         state.view.selected = 3;
         let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
-        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+        let Some(&Command::ReadKey { token, .. }) = cmds.first() else {
             panic!("expected an open, got {cmds:?}");
         };
         let (mut state, _) = update(
@@ -6003,7 +6183,7 @@ mod loading_indicator_tests {
         // Selected row instead of the Open key would be caught.
         state.view.selected = 7;
         let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('r'))));
-        let Some(&Command::RefetchOpenKey { token }) = cmds.first() else {
+        let Some(&Command::ReadKey { token, .. }) = cmds.first() else {
             panic!("expected a refetch, got {cmds:?}");
         };
         let pending = state.open_pending.expect("a refetch was just issued");
@@ -6027,7 +6207,7 @@ mod loading_indicator_tests {
         let mut state = browsing(10);
         state.view.selected = 3;
         let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
-        let Some(&Command::OpenKey { token, .. }) = cmds.first() else {
+        let Some(&Command::ReadKey { token, .. }) = cmds.first() else {
             panic!("expected an open, got {cmds:?}");
         };
         let (state, _) = update(
@@ -6047,12 +6227,12 @@ mod loading_indicator_tests {
         let mut state = browsing(10);
         state.view.selected = 3;
         let (mut state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
-        let Some(&Command::OpenKey { token: stale, .. }) = cmds.first() else {
+        let Some(&Command::ReadKey { token: stale, .. }) = cmds.first() else {
             panic!("expected an open");
         };
         state.view.selected = 5;
         let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
-        let Some(&Command::OpenKey { token: current, .. }) = cmds.first() else {
+        let Some(&Command::ReadKey { token: current, .. }) = cmds.first() else {
             panic!("expected an open");
         };
         let (state, _) = update(
@@ -6296,17 +6476,23 @@ mod cursor_mode_tests {
         assert_eq!(state.open.as_ref().unwrap().name, "k");
         assert!(!state.open.as_ref().unwrap().cursor_active);
         assert_eq!(state.focus, Pane::Value);
-        let Some(Command::OpenKey { token, index, name }) = cmds.into_iter().next() else {
+        let Some(Command::ReadKey {
+            token,
+            index,
+            key: name,
+            ..
+        }) = cmds.into_iter().next()
+        else {
             panic!("Enter on a detached key must open it, same as →");
         };
-        assert_eq!(index, state.selected_key().unwrap());
+        assert_eq!(index, state.selected_key());
 
         let (state, _) = update(
             state,
             Msg::ValueLoaded {
                 token,
-                index: Some(index),
-                name: String::from_utf8(name).unwrap(),
+                index,
+                name,
                 value: Value::Hash(PairValue {
                     pairs: vec![("f".into(), "v".into())],
                     total: 1,
@@ -6337,7 +6523,13 @@ mod cursor_mode_tests {
 
         let (state, cmds) = press(state, KeyCode::Enter);
         assert!(state.open.is_none(), "nothing to show yet");
-        let Some(Command::OpenKey { token, index, name }) = cmds.into_iter().next() else {
+        let Some(Command::ReadKey {
+            token,
+            index,
+            key: name,
+            ..
+        }) = cmds.into_iter().next()
+        else {
             panic!("Enter with a key selected but none open must open it");
         };
 
@@ -6345,8 +6537,8 @@ mod cursor_mode_tests {
             state,
             Msg::ValueLoaded {
                 token,
-                index: Some(index),
-                name: String::from_utf8(name).unwrap(),
+                index,
+                name,
                 value: Value::Hash(PairValue {
                     pairs: vec![("f".into(), "v".into())],
                     total: 1,
@@ -6513,7 +6705,7 @@ mod stack_navigation_tests {
         assert_eq!(state.focus, Pane::Keys);
         let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('l'))));
         assert_eq!(state.focus, Pane::Value);
-        assert!(matches!(cmds.first(), Some(Command::OpenKey { .. })));
+        assert!(matches!(cmds.first(), Some(Command::ReadKey { .. })));
     }
 
     #[test]

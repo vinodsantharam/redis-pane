@@ -1,5 +1,7 @@
 //! `Command` — everything the shells must do (PLAN M0.4).
 
+use crate::key::KeyName;
+
 /// Which read a reply belongs to.
 ///
 /// Reads are asynchronous and there can be more than one in flight, so a reply
@@ -29,16 +31,29 @@ pub struct ReadToken(pub u64);
 pub enum Command {
     /// Tear down the terminal and exit.
     Quit,
-    /// Re-read the open key from the server.
+    /// Read a key from the server: opening it, or refetching the one already
+    /// open. The one read command (ADR-0006).
     ///
-    /// **This always re-arms tracking**, and there is deliberately no variant
-    /// that reads without arming. Tracking is consumed by the invalidation it
-    /// produces (verified against Redis 8.4.0), so a read path that skipped
-    /// arming would leave the Viewer permanently dark while the header still
-    /// said `live` — the original RedisInsight defect by another route. Making
-    /// it one command is what stops that being possible on one branch of
-    /// several (ADR-0006).
-    RefetchOpenKey { token: ReadToken },
+    /// `key` is the exact bytes the server knows the key by, carried here
+    /// rather than looked up by the shell from the Open key. The Open key's
+    /// name used to be display text, so a key that was not valid UTF-8
+    /// refetched a *different* key, came back `✕ deleted`, and armed tracking
+    /// on that other key (review C1).
+    ///
+    /// `arm` says whether this read sends `CLIENT CACHING YES` with it, and the
+    /// core decides it — from the same [`crate::state::Link`] the header's
+    /// liveness is derived from — so the shell holds no second copy of the
+    /// tracking capability to fall out of step with it (review H3). Tracking
+    /// is consumed by the invalidation it produces (verified against Redis
+    /// 8.4.0), so every read on a tracking connection arms; there is no way to
+    /// issue one that does not.
+    ReadKey {
+        key: KeyName,
+        /// The Loaded set row this key was read from, if one is known.
+        index: Option<usize>,
+        token: ReadToken,
+        arm: bool,
+    },
     /// Try to connect again after the given delay.
     Reconnect { after_ms: u64 },
     /// Begin traversing the keyspace. `SCAN` only, never `KEYS` — cursor-based,
@@ -52,22 +67,13 @@ pub enum Command {
     /// keyspace would be `KEYS *` with extra steps, and it would compete with
     /// `SCAN` for the connection while the list is still filling.
     FetchMetadata { indices: Vec<usize> },
-    /// Open a key: read it, arming tracking in the same breath.
-    ///
-    /// Distinct from [`Command::RefetchOpenKey`] only in that it changes which
-    /// key is open; both go through the one read path that always arms.
-    OpenKey {
-        index: usize,
-        name: Vec<u8>,
-        token: ReadToken,
-    },
     /// Delete a key outright (`DEL`).
     ///
     /// Only ever issued once the reader has confirmed the preview
     /// [`crate::state::PendingMutation::DeleteKey`] described — this is the
     /// one point where the chokepoint's decision (allowed, or refused by
     /// Read-only Mode) becomes a command a shell will actually run (R4.4).
-    DeleteKey { index: usize, name: Vec<u8> },
+    DeleteKey { index: usize, name: KeyName },
     /// Overwrite a String value (`SET`).
     ///
     /// Only ever issued once the reader has confirmed the preview
@@ -77,7 +83,7 @@ pub enum Command {
     /// straight off this call's own reply — the core's only path for a value
     /// to reach the Viewer is a real read (ADR-0006), and `ValueSet`'s job is
     /// only to ask for one.
-    SetValue { name: Vec<u8>, new: Vec<u8> },
+    SetValue { name: KeyName, new: Vec<u8> },
     /// Overwrite one Hash field's value, keeping the field's own TTL
     /// (guarded `HSET`, sent as `EVAL`, PLAN M2 task 6, D1, ADR-0015).
     ///
@@ -88,7 +94,7 @@ pub enum Command {
     /// this call's own reply, for the same reason [`Command::SetValue`]
     /// does not (ADR-0006).
     SetHashField {
-        name: Vec<u8>,
+        name: KeyName,
         field: Vec<u8>,
         value: Vec<u8>,
     },
@@ -99,7 +105,7 @@ pub enum Command {
     /// [`crate::state::PendingMutation::AddHashField`] described (R4.4).
     /// Success is reported the same way [`Command::SetHashField`] is.
     AddHashField {
-        name: Vec<u8>,
+        name: KeyName,
         field: Vec<u8>,
         value: Vec<u8>,
     },
@@ -109,7 +115,7 @@ pub enum Command {
     /// [`crate::state::PendingMutation::DeleteHashField`] described (R4.4).
     /// Deleting the last field deletes the key itself — Redis's own
     /// behaviour, not something this command arranges.
-    DeleteHashField { name: Vec<u8>, field: Vec<u8> },
+    DeleteHashField { name: KeyName, field: Vec<u8> },
     /// Put text on the clipboard.
     ///
     /// The core builds the text; how it reaches a clipboard is the shell's

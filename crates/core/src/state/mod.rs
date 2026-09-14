@@ -216,7 +216,10 @@ pub enum PendingMutation {
     /// Delete one key outright (`DEL`). `index` is the Loaded set row it came
     /// from, carried the same way `Msg::ValueGone` carries it, so a rescan
     /// between staging and confirming cannot make this land on the wrong row.
-    DeleteKey { index: usize, name: Vec<u8> },
+    DeleteKey {
+        index: usize,
+        name: crate::key::KeyName,
+    },
     /// Overwrite a String value (`SET`), staged from an `$EDITOR` round trip
     /// (R3.2, R4.1). `was_json` is whether the *pre-edit* value was rendered
     /// through the JSON viewer — it is what the confirm dialog checks before
@@ -225,7 +228,7 @@ pub enum PendingMutation {
     /// JSON is a fact about the read that produced `old`, not about whatever
     /// the reader just typed.
     SetString {
-        name: Vec<u8>,
+        name: crate::key::KeyName,
         old: Vec<u8>,
         new: Vec<u8>,
         was_json: bool,
@@ -234,7 +237,7 @@ pub enum PendingMutation {
     /// (guarded `HSET`, PLAN M2 task 6, D1, ADR-0015). `old`/`was_json` carry
     /// the same meaning `SetString` gives them, one field wide.
     SetHashField {
-        name: Vec<u8>,
+        name: crate::key::KeyName,
         field: Vec<u8>,
         old: Vec<u8>,
         new: Vec<u8>,
@@ -243,7 +246,7 @@ pub enum PendingMutation {
     /// Add a Hash field that does not exist yet, never overwriting one that
     /// does (guarded `HSETNX`, PLAN M2 task 6, D1, ADR-0015).
     AddHashField {
-        name: Vec<u8>,
+        name: crate::key::KeyName,
         field: Vec<u8>,
         value: Vec<u8>,
     },
@@ -252,7 +255,7 @@ pub enum PendingMutation {
     /// the confirm dialog warns that the key itself will go, since `HDEL`
     /// deletes a Hash whose last field is removed.
     DeleteHashField {
-        name: Vec<u8>,
+        name: crate::key::KeyName,
         field: Vec<u8>,
         last_field: bool,
     },
@@ -269,35 +272,19 @@ impl PendingMutation {
     pub fn command_text(&self) -> String {
         match self {
             PendingMutation::DeleteKey { name, .. } => {
-                format!("DEL {}", String::from_utf8_lossy(name))
+                format!("DEL {}", name)
             }
             PendingMutation::SetString { name, new, .. } => {
-                format!(
-                    "SET {} {} KEEPTTL XX",
-                    String::from_utf8_lossy(name),
-                    String::from_utf8_lossy(new)
-                )
+                format!("SET {} {} KEEPTTL XX", name, String::from_utf8_lossy(new))
             }
             PendingMutation::SetHashField { name, field, .. } => {
-                format!(
-                    "HSET {} {}",
-                    String::from_utf8_lossy(name),
-                    String::from_utf8_lossy(field)
-                )
+                format!("HSET {} {}", name, String::from_utf8_lossy(field))
             }
             PendingMutation::AddHashField { name, field, .. } => {
-                format!(
-                    "HSETNX {} {}",
-                    String::from_utf8_lossy(name),
-                    String::from_utf8_lossy(field)
-                )
+                format!("HSETNX {} {}", name, String::from_utf8_lossy(field))
             }
             PendingMutation::DeleteHashField { name, field, .. } => {
-                format!(
-                    "HDEL {} {}",
-                    String::from_utf8_lossy(name),
-                    String::from_utf8_lossy(field)
-                )
+                format!("HDEL {} {}", name, String::from_utf8_lossy(field))
             }
         }
     }
@@ -700,6 +687,25 @@ impl State {
     /// does not expire.
     pub fn error_text(&self) -> Option<&str> {
         self.error.as_ref().map(|(text, _)| text.as_str())
+    }
+
+    /// Whether a read issued now must arm tracking with it (ADR-0006).
+    ///
+    /// True on any connection whose server accepted `CLIENT TRACKING`, in every
+    /// tracking state: `Available` (just connected, and arming is how it
+    /// becomes live), `Armed` (every read re-arms), `Consumed` (an invalidation
+    /// used the arming up, and this read is what restores it). The shell used
+    /// to keep its own copy of this, which a fred-level reconnect's re-probe
+    /// could not reach; now [`crate::Command::ReadKey`] carries the answer
+    /// (review H3).
+    pub fn read_arms_tracking(&self) -> bool {
+        matches!(
+            self.link,
+            Link::Up {
+                tracking: Tracking::Available | Tracking::Armed | Tracking::Consumed,
+                ..
+            }
+        )
     }
 
     pub fn liveness(&self) -> Liveness {

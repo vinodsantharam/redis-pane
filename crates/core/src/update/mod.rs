@@ -186,13 +186,15 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             at_ms,
         } => value_loaded(
             state,
-            token,
-            index,
-            name,
-            value,
-            ttl_seconds,
-            size_bytes,
-            at_ms,
+            ValueRead {
+                token,
+                index,
+                name,
+                value,
+                ttl_seconds,
+                size_bytes,
+                at_ms,
+            },
         ),
         Msg::ValueGone {
             token,

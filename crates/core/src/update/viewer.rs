@@ -3,19 +3,31 @@
 
 use super::*;
 
-// One field per `Msg::ValueLoaded` field: the extraction that turned this
-// match arm into a function did not change what it needs.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn value_loaded(
-    mut state: State,
-    token: ReadToken,
-    index: Option<usize>,
-    name: KeyName,
-    mut value: Value,
-    ttl_seconds: i32,
-    size_bytes: u32,
-    at_ms: u64,
-) -> (State, Vec<Command>) {
+/// One `Msg::ValueLoaded` reply, carried whole.
+///
+/// The seven fields arrive together and mean nothing apart, so they travel as
+/// one — the same reason the key rows take a `RowCtx` rather than ten loose
+/// arguments (review L4).
+pub(super) struct ValueRead {
+    pub token: ReadToken,
+    pub index: Option<usize>,
+    pub name: KeyName,
+    pub value: Value,
+    pub ttl_seconds: i32,
+    pub size_bytes: u32,
+    pub at_ms: u64,
+}
+
+pub(super) fn value_loaded(mut state: State, read: ValueRead) -> (State, Vec<Command>) {
+    let ValueRead {
+        token,
+        index,
+        name,
+        mut value,
+        ttl_seconds,
+        size_bytes,
+        at_ms,
+    } = read;
     // Only the answer to the question actually being asked may change
     // what is open. Without this, opening a slow key and then a fast one
     // put the slow one's reply in the Viewer when it finally landed —

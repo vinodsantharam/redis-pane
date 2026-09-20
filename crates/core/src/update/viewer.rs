@@ -359,3 +359,765 @@ pub(super) fn delete_hash_field(mut state: State) -> (State, Vec<Command>) {
     });
     (state, Vec::new())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::msg::KeyCode;
+
+    /// A key open in the Viewer *and focused*, at a two-pane width — the state
+    /// that `Action::Open` produces, since opening a key moves focus onto it.
+    fn viewing() -> State {
+        State {
+            cols: 130,
+            rows: 40,
+            focus: Pane::Value,
+            open: Some(OpenKey::new(
+                Some(0),
+                "k".into(),
+                crate::state::value::Value::Str(crate::state::value::StringValue::new("v", 40)),
+                -1,
+                10,
+                0,
+            )),
+            ..State::default()
+        }
+    }
+
+    /// Review M4: a String was wrapped once, by the shell, at half the
+    /// terminal's width, whatever the pane actually was, and stayed that way
+    /// through a resize or a divider drag.
+    #[test]
+    fn a_string_is_wrapped_to_its_pane_and_rewrapped_when_the_pane_changes() {
+        use crate::state::value::{StringValue, Value};
+        let first_row = |s: &State| match &s.open.as_ref().unwrap().value {
+            Some(Value::Str(v)) => v.lines[0].chars().count(),
+            other => panic!("expected a string, got {other:?}"),
+        };
+        let state = State {
+            cols: 130,
+            rows: 40,
+            ..State::default()
+        };
+        let token = state.read_token;
+        let (state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token,
+                index: None,
+                name: "k".into(),
+                // As the shell builds it: not wrapped at all.
+                value: Value::Str(StringValue::new(&"x".repeat(500), usize::MAX)),
+                ttl_seconds: -1,
+                size_bytes: 500,
+                at_ms: 0,
+            },
+        );
+        let wide = state.value_wrap_width();
+        assert_eq!(first_row(&state), wide, "wrapped to the pane on arrival");
+
+        let (state, _) = update(state, Msg::Resized { cols: 90, rows: 40 });
+        let narrow = state.value_wrap_width();
+        assert!(narrow < wide);
+        assert_eq!(
+            first_row(&state),
+            narrow,
+            "and again when the terminal narrows"
+        );
+    }
+
+    #[test]
+    fn a_held_update_is_applied_before_either_pane_gets_a_say() {
+        // The cheapest possible answer, and re-asking the server for something
+        // it has already sent is the one thing `r` must never do.
+        let mut state = viewing();
+        // An update only waits when the reader is not at rest — otherwise it
+        // lands straight away and there is nothing for `r` to apply.
+        state.open.as_mut().unwrap().at_rest = false;
+        let (state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token: ReadToken::default(),
+                index: Some(0),
+                name: "k".into(),
+                value: crate::state::value::Value::Str(crate::state::value::StringValue::new(
+                    "v2", 40,
+                )),
+                ttl_seconds: -1,
+                size_bytes: 11,
+                at_ms: 1_000,
+            },
+        );
+        assert!(state.open.as_ref().unwrap().pending.is_some(), "held");
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('r'))));
+        assert!(cmds.is_empty(), "no read is asked for");
+        assert!(state.open.as_ref().unwrap().pending.is_none(), "applied");
+    }
+}
+
+#[cfg(test)]
+mod cursor_mode_tests {
+    //! `Enter` activates a real cursor inside the open value; `Esc` exits it
+    //! without closing the key. While active, the six movement keys act on
+    //! the value cursor instead of the key list — `viewer_scroll_tests`
+    //! covers the paging/jump half of that once it is active.
+
+    use super::*;
+    use crate::msg::KeyCode;
+    use crate::state::open::OpenKey;
+    use crate::state::value::{PairValue, Value};
+
+    /// A key open and Attached: the Selected row is the Open key's own row,
+    /// which is what lets plain `Enter` take the fast path straight into
+    /// cursor mode without a read. `attached_and_gone_tests` covers the
+    /// opposite case, where Enter has to open the Selected key first.
+    fn open_with(pairs: usize) -> State {
+        let value = Value::Hash(PairValue {
+            pairs: (0..pairs)
+                .map(|i| (format!("f{i}").into_bytes(), "v".into()))
+                .collect(),
+            total: pairs,
+        });
+        let mut state = State {
+            cols: 130,
+            rows: 40,
+            open: Some(OpenKey::new(Some(0), "k".into(), value, -1, 10, 0)),
+            ..State::default()
+        };
+        state.keys.push(b"k");
+        state.rebuild_list();
+        state
+    }
+
+    fn press(state: State, code: KeyCode) -> (State, Vec<Command>) {
+        update(state, Msg::Key(KeyPress::plain(code)))
+    }
+
+    #[test]
+    fn enter_activates_cursor_mode_and_focuses_the_value_pane() {
+        let (state, _) = press(open_with(5), KeyCode::Enter);
+        let open = state.open.unwrap();
+        assert!(open.cursor_active);
+        assert_eq!(state.focus, Pane::Value);
+    }
+
+    #[test]
+    fn enter_with_nothing_open_does_nothing() {
+        let (state, cmds) = press(State::default(), KeyCode::Enter);
+        assert!(state.open.is_none());
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn enter_on_a_key_gone_before_load_does_nothing() {
+        // No body to move a cursor through — a name and a badge, nothing
+        // else. Attached (not merely open), so this exercises the branch
+        // that would otherwise re-read a key already confirmed gone on
+        // every Enter press.
+        let mut state = State {
+            open: Some(OpenKey::gone(Some(0), "k".into(), 0)),
+            ..State::default()
+        };
+        state.keys.push(b"k");
+        state.rebuild_list();
+        assert_eq!(state.attachment(), Some(Attachment::Attached));
+
+        let (state, cmds) = press(state, KeyCode::Enter);
+        assert!(!state.open.unwrap().cursor_active);
+        assert!(cmds.is_empty(), "a confirmed-gone key is not re-read");
+    }
+
+    #[test]
+    fn plain_movement_acts_on_the_key_list_until_enter_is_pressed() {
+        let state = open_with(5);
+        let (mut state, _) = update(state, Msg::ScanStarted { estimated_total: 2 });
+        state = update(
+            state,
+            Msg::ScanBatch {
+                keys: vec![b"a".to_vec(), b"b".to_vec()],
+            },
+        )
+        .0;
+        let before = state.view.selected;
+
+        let (state, _) = press(state, KeyCode::Down);
+        assert_eq!(
+            state.view.selected,
+            before + 1,
+            "not in cursor mode yet, so ↓ moves the key list"
+        );
+        assert_eq!(
+            state.open.unwrap().cursor,
+            0,
+            "the value cursor never moved"
+        );
+    }
+
+    #[test]
+    fn plain_movement_acts_on_the_value_cursor_once_active() {
+        let state = open_with(5);
+        let selected_before = state.view.selected;
+
+        let (state, _) = press(state, KeyCode::Enter);
+        let (state, _) = press(state, KeyCode::Down);
+
+        assert_eq!(state.open.unwrap().cursor, 1);
+        assert_eq!(
+            state.view.selected, selected_before,
+            "the key list is untouched while the cursor is active"
+        );
+    }
+
+    #[test]
+    fn esc_exits_cursor_mode_without_closing_the_key() {
+        let (state, _) = press(open_with(5), KeyCode::Enter);
+        let (state, _) = press(state, KeyCode::Esc);
+
+        let open = state.open.unwrap();
+        assert!(!open.cursor_active);
+        assert_eq!(state.focus, Pane::Keys);
+        assert!(
+            open.value.is_some(),
+            "the open key is untouched, not closed"
+        );
+    }
+
+    /// A moved cursor holds live updates (ADR-0006), and exiting cursor mode
+    /// must not silently let one through — the reader chooses when a held
+    /// update lands, same as every other apply-if-idle path.
+    #[test]
+    fn esc_does_not_restore_at_rest_on_its_own() {
+        let (state, _) = press(open_with(5), KeyCode::Enter);
+        let (state, _) = press(state, KeyCode::Down);
+        assert!(!state.open.as_ref().unwrap().may_apply());
+
+        let (state, _) = press(state, KeyCode::Esc);
+        assert!(!state.open.unwrap().may_apply());
+    }
+
+    /// Below 70 columns only one pane is drawn at a time; movement must be
+    /// aimed at whichever one that is, cursor mode or not (the same
+    /// discipline `pane_is_on_screen` already applies to the key list).
+    #[test]
+    fn narrow_width_moves_the_value_cursor_when_it_is_the_pane_on_screen() {
+        let mut state = open_with(5);
+        state.cols = 60;
+        let (state, _) = press(state, KeyCode::Enter);
+        let (state, _) = press(state, KeyCode::Down);
+        assert_eq!(state.open.unwrap().cursor, 1);
+    }
+
+    /// Left/Right are unbound while the value cursor is active — only
+    /// ↑↓/PgUp/PgDn/Home/End move it. Without the `cursor_active` guard in
+    /// `Action::CollapseGroup`/`Action::Open`, Left silently walked the tree
+    /// selection to its parent group underneath the open value, which is
+    /// what a live session actually hit: the open value stopped matching the
+    /// selected key ("not the selected key") while the cursor still visibly
+    /// sat on a row.
+    #[test]
+    fn left_and_right_do_not_move_the_key_list_while_the_cursor_is_active() {
+        let mut state = open_with(5);
+        state.tree_mode = true;
+        for name in ["page:a", "page:b"] {
+            state.keys.push(name.as_bytes());
+        }
+        state.rebuild_list();
+
+        let (state, _) = press(state, KeyCode::Enter);
+        let selected_before = state.view.selected;
+        let tree_before = state.tree.clone();
+
+        let (state, cmds) = press(state, KeyCode::Left);
+        assert_eq!(
+            state.view.selected, selected_before,
+            "Left must not move the key list while the value cursor is active"
+        );
+        assert_eq!(
+            state.tree, tree_before,
+            "Left must not collapse/expand a group while the value cursor is active"
+        );
+        assert!(cmds.is_empty());
+        assert!(state.open.as_ref().unwrap().cursor_active);
+
+        let (state, cmds) = press(state, KeyCode::Right);
+        assert_eq!(state.view.selected, selected_before);
+        assert!(cmds.is_empty());
+        assert!(state.open.unwrap().cursor_active);
+    }
+
+    /// Reported live: open a key, move the cursor, `Esc` back to the key
+    /// list, move the selection to a *different* key, press `Enter` — the
+    /// value pane kept showing the old key's value, un-highlighted, badged
+    /// `not the selected key`. Blocking `Enter` there would just trade one
+    /// confusing no-op for another (CLAUDE.md: an operation that silently
+    /// vanishes is indistinguishable from a bug); refetching what `Enter`
+    /// actually points at is the fix, and it is what `Action::Open` (`→`)
+    /// already does in the same situation — this only skips the extra
+    /// keystroke.
+    #[test]
+    fn enter_on_a_different_key_opens_it_and_activates_the_cursor_once_it_lands() {
+        let mut state = open_with(5);
+        state.keys.push(b"other");
+        state.rebuild_list();
+        // Name order: "k" (the Open key, row 0) then "other" (row 1) — select
+        // the latter, so the Open key is Detached rather than Attached.
+        state.view.selected = 1;
+        assert_eq!(state.attachment(), Some(Attachment::Detached { rows: -1 }));
+
+        let (state, cmds) = press(state, KeyCode::Enter);
+        // The stale value stays on screen, correctly badged, until the fresh
+        // read lands — not blanked out, and not silently ignored.
+        assert_eq!(state.open.as_ref().unwrap().name, "k");
+        assert!(!state.open.as_ref().unwrap().cursor_active);
+        assert_eq!(state.focus, Pane::Value);
+        let Some(Command::ReadKey {
+            token,
+            index,
+            key: name,
+            ..
+        }) = cmds.into_iter().next()
+        else {
+            panic!("Enter on a detached key must open it, same as →");
+        };
+        assert_eq!(index, state.selected_key());
+
+        let (state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token,
+                index,
+                name,
+                value: Value::Hash(PairValue {
+                    pairs: vec![("f".into(), "v".into())],
+                    total: 1,
+                }),
+                ttl_seconds: -1,
+                size_bytes: 4,
+                at_ms: 0,
+            },
+        );
+        let open = state.open.unwrap();
+        assert_eq!(open.name, "other");
+        assert!(
+            open.cursor_active,
+            "the cursor Enter asked for activates the moment the read it \
+             had to wait on actually lands"
+        );
+        assert_eq!(state.focus, Pane::Value);
+    }
+
+    #[test]
+    fn enter_with_nothing_open_opens_the_selected_key_and_activates_the_cursor_once_it_lands() {
+        let mut state = State {
+            rows: 40,
+            ..State::default()
+        };
+        state.keys.push(b"only");
+        state.rebuild_list();
+
+        let (state, cmds) = press(state, KeyCode::Enter);
+        assert!(state.open.is_none(), "nothing to show yet");
+        let Some(Command::ReadKey {
+            token,
+            index,
+            key: name,
+            ..
+        }) = cmds.into_iter().next()
+        else {
+            panic!("Enter with a key selected but none open must open it");
+        };
+
+        let (state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token,
+                index,
+                name,
+                value: Value::Hash(PairValue {
+                    pairs: vec![("f".into(), "v".into())],
+                    total: 1,
+                }),
+                ttl_seconds: -1,
+                size_bytes: 4,
+                at_ms: 0,
+            },
+        );
+        assert!(state.open.unwrap().cursor_active);
+    }
+
+    #[test]
+    fn enter_on_a_collapsed_group_row_does_nothing() {
+        let mut state = State {
+            tree_mode: true,
+            ..State::default()
+        };
+        state.keys.push(b"page:a");
+        state.keys.push(b"page:b");
+        state.rebuild_list();
+        assert!(matches!(
+            state.tree.row(0),
+            Some(crate::state::tree::Row::Group { .. })
+        ));
+
+        let (state, cmds) = press(state, KeyCode::Enter);
+        assert!(state.open.is_none(), "a group has no value to open");
+        assert!(cmds.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod loading_indicator_tests {
+    //! `state.open_pending` — the loading indicator's state. Set the moment a
+    //! read is issued (`Command::ReadKey`), cleared the
+    //! moment its reply lands, whatever that reply turns out to be.
+
+    use super::*;
+    use crate::msg::KeyCode;
+    use crate::state::value::{StringValue, Value};
+
+    fn browsing(n: usize) -> State {
+        let mut state = State {
+            cols: 130,
+            rows: 30,
+            ..State::default()
+        };
+        (state, _) = update(
+            state,
+            Msg::ScanStarted {
+                estimated_total: n as u64,
+            },
+        );
+        let keys = (0..n).map(|i| format!("k:{i}").into_bytes()).collect();
+        let (state, _) = update(state, Msg::ScanBatch { keys });
+        state
+    }
+
+    #[test]
+    fn opening_a_key_names_it_as_the_pending_read() {
+        let mut state = browsing(10);
+        state.view.selected = 3;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::ReadKey { token, .. }) = cmds.first() else {
+            panic!("expected an open, got {cmds:?}");
+        };
+        let pending = state.open_pending.expect("a read was just issued");
+        assert_eq!(pending.name, "k:3");
+        assert_eq!(pending.token, token);
+    }
+
+    #[test]
+    fn a_landed_value_clears_the_pending_read() {
+        let mut state = browsing(10);
+        state.view.selected = 3;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::ReadKey { token, .. }) = cmds.first() else {
+            panic!("expected an open, got {cmds:?}");
+        };
+        let (state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token,
+                index: Some(3),
+                name: "k:3".into(),
+                value: Value::Str(StringValue::new("v", 40)),
+                ttl_seconds: -1,
+                size_bytes: 64,
+                at_ms: 1_000,
+            },
+        );
+        assert!(state.open_pending.is_none());
+    }
+
+    #[test]
+    fn a_gone_reply_clears_the_pending_read_too() {
+        let mut state = browsing(10);
+        state.view.selected = 3;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::ReadKey { token, .. }) = cmds.first() else {
+            panic!("expected an open, got {cmds:?}");
+        };
+        let (state, _) = update(
+            state,
+            Msg::ValueGone {
+                token,
+                index: Some(3),
+                name: "k:3".into(),
+                at_ms: 1_000,
+            },
+        );
+        assert!(state.open_pending.is_none());
+    }
+
+    /// A stale reply answers a question the reader has already moved on from
+    /// (`metadata_tests::a_reply_from_a_superseded_read_never_reaches_the_viewer`)
+    /// — it must not clear the indicator for the read that superseded it.
+    #[test]
+    fn a_superseded_reply_does_not_clear_the_current_pending_read() {
+        let mut state = browsing(10);
+        state.view.selected = 3;
+        let (mut state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::ReadKey { token: stale, .. }) = cmds.first() else {
+            panic!("expected an open");
+        };
+        state.view.selected = 5;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::ReadKey { token: current, .. }) = cmds.first() else {
+            panic!("expected an open");
+        };
+        let (state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token: stale,
+                index: Some(3),
+                name: "k:3".into(),
+                value: Value::Str(StringValue::new("three", 40)),
+                ttl_seconds: -1,
+                size_bytes: 5,
+                at_ms: 2_000,
+            },
+        );
+        let pending = state.open_pending.expect("the current read is still out");
+        assert_eq!(pending.token, current);
+        assert_eq!(pending.name, "k:5");
+    }
+
+    /// Without this, a failed read leaves the header reading `⟳ fetching…`
+    /// forever — the exact "operation vanishes, nothing on screen explains
+    /// it" defect the error toast exists to prevent.
+    #[test]
+    fn a_failed_read_clears_the_pending_indicator() {
+        let mut state = browsing(10);
+        state.view.selected = 3;
+        let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        assert!(state.open_pending.is_some());
+        let (state, _) = update(
+            state,
+            Msg::Failed {
+                command: "reading k:3".into(),
+                detail: "WRONGTYPE".into(),
+                at_ms: 1_000,
+            },
+        );
+        assert!(state.open_pending.is_none());
+    }
+
+    #[test]
+    fn a_lost_connection_clears_the_pending_indicator() {
+        let mut state = browsing(10);
+        state.view.selected = 3;
+        let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        assert!(state.open_pending.is_some());
+        let (state, _) = update(state, Msg::ConnectionLost);
+        assert!(state.open_pending.is_none());
+    }
+
+    /// A Refetch of the key already open (manual `r`) is issued against the
+    /// Open key's own name, not the row under the cursor.
+    #[test]
+    fn a_manual_refetch_names_the_open_key_as_the_pending_read() {
+        let mut state = browsing(10);
+        state.view.selected = 3;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::ReadKey { token, .. }) = cmds.first() else {
+            panic!("expected an open, got {cmds:?}");
+        };
+        let (mut state, _) = update(
+            state,
+            Msg::ValueLoaded {
+                token,
+                index: Some(3),
+                name: "k:3".into(),
+                value: Value::Str(StringValue::new("v", 40)),
+                ttl_seconds: -1,
+                size_bytes: 64,
+                at_ms: 1_000,
+            },
+        );
+        // Move the cursor elsewhere before refetching, so a bug that named the
+        // Selected row instead of the Open key would be caught.
+        state.view.selected = 7;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('r'))));
+        let Some(&Command::ReadKey { token, .. }) = cmds.first() else {
+            panic!("expected a refetch, got {cmds:?}");
+        };
+        let pending = state.open_pending.expect("a refetch was just issued");
+        assert_eq!(pending.name, "k:3", "the Open key, not row 7");
+        assert_eq!(pending.token, token);
+    }
+
+    #[test]
+    fn a_pending_read_starts_unstamped() {
+        // `update()` has no clock of its own (ADR-0011) — only the shell
+        // knows when a read was actually dispatched, so this starts `None`
+        // until `Msg::ReadIssued` arrives.
+        let mut state = browsing(10);
+        state.view.selected = 3;
+        let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        assert_eq!(state.open_pending.unwrap().issued_at_ms, None);
+    }
+
+    #[test]
+    fn read_issued_stamps_the_matching_pending_read() {
+        let mut state = browsing(10);
+        state.view.selected = 3;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::ReadKey { token, .. }) = cmds.first() else {
+            panic!("expected an open, got {cmds:?}");
+        };
+        let (state, _) = update(
+            state,
+            Msg::ReadIssued {
+                token,
+                at_ms: 5_000,
+            },
+        );
+        assert_eq!(state.open_pending.unwrap().issued_at_ms, Some(5_000));
+    }
+
+    #[test]
+    fn read_issued_for_a_superseded_token_is_ignored() {
+        // The read it names is no longer the outstanding one — the same
+        // discipline `ValueLoaded`/`ValueGone` already apply to a stale token.
+        let mut state = browsing(10);
+        state.view.selected = 3;
+        let (mut state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::ReadKey { token: stale, .. }) = cmds.first() else {
+            panic!("expected an open");
+        };
+        state.view.selected = 5;
+        let (state, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        let Some(&Command::ReadKey { token: current, .. }) = cmds.first() else {
+            panic!("expected an open");
+        };
+        let (state, _) = update(
+            state,
+            Msg::ReadIssued {
+                token: stale,
+                at_ms: 5_000,
+            },
+        );
+        let pending = state.open_pending.expect("the current read is still out");
+        assert_eq!(pending.token, current);
+        assert_eq!(
+            pending.issued_at_ms, None,
+            "a stamp for a superseded read must not land on the current one"
+        );
+    }
+
+    #[test]
+    fn read_issued_with_nothing_pending_does_nothing() {
+        let (state, _) = update(
+            State::default(),
+            Msg::ReadIssued {
+                token: ReadToken::default(),
+                at_ms: 5_000,
+            },
+        );
+        assert!(state.open_pending.is_none());
+    }
+}
+
+#[cfg(test)]
+mod viewer_scroll_tests {
+    //! Paging and jump-to-start/end for the value cursor — useful on a
+    //! 500-entry zset or a large hex dump, where single-line `↑↓` alone is
+    //! too slow to be worth using. All of this only applies once `Enter`
+    //! (`Action::EnterValueCursor`) has activated the cursor; plain movement
+    //! acts on the key list otherwise (`cursor_mode_tests` covers that half).
+
+    use super::*;
+    use crate::msg::KeyCode;
+    use crate::state::open::OpenKey;
+    use crate::state::value::{MemberValue, Value};
+
+    fn open_with(n: usize) -> State {
+        let value = Value::Set(MemberValue {
+            members: (0..n).map(|i| format!("m{i}").into_bytes()).collect(),
+            total: n,
+        });
+        let mut state = State {
+            // A real width: at `State::default()`'s zero columns the layout is
+            // single-pane and the Viewer is not on screen, so its own scroll
+            // keys would correctly do nothing.
+            cols: 130,
+            rows: 40,
+            open: Some(OpenKey::new(Some(0), "k".into(), value, -1, 10, 0)),
+            ..State::default()
+        };
+        state.open.as_mut().unwrap().cursor_active = true;
+        state
+    }
+
+    fn press(state: State, code: KeyCode) -> (State, Vec<Command>) {
+        update(state, Msg::Key(KeyPress::plain(code)))
+    }
+
+    #[test]
+    fn page_down_moves_by_twenty_rows_and_clamps_at_the_end() {
+        let (state, _) = press(open_with(100), KeyCode::PageDown);
+        assert_eq!(state.open.unwrap().cursor, 20);
+    }
+
+    #[test]
+    fn page_down_past_the_end_clamps_rather_than_overshooting() {
+        let (state, _) = press(open_with(10), KeyCode::PageDown);
+        assert_eq!(state.open.unwrap().cursor, 9, "clamped to the last row");
+    }
+
+    #[test]
+    fn page_up_moves_back_and_clamps_at_zero() {
+        let mut state = open_with(100);
+        state.open.as_mut().unwrap().cursor = 25;
+        let (state, _) = press(state, KeyCode::PageUp);
+        assert_eq!(state.open.as_ref().unwrap().cursor, 5);
+
+        let (state, _) = press(state, KeyCode::PageUp);
+        assert_eq!(state.open.unwrap().cursor, 0, "clamped, not negative");
+    }
+
+    #[test]
+    fn home_jumps_to_the_top_in_one_keystroke() {
+        let mut state = open_with(500);
+        state.open.as_mut().unwrap().cursor = 300;
+        let (state, _) = press(state, KeyCode::Home);
+        assert_eq!(state.open.unwrap().cursor, 0);
+    }
+
+    #[test]
+    fn end_jumps_to_the_last_row_in_one_keystroke() {
+        let (state, _) = press(open_with(500), KeyCode::End);
+        assert_eq!(state.open.unwrap().cursor, 499);
+    }
+
+    #[test]
+    fn jumping_away_from_the_top_means_updates_are_announced_not_applied() {
+        // The existing apply-if-idle rule (ADR-0006) must hold for paging and
+        // jumping exactly as it already does for single-step movement.
+        let (state, _) = press(open_with(500), KeyCode::End);
+        assert!(!state.open.unwrap().may_apply());
+    }
+
+    #[test]
+    fn jumping_back_to_the_top_does_not_by_itself_restore_at_rest() {
+        // Consistent with the existing single-step behaviour: the reader
+        // chooses when a held update lands, rather than it being inferred from
+        // cursor position alone.
+        let mut state = open_with(500);
+        state.open.as_mut().unwrap().cursor = 300;
+        state.open.as_mut().unwrap().at_rest = false;
+        let (state, _) = press(state, KeyCode::Home);
+        let open = state.open.unwrap();
+        assert_eq!(open.cursor, 0);
+        assert!(!open.at_rest);
+    }
+
+    #[test]
+    fn movement_with_nothing_open_does_nothing() {
+        // Not in cursor mode (nothing to activate it on), so this falls
+        // through to the key-list branch — which is also empty, hence still
+        // a no-op, just via the other path.
+        let (state, cmds) = press(State::default(), KeyCode::PageDown);
+        assert!(state.open.is_none());
+        assert!(cmds.is_empty());
+    }
+}

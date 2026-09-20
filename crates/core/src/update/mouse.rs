@@ -109,3 +109,287 @@ pub(super) fn scroll_at(
         None => (state, Vec::new()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A key open in the Viewer *and focused*, at a two-pane width — the state
+    /// that `Action::Open` produces, since opening a key moves focus onto it.
+    fn viewing() -> State {
+        State {
+            cols: 130,
+            rows: 40,
+            focus: Pane::Value,
+            open: Some(OpenKey::new(
+                Some(0),
+                "k".into(),
+                crate::state::value::Value::Str(crate::state::value::StringValue::new("v", 40)),
+                -1,
+                10,
+                0,
+            )),
+            ..State::default()
+        }
+    }
+
+    // ── mouse: click-to-focus, scroll, drag-to-resize (R7.3) ────────────────
+
+    fn plan_at(state: &State) -> layout::Layout {
+        layout::layout(
+            ratatui::layout::Rect::new(0, 0, state.cols, state.rows),
+            state.focus,
+            state.split_adjust,
+        )
+    }
+
+    #[test]
+    fn a_click_in_the_keys_pane_focuses_it() {
+        let state = viewing(); // focus starts on Value
+        let plan = plan_at(&state);
+        let (state, cmds) = update(
+            state,
+            Msg::Mouse(MouseAction::Down {
+                col: plan.keys.x,
+                row: plan.keys.y,
+            }),
+        );
+        assert_eq!(state.focus, Pane::Keys);
+        assert!(cmds.is_empty(), "a focus change is a plain state mutation");
+    }
+
+    #[test]
+    fn a_click_in_the_value_pane_focuses_it() {
+        let mut state = viewing();
+        state.focus = Pane::Keys;
+        let plan = plan_at(&state);
+        let value = plan.value.unwrap();
+        let (state, _) = update(
+            state,
+            Msg::Mouse(MouseAction::Down {
+                col: value.x,
+                row: value.y,
+            }),
+        );
+        assert_eq!(state.focus, Pane::Value);
+    }
+
+    #[test]
+    fn clicking_outside_both_panes_changes_nothing() {
+        // The title bar row, for instance — row 0 is above `plan.keys.y`.
+        let state = viewing();
+        let before = state.focus;
+        let (state, _) = update(state, Msg::Mouse(MouseAction::Down { col: 5, row: 0 }));
+        assert_eq!(state.focus, before);
+    }
+
+    #[test]
+    fn grabbing_the_divider_begins_a_resize_drag_instead_of_a_focus_change() {
+        let mut state = viewing();
+        state.focus = Pane::Keys;
+        let plan = plan_at(&state);
+        let divider_col = plan.value.unwrap().x - 1;
+        let (state, _) = update(
+            state,
+            Msg::Mouse(MouseAction::Down {
+                col: divider_col,
+                row: plan.keys.y,
+            }),
+        );
+        assert!(state.resizing_split);
+        assert_eq!(
+            state.focus,
+            Pane::Keys,
+            "grabbing the divider is not a click"
+        );
+    }
+
+    #[test]
+    fn dragging_after_a_grab_follows_the_cursor() {
+        let state = viewing();
+        let plan = plan_at(&state);
+        let divider_col = plan.value.unwrap().x - 1;
+        let (state, _) = update(
+            state,
+            Msg::Mouse(MouseAction::Down {
+                col: divider_col,
+                row: plan.keys.y,
+            }),
+        );
+        let (state, _) = update(
+            state,
+            Msg::Mouse(MouseAction::Drag {
+                col: divider_col + 15,
+                row: plan.keys.y,
+            }),
+        );
+        assert_eq!(state.split_adjust, 15);
+
+        // And it can move the divider back the other way just as freely.
+        let (state, _) = update(
+            state,
+            Msg::Mouse(MouseAction::Drag {
+                col: divider_col - 5,
+                row: plan.keys.y,
+            }),
+        );
+        assert_eq!(state.split_adjust, -5);
+    }
+
+    #[test]
+    fn dragging_with_no_prior_grab_does_nothing() {
+        // A drag that started somewhere else entirely — text selection in a
+        // future feature, say — must not be mistaken for a resize.
+        let state = viewing();
+        assert!(!state.resizing_split);
+        let (state, _) = update(state, Msg::Mouse(MouseAction::Drag { col: 90, row: 5 }));
+        assert_eq!(state.split_adjust, 0);
+    }
+
+    #[test]
+    fn mouse_up_ends_the_drag() {
+        let state = viewing();
+        let plan = plan_at(&state);
+        let divider_col = plan.value.unwrap().x - 1;
+        let (state, _) = update(
+            state,
+            Msg::Mouse(MouseAction::Down {
+                col: divider_col,
+                row: plan.keys.y,
+            }),
+        );
+        let (state, _) = update(state, Msg::Mouse(MouseAction::Up));
+        assert!(!state.resizing_split);
+
+        // A drag after releasing must not still be honoured.
+        let (state, _) = update(
+            state,
+            Msg::Mouse(MouseAction::Drag {
+                col: divider_col + 20,
+                row: plan.keys.y,
+            }),
+        );
+        assert_eq!(state.split_adjust, 0);
+    }
+
+    #[test]
+    fn the_divider_cannot_be_grabbed_below_seventy_columns() {
+        // No divider is drawn there (DESIGN §2, stack navigation) — nothing
+        // should arm a resize that has no visible effect.
+        let mut state = State {
+            cols: 60,
+            rows: 40,
+            focus: Pane::Keys,
+            ..State::default()
+        };
+        state.split_adjust = 0;
+        let (state2, _) = update(
+            state.clone(),
+            Msg::Mouse(MouseAction::Down { col: 40, row: 10 }),
+        );
+        assert!(!state2.resizing_split);
+    }
+
+    /// A local stand-in for `scan_tests::browsing` — that helper lives in a
+    /// separate test module and this one does not reach across module
+    /// boundaries for its fixtures, matching the rest of this file.
+    fn many_rows(n: usize) -> State {
+        let mut state = State {
+            cols: 130,
+            rows: 30,
+            ..State::default()
+        };
+        (state, _) = update(
+            state,
+            Msg::ScanStarted {
+                estimated_total: n as u64,
+            },
+        );
+        let keys = (0..n).map(|i| format!("k:{i}").into_bytes()).collect();
+        update(state, Msg::ScanBatch { keys }).0
+    }
+
+    #[test]
+    fn scrolling_the_keys_pane_moves_the_selection_and_takes_focus() {
+        let mut state = many_rows(50);
+        state.focus = Pane::Value; // prove scrolling does not need a prior click
+        let plan = plan_at(&state);
+        let before = state.view.selected;
+        let (state, cmds) = update(
+            state,
+            Msg::Mouse(MouseAction::ScrollDown {
+                col: plan.keys.x,
+                row: plan.keys.y,
+            }),
+        );
+        assert_eq!(
+            state.focus,
+            Pane::Keys,
+            "the pane under the cursor, not held focus"
+        );
+        assert_eq!(state.view.selected, before + MOUSE_SCROLL_ROWS as usize);
+        let _ = cmds; // metadata fetches are allowed; not the point of this test
+    }
+
+    #[test]
+    fn scrolling_the_value_pane_scrolls_the_viewer_and_takes_focus() {
+        use crate::state::value::{MemberValue, Value};
+
+        let mut state = viewing();
+        state.focus = Pane::Keys;
+        state.open = Some(OpenKey::new(
+            Some(0),
+            "k".into(),
+            Value::Set(MemberValue {
+                members: (0..50).map(|i| format!("m{i}").into_bytes()).collect(),
+                total: 50,
+            }),
+            -1,
+            10,
+            0,
+        ));
+        let plan = plan_at(&state);
+        let value = plan.value.unwrap();
+        let (state, _) = update(
+            state,
+            Msg::Mouse(MouseAction::ScrollDown {
+                col: value.x,
+                row: value.y,
+            }),
+        );
+        assert_eq!(state.focus, Pane::Value);
+        let open = state.open.unwrap();
+        assert!(
+            open.cursor_active,
+            "scrolling the value pane enters cursor mode"
+        );
+        assert_eq!(open.cursor, MOUSE_SCROLL_ROWS as usize);
+    }
+
+    #[test]
+    fn scrolling_up_at_the_top_of_the_viewer_clamps_rather_than_going_negative() {
+        let state = viewing();
+        let plan = plan_at(&state);
+        let value = plan.value.unwrap();
+        let (state, _) = update(
+            state,
+            Msg::Mouse(MouseAction::ScrollUp {
+                col: value.x,
+                row: value.y,
+            }),
+        );
+        assert_eq!(state.open.unwrap().offset, 0);
+    }
+
+    #[test]
+    fn scrolling_outside_both_panes_changes_nothing() {
+        let state = many_rows(50);
+        let before = state.view.selected;
+        let (state, _) = update(
+            state,
+            Msg::Mouse(MouseAction::ScrollDown { col: 5, row: 0 }),
+        );
+        assert_eq!(state.view.selected, before);
+        assert_eq!(state.focus, Pane::Keys);
+    }
+}

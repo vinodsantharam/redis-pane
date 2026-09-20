@@ -219,3 +219,126 @@ pub(super) fn not_written(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::msg::KeyCode;
+
+    fn state_with_one_key() -> State {
+        let (s, _) = update(
+            State::default(),
+            Msg::ScanBatch {
+                keys: vec![b"k:0".to_vec()],
+            },
+        );
+        s
+    }
+
+    #[test]
+    fn delete_stages_a_preview_rather_than_executing_immediately() {
+        let s = state_with_one_key();
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        assert!(cmds.is_empty(), "nothing runs before it is confirmed");
+        match s.confirm {
+            Some(PendingMutation::DeleteKey { index, ref name }) => {
+                assert_eq!(index, 0);
+                assert_eq!(name, b"k:0");
+            }
+            other => panic!("expected a staged delete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn confirming_a_staged_delete_issues_del() {
+        let s = state_with_one_key();
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        assert!(s.confirm.is_none(), "the dialog closes on confirm");
+        assert_eq!(
+            cmds,
+            vec![Command::Execute {
+                mutation: Mutation::DeleteKey { key: "k:0".into() },
+                index: Some(0),
+            }]
+        );
+    }
+
+    #[test]
+    fn esc_dismisses_a_staged_delete_without_running_it() {
+        let s = state_with_one_key();
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Esc)));
+        assert!(s.confirm.is_none());
+        assert!(cmds.is_empty());
+    }
+
+    /// R4.4/DESIGN §6.5: the preview is composed first regardless of
+    /// Read-only Mode — refusal happens only at the confirm keypress, so the
+    /// reader always sees the real command before learning they cannot run
+    /// it.
+    #[test]
+    fn read_only_mode_refuses_at_confirm_not_at_the_keypress() {
+        let s = State {
+            read_only: Some(ReadOnlyReason::Environment),
+            ..state_with_one_key()
+        };
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        assert!(s.confirm.is_some(), "the preview is composed anyway");
+        assert!(cmds.is_empty());
+
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        assert!(s.confirm.is_none(), "the dialog still closes");
+        assert!(
+            !cmds.iter().any(|c| matches!(
+                c,
+                Command::Execute {
+                    mutation: Mutation::DeleteKey { .. },
+                    ..
+                }
+            )),
+            "but nothing was actually sent to the server"
+        );
+    }
+
+    #[test]
+    fn a_completed_delete_badges_the_row_gone() {
+        let s = state_with_one_key();
+        assert!(!s.keys.is_gone(0));
+        let (s, _) = update(
+            s,
+            Msg::MutationSettled {
+                mutation: Mutation::DeleteKey { key: "k:0".into() },
+                index: Some(0),
+                result: Ok(MutationOutcome::Done),
+                at_ms: 1_000,
+            },
+        );
+        assert!(s.keys.is_gone(0));
+    }
+
+    fn open_with_hash_for_gating() -> State {
+        let value = crate::state::Value::Hash(crate::state::value::PairValue {
+            pairs: vec![("f".into(), "v".into())],
+            total: 1,
+        });
+        let mut state = State {
+            cols: 130,
+            rows: 40,
+            focus: Pane::Value,
+            open: Some(OpenKey::new(Some(0), "k".into(), value, -1, 10, 0)),
+            ..State::default()
+        };
+        state.keys.push(b"k");
+        state.rebuild_list();
+        state
+    }
+
+    #[test]
+    fn d_in_the_keys_pane_stays_delete_key_not_hdel_with_a_hash_open() {
+        let mut s = open_with_hash_for_gating();
+        s.focus = Pane::Keys;
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        assert!(matches!(s.confirm, Some(PendingMutation::DeleteKey { .. })));
+    }
+}

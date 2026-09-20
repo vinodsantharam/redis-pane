@@ -252,3 +252,250 @@ pub(super) fn collapse_group(mut state: State) -> (State, Vec<Command>) {
     }
     after_move(state)
 }
+
+#[cfg(test)]
+mod tree_fold_tests {
+    //! `Enter` on a group row (`Action::ToggleGroup`) — fold and unfold must
+    //! be the same operation from the same row (#16).
+
+    use super::*;
+    use crate::msg::KeyCode;
+    use crate::state::tree::Row;
+
+    /// Two levels deep, so folding and unfolding a nested group is exercised
+    /// too, not just a top-level one.
+    fn nested_tree() -> State {
+        let mut state = State {
+            cols: 130,
+            rows: 30,
+            tree_mode: true,
+            ..State::default()
+        };
+        (state, _) = update(state, Msg::ScanStarted { estimated_total: 4 });
+        let keys = vec![
+            b"user:8812:cart".to_vec(),
+            b"user:8812:session".to_vec(),
+            b"user:8813:session".to_vec(),
+            b"feed:global:hot".to_vec(),
+        ];
+        let (state, _) = update(state, Msg::ScanBatch { keys });
+        state
+    }
+
+    fn press_left(state: State) -> State {
+        update(state, Msg::Key(KeyPress::plain(KeyCode::Left))).0
+    }
+
+    fn press_right(state: State) -> State {
+        update(state, Msg::Key(KeyPress::plain(KeyCode::Right))).0
+    }
+
+    fn group_row(state: &State, prefix: &str) -> usize {
+        (0..state.tree.len())
+            .find(|&r| {
+                matches!(state.tree.row(r), Some(Row::Group { .. }))
+                    && group_prefix_at(state, r).as_deref() == Some(prefix)
+            })
+            .unwrap_or_else(|| panic!("no group row for {prefix:?}"))
+    }
+
+    fn expanded(state: &State, row: usize) -> bool {
+        matches!(state.tree.row(row), Some(Row::Group { expanded: true, .. }))
+    }
+
+    /// Pressing Sort in tree mode used to cycle `list.sort` to Ttl/Size/Kind —
+    /// `rebuild_list` only ever snapped `Scan` back to `Name`, so any other
+    /// sort stuck. `Tree::rebuild` requires a name-ordered view to fold same-
+    /// prefix keys into one group in a single pass; under any other order it
+    /// loses the run and emits a fresh header each time adjacency breaks,
+    /// each with only part of the real descendant count — indistinguishable
+    /// from "expanding a group doesn't show its children".
+    #[test]
+    fn sort_is_inert_in_tree_mode_so_folding_never_sees_another_order() {
+        let mut state = State {
+            cols: 130,
+            rows: 30,
+            tree_mode: true,
+            ..State::default()
+        };
+        (state, _) = update(state, Msg::ScanStarted { estimated_total: 4 });
+        let keys = vec![
+            b"feed:a".to_vec(),
+            b"user:1:x".to_vec(),
+            b"feed:b".to_vec(),
+            b"user:1:y".to_vec(),
+        ];
+        (state, _) = update(state, Msg::ScanBatch { keys });
+        let before = state.tree.clone();
+
+        (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('s'))));
+
+        assert_eq!(
+            state.list.sort,
+            crate::state::view::SortBy::Name,
+            "Sort must not move the list off name order while folded"
+        );
+        assert_eq!(
+            state.tree, before,
+            "a no-op Sort must leave the fold exactly as it was"
+        );
+        let group_rows = (0..state.tree.len())
+            .filter(|&r| matches!(state.tree.row(r), Some(Row::Group { .. })))
+            .count();
+        assert_eq!(
+            group_rows, 3,
+            "one header each for feed:, user:, user:1: — not a fresh one \
+             per broken run of adjacency"
+        );
+    }
+
+    /// The regression this module exists for (#16, then re-fought over which
+    /// keys should drive it): collapsing and expanding the same row must be
+    /// the same operation done twice, whichever keys it lives on.
+    #[test]
+    fn left_collapses_in_place_and_right_expands_it_again_from_the_same_row() {
+        let state = nested_tree();
+        let before = state.tree.len();
+
+        let row = group_row(&state, "user:");
+        let mut state = state;
+        state.view.selected = row;
+
+        let state = press_left(state);
+        assert!(!expanded(&state, row), "Left collapses the group");
+        assert_eq!(
+            state.view.selected, row,
+            "collapsing does not move the cursor"
+        );
+        assert!(state.tree.len() < before, "children are hidden once folded");
+
+        let state = press_right(state);
+        assert!(expanded(&state, row), "Right expands it again, in place");
+        assert_eq!(state.view.selected, row);
+        assert_eq!(
+            state.tree.len(),
+            before,
+            "back to exactly the structure it started with"
+        );
+    }
+
+    #[test]
+    fn a_nested_group_collapses_and_expands_independently_of_its_parent() {
+        let state = nested_tree();
+        let before = state.tree.len();
+
+        let row = group_row(&state, "user:8812:");
+        let mut state = state;
+        state.view.selected = row;
+
+        let state = press_left(state);
+        assert!(!expanded(&state, row));
+        // The parent group and the sibling `user:8813:` group are untouched.
+        assert!(expanded(&state, group_row(&state, "user:")));
+
+        let state = press_right(state);
+        assert!(
+            expanded(&state, row),
+            "expands from the same row, same as the top-level case"
+        );
+        assert_eq!(state.tree.len(), before);
+    }
+
+    /// The standard treeview Right-arrow behavior: it never re-collapses an
+    /// already-open group, it steps into the first child instead. Only Left
+    /// ever collapses.
+    #[test]
+    fn right_on_an_expanded_group_steps_into_its_first_child_rather_than_collapsing_it() {
+        let state = nested_tree();
+        let row = group_row(&state, "user:");
+        let mut state = state;
+        state.view.selected = row;
+
+        let state = press_right(state);
+        assert!(expanded(&state, row), "Right must not have collapsed it");
+        assert_eq!(
+            state.view.selected,
+            row + 1,
+            "the cursor stepped into the first child row"
+        );
+    }
+
+    /// The symmetric standard behavior for Left: it never expands anything,
+    /// it only collapses or moves toward the root.
+    #[test]
+    fn left_on_an_already_collapsed_group_moves_to_its_parent() {
+        let mut state = nested_tree();
+        let row = group_row(&state, "user:8812:");
+        state.tree.toggle(&group_prefix_at(&state, row).unwrap());
+        state.rebuild_list();
+        // The row index may have shifted once `user:8812:`'s children hid.
+        let row = group_row(&state, "user:8812:");
+        state.view.selected = row;
+
+        let state = press_left(state);
+        assert!(
+            !expanded(&state, group_row(&state, "user:8812:")),
+            "an already-collapsed group must not have been touched"
+        );
+        assert_eq!(
+            state.view.selected,
+            group_row(&state, "user:"),
+            "the cursor moved to the parent group"
+        );
+    }
+
+    #[test]
+    fn left_on_a_key_row_moves_to_its_parent_group() {
+        let state = nested_tree();
+        let key_row = (0..state.tree.len())
+            .find(|&r| state.tree.key_index(r).is_some())
+            .expect("at least one key row is visible");
+        let mut state = state;
+        state.view.selected = key_row;
+
+        let state = press_left(state);
+        assert_eq!(
+            state.view.selected,
+            parent_row(&state, key_row).expect("a key always has a parent group"),
+            "a key has no children of its own to collapse, so Left goes straight to its parent"
+        );
+    }
+
+    /// The standard behavior at the root: a top-level group has nothing left
+    /// to collapse into and no parent to jump to, so Left is a no-op.
+    #[test]
+    fn left_on_a_collapsed_top_level_group_is_a_no_op() {
+        let mut state = nested_tree();
+        let row = group_row(&state, "user:");
+        state.tree.toggle(&group_prefix_at(&state, row).unwrap());
+        state.rebuild_list();
+        let row = group_row(&state, "user:");
+        state.view.selected = row;
+        let before = state.clone();
+
+        let state = press_left(state);
+        assert_eq!(state.view.selected, row, "the cursor does not move");
+        assert_eq!(
+            state.tree, before.tree,
+            "fold state is unchanged: there was nothing left to collapse"
+        );
+    }
+
+    /// Right on a key row is unaffected by any of this — it still opens the
+    /// key, tree mode or not.
+    #[test]
+    fn right_on_a_key_row_still_opens_it() {
+        let state = nested_tree();
+        let key_row = (0..state.tree.len())
+            .find(|&r| state.tree.key_index(r).is_some())
+            .expect("at least one key row is visible");
+        let mut state = state;
+        state.view.selected = key_row;
+
+        let (_, cmds) = update(state, Msg::Key(KeyPress::plain(KeyCode::Right)));
+        assert!(
+            matches!(cmds.as_slice(), [Command::ReadKey { .. }]),
+            "expected an open, got {cmds:?}"
+        );
+    }
+}

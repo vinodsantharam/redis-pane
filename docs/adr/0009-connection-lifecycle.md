@@ -45,6 +45,19 @@ as live.
 **Read-only Mode therefore carries a reason** — `environment`, `replica`, or `user` — and the
 header displays it. A guard whose origin is invisible is a guard the user will misread.
 
+**When `INFO` itself fails, the failure is reported, not defaulted.** Every row of that table is
+read from `INFO`, and that read can fail on its own — an ACL that denies the command, a server
+refusing it in some state, a reconnect onto a differently configured node. Three responses were
+available and only one is honest. Failing the connection turns an ACL restriction into an
+outage. Defaulting the readings to "clean" is worse than an outage: a replica then presents as a
+primary, and the `replica` guard is absent precisely where nothing on screen says so. So the
+connection is kept, no reason is invented, and the failure surfaces as a notification naming the
+command that failed (R7.4) — at startup and on every reconnect alike, since a refused `INFO`
+after a reconnect is as silent as one at launch. `--probe` prints it too.
+
+This leaves the safety chrome absent rather than wrong, which is the trade being made: the user
+is told that the checks did not run, instead of being shown a guard that was never evaluated.
+
 ## Alternatives considered
 
 **Open the TUI in a disconnected state at startup.** Rejected, though it is the tidier state

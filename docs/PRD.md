@@ -178,6 +178,12 @@ config file; a **Connection** is a live session, which may be **ad-hoc** (no Pro
   marks the Open key's row. This is a question of identity, not freshness: the value on screen is
   a live tracked read either way (R3.6, R3.7), and the failure being designed against is the user
   reading a correct value as though it belonged to the key under their cursor.
+- **R3.13** **Values are bytes, not text.** Redis stores byte strings, so no read may require a
+  value or a collection member to be valid UTF-8. A member that is valid UTF-8 renders as that
+  text; one that is not renders with every non-printable byte escaped as `\xHH`, so a msgpack
+  or protobuf field is legible rather than fatal. Decoding members as text made one binary
+  field enough to fail the read of an entire hash. A binary value or field is displayed but not
+  yet editable inline, and says so rather than refusing silently (R4.1).
 
 ### 6.4 Mutation
 - **R4.1** In-place edit for scalar values and collection members, with a diff-style confirm.

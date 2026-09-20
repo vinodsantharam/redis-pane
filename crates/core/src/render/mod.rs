@@ -58,7 +58,6 @@ pub fn frame(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect) -> Buf
 
 /// The value pane. Viewers land in M1.8; until then it states what is selected
 /// so the two-pane layout is real rather than a promise.
-#[allow(clippy::too_many_arguments)]
 fn value_pane(
     state: &State,
     theme: &Theme,
@@ -71,7 +70,7 @@ fn value_pane(
     if area.height == 0 || area.width < 6 {
         return;
     }
-    let now = clock.now_ms();
+    let now = clock.now_epoch_ms();
 
     // A read is in flight for a key that isn't (yet) what's on screen — a
     // first Open, or a switch to a different key while another's value was
@@ -86,7 +85,7 @@ fn value_pane(
     // indicator used to flash on and off within a frame or two on almost
     // every keypress, reading as a glitch rather than feedback.
     if let Some(pending) = &state.open_pending
-        && state.open.as_ref().map(|o| o.name.as_str()) != Some(pending.name.as_str())
+        && state.open.as_ref().map(|o| &o.name) != Some(&pending.name)
         && pending
             .issued_at_ms
             .is_some_and(|t| now.saturating_sub(t) >= PendingRead::APPEAR_DELAY_MS)
@@ -134,7 +133,13 @@ fn value_pane(
                 theme.style(Token::Muted),
             );
             let x1 = put(buf, x1, area.y, "  ·  ", theme.style(Token::Border));
-            put(buf, x1, area.y, &open.name, theme.style(Token::Text));
+            put(
+                buf,
+                x1,
+                area.y,
+                &open.name.display(),
+                theme.style(Token::Text),
+            );
             put(
                 buf,
                 area.x + 1,
@@ -147,7 +152,7 @@ fn value_pane(
                 buf,
                 area.x + 1,
                 area.y,
-                &open.name,
+                &open.name.display(),
                 theme.style(Token::Text),
             );
             put_right(
@@ -226,7 +231,7 @@ fn value_pane(
             .unwrap_or_default();
         let x1 = put(buf, x0, area.y, &format!("{hint} back"), sty(Token::Muted));
         put(buf, x1, area.y, "  ·  ", sty(Token::Border));
-        put(buf, x1 + 5, area.y, &open.name, sty(Token::Text))
+        put(buf, x1 + 5, area.y, &open.name.display(), sty(Token::Text))
     } else {
         // The key name is this pane's header, and like the keys pane's column
         // header it carries the focus (DESIGN §4): `r` refetches here and
@@ -238,7 +243,7 @@ fn value_pane(
         } else {
             Token::Text
         });
-        put(buf, x0, area.y, &open.name, name_style)
+        put(buf, x0, area.y, &open.name.display(), name_style)
     };
 
     // The chip. The wash says *that* the Viewer is off the cursor; this says it
@@ -322,7 +327,7 @@ fn value_pane(
     // Whether the inline editor's current text still parses as JSON, when
     // the value being edited was JSON-classified to begin with (ADR-0014) —
     // the live counterpart to the confirm dialog's `⚠ no longer valid JSON`.
-    if let Some(valid) = open.editor.as_ref().and_then(EditBuffer::json_valid) {
+    if let Some(valid) = open.editor().and_then(EditBuffer::json_valid) {
         let (label, token) = if valid {
             (" · json ✓", Token::Muted)
         } else {
@@ -352,7 +357,7 @@ fn value_pane(
     };
     let token = if open.deleted_at_ms.is_some() {
         Token::Danger
-    } else if open.pending.is_some() || open.editing {
+    } else if open.pending.is_some() || open.is_editing() {
         // Editing shares Warn with a held update: something to pay attention
         // to, nothing broken. Checked before the plain `●` case below, or an
         // idle edit with no pending change would render as plain green live.
@@ -401,7 +406,7 @@ fn value_pane(
     // that width `Up`/`Down` move by whole lines, which in a token is none.
     // The text colour is painted underneath instead of set on the widget,
     // since setting a style needs `&mut` and render only borrows `State`.
-    if let Some(editor) = &open.editor {
+    if let Some(editor) = open.editor() {
         if let Some(name) = editor.field_name() {
             // The two-part FIELD/VALUE form (PLAN M2 task 6 follow-up, F):
             // adding a field shows both, name first; editing an existing one
@@ -415,7 +420,7 @@ fn value_pane(
             // read as "the one taking keys right now".
             let name_part = editor.active_part() == Some(FieldPart::Name);
             let value_part = !name_part;
-            let show_marker = !editor.is_staged();
+            let show_marker = open.typing().is_some();
             let name_active = show_marker && name_part;
             let value_active = show_marker && value_part;
             // "FIELD"/"VALUE" are both five characters, so one constant
@@ -591,7 +596,13 @@ fn opening_placeholder(
             theme.style(Token::Muted),
         );
         let x1 = put(buf, x1, area.y, "  ·  ", theme.style(Token::Border));
-        put(buf, x1, area.y, &pending.name, theme.style(Token::Text));
+        put(
+            buf,
+            x1,
+            area.y,
+            &pending.name.display(),
+            theme.style(Token::Text),
+        );
         put(
             buf,
             area.x + 1,
@@ -605,7 +616,7 @@ fn opening_placeholder(
             buf,
             area.x + 1,
             area.y,
-            &pending.name,
+            &pending.name.display(),
             theme.style(Token::Text),
         );
         put_right(
@@ -681,7 +692,7 @@ fn status_bar(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect, buf: 
     let readout = state.scan.readout();
     let quiet = readout.is_empty()
         && state.list.sort_readout().is_none()
-        && state.notice_now(clock.now_ms()).is_none()
+        && state.notice_now(clock.now_epoch_ms()).is_none()
         && state.error_text().is_none();
     if quiet || area.height < 2 {
         return;
@@ -689,7 +700,7 @@ fn status_bar(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect, buf: 
     let y = area.height - if area.height >= 24 { 2 } else { 1 };
     let token = if state.error_text().is_some() {
         Token::Danger
-    } else if state.notice_now(clock.now_ms()).is_some() {
+    } else if state.notice_now(clock.now_epoch_ms()).is_some() {
         Token::Ok
     } else {
         match state.scan {
@@ -706,7 +717,7 @@ fn status_bar(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect, buf: 
     // A copy confirmation displaces the scan readout for a moment rather than
     // claiming another row (G7). A failure outranks both and stays until it is
     // dismissed, because an error nobody read is an error nobody handled.
-    if let Some(notice) = state.notice_now(clock.now_ms()) {
+    if let Some(notice) = state.notice_now(clock.now_epoch_ms()) {
         line = notice.to_string();
     }
     if let Some(error) = state.error_text() {
@@ -840,10 +851,7 @@ fn confirm_overlay(
         }
         PendingMutation::SetString { name, old, new, .. } => {
             // The value itself is the `+` side of the diff below.
-            lines.push((
-                format!("SET {} KEEPTTL XX", String::from_utf8_lossy(name)),
-                Token::Text,
-            ));
+            lines.push((format!("SET {} KEEPTTL XX", name.display()), Token::Text));
             push_diff_side(&mut lines, "-", old, Token::Danger);
             push_diff_side(&mut lines, "+", new, Token::Ok);
             if pending.json_warning() == Some(true) {
@@ -1137,12 +1145,7 @@ pub fn hint_bar(state: &State) -> String {
     // form's two parts each get their own wording (PLAN M2 task 6
     // follow-up, F/N) — the name part shares the editor's rank but not its
     // vocabulary, since `⌃S`/`↑` mean nothing there yet.
-    if let Some(editor) = state
-        .open
-        .as_ref()
-        .and_then(|o| o.editor.as_ref())
-        .filter(|e| !e.is_staged())
-    {
+    if let Some(editor) = state.open.as_ref().and_then(crate::state::OpenKey::typing) {
         let cancel = state.keymap.hint(Action::Cancel).unwrap_or_default();
         match editor.active_part() {
             Some(FieldPart::Name) => {
@@ -1226,7 +1229,7 @@ pub fn read_age(state: &State, clock: &dyn Clock) -> String {
     match state.last_read_ms {
         None => "never read".to_string(),
         Some(then) => {
-            let secs = clock.now_ms().saturating_sub(then) / 1000;
+            let secs = clock.now_epoch_ms().saturating_sub(then) / 1000;
             if secs < 1 {
                 "read just now".to_string()
             } else if secs < 60 {

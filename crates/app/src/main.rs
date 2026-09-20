@@ -5,11 +5,12 @@
 
 use clap::Parser;
 use fred::interfaces::ClientLike;
+use fred::prelude::Client;
 use redis_pane_core::resolve::{Credentials, EnvVars, Flags, resolve};
-use redis_pane_core::state::{Connection, ReadOnlyReason, State};
+use redis_pane_core::state::{Connection, Startup, State};
 use redis_pane_core::theme::Theme;
 
-use redis_pane::redis::ConnectError;
+use redis_pane::redis::{ConnectError, Established};
 use redis_pane::{SystemClock, config_io, exit, redis, terminal};
 
 /// A terminal UI for Redis.
@@ -67,6 +68,17 @@ fn env_vars() -> EnvVars {
     }
 }
 
+/// Target, Environment and Source on one line — what `--print-target` and
+/// `--probe` both lead with, and what the title bar shows (ADR-0001).
+fn readout(connection: &Connection) -> String {
+    format!(
+        "{} · {} · {}",
+        connection.target,
+        connection.environment.label(),
+        connection.source.label()
+    )
+}
+
 /// The diagnostic printed when a target cannot be reached (R1.14, ADR-0009).
 ///
 /// It names the target *and* its Source, because "connection refused" without
@@ -82,52 +94,63 @@ fn startup_failure(connection: &Connection, err: &ConnectError) -> String {
     )
 }
 
-/// Connect, report what the server supports, and exit. M0.8's proof, runnable
-/// by hand as well as by the suite.
-fn probe(connection: &Connection, credentials: &Credentials, dial: &str) -> i32 {
-    let runtime = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("redis-pane: {e}");
-            return exit::CONNECTION;
-        }
-    };
-
+/// Connect, or exit with the diagnostic and the exit code for why not.
+///
+/// The one place a connect failure becomes an exit code, for `--probe` and a
+/// session alike: the two used to repeat this, and exit codes are an interface
+/// scripts depend on (review M8).
+fn connect_or_exit(
+    connection: &Connection,
+    credentials: &Credentials,
+    dial: &str,
+) -> (tokio::runtime::Runtime, Client, Established) {
+    let runtime = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
+        eprintln!("redis-pane: {e}");
+        std::process::exit(exit::CONNECTION);
+    });
     match runtime.block_on(redis::connect_with(dial, credentials)) {
-        Ok((client, established)) => {
-            println!(
-                "{} · {} · {}",
-                connection.target,
-                connection.environment.label(),
-                connection.source.label()
-            );
-            println!("redis {}", established.version);
-            if let Some(reason) = established.read_only {
-                println!("read-only: {} (not liftable)", reason.label());
-            }
-            if let Some(condition) = established.condition {
-                println!("condition: {}", condition.readout());
-            }
-            println!(
-                "liveness: {}",
-                if established.tracking_supported {
-                    "CLIENT TRACKING accepted — push-driven"
-                } else {
-                    "CLIENT TRACKING refused — degrading to manual"
-                }
-            );
-            let _ = runtime.block_on(client.quit());
-            exit::OK
-        }
-        Err(err @ (ConnectError::BelowFloor { .. } | ConnectError::NoResp3 { .. })) => {
-            eprintln!("{}", startup_failure(connection, &err));
-            exit::UNSUPPORTED_SERVER
-        }
+        Ok((client, established)) => (runtime, client, established),
         Err(err) => {
             eprintln!("{}", startup_failure(connection, &err));
-            exit::CONNECTION
+            std::process::exit(match err {
+                ConnectError::BelowFloor { .. } | ConnectError::NoResp3 { .. } => {
+                    exit::UNSUPPORTED_SERVER
+                }
+                _ => exit::CONNECTION,
+            });
         }
     }
+}
+
+/// Report what the server supports. M0.8's proof, runnable by hand as well as
+/// by the suite.
+fn probe(
+    runtime: &tokio::runtime::Runtime,
+    connection: &Connection,
+    client: &Client,
+    established: &Established,
+) -> i32 {
+    println!("{}", readout(connection));
+    println!("redis {}", established.version);
+    if let Some(reason) = established.read_only {
+        println!("read-only: {} (not liftable)", reason.label());
+    }
+    if let Some(condition) = established.condition {
+        println!("condition: {}", condition.readout());
+    }
+    if let Some(e) = &established.server_state_error {
+        println!("replica/condition checks failed: {e}");
+    }
+    println!(
+        "liveness: {}",
+        if established.tracking_supported {
+            "CLIENT TRACKING accepted — push-driven"
+        } else {
+            "CLIENT TRACKING refused — degrading to manual"
+        }
+    );
+    let _ = runtime.block_on(client.quit());
+    exit::OK
 }
 
 fn main() {
@@ -169,72 +192,34 @@ fn main() {
     let dial = resolution.dial_url();
 
     if cli.print_target {
-        println!(
-            "{} · {} · {}",
-            connection.target,
-            connection.environment.label(),
-            connection.source.label()
-        );
+        println!("{}", readout(&connection));
         std::process::exit(exit::OK);
-    }
-
-    if cli.probe {
-        std::process::exit(probe(&connection, &resolution.credentials, dial));
     }
 
     // Connect before taking over the terminal: a failure here is a diagnostic
     // in the shell, not an error box in a TUI (ADR-0009).
-    let runtime = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("redis-pane: {e}");
-            std::process::exit(exit::CONNECTION);
-        }
-    };
-    let (client, established) =
-        match runtime.block_on(redis::connect_with(dial, &resolution.credentials)) {
-            Ok(pair) => pair,
-            Err(err @ (ConnectError::BelowFloor { .. } | ConnectError::NoResp3 { .. })) => {
-                eprintln!("{}", startup_failure(&connection, &err));
-                std::process::exit(exit::UNSUPPORTED_SERVER);
-            }
-            Err(err) => {
-                eprintln!("{}", startup_failure(&connection, &err));
-                std::process::exit(exit::CONNECTION);
-            }
-        };
+    let (runtime, client, established) =
+        connect_or_exit(&connection, &resolution.credentials, dial);
 
-    let clock = SystemClock;
-    // `prod` and `unknown` start guarded (R4.5, ADR-0004). A replica outranks
-    // the Environment: that reason cannot be lifted, so claiming the weaker one
-    // would offer a toggle the server will refuse (R1.15, ADR-0009).
-    let read_only = established.read_only.or_else(|| {
-        connection
-            .environment
-            .read_only_by_default()
-            .then_some(ReadOnlyReason::Environment)
-    });
-    let state = State {
+    if cli.probe {
+        std::process::exit(probe(&runtime, &connection, &client, &established));
+    }
+
+    // Which Read-only reason a session starts with is the core's rule
+    // (`State::new`): a replica outranks the Environment's default.
+    let state = State::new(Startup {
         connection,
-        read_only,
+        server_read_only: established.read_only,
         condition: established.condition,
-        // Tree is the default view (DESIGN §9, resolved): it shows fewer rows
-        // at rest, and `t` is one keypress from flat for anyone who wants it.
-        // Set here rather than on State::default() — a great many tests use
-        // that as a blank-slate baseline and rely on tree_mode being false
-        // unless a test opts in explicitly.
-        tree_mode: true,
-        ..State::default()
-    };
+    });
     let theme = Theme::new(terminal::detect_color_depth());
 
-    let tracking = established.tracking_supported;
     if let Err(err) = runtime.block_on(terminal::run(
         state,
         theme,
-        &clock,
+        std::sync::Arc::new(SystemClock),
         client,
-        tracking,
+        established,
         dial.to_string(),
         resolution.credentials.clone(),
     )) {

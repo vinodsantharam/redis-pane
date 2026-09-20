@@ -17,7 +17,7 @@ pub mod view;
 pub use copy::CopyWhat;
 pub use editor::{EditBuffer, EditTarget, FieldPart};
 pub use loaded::{KeyKind, LoadedSet};
-pub use open::{Attachment, OpenKey, PendingRead, ReadOutcome};
+pub use open::{Attachment, EditPhase, OpenKey, PendingRead, ReadOutcome};
 pub use scan::ScanState;
 pub use tree::Tree;
 pub use value::{Value, Viewer, looks_like_json};
@@ -216,7 +216,10 @@ pub enum PendingMutation {
     /// Delete one key outright (`DEL`). `index` is the Loaded set row it came
     /// from, carried the same way `Msg::ValueGone` carries it, so a rescan
     /// between staging and confirming cannot make this land on the wrong row.
-    DeleteKey { index: usize, name: Vec<u8> },
+    DeleteKey {
+        index: usize,
+        name: crate::key::KeyName,
+    },
     /// Overwrite a String value (`SET`), staged from an `$EDITOR` round trip
     /// (R3.2, R4.1). `was_json` is whether the *pre-edit* value was rendered
     /// through the JSON viewer — it is what the confirm dialog checks before
@@ -225,7 +228,7 @@ pub enum PendingMutation {
     /// JSON is a fact about the read that produced `old`, not about whatever
     /// the reader just typed.
     SetString {
-        name: Vec<u8>,
+        name: crate::key::KeyName,
         old: Vec<u8>,
         new: Vec<u8>,
         was_json: bool,
@@ -234,7 +237,7 @@ pub enum PendingMutation {
     /// (guarded `HSET`, PLAN M2 task 6, D1, ADR-0015). `old`/`was_json` carry
     /// the same meaning `SetString` gives them, one field wide.
     SetHashField {
-        name: Vec<u8>,
+        name: crate::key::KeyName,
         field: Vec<u8>,
         old: Vec<u8>,
         new: Vec<u8>,
@@ -243,7 +246,7 @@ pub enum PendingMutation {
     /// Add a Hash field that does not exist yet, never overwriting one that
     /// does (guarded `HSETNX`, PLAN M2 task 6, D1, ADR-0015).
     AddHashField {
-        name: Vec<u8>,
+        name: crate::key::KeyName,
         field: Vec<u8>,
         value: Vec<u8>,
     },
@@ -252,7 +255,7 @@ pub enum PendingMutation {
     /// the confirm dialog warns that the key itself will go, since `HDEL`
     /// deletes a Hash whose last field is removed.
     DeleteHashField {
-        name: Vec<u8>,
+        name: crate::key::KeyName,
         field: Vec<u8>,
         last_field: bool,
     },
@@ -269,35 +272,19 @@ impl PendingMutation {
     pub fn command_text(&self) -> String {
         match self {
             PendingMutation::DeleteKey { name, .. } => {
-                format!("DEL {}", String::from_utf8_lossy(name))
+                format!("DEL {}", name)
             }
             PendingMutation::SetString { name, new, .. } => {
-                format!(
-                    "SET {} {} KEEPTTL XX",
-                    String::from_utf8_lossy(name),
-                    String::from_utf8_lossy(new)
-                )
+                format!("SET {} {} KEEPTTL XX", name, String::from_utf8_lossy(new))
             }
             PendingMutation::SetHashField { name, field, .. } => {
-                format!(
-                    "HSET {} {}",
-                    String::from_utf8_lossy(name),
-                    String::from_utf8_lossy(field)
-                )
+                format!("HSET {} {}", name, String::from_utf8_lossy(field))
             }
             PendingMutation::AddHashField { name, field, .. } => {
-                format!(
-                    "HSETNX {} {}",
-                    String::from_utf8_lossy(name),
-                    String::from_utf8_lossy(field)
-                )
+                format!("HSETNX {} {}", name, String::from_utf8_lossy(field))
             }
             PendingMutation::DeleteHashField { name, field, .. } => {
-                format!(
-                    "HDEL {} {}",
-                    String::from_utf8_lossy(name),
-                    String::from_utf8_lossy(field)
-                )
+                format!("HDEL {} {}", name, String::from_utf8_lossy(field))
             }
         }
     }
@@ -340,34 +327,47 @@ impl PendingMutation {
         }
     }
 
-    /// The shell work confirming this dispatches. The only place a
-    /// `PendingMutation` turns into a [`crate::Command`] — the chokepoint's
-    /// actual enforcement point, mirrored from how `scan_batch` is the one
-    /// place the Loaded set cap is enforced (ADR-0010).
-    pub fn into_commands(self) -> Vec<crate::Command> {
-        match self {
+    /// The shell work confirming this dispatches: the write, without what the
+    /// dialog showed about it. The only place a `PendingMutation` becomes a
+    /// [`crate::Command`] — the chokepoint's actual enforcement point, mirrored
+    /// from how `scan_batch` is the one place the Loaded set cap is enforced
+    /// (ADR-0010).
+    pub fn into_command(self) -> crate::Command {
+        use crate::mutation::Mutation;
+        let (mutation, index) = match self {
             PendingMutation::DeleteKey { index, name } => {
-                vec![crate::Command::DeleteKey { index, name }]
+                (Mutation::DeleteKey { key: name }, Some(index))
             }
-            PendingMutation::SetString { name, new, .. } => {
-                vec![crate::Command::SetValue { name, new }]
-            }
+            PendingMutation::SetString { name, new, .. } => (
+                Mutation::SetString {
+                    key: name,
+                    value: new,
+                },
+                None,
+            ),
             PendingMutation::SetHashField {
                 name, field, new, ..
-            } => {
-                vec![crate::Command::SetHashField {
-                    name,
+            } => (
+                Mutation::SetHashField {
+                    key: name,
                     field,
                     value: new,
-                }]
-            }
-            PendingMutation::AddHashField { name, field, value } => {
-                vec![crate::Command::AddHashField { name, field, value }]
-            }
+                },
+                None,
+            ),
+            PendingMutation::AddHashField { name, field, value } => (
+                Mutation::AddHashField {
+                    key: name,
+                    field,
+                    value,
+                },
+                None,
+            ),
             PendingMutation::DeleteHashField { name, field, .. } => {
-                vec![crate::Command::DeleteHashField { name, field }]
+                (Mutation::DeleteHashField { key: name, field }, None)
             }
-        }
+        };
+        crate::Command::Execute { mutation, index }
     }
 }
 
@@ -444,7 +444,7 @@ pub struct State {
     /// exactly as it always did.
     ///
     /// Session-only for now — restoring it across a relaunch needs the
-    /// session-state file `state_file.rs` does not implement yet (ADR-0003).
+    /// session-state file ADR-0003 describes, which is not implemented yet.
     pub split_adjust: i16,
     /// Set between a mouse-down that grabbed the divider and the matching
     /// mouse-up (R7.3, drag-to-resize). While true, `Drag` events move
@@ -481,7 +481,47 @@ pub struct State {
     pub error: Option<(String, u64)>,
 }
 
+/// What the shell has learned by the time the core starts: the resolved
+/// Connection, and what connecting found out about the server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Startup {
+    pub connection: Connection,
+    /// Read-only Mode the *server* imposes: a replica (R1.15).
+    pub server_read_only: Option<ReadOnlyReason>,
+    pub condition: Option<ServerCondition>,
+}
+
 impl State {
+    /// The state a session starts in (review H2).
+    ///
+    /// The shell used to assemble this field by field in `main.rs`, including
+    /// the rule for which Read-only reason wins. That rule is the core's, and
+    /// now it is tested here: `prod` and `unknown` start guarded (R4.5,
+    /// ADR-0004), and a replica outranks the Environment, because that reason
+    /// cannot be lifted and claiming the weaker one would offer a toggle the
+    /// server will refuse (R1.15, ADR-0009).
+    pub fn new(startup: Startup) -> Self {
+        let read_only = startup.server_read_only.or_else(|| {
+            startup
+                .connection
+                .environment
+                .read_only_by_default()
+                .then_some(ReadOnlyReason::Environment)
+        });
+        State {
+            connection: startup.connection,
+            read_only,
+            condition: startup.condition,
+            // Tree is the default view (DESIGN §9, resolved): it shows fewer
+            // rows at rest, and `t` is one keypress from flat for anyone who
+            // wants it. Set here rather than on `State::default()`: a great many
+            // tests use that as a blank-slate baseline and rely on tree_mode
+            // being false unless a test opts in explicitly.
+            tree_mode: true,
+            ..State::default()
+        }
+    }
+
     /// Whether a pane-scoped key belongs to the keys pane rather than the
     /// Viewer (R2.7).
     ///
@@ -522,6 +562,26 @@ impl State {
         self.pane_visible(crate::render::layout::Pane::Value)
     }
 
+    /// How many characters a String value's row holds: the Viewer body's text
+    /// width at this terminal size and divider position, exactly as the value
+    /// pane draws it (review M4).
+    pub fn value_wrap_width(&self) -> usize {
+        let area = ratatui::layout::Rect::new(0, 0, self.cols, self.rows);
+        crate::render::layout::layout(area, crate::render::layout::Pane::Value, self.split_adjust)
+            .value
+            // One column for each side's margin, and one the row clip keeps
+            // clear (`render::value_pane`).
+            .map_or(0, |pane| pane.width.saturating_sub(3) as usize)
+    }
+
+    /// Re-wrap the Open key's value after the terminal or the divider moved.
+    pub(crate) fn rewrap_open(&mut self) {
+        let width = self.value_wrap_width();
+        if let Some(open) = &mut self.open {
+            open.rewrap(width);
+        }
+    }
+
     /// Whether there are two panes on screen for `⌃←`/`⌃→` to divide.
     ///
     /// Below 70 columns exactly one pane is drawn (DESIGN §2, stack
@@ -532,12 +592,6 @@ impl State {
         self.cols >= crate::render::layout::TWO_PANE_MIN_COLS
     }
 
-    /// What the header may claim about currency.
-    ///
-    /// There is deliberately no setter for this. Liveness is *derived* from the
-    /// link and the tracking state, so no code path can set the header to
-    /// `live` without the server having actually armed — which is the failure
-    /// ADR-0009 exists to prevent, and the one most likely to rot silently.
     /// Whether Read-only Mode can be lifted right now. A replica cannot, so the
     /// hint must read `locked` rather than offering a key that will not work.
     pub fn read_only_liftable(&self) -> bool {
@@ -702,6 +756,31 @@ impl State {
         self.error.as_ref().map(|(text, _)| text.as_str())
     }
 
+    /// Whether a read issued now must arm tracking with it (ADR-0006).
+    ///
+    /// True on any connection whose server accepted `CLIENT TRACKING`, in every
+    /// tracking state: `Available` (just connected, and arming is how it
+    /// becomes live), `Armed` (every read re-arms), `Consumed` (an invalidation
+    /// used the arming up, and this read is what restores it). The shell used
+    /// to keep its own copy of this, which a fred-level reconnect's re-probe
+    /// could not reach; now [`crate::Command::ReadKey`] carries the answer
+    /// (review H3).
+    pub fn read_arms_tracking(&self) -> bool {
+        matches!(
+            self.link,
+            Link::Up {
+                tracking: Tracking::Available | Tracking::Armed | Tracking::Consumed,
+                ..
+            }
+        )
+    }
+
+    /// What the header may claim about currency.
+    ///
+    /// There is deliberately no setter for this. Liveness is *derived* from the
+    /// link and the tracking state, so no code path can set the header to
+    /// `live` without the server having actually armed — which is the failure
+    /// ADR-0009 exists to prevent, and the one most likely to rot silently.
     pub fn liveness(&self) -> Liveness {
         match &self.link {
             Link::Connecting | Link::Reconnecting { .. } => Liveness::Disconnected,
@@ -714,5 +793,53 @@ impl State {
                 Tracking::Unsupported => Liveness::Manual,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn startup(environment: Environment, server_read_only: Option<ReadOnlyReason>) -> Startup {
+        Startup {
+            connection: Connection {
+                environment,
+                ..Connection::default()
+            },
+            server_read_only,
+            condition: None,
+        }
+    }
+
+    #[test]
+    fn a_session_starts_guarded_exactly_where_the_environment_says() {
+        let cases = [
+            (Environment::Local, None),
+            (Environment::Staging, None),
+            (Environment::Prod, Some(ReadOnlyReason::Environment)),
+            (Environment::Unknown, Some(ReadOnlyReason::Environment)),
+        ];
+        for (environment, expected) in cases {
+            let state = State::new(startup(environment, None));
+            assert_eq!(state.read_only, expected, "{environment:?}");
+        }
+    }
+
+    #[test]
+    fn a_replica_outranks_the_environment_guard_from_the_first_frame() {
+        for environment in [Environment::Local, Environment::Prod] {
+            let state = State::new(startup(environment, Some(ReadOnlyReason::Replica)));
+            assert_eq!(
+                state.read_only,
+                Some(ReadOnlyReason::Replica),
+                "{environment:?}"
+            );
+            assert!(!state.read_only_liftable());
+        }
+    }
+
+    #[test]
+    fn a_session_starts_in_tree_mode() {
+        assert!(State::new(startup(Environment::Local, None)).tree_mode);
     }
 }

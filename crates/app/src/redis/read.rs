@@ -12,6 +12,10 @@
 //! therefore driven by the capability probe, and by nothing else, which is what
 //! [`Arming`] exists to make explicit. A bare `bool` here would invite a caller
 //! to pass `false` for convenience, and that caller would silently go dark.
+//!
+//! Every collection member is read as bytes, never as `String`: fred refuses
+//! to decode invalid UTF-8 into a `String`, so one binary field used to fail
+//! the whole read. The Viewer decides how a cell is shown (review C2).
 
 use fred::prelude::*;
 use fred::types::CustomCommand;
@@ -130,7 +134,6 @@ pub struct ReadValue {
 pub async fn read_value(
     client: &Client,
     name: &[u8],
-    pane_width: usize,
     arming: Arming,
 ) -> Result<Option<ReadValue>, Error> {
     let key: Key = name.into();
@@ -155,59 +158,86 @@ pub async fn read_value(
         return Ok(None);
     }
 
-    let ttl: i64 = client.ttl(key.clone()).await.unwrap_or(-1);
-    let size: i64 = client
-        .memory_usage(key.clone(), None)
-        .await
-        .unwrap_or(Some(0))
-        .unwrap_or(0);
-
-    let value = match kind.as_str() {
-        "string" => string_value(client, key, pane_width).await?,
+    // Everything else the header needs — TTL, size, the length behind the
+    // count — plus, for the types whose window is one command, the window
+    // itself, in one round trip. These used to be four to six awaits in a row,
+    // and TTL, `MEMORY USAGE`, the length and a stream's entries each fell back
+    // to a default on error: a failure became a confident wrong figure, or an
+    // empty stream (R7.4, review M6). Hash and Set page with a cursor, so their
+    // window follows separately.
+    let meta = client.pipeline();
+    let _: () = meta.ttl(key.clone()).await?;
+    let _: () = meta.memory_usage(key.clone(), None).await?;
+    match kind.as_str() {
         "hash" => {
-            let total: i64 = client.hlen(key.clone()).await.unwrap_or(0);
-            let pairs = hscan_window(client, &key).await?;
-            Value::Hash(PairValue {
-                pairs,
-                total: total.max(0) as usize,
-            })
+            let _: () = meta.hlen(key.clone()).await?;
         }
         "list" => {
-            let total: i64 = client.llen(key.clone()).await.unwrap_or(0);
-            let items: Vec<String> = client.lrange(key, 0, WINDOW - 1).await?;
-            Value::List(IndexedValue {
-                items,
-                total: total.max(0) as usize,
-            })
+            let _: () = meta.llen(key.clone()).await?;
+            let _: () = meta.lrange(key.clone(), 0, WINDOW - 1).await?;
         }
         "set" => {
-            let total: i64 = client.scard(key.clone()).await.unwrap_or(0);
-            let members = sscan_window(client, &key).await?;
-            Value::Set(MemberValue {
-                members,
-                total: total.max(0) as usize,
-            })
+            let _: () = meta.scard(key.clone()).await?;
         }
         "zset" => {
-            let total: i64 = client.zcard(key.clone()).await.unwrap_or(0);
-            let entries: Vec<(String, f64)> = client
-                .zrange(key, 0, WINDOW - 1, None, false, None, true)
+            let _: () = meta.zcard(key.clone()).await?;
+            let _: () = meta
+                .zrange(key.clone(), 0, WINDOW - 1, None, false, None, true)
                 .await?;
-            Value::ZSet(ScoredValue {
-                entries,
-                total: total.max(0) as usize,
-            })
         }
-        "stream" => stream_value(client, key).await?,
-        // A type this build does not model still gets shown, as bytes. Refusing
-        // to display something is worse than displaying it plainly.
+        "stream" => {
+            let _: () = meta.xlen(key.clone()).await?;
+            // XREVRANGE, not XRANGE: DESIGN §6.3 asks for a reverse-chronological
+            // timeline, and it is not only ordering. XRANGE("-", "+", COUNT) takes
+            // the *oldest* COUNT entries — on a stream past the window size, that
+            // was the ancient history, not the recent activity a triage view
+            // actually needs. XREVRANGE("+", "-", COUNT) takes the most recent.
+            let _: () = meta
+                .xrevrange(key.clone(), "+", "-", Some(WINDOW as u64))
+                .await?;
+        }
+        // Strings, and any type this build does not model: shown as what GET
+        // returns. Refusing to display something is worse than displaying it
+        // plainly.
         _ => {
-            let bytes: Vec<u8> = client
-                .get::<Option<Vec<u8>>, _>(key)
-                .await?
-                .unwrap_or_default();
-            Value::Binary(BinaryValue { bytes })
+            let _: () = meta.get(key.clone()).await?;
         }
+    }
+    let mut replies = meta.all::<Vec<RedisValue>>().await?.into_iter();
+    let mut next = move || {
+        replies
+            .next()
+            .ok_or_else(|| Error::new(ErrorKind::Protocol, "a pipelined read came back short"))
+    };
+    let ttl: i64 = next()?.convert()?;
+    // `MEMORY USAGE` answers nil for a key that vanished after `TYPE`.
+    let size: i64 = next()?.convert::<Option<i64>>()?.unwrap_or(0);
+
+    let value = match kind.as_str() {
+        "string" => string_value(next()?.convert::<Option<Vec<u8>>>()?.unwrap_or_default()),
+        "hash" => Value::Hash(PairValue {
+            total: length(next()?)?,
+            pairs: hscan_window(client, &key).await?,
+        }),
+        "list" => Value::List(IndexedValue {
+            total: length(next()?)?,
+            items: next()?.convert()?,
+        }),
+        "set" => Value::Set(MemberValue {
+            total: length(next()?)?,
+            members: sscan_window(client, &key).await?,
+        }),
+        "zset" => Value::ZSet(ScoredValue {
+            total: length(next()?)?,
+            entries: next()?.convert()?,
+        }),
+        "stream" => Value::Stream(StreamValue {
+            total: length(next()?)?,
+            entries: next()?.convert()?,
+        }),
+        _ => Value::Binary(BinaryValue {
+            bytes: next()?.convert::<Option<Vec<u8>>>()?.unwrap_or_default(),
+        }),
     };
 
     Ok(Some(ReadValue {
@@ -215,6 +245,11 @@ pub async fn read_value(
         ttl_seconds: ttl.clamp(-1, i32::MAX as i64) as i32,
         size_bytes: size.clamp(0, u32::MAX as i64 - 1) as u32,
     }))
+}
+
+/// A `*LEN`/`*CARD` reply as a count.
+fn length(reply: RedisValue) -> Result<usize, Error> {
+    Ok(reply.convert::<i64>()?.max(0) as usize)
 }
 
 /// Fetch up to [`WINDOW`] fields via `HSCAN`, the windowing discipline
@@ -230,11 +265,11 @@ pub async fn read_value(
 /// background command this project's read path does not otherwise have (see
 /// `ReadGate` above). A hand-rolled loop with an explicit stopping condition
 /// has no such edge to remember.
-async fn hscan_window(client: &Client, key: &Key) -> Result<Vec<(String, String)>, Error> {
+async fn hscan_window(client: &Client, key: &Key) -> Result<Vec<(Vec<u8>, Vec<u8>)>, Error> {
     let mut pairs = Vec::new();
     let mut cursor = "0".to_string();
     for _ in 0..SCAN_ROUNDS {
-        let (next, flat): (String, Vec<String>) = client
+        let (next, flat): (String, Vec<Vec<u8>>) = client
             .custom(
                 CustomCommand::new("HSCAN", key.as_bytes(), false),
                 vec![
@@ -269,11 +304,11 @@ async fn hscan_window(client: &Client, key: &Key) -> Result<Vec<(String, String)
 
 /// `SSCAN`'s half of [`hscan_window`] — see its comment for why this is a
 /// hand-rolled loop rather than `Client::sscan`'s stream.
-async fn sscan_window(client: &Client, key: &Key) -> Result<Vec<String>, Error> {
+async fn sscan_window(client: &Client, key: &Key) -> Result<Vec<Vec<u8>>, Error> {
     let mut members = Vec::new();
     let mut cursor = "0".to_string();
     for _ in 0..SCAN_ROUNDS {
-        let (next, page): (String, Vec<String>) = client
+        let (next, page): (String, Vec<Vec<u8>>) = client
             .custom(
                 CustomCommand::new("SSCAN", key.as_bytes(), false),
                 vec![
@@ -296,37 +331,14 @@ async fn sscan_window(client: &Client, key: &Key) -> Result<Vec<String>, Error> 
 
 /// Strings are the one type whose *shape* is not given by its Redis type: it
 /// may be JSON, text, or arbitrary bytes, and each wants a different viewer.
-async fn string_value(client: &Client, key: Key, width: usize) -> Result<Value, Error> {
-    let bytes: Vec<u8> = client
-        .get::<Option<Vec<u8>>, _>(key)
-        .await?
-        .unwrap_or_default();
-    match String::from_utf8(bytes.clone()) {
-        Ok(text) => {
-            if looks_like_json(&text) {
-                Ok(Value::Json(JsonValue::parse(&text)))
-            } else {
-                Ok(Value::Str(StringValue::new(&text, width)))
-            }
-        }
+fn string_value(bytes: Vec<u8>) -> Value {
+    match String::from_utf8(bytes) {
+        Ok(text) if looks_like_json(&text) => Value::Json(JsonValue::parse(&text)),
+        // Unwrapped: the core wraps it to the pane it lands in (review M4).
+        Ok(text) => Value::Str(StringValue::new(&text, usize::MAX)),
         // Not valid UTF-8, so it is a blob. A hex dump is honest; mojibake is not.
-        Err(_) => Ok(Value::Binary(BinaryValue { bytes })),
+        Err(e) => Value::Binary(BinaryValue {
+            bytes: e.into_bytes(),
+        }),
     }
-}
-
-async fn stream_value(client: &Client, key: Key) -> Result<Value, Error> {
-    let total: i64 = client.xlen(key.clone()).await.unwrap_or(0);
-    // XREVRANGE, not XRANGE: DESIGN §6.3 asks for a reverse-chronological
-    // timeline, and it is not only ordering. XRANGE("-", "+", COUNT) takes the
-    // *oldest* COUNT entries — on a stream past the window size, that was the
-    // ancient history, not the recent activity a triage view actually needs.
-    // XREVRANGE("+", "-", COUNT) takes the most recent COUNT, newest first.
-    let entries: Vec<(String, Vec<(String, String)>)> = client
-        .xrevrange(key, "+", "-", Some(WINDOW as u64))
-        .await
-        .unwrap_or_default();
-    Ok(Value::Stream(StreamValue {
-        entries,
-        total: total.max(0) as usize,
-    }))
 }

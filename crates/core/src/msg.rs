@@ -93,22 +93,6 @@ pub enum MouseAction {
     ScrollDown { col: u16, row: u16 },
 }
 
-/// Why a guarded write did not write anything (PLAN M2 task 6, D1, ADR-0015).
-///
-/// One enum for every guard a write can trip, whichever mutation it was —
-/// `Msg::NotWritten` carries this rather than the mutation itself, so the
-/// `update()` handler is one match on *why*, not one per command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NotWritten {
-    /// The key itself was already gone. Tombstoned, the same as a
-    /// `ValueGone` — the key is never recreated (ADR-0014).
-    KeyGone,
-    /// A `SetHashField` found the field already gone.
-    FieldGone,
-    /// An `AddHashField` found the field already there.
-    FieldExists,
-}
-
 /// Every input to the core: keystrokes, resizes, and replies from the shells.
 ///
 /// The core has no other way in. A shell that wants to tell the core something
@@ -201,7 +185,7 @@ pub enum Msg {
         /// after a rescan took it away — the value is still the value, but
         /// there is no row it may be written back to.
         index: Option<usize>,
-        name: String,
+        name: crate::key::KeyName,
         value: crate::state::Value,
         ttl_seconds: i32,
         size_bytes: u32,
@@ -225,7 +209,7 @@ pub enum Msg {
         /// The Loaded set row this key was read from, if one was known —
         /// same meaning as [`Msg::ValueLoaded::index`].
         index: Option<usize>,
-        name: String,
+        name: crate::key::KeyName,
         at_ms: u64,
     },
     /// Something was copied. Drives a notice that fades on its own.
@@ -257,69 +241,25 @@ pub enum Msg {
         read_only: Option<crate::state::ReadOnlyReason>,
         condition: Option<crate::state::ServerCondition>,
     },
-    /// A staged `DeleteKey` completed — the key is gone, whether it still
-    /// existed at the moment `DEL` ran or was already gone by then. Not a
-    /// read, so it carries no [`crate::command::ReadToken`]; a delete only
-    /// ever follows a confirm the reader just pressed, and there is at most
-    /// one staged at a time (R4.3, R4.4).
-    KeyDeleted {
-        /// The Loaded set row this key was staged from, if one was known —
-        /// same meaning as [`Msg::ValueGone::index`].
-        index: Option<usize>,
-        name: String,
-        at_ms: u64,
-    },
     /// The terminal reported a bracketed paste (ADR-0014).
     ///
     /// With the inline editor open this is one `insert_str`, staged as a
     /// single undo step; while the filter is capturing it is appended
     /// (newlines stripped); otherwise it is ignored.
     Paste(String),
-    /// A `SET` from `Command::SetValue` completed (R4.1).
+    /// A [`crate::Command::Execute`] finished (R4.1, R4.3, R7.4).
     ///
-    /// Carries no value of its own: what follows is the same Refetch every
-    /// other change to the open key goes through
-    /// (`crate::update::issue_refetch`) — the reply is what actually reaches
-    /// the Viewer, never the bytes this message's own sender already knew
-    /// (ADR-0006: no value cache, not even a one-message-long one). Guarded
-    /// by `name`, the same way `ValueGone`/`KeyDeleted` are: the reader may
-    /// have moved on to a different key by the time this lands.
-    ValueSet {
-        name: String,
-        at_ms: u64,
-    },
-    /// A guarded write refused to write, because its precondition was no
-    /// longer true by the time it reached the server (R4.1, PLAN M2 task 6,
-    /// D1, ADR-0014, ADR-0015).
-    ///
-    /// Not a `Failed` — the server did exactly as asked and nothing broke;
-    /// the write is simply not there to reread. The edited text goes back
-    /// into the buffer either way, since no read can recover it — what
-    /// differs by `why` is whether the key itself is gone (tombstoned, same
-    /// as a `ValueGone`) or only the precondition failed (the buffer is
-    /// handed back with a Refetch in flight, held under R3.8 while it is
-    /// open again). Guarded by `name`, like `ValueSet`: the reader may have
-    /// moved on to a different key by the time this lands. The command this
-    /// was — `SET`, `HSET key field`, or `HSETNX key field` — is not carried
-    /// here: the buffer that is about to be handed back already knows, via
-    /// `EditBuffer::target`, so the core derives it rather than trusting a
-    /// second copy the shell could get out of sync with the first.
-    NotWritten {
-        name: String,
-        why: NotWritten,
-        at_ms: u64,
-    },
-    /// A staged `DeleteHashField` found the field already gone (PLAN M2 task
-    /// 6, D1, D4).
-    ///
-    /// Not an error, and not routed through `NotWritten`: `HDEL` did exactly
-    /// what was asked and found nothing to remove, and there is no buffer to
-    /// hand anything back to — `Delete` never opens one. Reported as a
-    /// notice, then a Refetch, the same way every other change to the open
-    /// key is (ADR-0006).
-    HashFieldAlreadyGone {
-        name: String,
-        field: String,
+    /// Carries the mutation it answers, so the core — not the shell — decides
+    /// what each outcome means: a delete tombstones, a write refetches, a guard
+    /// that refused hands the edit back, and an error is shown with the command
+    /// that failed (review H1). `result`'s `Err` is the server's error detail.
+    /// Guarded by the mutation's key: the reader may have moved on to a
+    /// different key by the time this lands.
+    MutationSettled {
+        mutation: crate::mutation::Mutation,
+        /// As issued in [`crate::Command::Execute`].
+        index: Option<usize>,
+        result: Result<crate::mutation::MutationOutcome, String>,
         at_ms: u64,
     },
     /// An operation failed. Carries the command that failed (R7.4).

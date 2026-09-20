@@ -24,8 +24,7 @@ pub const MAX_EDIT_BYTES: usize = 200 * 1024;
 ///
 /// Distinct from the value being edited, which is always plain text in the
 /// buffer either way — this is what `EditorStage` builds a
-/// [`crate::state::PendingMutation`] out of, and what a `Msg::NotWritten`
-/// reply is about when it asks the buffer what command it was.
+/// [`crate::state::PendingMutation`] out of.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditTarget {
     /// The Open value's whole body — a String or a JSON-classified String
@@ -71,10 +70,6 @@ pub struct EditBuffer {
     /// staged `SetString` can warn if the edit no longer parses (mirrors
     /// `PendingMutation::SetString::was_json`).
     was_json: bool,
-    /// Handed to the confirm dialog. Still drawn, so the pane shows what is
-    /// about to be written rather than the value it replaces, but it takes no
-    /// more keys.
-    staged: bool,
     /// What this buffer writes back when staged (PLAN M2 task 6, D3).
     target: EditTarget,
 }
@@ -85,7 +80,6 @@ impl PartialEq for EditBuffer {
             && self.area.cursor() == other.area.cursor()
             && self.original == other.original
             && self.was_json == other.was_json
-            && self.staged == other.staged
             && self.target == other.target
     }
 }
@@ -143,7 +137,6 @@ impl EditBuffer {
             area,
             original: text.into_bytes(),
             was_json,
-            staged: false,
             target: EditTarget::Value,
         })
     }
@@ -165,7 +158,14 @@ impl EditBuffer {
     /// "JSON" in any sense either caller means, and classifying it as such
     /// warned `⚠ no longer valid JSON` on every edit that turned it into
     /// plain text.
-    pub fn for_hash_field(field: String, value: &str) -> Result<EditBuffer, &'static str> {
+    pub fn for_hash_field(field: &[u8], value: &[u8]) -> Result<EditBuffer, &'static str> {
+        // A text editor cannot round-trip arbitrary bytes, and a lossy field
+        // name would write to a different field, so a field whose name or
+        // value is not UTF-8 is refused the way `Value::Binary` is (review C2).
+        let (Ok(field), Ok(value)) = (std::str::from_utf8(field), std::str::from_utf8(value))
+        else {
+            return Err("binary fields aren't editable here yet");
+        };
         if value.len() > MAX_EDIT_BYTES {
             return Err(
                 "too large to edit inline (over 200KB) — an external-editor escape hatch is planned",
@@ -180,8 +180,9 @@ impl EditBuffer {
             area,
             original: value.as_bytes().to_vec(),
             was_json,
-            staged: false,
-            target: EditTarget::HashField { field },
+            target: EditTarget::HashField {
+                field: field.to_string(),
+            },
         })
     }
 
@@ -199,7 +200,6 @@ impl EditBuffer {
             area,
             original: Vec::new(),
             was_json: false,
-            staged: false,
             target: EditTarget::NewHashField {
                 field: String::new(),
                 part: FieldPart::Name,
@@ -314,21 +314,6 @@ impl EditBuffer {
     pub fn json_valid(&self) -> Option<bool> {
         self.was_json
             .then(|| serde_json::from_slice::<serde_json::Value>(&self.text()).is_ok())
-    }
-
-    /// Hand the buffer to the confirm dialog: it stays on screen but takes no
-    /// more keys.
-    pub fn stage(&mut self) {
-        self.staged = true;
-    }
-
-    /// Take the buffer back from the confirm dialog, to be typed into again.
-    pub fn unstage(&mut self) {
-        self.staged = false;
-    }
-
-    pub fn is_staged(&self) -> bool {
-        self.staged
     }
 
     /// Whether the text has changed from what the buffer was opened with.
@@ -516,6 +501,19 @@ mod tests {
         });
         let err = EditBuffer::from_value(&value, 0).unwrap_err();
         assert_eq!(err, "binary values aren't editable here yet");
+    }
+
+    #[test]
+    fn a_hash_field_that_is_not_utf8_refuses_with_a_notice() {
+        let refused = "binary fields aren't editable here yet";
+        assert_eq!(
+            EditBuffer::for_hash_field(b"\xff", b"v").unwrap_err(),
+            refused
+        );
+        assert_eq!(
+            EditBuffer::for_hash_field(b"f", b"\x80").unwrap_err(),
+            refused
+        );
     }
 
     #[test]

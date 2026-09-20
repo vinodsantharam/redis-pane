@@ -146,8 +146,14 @@ pub fn render(
     // Read once per frame, not once per row: `LoadedSet::ttl_now` is what
     // turns each row's TTL into a countdown (R3.9, extended here from the
     // Viewer), and every visible row this frame should read the same instant.
-    let now_s = (clock.now_ms() / 1000) as u32;
+    let now_s = (clock.now_epoch_ms() / 1000) as u32;
     let cols = Columns::for_pane(area.width, density);
+    let ctx = RowCtx {
+        theme,
+        area,
+        cols,
+        now_s,
+    };
     let mut y = area.y;
 
     // A capped scan means the list on screen is not the whole keyspace — a
@@ -203,33 +209,15 @@ pub fn render(
         if is_open {
             mark = OpenRowMark::At(at);
         }
+        let row_at = RowAt {
+            y: at,
+            selected,
+            is_open,
+        };
         if state.tree_mode {
-            tree_row(
-                state,
-                display_row,
-                selected,
-                is_open,
-                theme,
-                area,
-                cols,
-                at,
-                now_s,
-                buf,
-            );
+            tree_row(state, ctx, row_at, display_row, buf);
         } else if let Some(i) = state.list.index_at(display_row) {
-            key_row(
-                &state.keys,
-                i,
-                selected,
-                is_open,
-                theme,
-                area,
-                cols,
-                at,
-                0,
-                now_s,
-                buf,
-            );
+            key_row(&state.keys, ctx, row_at, i, 0, buf);
         }
     }
     mark
@@ -275,20 +263,33 @@ fn filter_line(state: &State, theme: &Theme, area: Rect, y: u16, buf: &mut Buffe
     }
 }
 
-/// A folded group, or a key nested under one.
-#[allow(clippy::too_many_arguments)]
-fn tree_row(
-    state: &State,
-    display_row: usize,
-    selected: bool,
-    is_open: bool,
-    theme: &Theme,
+/// What every row of one frame's key list shares, read once per frame
+/// rather than passed row by row as loose arguments (review L4).
+#[derive(Clone, Copy)]
+struct RowCtx<'a> {
+    theme: &'a Theme,
     area: Rect,
     cols: Columns,
-    y: u16,
+    /// The clock in epoch seconds, so every row's TTL counts down from the same
+    /// instant.
     now_s: u32,
-    buf: &mut Buffer,
-) {
+}
+
+/// Where one row goes, and how it is marked.
+#[derive(Clone, Copy)]
+struct RowAt {
+    y: u16,
+    selected: bool,
+    /// The Open key's row (CONTEXT.md's Selected key vs Open key).
+    is_open: bool,
+}
+
+/// A folded group, or a key nested under one.
+fn tree_row(state: &State, ctx: RowCtx<'_>, at: RowAt, display_row: usize, buf: &mut Buffer) {
+    let RowCtx {
+        theme, area, cols, ..
+    } = ctx;
+    let RowAt { y, selected, .. } = at;
     use crate::state::tree::Row;
     match state.tree.row(display_row) {
         Some(Row::Group {
@@ -334,19 +335,9 @@ fn tree_row(
                 );
             }
         }
-        Some(Row::Key { index, depth }) => key_row(
-            &state.keys,
-            index as usize,
-            selected,
-            is_open,
-            theme,
-            area,
-            cols,
-            y,
-            depth * 2,
-            now_s,
-            buf,
-        ),
+        Some(Row::Key { index, depth }) => {
+            key_row(&state.keys, ctx, at, index as usize, depth * 2, buf)
+        }
         None => {}
     }
 }
@@ -370,20 +361,18 @@ fn header(theme: &Theme, area: Rect, cols: Columns, focused: bool, buf: &mut Buf
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn key_row(
-    keys: &LoadedSet,
-    i: usize,
-    selected: bool,
-    is_open: bool,
-    theme: &Theme,
-    area: Rect,
-    cols: Columns,
-    y: u16,
-    indent: u16,
-    now_s: u32,
-    buf: &mut Buffer,
-) {
+fn key_row(keys: &LoadedSet, ctx: RowCtx<'_>, at: RowAt, i: usize, indent: u16, buf: &mut Buffer) {
+    let RowCtx {
+        theme,
+        area,
+        cols,
+        now_s,
+    } = ctx;
+    let RowAt {
+        y,
+        selected,
+        is_open,
+    } = at;
     if selected {
         fill_row(buf, area, y, theme.style(Token::Selected));
     }

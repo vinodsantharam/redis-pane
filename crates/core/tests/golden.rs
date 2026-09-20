@@ -1618,7 +1618,7 @@ fn copying_a_value_with_nothing_open_says_so_instead_of_copying_nothing() {
 #[test]
 fn copying_a_windowed_value_says_how_much_it_took() {
     let windowed = Value::List(IndexedValue {
-        items: (0..500).map(|i| format!("item-{i}")).collect(),
+        items: (0..500).map(|i| format!("item-{i}").into_bytes()).collect(),
         total: 12_000,
     });
     let mut state = opened("feed:global:hot", windowed, 600);
@@ -1712,7 +1712,8 @@ fn copying_a_value_is_not_affected_by_where_the_viewer_is_scrolled() {
 #[test]
 fn golden_viewer_editing_with_nothing_pending() {
     let mut state = opened("user:8812:session", hash_value(), 2_537);
-    state.open.as_mut().unwrap().editing = true;
+    // Mid-edit with no buffer on screen: the header alone says so.
+    state.open.as_mut().unwrap().edit = redis_pane_core::state::EditPhase::Saving;
     assert_golden("viewer_editing", &draw(&state, 130, 22));
 }
 
@@ -1721,7 +1722,8 @@ fn editing_is_visibly_distinct_from_plain_live_in_monochrome_too() {
     // Colour is never the only carrier of meaning (DESIGN §5): the word
     // "editing" must appear even with hue gone entirely.
     let mut state = opened("k", hash_value(), 600);
-    state.open.as_mut().unwrap().editing = true;
+    // Mid-edit with no buffer on screen: the header alone says so.
+    state.open.as_mut().unwrap().edit = redis_pane_core::state::EditPhase::Saving;
     let mono = render::frame(
         &state,
         &Theme::new(ColorDepth::Monochrome),
@@ -1748,8 +1750,7 @@ fn golden_editor_open_on_a_string() {
     )
     .unwrap();
     let open = state.open.as_mut().unwrap();
-    open.editor = Some(editor);
-    open.editing = true;
+    open.begin_edit(editor);
     assert_golden("editor_open_on_a_string", &draw(&state, 130, 22));
 }
 
@@ -1764,8 +1765,7 @@ fn golden_editor_json_invalid_shows_json_cross() {
         EditBuffer::from_value(&Value::Json(JsonValue::parse("{\"a\":1}")), 0).unwrap();
     editor.insert_char('x'); // breaks the JSON
     let open = state.open.as_mut().unwrap();
-    open.editor = Some(editor);
-    open.editing = true;
+    open.begin_edit(editor);
     let frame = draw(&state, 130, 22);
     assert!(
         frame.contains("json ✗"),
@@ -1784,8 +1784,7 @@ fn golden_editor_wraps_a_long_line() {
     let long = "word ".repeat(60);
     let editor = EditBuffer::from_value(&Value::Str(StringValue::new(&long, 65)), 0).unwrap();
     let open = state.open.as_mut().unwrap();
-    open.editor = Some(editor);
-    open.editing = true;
+    open.begin_edit(editor);
     assert_golden("editor_wraps_a_long_line", &draw(&state, 80, 22));
 }
 
@@ -1798,8 +1797,7 @@ fn golden_editor_hint_bar() {
     );
     let editor = EditBuffer::from_value(&Value::Str(StringValue::new("v1", 65)), 0).unwrap();
     let open = state.open.as_mut().unwrap();
-    open.editor = Some(editor);
-    open.editing = true;
+    open.begin_edit(editor);
     assert_eq!(hint_bar(&state), "⌃S stage   ⌃Z undo   Esc cancel");
 }
 
@@ -1815,7 +1813,7 @@ fn golden_confirm_diff_after_staging_an_edit() {
     state.focus = Pane::Value;
     let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
     let mut state = state;
-    let editor = state.open.as_mut().unwrap().editor.as_mut().unwrap();
+    let editor = state.open.as_mut().unwrap().typing_mut().unwrap();
     editor.insert_str("!");
     let (state, _) = update(state, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
     assert!(state.confirm.is_some());
@@ -1832,8 +1830,7 @@ fn golden_editing_an_existing_field_shows_it_read_only_above_the_active_value() 
     let open = state.open.as_mut().unwrap();
     open.cursor_active = true;
     open.cursor = 1; // "device"
-    open.editor = Some(EditBuffer::for_hash_field("device".into(), "ios/17.2").unwrap());
-    open.editing = true;
+    open.begin_edit(EditBuffer::for_hash_field(b"device", b"ios/17.2").unwrap());
     assert_golden("hash_form_edit_field", &draw(&state, 130, 22));
 }
 
@@ -1841,9 +1838,8 @@ fn golden_editing_an_existing_field_shows_it_read_only_above_the_active_value() 
 fn golden_hash_add_form_name_part_shows_the_placeholder_on_value() {
     let mut state = opened("user:8812:session", hash_value(), 2_537);
     let open = state.open.as_mut().unwrap();
-    open.editor = Some(EditBuffer::new_hash_field());
-    open.editing = true;
-    let editor = open.editor.as_mut().unwrap();
+    open.begin_edit(EditBuffer::new_hash_field());
+    let editor = open.typing_mut().unwrap();
     editor.name_push('n');
     editor.name_push('e');
     editor.name_push('w');
@@ -1857,9 +1853,8 @@ fn golden_hash_add_form_name_part_shows_the_placeholder_on_value() {
 fn golden_hash_add_form_duplicate_name_shows_the_warning() {
     let mut state = opened("user:8812:session", hash_value(), 2_537);
     let open = state.open.as_mut().unwrap();
-    open.editor = Some(EditBuffer::new_hash_field());
-    open.editing = true;
-    let editor = open.editor.as_mut().unwrap();
+    open.begin_edit(EditBuffer::new_hash_field());
+    let editor = open.typing_mut().unwrap();
     // "device" is one of `hash_value()`'s fields — a shown duplicate.
     for c in "device".chars() {
         editor.name_push(c);
@@ -1879,7 +1874,7 @@ fn golden_confirm_set_hash_field_shows_the_effective_command_and_its_guard() {
     // the guard line and the diff rather than the JSON-parses warning
     let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
     let mut state = state;
-    let editor = state.open.as_mut().unwrap().editor.as_mut().unwrap();
+    let editor = state.open.as_mut().unwrap().typing_mut().unwrap();
     editor.insert_str("x");
     let (state, _) = update(state, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
     assert!(state.confirm.is_some());
@@ -1896,7 +1891,7 @@ fn golden_hash_add_form_value_part_shows_field_above_the_active_editor() {
     });
     let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Enter)));
     let mut state = state;
-    let editor = state.open.as_mut().unwrap().editor.as_mut().unwrap();
+    let editor = state.open.as_mut().unwrap().typing_mut().unwrap();
     editor.insert_str("fr");
     assert_golden("hash_form_add_value", &draw(&state, 130, 22));
 }
@@ -1911,7 +1906,7 @@ fn golden_confirm_add_hash_field_shows_the_guard_and_only_a_plus_side() {
     });
     let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Enter)));
     let mut state = state;
-    let editor = state.open.as_mut().unwrap().editor.as_mut().unwrap();
+    let editor = state.open.as_mut().unwrap().typing_mut().unwrap();
     editor.insert_str("fr");
     let (state, _) = update(state, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
     assert!(state.confirm.is_some());
@@ -2427,7 +2422,7 @@ fn golden_viewer_opening() {
     let mut state = many_keys();
     state.open_pending = Some(PendingRead {
         name: "user:8812:session".into(),
-        token: ReadToken(1),
+        token: ReadToken::default(),
         index: Some(2),
         // Well past `APPEAR_DELAY_MS` relative to `CLOCK` (74_000): this read
         // is genuinely slow, so the placeholder must show.
@@ -2461,7 +2456,7 @@ fn golden_viewer_opening_a_fast_read_shows_nothing_at_all() {
     let mut too_recent = many_keys();
     too_recent.open_pending = Some(PendingRead {
         name: "user:8812:session".into(),
-        token: ReadToken(1),
+        token: ReadToken::default(),
         index: Some(2),
         // 100ms elapsed against `CLOCK` (74_000) — under the 200ms gate.
         issued_at_ms: Some(73_900),
@@ -2477,7 +2472,7 @@ fn golden_viewer_opening_a_fast_read_shows_nothing_at_all() {
     let mut unstamped = many_keys();
     unstamped.open_pending = Some(PendingRead {
         name: "user:8812:session".into(),
-        token: ReadToken(1),
+        token: ReadToken::default(),
         index: Some(2),
         issued_at_ms: None,
         activate_cursor: false,
@@ -2501,7 +2496,7 @@ fn golden_viewer_opening_a_different_key_than_the_one_already_shown() {
     let mut state = opened("user:8812:session", hash_value(), 2_537);
     state.open_pending = Some(PendingRead {
         name: "user:8812:cart".into(),
-        token: ReadToken(2),
+        token: ReadToken::default(),
         index: Some(0),
         issued_at_ms: Some(73_000),
         activate_cursor: false,
@@ -2528,7 +2523,7 @@ fn golden_viewer_refetching() {
     let mut state = opened("user:8812:session", hash_value(), 2_537);
     state.open_pending = Some(PendingRead {
         name: "user:8812:session".into(),
-        token: ReadToken(3),
+        token: ReadToken::default(),
         index: state.open.as_ref().unwrap().index,
         issued_at_ms: Some(73_000),
         activate_cursor: false,
@@ -2560,7 +2555,7 @@ fn golden_viewer_refetching_a_fast_reply_shows_nothing_at_all() {
     let mut state = opened("user:8812:session", hash_value(), 2_537);
     state.open_pending = Some(PendingRead {
         name: "user:8812:session".into(),
-        token: ReadToken(3),
+        token: ReadToken::default(),
         index: state.open.as_ref().unwrap().index,
         issued_at_ms: Some(73_900),
         activate_cursor: false,
@@ -2719,8 +2714,7 @@ fn down_moves_by_wrapped_row_in_a_value_with_no_newlines_once_drawn() {
         .open
         .as_ref()
         .unwrap()
-        .editor
-        .as_ref()
+        .editor()
         .unwrap()
         .widget()
         .cursor();

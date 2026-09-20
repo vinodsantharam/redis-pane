@@ -28,6 +28,19 @@ pub fn looks_like_json(text: &str) -> bool {
     trimmed.starts_with('{') || trimmed.starts_with('[')
 }
 
+/// One cell of a collection value, as text.
+///
+/// Redis stores bytes. A cell that is valid UTF-8 is shown as that text; one
+/// that is not has every non-printable byte escaped as `\xHH`. A msgpack or
+/// protobuf field used to fail the whole read instead, because every member
+/// was decoded as a `String` (review C2).
+pub fn cell_text(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_string(),
+        Err(_) => bytes.escape_ascii().to_string(),
+    }
+}
+
 /// A fetched value, ready to display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
@@ -53,6 +66,13 @@ impl Value {
             Value::Stream(v) => v,
             Value::Json(v) => v,
             Value::Binary(v) => v,
+        }
+    }
+
+    /// Re-wrap to a pane `width`. Only a String's rows depend on it.
+    pub fn rewrap(&mut self, width: usize) {
+        if let Value::Str(s) = self {
+            s.rewrap(width);
         }
     }
 
@@ -115,8 +135,8 @@ pub struct StringValue {
     pub bytes: usize,
     /// The text exactly as read, before wrapping.
     ///
-    /// `lines` is a *display* artifact — wrapped at whatever the pane's width
-    /// happened to be when this was built, with wrap-inserted breaks and real
+    /// `lines` is a *display* artifact — wrapped to the pane it is drawn in,
+    /// and re-wrapped whenever that pane changes, with wrap-inserted breaks and real
     /// `\n`s flattened into the same `Vec<String>` and therefore no longer
     /// distinguishable from each other. That makes `lines` a one-way
     /// transform: there is no rejoining it back into the original text
@@ -130,25 +150,37 @@ impl StringValue {
     /// Wrap at the pane width. Long values are common and horizontal scrolling
     /// is worse than wrapping for something you are reading rather than editing.
     pub fn new(text: &str, width: usize) -> Self {
-        let width = width.max(8);
-        let mut lines = Vec::new();
-        for raw in text.split('\n') {
-            if raw.is_empty() {
-                lines.push(String::new());
-            }
-            let mut rest: Vec<char> = raw.chars().collect();
-            while !rest.is_empty() {
-                let take = width.min(rest.len());
-                lines.push(rest[..take].iter().collect());
-                rest.drain(..take);
-            }
-        }
         Self {
-            lines,
+            lines: wrap(text, width),
             bytes: text.len(),
             raw: text.to_string(),
         }
     }
+
+    /// Wrap the same text to a different width.
+    pub fn rewrap(&mut self, width: usize) {
+        self.lines = wrap(&self.raw, width);
+    }
+}
+
+/// Cut `text` into rows no wider than `width` characters, keeping its own
+/// line breaks. A floor of 8 keeps a very narrow pane from producing
+/// one-character rows.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(8);
+    let mut lines = Vec::new();
+    for raw in text.split('\n') {
+        if raw.is_empty() {
+            lines.push(String::new());
+        }
+        let mut rest: Vec<char> = raw.chars().collect();
+        while !rest.is_empty() {
+            let take = width.min(rest.len());
+            lines.push(rest[..take].iter().collect());
+            rest.drain(..take);
+        }
+    }
+    lines
 }
 
 impl Viewer for StringValue {
@@ -170,7 +202,7 @@ impl Viewer for StringValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PairValue {
-    pub pairs: Vec<(String, String)>,
+    pub pairs: Vec<(Vec<u8>, Vec<u8>)>,
     /// The hash's real field count, which may exceed what was fetched.
     ///
     /// `HGETALL` used to bring back the whole hash regardless of size, into a
@@ -188,7 +220,9 @@ impl PairValue {
     /// duplicate outside the window is not answered here; the `HSETNX` guard
     /// at write time is what catches those.
     pub fn has_field(&self, name: &str) -> bool {
-        self.pairs.iter().any(|(f, _)| f == name)
+        self.pairs
+            .iter()
+            .any(|(f, _)| f.as_slice() == name.as_bytes())
     }
 }
 
@@ -208,7 +242,7 @@ impl Viewer for PairValue {
     fn row(&self, i: usize, _now_ms: u64) -> Vec<String> {
         self.pairs
             .get(i)
-            .map(|(k, v)| vec![k.clone(), v.clone()])
+            .map(|(k, v)| vec![cell_text(k), cell_text(v)])
             .unwrap_or_default()
     }
 }
@@ -217,7 +251,7 @@ impl Viewer for PairValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct IndexedValue {
-    pub items: Vec<String>,
+    pub items: Vec<Vec<u8>>,
     /// The list's real length, which may exceed what was fetched.
     pub total: usize,
 }
@@ -238,7 +272,7 @@ impl Viewer for IndexedValue {
     fn row(&self, i: usize, _now_ms: u64) -> Vec<String> {
         self.items
             .get(i)
-            .map(|v| vec![i.to_string(), v.clone()])
+            .map(|v| vec![i.to_string(), cell_text(v)])
             .unwrap_or_default()
     }
 }
@@ -247,7 +281,7 @@ impl Viewer for IndexedValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MemberValue {
-    pub members: Vec<String>,
+    pub members: Vec<Vec<u8>>,
     pub total: usize,
 }
 
@@ -267,7 +301,7 @@ impl Viewer for MemberValue {
     fn row(&self, i: usize, _now_ms: u64) -> Vec<String> {
         self.members
             .get(i)
-            .map(|m| vec![m.clone()])
+            .map(|m| vec![cell_text(m)])
             .unwrap_or_default()
     }
 }
@@ -276,7 +310,7 @@ impl Viewer for MemberValue {
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ScoredValue {
-    pub entries: Vec<(String, f64)>,
+    pub entries: Vec<(Vec<u8>, f64)>,
     pub total: usize,
 }
 
@@ -298,7 +332,7 @@ impl Viewer for ScoredValue {
     fn row(&self, i: usize, _now_ms: u64) -> Vec<String> {
         self.entries
             .get(i)
-            .map(|(m, s)| vec![format_score(*s), m.clone()])
+            .map(|(m, s)| vec![format_score(*s), cell_text(m)])
             .unwrap_or_default()
     }
 }
@@ -314,9 +348,14 @@ fn format_score(s: f64) -> String {
 
 // ── stream ──────────────────────────────────────────────────────────────────
 
+/// One stream entry: its ID, and its fields. IDs are always ASCII
+/// (`<ms>-<seq>`); field names and values are bytes like every other
+/// collection cell.
+pub type StreamEntry = (String, Vec<(Vec<u8>, Vec<u8>)>);
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StreamValue {
-    pub entries: Vec<(String, Vec<(String, String)>)>,
+    pub entries: Vec<StreamEntry>,
     pub total: usize,
 }
 
@@ -339,7 +378,7 @@ impl Viewer for StreamValue {
             .map(|(id, fields)| {
                 let rendered = fields
                     .iter()
-                    .map(|(k, v)| format!("{k}={v}"))
+                    .map(|(k, v)| format!("{}={}", cell_text(k), cell_text(v)))
                     .collect::<Vec<_>>()
                     .join("  ");
                 vec![id.clone(), stream_entry_age(id, now_ms), rendered]
@@ -518,7 +557,9 @@ mod tests {
     #[test]
     fn the_element_count_lives_in_the_header_where_it_costs_no_column() {
         let hash = PairValue {
-            pairs: (0..14).map(|i| (format!("f{i}"), "v".into())).collect(),
+            pairs: (0..14)
+                .map(|i| (format!("f{i}").into_bytes(), "v".into()))
+                .collect(),
             total: 14,
         };
         assert_eq!(hash.measure(), "14 fields");
@@ -607,6 +648,29 @@ mod tests {
         assert_eq!(row[0], "00000000");
         assert_eq!(row[1], "41 42 00 ff");
         assert_eq!(row[2], "AB..", "unprintables become dots, not gaps");
+    }
+
+    /// Review C2: one msgpack field used to fail the whole read. It is shown
+    /// as escaped bytes instead, and valid text is untouched.
+    #[test]
+    fn a_collection_cell_that_is_not_utf8_is_shown_escaped_not_refused() {
+        let hash = PairValue {
+            pairs: vec![
+                (b"\xff\xfex".to_vec(), b"y\x80".to_vec()),
+                ("plain".into(), "text".into()),
+            ],
+            total: 2,
+        };
+        assert_eq!(hash.row(0, 0), [r"\xff\xfex", r"y\x80"]);
+        assert_eq!(hash.row(1, 0), ["plain", "text"]);
+        assert!(hash.has_field("plain"));
+
+        // A truncated multi-byte sequence: not UTF-8, so escaped.
+        let set = MemberValue {
+            members: vec![b"a\xc3".to_vec()],
+            total: 1,
+        };
+        assert_eq!(set.row(0, 0), [r"a\xc3"]);
     }
 
     #[test]

@@ -112,10 +112,18 @@ async fn an_armed_key_receives_an_invalidation_and_the_arming_is_consumed() {
     let _: () = writer.set("k", "v1", None, None, false).await.unwrap();
 
     // Arm by reading through the one read path that always arms.
-    let got: Option<String> = redis_pane::redis::refetch_and_rearm(&client, "k")
-        .await
-        .unwrap();
-    assert_eq!(got.as_deref(), Some("v1"));
+    let got = redis_pane::redis::read::read_value(
+        &client,
+        b"k",
+        redis_pane::redis::read::Arming::Enabled,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    match got.value {
+        redis_pane_core::state::value::Value::Str(s) => assert_eq!(s.raw, "v1"),
+        other => panic!("expected a String value, got {other:?}"),
+    }
 
     let _: () = writer.set("k", "v2", None, None, false).await.unwrap();
     let first = tokio::time::timeout(Duration::from_secs(5), invalidations.recv()).await;
@@ -135,9 +143,13 @@ async fn an_armed_key_receives_an_invalidation_and_the_arming_is_consumed() {
     );
 
     // Re-arming brings it back, which is why Refetch is the only read path.
-    let _: Option<String> = redis_pane::redis::refetch_and_rearm(&client, "k")
-        .await
-        .unwrap();
+    let _ = redis_pane::redis::read::read_value(
+        &client,
+        b"k",
+        redis_pane::redis::read::Arming::Enabled,
+    )
+    .await
+    .unwrap();
     let _: () = writer.set("k", "v4", None, None, false).await.unwrap();
     let third = tokio::time::timeout(Duration::from_secs(5), invalidations.recv()).await;
     assert!(third.is_ok(), "re-arming must restore liveness");
@@ -260,7 +272,6 @@ async fn a_read_armed_while_other_commands_share_the_connection_is_still_tracked
         let read = redis_pane::redis::read::read_value(
             &client,
             b"k",
-            80,
             redis_pane::redis::read::Arming::Enabled,
         )
         .await
@@ -303,9 +314,13 @@ async fn a_reconnect_loses_tracking_which_is_why_it_must_be_re_armed() {
         .unwrap();
     writer.init().await.unwrap();
     let _: () = writer.set("k", "v1", None, None, false).await.unwrap();
-    let _: Option<String> = redis_pane::redis::refetch_and_rearm(&client, "k")
-        .await
-        .unwrap();
+    let _ = redis_pane::redis::read::read_value(
+        &client,
+        b"k",
+        redis_pane::redis::read::Arming::Enabled,
+    )
+    .await
+    .unwrap();
 
     // Take the server away and bring it back. fred reconnects underneath us,
     // and the server on the other side remembers nothing about what we were
@@ -368,14 +383,20 @@ async fn tracking_round_trip_when_a_server_url_is_supplied() {
     writer.init().await.unwrap();
     let _: () = writer.set("rp:it", "v1", None, None, false).await.unwrap();
 
-    let got: Option<String> = redis_pane::redis::refetch_and_rearm(&client, "rp:it")
-        .await
-        .unwrap();
-    assert_eq!(
-        got.as_deref(),
-        Some("v1"),
-        "the armed read must see the value"
-    );
+    let got = redis_pane::redis::read::read_value(
+        &client,
+        b"rp:it",
+        redis_pane::redis::read::Arming::Enabled,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    match got.value {
+        redis_pane_core::state::value::Value::Str(s) => {
+            assert_eq!(s.raw, "v1", "the armed read must see the value")
+        }
+        other => panic!("expected a String value, got {other:?}"),
+    }
 
     let _: () = writer.set("rp:it", "v2", None, None, false).await.unwrap();
     assert!(
@@ -395,9 +416,13 @@ async fn tracking_round_trip_when_a_server_url_is_supplied() {
     );
 
     // And Refetch — the only read path — brings it back.
-    let _: Option<String> = redis_pane::redis::refetch_and_rearm(&client, "rp:it")
-        .await
-        .unwrap();
+    let _ = redis_pane::redis::read::read_value(
+        &client,
+        b"rp:it",
+        redis_pane::redis::read::Arming::Enabled,
+    )
+    .await
+    .unwrap();
     let _: () = writer.set("rp:it", "v4", None, None, false).await.unwrap();
     assert!(
         tokio::time::timeout(Duration::from_secs(5), invalidations.recv())
@@ -762,6 +787,52 @@ async fn a_primary_is_not_flagged_as_a_replica() {
 
 #[tokio::test]
 #[ignore = "needs docker"]
+async fn a_refused_info_is_reported_not_treated_as_a_primary() {
+    // review M1: `server_conditions` used to default `read_only`/`condition`
+    // to `None` when INFO failed — indistinguishable from a primary reporting
+    // a clean bill of health. An ACL that denies `info` (as a managed
+    // platform's restricted role might) simulates that refusal.
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: String = writer
+        .custom(
+            fred::types::CustomCommand::new("ACL", None, false),
+            vec![
+                "SETUSER", "noinfo", "on", "nopass", "~*", "&*", "+@all", "-info",
+            ],
+        )
+        .await
+        .unwrap();
+
+    let creds = Credentials {
+        username: Some("noinfo".into()),
+        // `nopass` still requires an AUTH with an empty password to take
+        // effect — fred only sends AUTH at all when a password is present
+        // (see fred's `protocol::connection::authenticate`), so a `None`
+        // password here would silently stay on the `default` user, which
+        // has every permission, and the ACL below would never be exercised.
+        password: PasswordSource::Literal(String::new()),
+        ..Credentials::default()
+    };
+    // The connection's own version check also depends on `INFO server`, so an
+    // ACL that denies `info` entirely is refused before `server_conditions`
+    // ever runs — the connect fails with a diagnostic rather than reaching
+    // `Established`. That is still the safe outcome (a user sees why), so this
+    // asserts the failure is visible rather than exercising the field.
+    let err = redis_pane::redis::connect_with(&url, &creds)
+        .await
+        .expect_err("an ACL that denies `info` also blocks the version check");
+    let msg = err.to_string();
+    assert!(!msg.is_empty(), "a failed connect must still say why");
+
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
 async fn a_replica_turns_on_read_only_mode_before_any_write_is_attempted() {
     // DESIGN principle 5: danger visible before it is possible. Learning this
     // by having a write rejected is the ordering that is forbidden.
@@ -840,7 +911,6 @@ async fn a_key_opens_on_a_server_that_refuses_tracking() {
     let read = redis_pane::redis::read::read_value(
         &client,
         b"readable",
-        50,
         redis_pane::redis::read::Arming::Unsupported,
     )
     .await
@@ -852,7 +922,6 @@ async fn a_key_opens_on_a_server_that_refuses_tracking() {
     let armed = redis_pane::redis::read::read_value(
         &client,
         b"readable",
-        50,
         redis_pane::redis::read::Arming::Enabled,
     )
     .await
@@ -892,7 +961,7 @@ async fn opening_a_key_on_a_tracking_capable_server_reaches_live_state() {
     );
 
     let arming = redis_pane::redis::read::Arming::Enabled;
-    let read = redis_pane::redis::read::read_value(&client, b"k", 40, arming)
+    let read = redis_pane::redis::read::read_value(&client, b"k", arming)
         .await
         .unwrap();
     assert!(read.is_some(), "arming happens inside a successful read");
@@ -943,7 +1012,6 @@ async fn a_stream_is_read_newest_first_not_oldest_first() {
     let value = redis_pane::redis::read::read_value(
         &client,
         b"orders",
-        40,
         redis_pane::redis::read::Arming::Unsupported,
     )
     .await
@@ -957,9 +1025,9 @@ async fn a_stream_is_read_newest_first_not_oldest_first() {
     assert_eq!(stream.total, 10);
     // First entry back must be seq=9 (the most recently added), not seq=0.
     let first_fields = &stream.entries[0].1;
-    assert_eq!(first_fields[0], ("seq".to_string(), "9".to_string()));
+    assert_eq!(first_fields[0], (b"seq".to_vec(), b"9".to_vec()));
     let last_fields = &stream.entries[9].1;
-    assert_eq!(last_fields[0], ("seq".to_string(), "0".to_string()));
+    assert_eq!(last_fields[0], (b"seq".to_vec(), b"0".to_vec()));
 
     let _ = client.quit().await;
     let _ = writer.quit().await;
@@ -982,7 +1050,6 @@ async fn a_freshly_added_entry_reads_as_just_added() {
     let value = redis_pane::redis::read::read_value(
         &client,
         b"events",
-        40,
         redis_pane::redis::read::Arming::Unsupported,
     )
     .await
@@ -1050,10 +1117,8 @@ async fn back_to_back_opens_leave_the_second_key_armed_not_the_first() {
     let a = gate.begin();
     let b = gate.begin();
     let (ca, cb) = (client.clone(), client.clone());
-    let ha =
-        tokio::spawn(async move { a.run(read_value(&ca, b"first", 40, Arming::Enabled)).await });
-    let hb =
-        tokio::spawn(async move { b.run(read_value(&cb, b"second", 40, Arming::Enabled)).await });
+    let ha = tokio::spawn(async move { a.run(read_value(&ca, b"first", Arming::Enabled)).await });
+    let hb = tokio::spawn(async move { b.run(read_value(&cb, b"second", Arming::Enabled)).await });
     let (ra, rb) = (ha.await.unwrap(), hb.await.unwrap());
 
     assert!(
@@ -1073,7 +1138,7 @@ async fn back_to_back_opens_leave_the_second_key_armed_not_the_first() {
 
     // And not `first`. Re-arm on `second` so the consumed arming cannot be
     // mistaken for the absence of one, then write to `first`.
-    let _ = read_value(&client, b"second", 40, Arming::Enabled)
+    let _ = read_value(&client, b"second", Arming::Enabled)
         .await
         .unwrap();
     let _: () = writer.set("first", "a2", None, None, false).await.unwrap();
@@ -1112,7 +1177,6 @@ async fn a_large_hash_is_windowed_not_pulled_whole() {
     let read = redis_pane::redis::read::read_value(
         &client,
         b"bighash",
-        40,
         redis_pane::redis::read::Arming::Enabled,
     )
     .await
@@ -1133,8 +1197,13 @@ async fn a_large_hash_is_windowed_not_pulled_whole() {
     let names: std::collections::HashSet<_> = hash.pairs.iter().map(|(k, _)| k.clone()).collect();
     assert_eq!(names.len(), 500, "no duplicate fields from re-scanning");
     for (k, v) in &hash.pairs {
+        let k = std::str::from_utf8(k).unwrap();
         let n: usize = k.strip_prefix('f').unwrap().parse().unwrap();
-        assert_eq!(*v, format!("v{n}"), "field and value must still agree");
+        assert_eq!(
+            *v,
+            format!("v{n}").into_bytes(),
+            "field and value must still agree"
+        );
     }
 
     let _ = client.quit().await;
@@ -1157,7 +1226,6 @@ async fn a_large_set_is_windowed_not_pulled_whole() {
     let read = redis_pane::redis::read::read_value(
         &client,
         b"bigset",
-        40,
         redis_pane::redis::read::Arming::Enabled,
     )
     .await
@@ -1199,7 +1267,7 @@ async fn a_small_hash_and_set_still_come_back_whole() {
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
     let arming = redis_pane::redis::read::Arming::Enabled;
 
-    let hash = redis_pane::redis::read::read_value(&client, b"smallhash", 40, arming)
+    let hash = redis_pane::redis::read::read_value(&client, b"smallhash", arming)
         .await
         .unwrap()
         .unwrap();
@@ -1210,7 +1278,7 @@ async fn a_small_hash_and_set_still_come_back_whole() {
     assert_eq!(h.total, 3);
     assert_eq!(h.window(), None, "nothing was withheld");
 
-    let set = redis_pane::redis::read::read_value(&client, b"smallset", 40, arming)
+    let set = redis_pane::redis::read::read_value(&client, b"smallset", arming)
         .await
         .unwrap()
         .unwrap();
@@ -1245,7 +1313,7 @@ async fn deleting_a_key_removes_it_from_the_server() {
     let _: () = writer.set("k:0", "v", None, None, false).await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    redis_pane::redis::delete_key(&client, b"k:0")
+    redis_pane::redis::mutate::delete_key(&client, b"k:0")
         .await
         .unwrap();
 
@@ -1275,7 +1343,9 @@ async fn deleting_a_key_with_bytes_that_look_like_small_integers_does_not_delete
     let _: () = writer.set("7", "decoy", None, None, false).await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    redis_pane::redis::delete_key(&client, name).await.unwrap();
+    redis_pane::redis::mutate::delete_key(&client, name)
+        .await
+        .unwrap();
 
     let target: Option<Vec<u8>> = writer.get(name).await.unwrap();
     assert_eq!(target, None, "the intended key must be gone");
@@ -1303,7 +1373,7 @@ async fn setting_a_value_overwrites_it_on_the_server() {
     let _: () = writer.set("k:0", "old", None, None, false).await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    redis_pane::redis::set_value(&client, b"k:0", b"new")
+    redis_pane::redis::mutate::set_value(&client, b"k:0", b"new")
         .await
         .unwrap();
 
@@ -1331,7 +1401,7 @@ async fn setting_a_value_with_bytes_that_look_like_small_integers_does_not_touch
     let _: () = writer.set("7", "decoy", None, None, false).await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    redis_pane::redis::set_value(&client, name, b"new")
+    redis_pane::redis::mutate::set_value(&client, name, b"new")
         .await
         .unwrap();
 
@@ -1364,7 +1434,7 @@ async fn setting_a_json_looking_value_preserves_the_bytes_exactly() {
     let _: () = writer.set("cfg:1", "{}", None, None, false).await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let written = redis_pane::redis::set_value(&client, b"cfg:1", compact)
+    let written = redis_pane::redis::mutate::set_value(&client, b"cfg:1", compact)
         .await
         .unwrap();
     assert!(written);
@@ -1398,7 +1468,7 @@ async fn setting_a_value_keeps_the_keys_ttl() {
         .unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let written = redis_pane::redis::set_value(&client, b"session:1", b"new")
+    let written = redis_pane::redis::mutate::set_value(&client, b"session:1", b"new")
         .await
         .unwrap();
 
@@ -1425,7 +1495,7 @@ async fn setting_a_value_on_a_key_that_is_gone_writes_nothing_and_does_not_recre
     writer.init().await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let written = redis_pane::redis::set_value(&client, b"expired:1", b"new")
+    let written = redis_pane::redis::mutate::set_value(&client, b"expired:1", b"new")
         .await
         .unwrap();
 
@@ -1442,15 +1512,11 @@ async fn setting_a_value_on_a_key_that_is_gone_writes_nothing_and_does_not_recre
 
 #[tokio::test]
 #[ignore = "needs docker"]
-async fn a_hash_with_non_utf8_field_and_value_fails_to_read_rather_than_reading_lossily() {
-    // `hscan_window` asks fred for `Vec<String>`, and fred's `FromValue for
-    // String` goes through `Value::into_string`, which for a `Bytes` reply is
-    // `String::from_utf8(bytes).ok()` — `None`, not a replacement-character
-    // fallback, on invalid UTF-8. So a field name or value that isn't valid
-    // UTF-8 must make `read_value` return `Err`, not a lossily-decoded pair.
-    // This test exists to pin that finding down against a real server before
-    // any editing code is written on top of it: Phase 1 does not fix this,
-    // only reports it, per the task 6 plan step 0.
+async fn a_hash_with_non_utf8_field_and_value_reads_as_bytes_rather_than_failing() {
+    // Pinned in M2 task 6 step 0 as a known gap: `hscan_window` asked fred for
+    // `Vec<String>`, and fred's `FromValue for String` refuses invalid UTF-8,
+    // so one binary field failed the whole read. Members are read as bytes
+    // now, and the exact bytes must come back (review C2).
     let (_c, url) = start("redis", "7-alpine").await;
     let writer = Builder::from_config(Config::from_url(&url).unwrap())
         .build()
@@ -1465,17 +1531,164 @@ async fn a_hash_with_non_utf8_field_and_value_fails_to_read_rather_than_reading_
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
     let arming = redis_pane::redis::read::Arming::Enabled;
-    let result = redis_pane::redis::read::read_value(&client, b"bytey-hash", 40, arming).await;
+    let result = redis_pane::redis::read::read_value(&client, b"bytey-hash", arming).await;
 
-    match result {
-        Err(e) => {
-            // Report the exact shape of the failure for the checkpoint.
-            eprintln!("non-UTF-8 hash field/value read failed as expected: {e}");
+    match result.map(|read| read.map(|r| r.value)) {
+        Ok(Some(redis_pane_core::state::value::Value::Hash(hash))) => {
+            assert_eq!(hash.pairs, vec![(bad_field.to_vec(), bad_value.to_vec())]);
         }
-        Ok(_) => panic!(
-            "expected fred's String conversion to reject invalid UTF-8 with an error, but the read succeeded"
-        ),
+        other => panic!("expected the hash, read as bytes; got {other:?}"),
     }
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn every_collection_type_reads_non_utf8_members_as_bytes() {
+    use fred::types::{CustomCommand, Value as Wire};
+    use redis_pane_core::state::value::{IndexedValue, MemberValue, ScoredValue, Value};
+
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let raw: &[u8] = &[b'm', 0xff, 0x80];
+    for (cmd, args) in [
+        ("RPUSH", vec![Wire::from("bytey-list"), Wire::from(raw)]),
+        ("SADD", vec![Wire::from("bytey-set"), Wire::from(raw)]),
+        (
+            "ZADD",
+            vec![Wire::from("bytey-zset"), Wire::from("1"), Wire::from(raw)],
+        ),
+        (
+            "XADD",
+            vec![
+                Wire::from("bytey-stream"),
+                Wire::from("*"),
+                Wire::from(raw),
+                Wire::from(raw),
+            ],
+        ),
+    ] {
+        let _: Wire = writer
+            .custom(CustomCommand::new(cmd, None, false), args)
+            .await
+            .unwrap();
+    }
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let arming = redis_pane::redis::read::Arming::Enabled;
+    let read = |name: &'static [u8]| {
+        let client = client.clone();
+        async move {
+            redis_pane::redis::read::read_value(&client, name, arming)
+                .await
+                .map(|read| read.map(|r| r.value))
+        }
+    };
+
+    assert_eq!(
+        read(b"bytey-list").await.unwrap(),
+        Some(Value::List(IndexedValue {
+            items: vec![raw.to_vec()],
+            total: 1,
+        }))
+    );
+    assert_eq!(
+        read(b"bytey-set").await.unwrap(),
+        Some(Value::Set(MemberValue {
+            members: vec![raw.to_vec()],
+            total: 1,
+        }))
+    );
+    assert_eq!(
+        read(b"bytey-zset").await.unwrap(),
+        Some(Value::ZSet(ScoredValue {
+            entries: vec![(raw.to_vec(), 1.0)],
+            total: 1,
+        }))
+    );
+    match read(b"bytey-stream").await.unwrap() {
+        Some(Value::Stream(stream)) => {
+            assert_eq!(stream.entries.len(), 1);
+            assert_eq!(stream.entries[0].1, vec![(raw.to_vec(), raw.to_vec())]);
+        }
+        other => panic!("expected the stream, read as bytes; got {other:?}"),
+    }
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+/// Review H1: `mutate::execute` is the shell's whole write interface, so each
+/// outcome the core gives meaning to is pinned here against a real server.
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn execute_reports_how_each_write_settled() {
+    use redis_pane::redis::mutate::execute;
+    use redis_pane_core::mutation::{Mutation, MutationOutcome, NotWritten};
+
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer.set("s", "old", None, None, false).await.unwrap();
+    let _: () = writer.hset("h", [("f", "v")]).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let cases = [
+        (
+            Mutation::SetString {
+                key: "s".into(),
+                value: b"new".to_vec(),
+            },
+            MutationOutcome::Done,
+        ),
+        (
+            Mutation::SetString {
+                key: "missing".into(),
+                value: b"new".to_vec(),
+            },
+            MutationOutcome::NotWritten(NotWritten::KeyGone),
+        ),
+        (
+            Mutation::SetHashField {
+                key: "h".into(),
+                field: b"nope".to_vec(),
+                value: b"x".to_vec(),
+            },
+            MutationOutcome::NotWritten(NotWritten::FieldGone),
+        ),
+        (
+            Mutation::AddHashField {
+                key: "h".into(),
+                field: b"f".to_vec(),
+                value: b"x".to_vec(),
+            },
+            MutationOutcome::NotWritten(NotWritten::FieldExists),
+        ),
+        (
+            Mutation::DeleteHashField {
+                key: "h".into(),
+                field: b"nope".to_vec(),
+            },
+            MutationOutcome::NothingToRemove,
+        ),
+        (
+            Mutation::DeleteKey { key: "s".into() },
+            MutationOutcome::Done,
+        ),
+    ];
+    for (mutation, expected) in cases {
+        let got = execute(&client, &mutation).await.unwrap();
+        assert_eq!(got, expected, "{mutation:?}");
+    }
+    let exists: i64 = writer.exists("missing").await.unwrap();
+    assert_eq!(exists, 0, "a SET on a gone key never recreates it");
 
     let _ = client.quit().await;
     let _ = writer.quit().await;
@@ -1495,10 +1708,10 @@ async fn editing_a_hash_field_overwrites_it_and_keeps_the_keys_ttl() {
     let _: () = writer.expire("h:1", 600, None).await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let outcome = redis_pane::redis::set_hash_field(&client, b"h:1", b"token", b"new")
+    let outcome = redis_pane::redis::mutate::set_hash_field(&client, b"h:1", b"token", b"new")
         .await
         .unwrap();
-    assert_eq!(outcome, redis_pane::redis::FieldWrite::Written);
+    assert_eq!(outcome, redis_pane::redis::mutate::FieldWrite::Written);
 
     let now: Option<String> = writer.hget("h:1", "token").await.unwrap();
     assert_eq!(now.as_deref(), Some("new"));
@@ -1540,10 +1753,10 @@ async fn field_ttl_survives_an_edit(image: &str, tag: &str) {
     assert_eq!(field_ttl, vec![1], "HEXPIRE must have set the field TTL");
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let outcome = redis_pane::redis::set_hash_field(&client, b"h:2", b"token", b"new")
+    let outcome = redis_pane::redis::mutate::set_hash_field(&client, b"h:2", b"token", b"new")
         .await
         .unwrap();
-    assert_eq!(outcome, redis_pane::redis::FieldWrite::Written);
+    assert_eq!(outcome, redis_pane::redis::mutate::FieldWrite::Written);
 
     let now: Option<String> = writer.hget("h:2", "token").await.unwrap();
     assert_eq!(now.as_deref(), Some("new"));
@@ -1579,10 +1792,10 @@ async fn the_edit_script_still_works_on_redis_6_2_where_hpexpiretime_does_not_ex
     let _: () = writer.hset("h:3", [("token", "old")]).await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let outcome = redis_pane::redis::set_hash_field(&client, b"h:3", b"token", b"new")
+    let outcome = redis_pane::redis::mutate::set_hash_field(&client, b"h:3", b"token", b"new")
         .await
         .unwrap();
-    assert_eq!(outcome, redis_pane::redis::FieldWrite::Written);
+    assert_eq!(outcome, redis_pane::redis::mutate::FieldWrite::Written);
 
     let now: Option<String> = writer.hget("h:3", "token").await.unwrap();
     assert_eq!(now.as_deref(), Some("new"));
@@ -1602,10 +1815,10 @@ async fn editing_a_gone_field_writes_nothing() {
     let _: () = writer.hset("h:4", [("a", "1")]).await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let outcome = redis_pane::redis::set_hash_field(&client, b"h:4", b"missing", b"new")
+    let outcome = redis_pane::redis::mutate::set_hash_field(&client, b"h:4", b"missing", b"new")
         .await
         .unwrap();
-    assert_eq!(outcome, redis_pane::redis::FieldWrite::FieldGone);
+    assert_eq!(outcome, redis_pane::redis::mutate::FieldWrite::FieldGone);
 
     let still_absent: Option<String> = writer.hget("h:4", "missing").await.unwrap();
     assert_eq!(still_absent, None, "nothing must have been written");
@@ -1630,10 +1843,10 @@ async fn editing_a_field_on_a_gone_key_does_not_recreate_it() {
     writer.init().await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let outcome = redis_pane::redis::set_hash_field(&client, b"h:gone", b"token", b"new")
+    let outcome = redis_pane::redis::mutate::set_hash_field(&client, b"h:gone", b"token", b"new")
         .await
         .unwrap();
-    assert_eq!(outcome, redis_pane::redis::FieldWrite::KeyGone);
+    assert_eq!(outcome, redis_pane::redis::mutate::FieldWrite::KeyGone);
 
     let exists: i64 = writer.exists("h:gone").await.unwrap();
     assert_eq!(exists, 0, "the key must not be recreated");
@@ -1653,10 +1866,10 @@ async fn adding_a_new_hash_field_creates_it() {
     let _: () = writer.hset("h:5", [("a", "1")]).await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let outcome = redis_pane::redis::add_hash_field(&client, b"h:5", b"b", b"2")
+    let outcome = redis_pane::redis::mutate::add_hash_field(&client, b"h:5", b"b", b"2")
         .await
         .unwrap();
-    assert_eq!(outcome, redis_pane::redis::FieldAdd::Added);
+    assert_eq!(outcome, redis_pane::redis::mutate::FieldAdd::Added);
 
     let value: Option<String> = writer.hget("h:5", "b").await.unwrap();
     assert_eq!(value.as_deref(), Some("2"));
@@ -1676,10 +1889,10 @@ async fn adding_a_field_that_already_exists_leaves_it_unchanged() {
     let _: () = writer.hset("h:6", [("a", "1")]).await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let outcome = redis_pane::redis::add_hash_field(&client, b"h:6", b"a", b"clobbered")
+    let outcome = redis_pane::redis::mutate::add_hash_field(&client, b"h:6", b"a", b"clobbered")
         .await
         .unwrap();
-    assert_eq!(outcome, redis_pane::redis::FieldAdd::FieldExists);
+    assert_eq!(outcome, redis_pane::redis::mutate::FieldAdd::FieldExists);
 
     let value: Option<String> = writer.hget("h:6", "a").await.unwrap();
     assert_eq!(value.as_deref(), Some("1"), "must not be overwritten");
@@ -1698,10 +1911,10 @@ async fn adding_a_field_to_a_gone_key_does_not_recreate_it() {
     writer.init().await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let outcome = redis_pane::redis::add_hash_field(&client, b"h:gone2", b"a", b"1")
+    let outcome = redis_pane::redis::mutate::add_hash_field(&client, b"h:gone2", b"a", b"1")
         .await
         .unwrap();
-    assert_eq!(outcome, redis_pane::redis::FieldAdd::KeyGone);
+    assert_eq!(outcome, redis_pane::redis::mutate::FieldAdd::KeyGone);
 
     let exists: i64 = writer.exists("h:gone2").await.unwrap();
     assert_eq!(exists, 0, "the key must not be recreated");
@@ -1721,7 +1934,7 @@ async fn deleting_a_hash_field_removes_only_that_field() {
     let _: () = writer.hset("h:7", [("a", "1"), ("b", "2")]).await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let removed = redis_pane::redis::delete_hash_field(&client, b"h:7", b"a")
+    let removed = redis_pane::redis::mutate::delete_hash_field(&client, b"h:7", b"a")
         .await
         .unwrap();
     assert!(removed);
@@ -1746,7 +1959,7 @@ async fn deleting_an_already_gone_field_reports_false() {
     let _: () = writer.hset("h:8", [("a", "1")]).await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let removed = redis_pane::redis::delete_hash_field(&client, b"h:8", b"missing")
+    let removed = redis_pane::redis::mutate::delete_hash_field(&client, b"h:8", b"missing")
         .await
         .unwrap();
     assert!(!removed);
@@ -1769,7 +1982,7 @@ async fn deleting_the_last_field_deletes_the_key() {
     let _: () = writer.hset("h:9", [("only", "1")]).await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let removed = redis_pane::redis::delete_hash_field(&client, b"h:9", b"only")
+    let removed = redis_pane::redis::mutate::delete_hash_field(&client, b"h:9", b"only")
         .await
         .unwrap();
     assert!(removed);
@@ -1806,7 +2019,7 @@ async fn deleting_a_field_with_bytes_that_look_like_small_integers_touches_only_
         .unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let removed = redis_pane::redis::delete_hash_field(&client, b"h:10", field)
+    let removed = redis_pane::redis::mutate::delete_hash_field(&client, b"h:10", field)
         .await
         .unwrap();
     assert!(removed);
@@ -1840,10 +2053,10 @@ async fn a_bytey_field_name_can_be_edited_without_touching_a_decoy() {
     let _: () = writer.hset("h:11", [("7", "decoy")]).await.unwrap();
 
     let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
-    let outcome = redis_pane::redis::set_hash_field(&client, b"h:11", field, b"new")
+    let outcome = redis_pane::redis::mutate::set_hash_field(&client, b"h:11", field, b"new")
         .await
         .unwrap();
-    assert_eq!(outcome, redis_pane::redis::FieldWrite::Written);
+    assert_eq!(outcome, redis_pane::redis::mutate::FieldWrite::Written);
 
     let target: Option<String> = writer.hget("h:11", field).await.unwrap();
     assert_eq!(target.as_deref(), Some("new"));

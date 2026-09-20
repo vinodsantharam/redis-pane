@@ -75,9 +75,9 @@ pub struct PendingRead {
     /// The key this read is about — compared against the Open key's name at
     /// render time to tell a first Open (no name match, or nothing open yet)
     /// from a Refetch (name matches the Open key).
-    pub name: String,
+    pub name: crate::key::KeyName,
     pub token: crate::command::ReadToken,
-    /// Mirrors `Command::OpenKey`'s index, for header context on a first Open.
+    /// Mirrors `Command::ReadKey`'s index, for header context on a first Open.
     pub index: Option<usize>,
     /// When the read was actually issued, per the shell's clock. `None` until
     /// `Msg::ReadIssued` stamps it — the render layer treats an unstamped
@@ -124,6 +124,33 @@ pub struct Pending {
     pub at_ms: u64,
 }
 
+/// Where an inline edit of the Open key stands (R3.8, ADR-0014).
+///
+/// Two fields used to carry this — `editing: bool` beside an
+/// `Option<EditBuffer>` with its own `staged` flag — and two of their
+/// combinations meant nothing. Their agreement was kept by convention, and an
+/// unrelated failure broke it: `editing` went false under a buffer still being
+/// typed into, and the next live update could land beneath unsaved text. One
+/// enum has exactly the states an edit goes through (review H2).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum EditPhase {
+    /// No edit.
+    #[default]
+    Idle,
+    /// The reader is typing; the buffer takes every key.
+    Typing(super::EditBuffer),
+    /// Handed to the confirm dialog, or its write is in flight. Still drawn, so
+    /// the pane shows what is about to be written rather than the value it
+    /// replaces, but it takes no keys.
+    Staged(super::EditBuffer),
+    /// The write is in flight and the buffer is gone — a held update was
+    /// applied over it. The edit is not over until the write settles.
+    Saving,
+    /// The write landed. The edit is over; the buffer stands in for the value
+    /// until the read back reaches the screen.
+    Landed(super::EditBuffer),
+}
+
 /// The Open key: the key currently in the Viewer.
 ///
 /// It is frequently *not* the Selected key — opening is explicit, and moving
@@ -148,7 +175,7 @@ pub struct OpenKey {
     /// the row list is rebuilt rather than searched for per frame — moving the
     /// cursor never changes it, so the render path needs no reverse lookup.
     pub row: Option<usize>,
-    pub name: String,
+    pub name: crate::key::KeyName,
     /// `None` means exactly one thing: no value has ever been read for this
     /// key. That is a real, distinct state from "read, then deleted" — a key
     /// requested and found gone before ever loading has no "what was in it"
@@ -178,19 +205,11 @@ pub struct OpenKey {
     pub cursor_active: bool,
     /// Whether the body is scrolled to the top and no editor is open.
     pub at_rest: bool,
-    /// Set while an editor holds an unsaved buffer. An arriving update never
-    /// touches it — that is a bug, not a trade-off.
-    pub editing: bool,
-    /// The reader's unsaved text, while the inline editor is open (R3.8).
-    ///
-    /// Distinct from `value`: this is what the reader is typing, never a
-    /// cache of what the server last said. `editing` is the R3.8 guard and
-    /// spans the buffer, the confirm dialog, and the `SET` in flight; this
-    /// field lasts while the buffer is on screen — through typing and, once
-    /// staged, under the confirm dialog and while the `SET` is in flight —
-    /// and is `None` again once a newer read reaches the screen or the edit
-    /// ends (`Esc`, a refusal, a failure, the key gone).
-    pub editor: Option<super::EditBuffer>,
+    /// Where an inline edit stands (R3.8). A buffer is what the reader is
+    /// typing, never a cache of what the server last said, and an arriving
+    /// update never touches one being typed into — that is a bug, not a
+    /// trade-off.
+    pub edit: EditPhase,
     /// An update that arrived while the reader was not at rest.
     pub pending: Option<Pending>,
     /// The server said this key was deleted, expired or evicted. The last read
@@ -204,7 +223,7 @@ pub struct OpenKey {
 impl OpenKey {
     pub fn new(
         index: Option<usize>,
-        name: String,
+        name: crate::key::KeyName,
         value: Value,
         ttl_seconds: i32,
         size_bytes: u32,
@@ -222,8 +241,7 @@ impl OpenKey {
             cursor: 0,
             cursor_active: false,
             at_rest: true,
-            editing: false,
-            editor: None,
+            edit: EditPhase::Idle,
             pending: None,
             deleted_at_ms: None,
             last_read: ReadOutcome::Opened,
@@ -239,7 +257,7 @@ impl OpenKey {
     /// Viewer renders that as a single line — the name, and that it is gone —
     /// rather than reaching for chrome that describes a value that was never
     /// read.
-    pub fn gone(index: Option<usize>, name: String, at_ms: u64) -> Self {
+    pub fn gone(index: Option<usize>, name: crate::key::KeyName, at_ms: u64) -> Self {
         Self {
             index,
             row: None,
@@ -252,8 +270,7 @@ impl OpenKey {
             cursor: 0,
             cursor_active: false,
             at_rest: true,
-            editing: false,
-            editor: None,
+            edit: EditPhase::Idle,
             pending: None,
             deleted_at_ms: Some(at_ms),
             last_read: ReadOutcome::Opened,
@@ -269,7 +286,26 @@ impl OpenKey {
     /// need no scrolling at all still has a cursor sitting on a specific
     /// field the reader is looking at, and `offset` alone would miss that.
     pub fn may_apply(&self) -> bool {
-        self.at_rest && !self.editing && self.cursor == 0
+        self.at_rest && !self.is_editing() && self.cursor == 0
+    }
+
+    /// Re-wrap the value, and any held one, to `width`, keeping the cursor
+    /// inside the rows that now exist.
+    ///
+    /// Wrapping is a fact about the pane, not about the value, so it is redone
+    /// whenever the pane changes. The shell used to wrap a String once, at
+    /// half the terminal's width whatever the pane actually was, and it stayed
+    /// that way through every resize and divider drag (review M4).
+    pub fn rewrap(&mut self, width: usize) {
+        if let Some(value) = &mut self.value {
+            value.rewrap(width);
+            let last = value.viewer().row_count().saturating_sub(1);
+            self.cursor = self.cursor.min(last);
+            self.offset = self.offset.min(self.cursor);
+        }
+        if let Some(pending) = &mut self.pending {
+            pending.value.rewrap(width);
+        }
     }
 
     /// How long the header states what the last read found before falling back
@@ -324,22 +360,97 @@ impl OpenKey {
         self.drop_staged_buffer();
     }
 
+    /// Whether an edit is under way — typing, under the confirm dialog, or
+    /// saving. R3.8's guard spans all three.
+    pub fn is_editing(&self) -> bool {
+        matches!(
+            self.edit,
+            EditPhase::Typing(_) | EditPhase::Staged(_) | EditPhase::Saving
+        )
+    }
+
+    /// The buffer on screen, whatever its phase.
+    pub fn editor(&self) -> Option<&super::EditBuffer> {
+        match &self.edit {
+            EditPhase::Typing(buffer) | EditPhase::Staged(buffer) | EditPhase::Landed(buffer) => {
+                Some(buffer)
+            }
+            EditPhase::Idle | EditPhase::Saving => None,
+        }
+    }
+
+    /// The buffer, only while it takes keys.
+    pub fn typing(&self) -> Option<&super::EditBuffer> {
+        match &self.edit {
+            EditPhase::Typing(buffer) => Some(buffer),
+            _ => None,
+        }
+    }
+
+    /// The buffer, only while it takes keys.
+    pub fn typing_mut(&mut self) -> Option<&mut super::EditBuffer> {
+        match &mut self.edit {
+            EditPhase::Typing(buffer) => Some(buffer),
+            _ => None,
+        }
+    }
+
+    /// Open a buffer to type into. Before the shell has done anything: R3.8's
+    /// "an open editor is never touched" has to hold from the moment the reader
+    /// asked to edit, not from whenever a later message gets around to it.
+    pub fn begin_edit(&mut self, buffer: super::EditBuffer) {
+        self.edit = EditPhase::Typing(buffer);
+    }
+
+    /// Hand the buffer being typed to the confirm dialog, and return it.
+    /// `None` when nothing was being typed.
+    pub fn stage_edit(&mut self) -> Option<&super::EditBuffer> {
+        self.edit = match std::mem::take(&mut self.edit) {
+            EditPhase::Typing(buffer) => EditPhase::Staged(buffer),
+            other => other,
+        };
+        match &self.edit {
+            EditPhase::Staged(buffer) => Some(buffer),
+            _ => None,
+        }
+    }
+
+    /// End the edit and discard its buffer: `Esc`, a refusal at the dialog, a
+    /// failed write.
+    pub fn end_edit(&mut self) {
+        self.edit = EditPhase::Idle;
+    }
+
+    /// The write landed. The edit is over, but a staged buffer keeps standing
+    /// in for the value until the read back reaches the screen. A buffer being
+    /// typed into is left alone.
+    pub fn write_landed(&mut self) {
+        self.edit = match std::mem::take(&mut self.edit) {
+            EditPhase::Staged(buffer) => EditPhase::Landed(buffer),
+            EditPhase::Typing(buffer) => EditPhase::Typing(buffer),
+            EditPhase::Idle | EditPhase::Saving | EditPhase::Landed(_) => EditPhase::Idle,
+        };
+    }
+
     /// A staged buffer only stands in for the value until a newer read or
     /// the end of the edit replaces it. A buffer still being typed into is
     /// never touched (R3.8).
     pub fn drop_staged_buffer(&mut self) {
-        if self.editor.as_ref().is_some_and(|e| e.is_staged()) {
-            self.editor = None;
-        }
+        self.edit = match std::mem::take(&mut self.edit) {
+            EditPhase::Staged(_) => EditPhase::Saving,
+            EditPhase::Landed(_) => EditPhase::Idle,
+            other => other,
+        };
     }
 
     /// Hand a staged buffer back to be typed into, when it turned out there
-    /// was no key left to write it to. `editing` is left alone: the buffer is
-    /// open again, and R3.8's guard spans it.
+    /// was no key or field left to write it to. The edit is under way again,
+    /// and R3.8's guard spans it.
     pub fn unstage_buffer(&mut self) {
-        if let Some(editor) = &mut self.editor {
-            editor.unstage();
-        }
+        self.edit = match std::mem::take(&mut self.edit) {
+            EditPhase::Staged(buffer) | EditPhase::Landed(buffer) => EditPhase::Typing(buffer),
+            other => other,
+        };
     }
 
     /// Apply a held update, when the reader asks for it.
@@ -375,7 +486,7 @@ impl OpenKey {
         if let Some(gone) = self.deleted_at_ms {
             return format!("✕ deleted {}", ago(now_ms, gone));
         }
-        if self.editing && self.pending.is_some() {
+        if self.is_editing() && self.pending.is_some() {
             return format!("{} · changed · held", self.edit_verb());
         }
         if let Some(p) = &self.pending {
@@ -388,7 +499,7 @@ impl OpenKey {
         // editor UI yet (M2), so `editing` is never set by shipped code today —
         // this exists so the header is correct the day one lands, rather than
         // silently wrong from the first edit built.
-        if self.editing {
+        if self.is_editing() {
             return self.edit_verb().into();
         }
         // What the last read found, while it is still news. This is the half
@@ -426,7 +537,7 @@ impl OpenKey {
     /// plumbing, and any future editor-less use of the flag) falls back to
     /// the plain form.
     fn edit_verb(&self) -> &'static str {
-        match self.editor.as_ref().map(super::EditBuffer::target) {
+        match self.editor().map(super::EditBuffer::target) {
             Some(super::EditTarget::NewHashField { .. }) => "✎ adding field",
             Some(super::EditTarget::HashField { .. }) => "✎ editing field",
             Some(super::EditTarget::Value) | None => "✎ editing",
@@ -440,7 +551,7 @@ impl OpenKey {
     /// hidden duplicate outside the window is not this function's job; the
     /// `HSETNX` guard at write time is what catches those.
     pub fn hash_field_shown_duplicate(&self) -> bool {
-        let Some(name) = self.editor.as_ref().and_then(super::EditBuffer::field_name) else {
+        let Some(name) = self.editor().and_then(super::EditBuffer::field_name) else {
             return false;
         };
         if name.is_empty() {
@@ -557,7 +668,13 @@ mod tests {
     fn mid_edit_an_update_never_touches_the_buffer() {
         // Not a trade-off. Clobbering a half-typed value is a bug.
         let mut k = open();
-        k.editing = true;
+        k.begin_edit(
+            super::super::EditBuffer::from_value(
+                &Value::Str(super::super::value::StringValue::new("v", 40)),
+                0,
+            )
+            .unwrap(),
+        );
         k.absorb(pair("v2"), 500, 120, 12_000);
         assert_eq!(k.value, Some(pair("v1")));
         assert_eq!(k.currency(true, 12_000), "✎ editing · changed · held");
@@ -652,7 +769,13 @@ mod editing_indicator_tests {
     #[test]
     fn editing_with_nothing_pending_says_so_rather_than_reading_as_plain_live() {
         let mut k = OpenKey::new(Some(0), "k".into(), pair(), -1, 10, 0);
-        k.editing = true;
+        k.begin_edit(
+            super::super::EditBuffer::from_value(
+                &Value::Str(super::super::value::StringValue::new("v", 40)),
+                0,
+            )
+            .unwrap(),
+        );
         assert_eq!(k.currency(true, 0), "✎ editing");
         assert_ne!(
             k.currency(true, 0),
@@ -664,7 +787,13 @@ mod editing_indicator_tests {
     #[test]
     fn editing_with_a_pending_update_still_says_held() {
         let mut k = OpenKey::new(Some(0), "k".into(), pair(), -1, 10, 0);
-        k.editing = true;
+        k.begin_edit(
+            super::super::EditBuffer::from_value(
+                &Value::Str(super::super::value::StringValue::new("v", 40)),
+                0,
+            )
+            .unwrap(),
+        );
         k.absorb(pair(), -1, 10, 1_000);
         assert_eq!(k.currency(true, 1_000), "✎ editing · changed · held");
     }

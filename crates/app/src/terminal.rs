@@ -6,6 +6,8 @@
 //! doing, because nothing here waits on the network.
 
 use std::io::{Stdout, stdout};
+use std::ops::ControlFlow;
+use std::sync::Arc;
 
 use crossterm::event::{
     self, Event, KeyCode as XKeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton,
@@ -19,7 +21,9 @@ use fred::interfaces::EventInterface;
 use fred::prelude::Client;
 use redis_pane_core::clock::Clock;
 use redis_pane_core::command::ReadToken;
-use redis_pane_core::msg::{KeyCode, KeyPress, MouseAction, NotWritten};
+use redis_pane_core::key::KeyName;
+use redis_pane_core::msg::{KeyCode, KeyPress, MouseAction};
+use redis_pane_core::mutation::Mutation;
 use redis_pane_core::resolve::Credentials;
 use redis_pane_core::theme::{ColorDepth, Theme};
 use redis_pane_core::{Command, Msg, State, render, update};
@@ -27,6 +31,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::redis::Established;
+use crate::redis::read::{Arming, ReadGate};
 
 /// Restores the terminal on drop, including when the process is unwinding.
 /// Leaving a terminal in raw mode after a panic is the rudest thing a TUI can
@@ -93,6 +98,9 @@ pub fn translate_mouse(mouse: MouseEvent) -> Option<Msg> {
     Some(Msg::Mouse(action))
 }
 
+/// The terminal as the loop draws to it.
+type Term = Terminal<CrosstermBackend<Stdout>>;
+
 /// Run the event loop until the core says to quit.
 ///
 /// The render loop never does I/O. Redis work happens on tokio tasks that send
@@ -101,9 +109,9 @@ pub fn translate_mouse(mouse: MouseEvent) -> Option<Msg> {
 pub async fn run(
     mut state: State,
     theme: Theme,
-    clock: &dyn Clock,
-    mut client: Client,
-    mut tracking: bool,
+    clock: Arc<dyn Clock>,
+    client: Client,
+    established: Established,
     dial: String,
     credentials: Credentials,
 ) -> std::io::Result<()> {
@@ -116,8 +124,7 @@ pub async fn run(
     )?;
     let _guard = Guard;
 
-    let mut term: Terminal<CrosstermBackend<Stdout>> =
-        Terminal::new(CrosstermBackend::new(stdout()))?;
+    let mut term: Term = Terminal::new(CrosstermBackend::new(stdout()))?;
 
     let (tx, mut rx) = mpsc::channel::<Msg>(256);
 
@@ -163,67 +170,52 @@ pub async fn run(
     let size = term.size()?;
     (state, _) = update(
         state,
+        Msg::Connected {
+            version: established.version.to_string(),
+            tracking_supported: established.tracking_supported,
+        },
+    );
+    // A refused INFO at startup must be as visible as one after a reconnect
+    // (review M1) — the replica guard failing open is silent otherwise.
+    if let Some(detail) = established.server_state_error.clone() {
+        (state, _) = update(
+            state,
+            Msg::Failed {
+                command: "INFO (replica and write-rejection checks)".into(),
+                detail,
+                at_ms: clock.now_epoch_ms(),
+            },
+        );
+    }
+    (state, _) = update(
+        state,
         Msg::Resized {
             cols: size.width,
             rows: size.height,
         },
     );
-    (state, _) = update(
-        state,
-        Msg::Connected {
-            version: String::new(),
-            tracking_supported: tracking,
+
+    let (landed_tx, mut landed_rx) = mpsc::channel::<(Client, Established)>(1);
+    let mut shell = Shell {
+        client,
+        tx,
+        clock: clock.clone(),
+        read_gate: ReadGate::default(),
+        scan_cancel: None,
+        reconnect: Reconnect {
+            dial,
+            credentials,
+            attempt: 0,
+            cancel: None,
+            landed: landed_tx,
         },
-    );
-
-    // Driven by the capability probe, never by preference (ADR-0007).
-    // Mutable: a reconnect re-probes tracking (a fresh connection may find a
-    // different server, or the same server in a different mood), and every
-    // read after that must arm — or not — accordingly.
-    let mut arming = if tracking {
-        crate::redis::read::Arming::Enabled
-    } else {
-        crate::redis::read::Arming::Unsupported
     };
-
-    let mut scan_cancel: Option<CancellationToken> = None;
-    // Reads take turns, and superseded ones never reach the wire. See
-    // `redis::read::ReadGate` for why that is a liveness invariant and not a
-    // tidiness preference.
-    let mut read_gate = crate::redis::read::ReadGate::default();
-    start_scan(&client, None, &tx, &mut scan_cancel);
-
-    // Superseded exactly like `scan_cancel`/`read_gate`: a manual retry
-    // (`r` while disconnected, ADR-0009) must cancel whatever backoff sleep
-    // or in-flight attempt was already running rather than race it.
-    let mut reconnect_cancel: Option<CancellationToken> = None;
-    // How many attempts this outage has cost, purely for the backoff curve
-    // and the header's countdown (`Msg::ReconnectScheduled`) — reset to 0 the
-    // moment a reconnect actually lands. `Command::Reconnect` carries no
-    // attempt number of its own; this is the one place that counts.
-    let mut reconnect_attempt: u32 = 0;
-    // A successful reconnect swaps in a brand new `Client` (`connect_with`
-    // redoes the whole startup ritual — version floor, tracking probe, server
-    // conditions — exactly as it should: a server that vanished and came back
-    // is not guaranteed to still be the same server). `Client` cannot travel
-    // through `tx`/`Msg`: the core stays free of `fred` by construction
-    // (ADR-0011's boundary), so a fresh client can only reach `run`'s own
-    // locals through a side channel the main loop polls directly, never
-    // through `update()`.
-    let (reconnected_tx, mut reconnected_rx) = mpsc::channel::<(Client, Established)>(1);
-
-    // fred reconnects underneath us, and the server on the other side remembers
-    // nothing about what we were watching. Telling the core lets it drop the
-    // liveness claim and re-arm — the invariant ADR-0009 exists for, which
-    // until now was enforced only where it was tested (PLAN M0.10). Re-run
-    // after every successful reconnect (below), against the new client, since
-    // subscriptions are tied to the `Client` instance they were opened on —
-    // one that has been replaced no longer delivers anything.
-    spawn_link_watchers(&client, &tx, tracking);
+    shell.start_scan(None);
+    shell.watch_link();
 
     loop {
         term.draw(|f| {
-            let buf = render::frame(&state, &theme, clock, f.area());
+            let buf = render::frame(&state, &theme, clock.as_ref(), f.area());
             *f.buffer_mut() = buf;
         })?;
 
@@ -237,31 +229,8 @@ pub async fn run(
         let msg = tokio::select! {
             biased;
             msg = rx.recv() => msg,
-            // A reconnect that landed. Swapped in here, in the same task as
-            // everything else in this loop, rather than inside the spawned
-            // task that found it — so `client`/`arming` are current *before*
-            // the `Msg::Connected` this constructs is ever handed to
-            // `update()`, and so `Command::RefetchOpenKey` (which
-            // `Msg::Connected` already asks for when tracking is supported)
-            // reads the new connection rather than the dead one. Ordering
-            // here is not incidental: the same guarantee through `tx`/`rx`
-            // would need `Msg::Connected` to arrive only after the client was
-            // already swapped, and two independent channels give no such
-            // promise about which is drained first.
-            Some((new_client, established)) = reconnected_rx.recv() => {
-                client = new_client;
-                tracking = established.tracking_supported;
-                arming = if tracking {
-                    crate::redis::read::Arming::Enabled
-                } else {
-                    crate::redis::read::Arming::Unsupported
-                };
-                reconnect_attempt = 0;
-                spawn_link_watchers(&client, &tx, tracking);
-                Some(Msg::Connected {
-                    version: established.version.to_string(),
-                    tracking_supported: tracking,
-                })
+            Some((client, established)) = landed_rx.recv() => {
+                Some(shell.reconnected(client, &established))
             },
             () = tokio::time::sleep(std::time::Duration::from_secs(1)) => continue,
         };
@@ -272,625 +241,482 @@ pub async fn run(
         (state, commands) = update(state, msg);
 
         for command in commands {
-            match command {
-                Command::Quit => return Ok(()),
-                Command::StartScan { pattern } => {
-                    start_scan(&client, pattern, &tx, &mut scan_cancel)
+            if shell.execute(command, &state, &mut term).await.is_break() {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// What the shell holds while the loop runs (review H1).
+///
+/// The connection, the channel back into the core, the clock, and every
+/// in-flight handle, in one place: each [`Command`] is carried out by a method
+/// with the context it needs, rather than by a free function taking eight
+/// arguments or an arm of a five-hundred-line loop.
+struct Shell {
+    client: Client,
+    tx: mpsc::Sender<Msg>,
+    /// Every timestamp a message carries comes from here, never from an
+    /// inline `SystemTime::now()`, so there is one clock to inject (review H4).
+    clock: Arc<dyn Clock>,
+    /// Reads take turns, and superseded ones never reach the wire. See
+    /// [`ReadGate`] for why that is a liveness invariant and not a tidiness
+    /// preference.
+    read_gate: ReadGate,
+    scan_cancel: Option<CancellationToken>,
+    reconnect: Reconnect,
+}
+
+/// Retrying a dropped link (ADR-0009).
+struct Reconnect {
+    dial: String,
+    credentials: Credentials,
+    /// How many attempts this outage has cost, purely for the backoff curve
+    /// and the header's countdown (`Msg::ReconnectScheduled`) — reset to 0 the
+    /// moment a reconnect actually lands. `Command::Reconnect` carries no
+    /// attempt number of its own; this is the one place that counts.
+    attempt: u32,
+    /// Superseded exactly like [`Shell::scan_cancel`]: a manual retry (`r`
+    /// while disconnected) must cancel whatever backoff sleep or in-flight
+    /// attempt was already running rather than race it.
+    cancel: Option<CancellationToken>,
+    /// Where a successful attempt's new `Client` goes. A `Client` cannot travel
+    /// through a `Msg` without giving the core a dependency on `fred`, which
+    /// the core/shell boundary (ADR-0011) forbids, so the loop polls this
+    /// channel directly.
+    landed: mpsc::Sender<(Client, Established)>,
+}
+
+impl Shell {
+    /// Carry out one command. `Break` means the core asked to quit.
+    async fn execute(
+        &mut self,
+        command: Command,
+        state: &State,
+        term: &mut Term,
+    ) -> ControlFlow<()> {
+        match command {
+            Command::Quit => return ControlFlow::Break(()),
+            Command::StartScan { pattern } => self.start_scan(pattern),
+            Command::CancelScan => {
+                if let Some(token) = self.scan_cancel.take() {
+                    token.cancel();
                 }
-                Command::CancelScan => {
-                    if let Some(token) = scan_cancel.take() {
-                        token.cancel();
-                    }
-                }
-                Command::FetchMetadata { indices } => {
-                    // Resolve names here, on the UI side, so the task owns no
-                    // reference into state.
-                    let window: Vec<(usize, Vec<u8>)> = indices
-                        .iter()
-                        .filter_map(|i| state.keys.name(*i).map(|n| (*i, n.to_vec())))
-                        .collect();
-                    if window.is_empty() {
-                        continue;
-                    }
-                    let client = client.clone();
-                    let tx = tx.clone();
-                    tokio::spawn(async move {
-                        let at_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(0);
-                        match crate::redis::fetch_metadata(&client, &window).await {
-                            Ok((entries, gone)) if !entries.is_empty() || !gone.is_empty() => {
-                                let _ = tx
-                                    .send(Msg::MetadataBatch {
-                                        entries,
-                                        gone,
-                                        at_ms,
-                                    })
-                                    .await;
-                            }
-                            Ok(_) => {}
-                            Err(e) => {
-                                let _ = tx
-                                    .send(Msg::Failed {
-                                        command: "fetching metadata".into(),
-                                        detail: e.details().to_string(),
-                                        at_ms: 0,
-                                    })
-                                    .await;
-                            }
-                        }
-                    });
-                }
-                Command::OpenKey { index, name, token } => open_key(
+            }
+            Command::FetchMetadata { indices } => self.fetch_metadata(state, &indices),
+            Command::ReadKey {
+                key,
+                index,
+                token,
+                arm,
+            } => self.read_key(key, index, token, arm),
+            Command::Execute { mutation, index } => self.mutate(mutation, index),
+            Command::CopyToClipboard { text, label } => self.copy(text, label, term).await,
+            Command::Notify { text } => {
+                let at_ms = self.clock.now_epoch_ms();
+                let _ = self.tx.send(Msg::Noticed { text, at_ms }).await;
+            }
+            Command::Reconnect { after_ms } => {
+                self.reconnect.schedule(after_ms, &self.tx, &self.clock)
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn start_scan(&mut self, pattern: Option<String>) {
+        if let Some(previous) = self.scan_cancel.take() {
+            previous.cancel();
+        }
+        let token = CancellationToken::new();
+        self.scan_cancel = Some(token.clone());
+        let client = self.client.clone();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            crate::redis::scan::stream_keys(&client, pattern.as_deref(), tx, token).await;
+        });
+    }
+
+    fn fetch_metadata(&self, state: &State, indices: &[usize]) {
+        // Resolve names here, on the UI side, so the task owns no reference
+        // into state.
+        let window: Vec<(usize, Vec<u8>)> = indices
+            .iter()
+            .filter_map(|i| state.keys.name(*i).map(|n| (*i, n.to_vec())))
+            .collect();
+        if window.is_empty() {
+            return;
+        }
+        let (client, tx, clock) = (self.client.clone(), self.tx.clone(), self.clock.clone());
+        tokio::spawn(async move {
+            let at_ms = clock.now_epoch_ms();
+            let msg = match crate::redis::fetch_metadata(&client, &window).await {
+                Ok((entries, gone)) if entries.is_empty() && gone.is_empty() => return,
+                Ok((entries, gone)) => Msg::MetadataBatch {
+                    entries,
+                    gone,
+                    at_ms,
+                },
+                Err(e) => Msg::Failed {
+                    command: "fetching metadata".into(),
+                    detail: e.details().to_string(),
+                    at_ms: clock.now_epoch_ms(),
+                },
+            };
+            let _ = tx.send(msg).await;
+        });
+    }
+
+    /// Read a key and send the result in. The one read path: it always re-arms
+    /// where arming is possible, so there is no branch on which liveness can be
+    /// silently lost (ADR-0006).
+    ///
+    /// Every `Command::ReadKey` lands here: an Open, a manual Refetch, and the
+    /// one an invalidation push triggers. That is what unifies both re-arm
+    /// invariants (ADR-0006, ADR-0009) into one place instead of two. Whether to
+    /// arm is the command's `arm`, decided by the core (review H3); the key is the
+    /// command's exact bytes, never rebuilt from display text (review C1).
+    ///
+    /// **Found by testing against real managed servers, not by any test in the
+    /// suite:** `CLIENT CACHING YES` was sent and awaited inside `read_value`, but
+    /// nothing ever told the core it had succeeded. `State::liveness()` correctly
+    /// refuses to report `Live` without a `Msg::TrackingArmed` — that guard is the
+    /// whole point of ADR-0009 — but nothing on this path ever sent one. The header
+    /// read `○ manual` forever, on every server, including local Redis with
+    /// tracking fully working. The core's invariant was airtight; the shell simply
+    /// never told it the truth.
+    fn read_key(&mut self, key: KeyName, index: Option<usize>, token: ReadToken, arm: bool) {
+        // Supersede whatever was in flight. The core would ignore its reply anyway
+        // — every reply carries the token of the read it answers — but ignoring a
+        // reply does not un-send the `CLIENT CACHING YES` that came with it, and
+        // that is the half which decides what the server tracks.
+        let permit = self.read_gate.begin();
+        let arming = if arm {
+            Arming::Enabled
+        } else {
+            Arming::Unsupported
+        };
+        let (client, tx, clock) = (self.client.clone(), self.tx.clone(), self.clock.clone());
+
+        // Stamps the loading indicator's delay gate (`PendingRead::APPEAR_DELAY_MS`,
+        // `crates/core/src/state/open.rs`). `update()` has no clock of its own
+        // (ADR-0011); this is the one moment the shell actually knows when the
+        // read was dispatched. Best-effort: a dropped send (the channel full)
+        // just leaves the read unstamped, which the render layer already treats
+        // as "not yet worth mentioning" — never a crash, never a wrong timestamp.
+        let _ = tx.try_send(Msg::ReadIssued {
+            token,
+            at_ms: clock.now_epoch_ms(),
+        });
+
+        tokio::spawn(async move {
+            let at_ms = clock.now_epoch_ms();
+            let Some(result) = permit
+                .run(crate::redis::read::read_value(
                     &client,
-                    Some(index),
-                    name,
-                    token,
-                    &tx,
-                    area_width(&term),
+                    key.as_bytes(),
                     arming,
-                    &mut read_gate,
-                ),
-                Command::RefetchOpenKey { token } => {
-                    if let Some(open) = &state.open {
-                        open_key(
-                            &client,
-                            open.index,
-                            open.name.as_bytes().to_vec(),
-                            token,
-                            &tx,
-                            area_width(&term),
-                            arming,
-                            &mut read_gate,
-                        );
-                    }
-                }
-                Command::CopyToClipboard { text, label } => {
-                    let method = crate::clipboard::detect_method();
-                    // Truncation is an OSC-52-only concern (native has no
-                    // comparable cap), and only OSC 52 writes to our own
-                    // stdout, so only it needs a redraw after.
-                    let truncated = method == crate::clipboard::Method::Osc52
-                        && crate::clipboard::was_truncated(&text);
-                    let result = crate::clipboard::copy(&text, method);
-                    if method == crate::clipboard::Method::Osc52 {
-                        let _ = term.clear();
-                    }
-                    let at_ms = clock.now_ms();
-                    match result {
-                        Ok(()) => {
-                            let label = if truncated {
-                                format!("{label}, truncated")
-                            } else {
-                                label
-                            };
-                            let _ = tx.send(Msg::Copied { label, at_ms }).await;
+                ))
+                .await
+            else {
+                return;
+            };
+
+            // `read_value` sends `CLIENT CACHING YES` in one pipeline with its
+            // first read and returns early with `?` if either fails, so any Ok(_)
+            // here means arming already succeeded on the wire — this message is
+            // what makes that fact reach the core.
+            if arming == Arming::Enabled && result.is_ok() {
+                let _ = tx.send(Msg::TrackingArmed).await;
+            }
+
+            let msg = match result {
+                Ok(Some(read)) => Msg::ValueLoaded {
+                    token,
+                    index,
+                    name: key,
+                    value: read.value,
+                    ttl_seconds: read.ttl_seconds,
+                    size_bytes: read.size_bytes,
+                    at_ms,
+                },
+                Ok(None) => Msg::ValueGone {
+                    token,
+                    index,
+                    name: key,
+                    at_ms,
+                },
+                // Never swallowed: a Redis error that produces no visible effect is
+                // indistinguishable from the app deciding to do nothing (R7.4).
+                //
+                // Deliberately carries no token, so it is never dropped as stale. A
+                // read that failed, failed — the key it names is in the message, and
+                // suppressing it because the reader has moved on would be swallowing
+                // an error on a technicality (R7.4).
+                Err(e) => Msg::Failed {
+                    command: format!("reading {key}"),
+                    detail: e.details().to_string(),
+                    at_ms,
+                },
+            };
+            let _ = tx.send(msg).await;
+        });
+    }
+
+    /// Execute a confirmed write and report how it settled (review H1).
+    ///
+    /// What the outcome means is the core's to decide; this only carries it
+    /// back, with the mutation it answers.
+    fn mutate(&self, mutation: Mutation, index: Option<usize>) {
+        let (client, tx, clock) = (self.client.clone(), self.tx.clone(), self.clock.clone());
+        tokio::spawn(async move {
+            let result = crate::redis::mutate::execute(&client, &mutation)
+                .await
+                .map_err(|e| e.details().to_string());
+            let at_ms = clock.now_epoch_ms();
+            let _ = tx
+                .send(Msg::MutationSettled {
+                    mutation,
+                    index,
+                    result,
+                    at_ms,
+                })
+                .await;
+        });
+    }
+
+    async fn copy(&self, text: String, label: String, term: &mut Term) {
+        let method = crate::clipboard::detect_method();
+        // Truncation is an OSC-52-only concern (native has no comparable cap),
+        // and only OSC 52 writes to our own stdout, so only it needs a redraw
+        // after.
+        let truncated =
+            method == crate::clipboard::Method::Osc52 && crate::clipboard::was_truncated(&text);
+        let result = crate::clipboard::copy(&text, method);
+        if method == crate::clipboard::Method::Osc52 {
+            let _ = term.clear();
+        }
+        let at_ms = self.clock.now_epoch_ms();
+        let msg = match result {
+            Ok(()) => Msg::Copied {
+                label: if truncated {
+                    format!("{label}, truncated")
+                } else {
+                    label
+                },
+                at_ms,
+            },
+            // A copy that failed used to produce nothing at all — no notice, no
+            // error — which is indistinguishable from one that worked, and leaves
+            // the reader pasting whatever was on the clipboard before (R7.4). OSC
+            // 52 can still be dropped by the terminal without telling anyone;
+            // that is a limit of the protocol. This is the half we can see.
+            Err(e) => Msg::Failed {
+                command: "copying to the clipboard".into(),
+                detail: e.to_string(),
+                at_ms,
+            },
+        };
+        let _ = self.tx.send(msg).await;
+    }
+
+    /// A reconnect that landed.
+    ///
+    /// Swapped in here, in the same task as everything else in the loop, rather
+    /// than inside the spawned task that found it — so `client` is current
+    /// *before* the `Msg::Connected` this returns is ever handed to `update()`,
+    /// and so the `Command::ReadKey` that `Msg::Connected` asks for reads the new
+    /// connection rather than the dead one. Ordering here is not incidental: the
+    /// same guarantee through the message channel would need `Msg::Connected` to
+    /// arrive only after the client was already swapped, and two independent
+    /// channels give no such promise about which is drained first.
+    fn reconnected(&mut self, client: Client, established: &Established) -> Msg {
+        self.client = client;
+        self.reconnect.attempt = 0;
+        // Subscriptions are tied to the `Client` they were opened on; one that
+        // has been replaced no longer delivers anything.
+        self.watch_link();
+        Msg::Connected {
+            version: established.version.to_string(),
+            tracking_supported: established.tracking_supported,
+        }
+    }
+
+    /// Subscribe to the client's link-level streams: reconnect notifications,
+    /// wire errors, and invalidation pushes. Tied to the `Client` instance, so
+    /// this runs again after every successful reconnect.
+    fn watch_link(&self) {
+        // fred reconnects underneath us on its own schedule if it has a
+        // `ReconnectPolicy` (this app sets none, so in practice this fires only
+        // if that ever changes) — and the server on the other side remembers
+        // nothing about what we were watching. Telling the core lets it drop the
+        // liveness claim and re-arm, the invariant ADR-0009 exists for.
+        {
+            let mut reconnects = self.client.reconnect_rx();
+            let tx = self.tx.clone();
+            let probe = self.client.clone();
+            let clock = self.clock.clone();
+            tokio::spawn(async move {
+                while reconnects.recv().await.is_ok() {
+                    // A fresh connection tracks nothing, so capability must be
+                    // re-probed rather than remembered.
+                    let tracking = crate::redis::probe_tracking(&probe).await;
+                    // A refused INFO here must be as visible as any other
+                    // failure — defaulting to "not a replica" is the silent
+                    // failure ADR-0009 exists to prevent (review M1).
+                    match crate::redis::server_conditions(&probe).await {
+                        Ok((read_only, condition)) => {
+                            let _ = tx
+                                .send(Msg::ServerState {
+                                    read_only,
+                                    condition,
+                                })
+                                .await;
                         }
-                        // A copy that failed used to produce nothing at all —
-                        // no notice, no error — which is indistinguishable from
-                        // one that worked, and leaves the reader pasting
-                        // whatever was on the clipboard before (R7.4). OSC 52
-                        // can still be dropped by the terminal without telling
-                        // anyone; that is a limit of the protocol. This is the
-                        // half we can see.
                         Err(e) => {
                             let _ = tx
                                 .send(Msg::Failed {
-                                    command: "copying to the clipboard".into(),
-                                    detail: e.to_string(),
-                                    at_ms,
+                                    command: "INFO (replica and write-rejection checks)".into(),
+                                    detail: e.details().to_string(),
+                                    at_ms: clock.now_epoch_ms(),
                                 })
                                 .await;
                         }
                     }
+                    if tx
+                        .send(Msg::Connected {
+                            version: String::new(),
+                            tracking_supported: tracking,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
-                Command::Notify { text } => {
-                    let at_ms = clock.now_ms();
-                    let _ = tx.send(Msg::Noticed { text, at_ms }).await;
-                }
-                Command::DeleteKey { index, name } => {
-                    let client = client.clone();
-                    let tx = tx.clone();
-                    tokio::spawn(async move {
-                        let at_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(0);
-                        let name_str = String::from_utf8_lossy(&name).into_owned();
-                        match crate::redis::delete_key(&client, &name).await {
-                            Ok(()) => {
-                                let _ = tx
-                                    .send(Msg::KeyDeleted {
-                                        index: Some(index),
-                                        name: name_str,
-                                        at_ms,
-                                    })
-                                    .await;
-                            }
-                            Err(e) => {
-                                let _ = tx
-                                    .send(Msg::Failed {
-                                        command: format!("DEL {name_str}"),
-                                        detail: e.details().to_string(),
-                                        at_ms,
-                                    })
-                                    .await;
-                            }
+            });
+        }
+        {
+            let mut errors = self.client.error_rx();
+            let tx = self.tx.clone();
+            let clock = self.clock.clone();
+            tokio::spawn(async move {
+                while let Ok((error, _server)) = errors.recv().await {
+                    // A connection-level error means the link is gone; anything
+                    // else is a command failure and belongs in a notification.
+                    let msg = if matches!(error.kind(), fred::error::ErrorKind::IO) {
+                        Msg::ConnectionLost
+                    } else {
+                        Msg::Failed {
+                            command: "connection".into(),
+                            detail: error.details().to_string(),
+                            at_ms: clock.now_epoch_ms(),
                         }
-                    });
+                    };
+                    if tx.send(msg).await.is_err() {
+                        return;
+                    }
                 }
-                Command::SetValue { name, new } => {
-                    let client = client.clone();
-                    let tx = tx.clone();
-                    tokio::spawn(async move {
-                        let at_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(0);
-                        let name_str = String::from_utf8_lossy(&name).into_owned();
-                        match crate::redis::set_value(&client, &name, &new).await {
-                            Ok(true) => {
-                                let _ = tx
-                                    .send(Msg::ValueSet {
-                                        name: name_str,
-                                        at_ms,
-                                    })
-                                    .await;
-                            }
-                            Ok(false) => {
-                                let _ = tx
-                                    .send(Msg::NotWritten {
-                                        name: name_str,
-                                        why: NotWritten::KeyGone,
-                                        at_ms,
-                                    })
-                                    .await;
-                            }
-                            Err(e) => {
-                                let _ = tx
-                                    .send(Msg::Failed {
-                                        command: format!("SET {name_str}"),
-                                        detail: e.details().to_string(),
-                                        at_ms,
-                                    })
-                                    .await;
-                            }
-                        }
-                    });
+            });
+        }
+
+        // Invalidation pushes arrive on their own task and become messages like
+        // everything else. This is what makes a value update with no keypress —
+        // and it is the whole reason this project exists (ADR-0006). Subscribed
+        // whether or not the server tracks: a connection that never arms never
+        // receives a push, and the capability is the core's to know (review H3).
+        {
+            let mut invalidations =
+                fred::interfaces::TrackingInterface::invalidation_rx(&self.client);
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                while let Ok(_invalidation) = invalidations.recv().await {
+                    // The server has told us the open key changed, which also
+                    // consumed the arming. Refetching is what re-arms, and the core
+                    // decides whether the result lands or is announced.
+                    if tx.send(Msg::Invalidated).await.is_err() {
+                        return;
+                    }
                 }
-                Command::SetHashField { name, field, value } => {
-                    let client = client.clone();
-                    let tx = tx.clone();
-                    tokio::spawn(async move {
-                        let at_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(0);
-                        let name_str = String::from_utf8_lossy(&name).into_owned();
-                        let field_str = String::from_utf8_lossy(&field).into_owned();
-                        match crate::redis::set_hash_field(&client, &name, &field, &value).await {
-                            Ok(crate::redis::FieldWrite::Written) => {
-                                let _ = tx
-                                    .send(Msg::ValueSet {
-                                        name: name_str,
-                                        at_ms,
-                                    })
-                                    .await;
-                            }
-                            Ok(crate::redis::FieldWrite::FieldGone) => {
-                                let _ = tx
-                                    .send(Msg::NotWritten {
-                                        name: name_str,
-                                        why: NotWritten::FieldGone,
-                                        at_ms,
-                                    })
-                                    .await;
-                            }
-                            Ok(crate::redis::FieldWrite::KeyGone) => {
-                                let _ = tx
-                                    .send(Msg::NotWritten {
-                                        name: name_str,
-                                        why: NotWritten::KeyGone,
-                                        at_ms,
-                                    })
-                                    .await;
-                            }
-                            Err(e) => {
-                                let _ = tx
-                                    .send(Msg::Failed {
-                                        command: format!("HSET {name_str} {field_str}"),
-                                        detail: e.details().to_string(),
-                                        at_ms,
-                                    })
-                                    .await;
-                            }
-                        }
-                    });
-                }
-                Command::AddHashField { name, field, value } => {
-                    let client = client.clone();
-                    let tx = tx.clone();
-                    tokio::spawn(async move {
-                        let at_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(0);
-                        let name_str = String::from_utf8_lossy(&name).into_owned();
-                        let field_str = String::from_utf8_lossy(&field).into_owned();
-                        match crate::redis::add_hash_field(&client, &name, &field, &value).await {
-                            Ok(crate::redis::FieldAdd::Added) => {
-                                let _ = tx
-                                    .send(Msg::ValueSet {
-                                        name: name_str,
-                                        at_ms,
-                                    })
-                                    .await;
-                            }
-                            Ok(crate::redis::FieldAdd::FieldExists) => {
-                                let _ = tx
-                                    .send(Msg::NotWritten {
-                                        name: name_str,
-                                        why: NotWritten::FieldExists,
-                                        at_ms,
-                                    })
-                                    .await;
-                            }
-                            Ok(crate::redis::FieldAdd::KeyGone) => {
-                                let _ = tx
-                                    .send(Msg::NotWritten {
-                                        name: name_str,
-                                        why: NotWritten::KeyGone,
-                                        at_ms,
-                                    })
-                                    .await;
-                            }
-                            Err(e) => {
-                                let _ = tx
-                                    .send(Msg::Failed {
-                                        command: format!("HSETNX {name_str} {field_str}"),
-                                        detail: e.details().to_string(),
-                                        at_ms,
-                                    })
-                                    .await;
-                            }
-                        }
-                    });
-                }
-                Command::DeleteHashField { name, field } => {
-                    let client = client.clone();
-                    let tx = tx.clone();
-                    tokio::spawn(async move {
-                        let at_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(0);
-                        let name_str = String::from_utf8_lossy(&name).into_owned();
-                        let field_str = String::from_utf8_lossy(&field).into_owned();
-                        match crate::redis::delete_hash_field(&client, &name, &field).await {
-                            Ok(true) => {
-                                let _ = tx
-                                    .send(Msg::ValueSet {
-                                        name: name_str,
-                                        at_ms,
-                                    })
-                                    .await;
-                            }
-                            Ok(false) => {
-                                let _ = tx
-                                    .send(Msg::HashFieldAlreadyGone {
-                                        name: name_str,
-                                        field: field_str,
-                                        at_ms,
-                                    })
-                                    .await;
-                            }
-                            Err(e) => {
-                                let _ = tx
-                                    .send(Msg::Failed {
-                                        command: format!("HDEL {name_str} {field_str}"),
-                                        detail: e.details().to_string(),
-                                        at_ms,
-                                    })
-                                    .await;
-                            }
-                        }
-                    });
-                }
-                Command::Reconnect { after_ms } => {
-                    reconnect_attempt += 1;
-                    spawn_reconnect_attempt(
-                        dial.clone(),
-                        credentials.clone(),
-                        after_ms,
-                        reconnect_attempt,
-                        tx.clone(),
-                        reconnected_tx.clone(),
-                        &mut reconnect_cancel,
-                    );
-                }
-            }
+            });
         }
     }
 }
 
-/// Read a key and send the result in. The one read path: it always re-arms,
-/// so there is no branch on which liveness can be silently lost (ADR-0006).
-///
-/// Both `Command::OpenKey` and `Command::RefetchOpenKey` — including the one
-/// an invalidation push triggers — call this, which is what unifies both
-/// re-arm invariants (ADR-0006, ADR-0009) into one place instead of two.
-///
-/// **Found by testing against real managed servers, not by any test in the
-/// suite:** `CLIENT CACHING YES` was sent and awaited inside `read_value`, but
-/// nothing ever told the core it had succeeded. `State::liveness()` correctly
-/// refuses to report `Live` without a `Msg::TrackingArmed` — that guard is the
-/// whole point of ADR-0009 — but nothing on this path ever sent one. The header
-/// read `○ manual` forever, on every server, including local Redis with
-/// tracking fully working. The core's invariant was airtight; the shell simply
-/// never told it the truth.
-#[allow(clippy::too_many_arguments)]
-fn open_key(
-    client: &Client,
-    index: Option<usize>,
-    name: Vec<u8>,
-    token: ReadToken,
-    tx: &mpsc::Sender<Msg>,
-    pane_width: usize,
-    arming: crate::redis::read::Arming,
-    gate: &mut crate::redis::read::ReadGate,
-) {
-    // Supersede whatever was in flight. The core would ignore its reply anyway
-    // — every reply carries the token of the read it answers — but ignoring a
-    // reply does not un-send the `CLIENT CACHING YES` that came with it, and
-    // that is the half which decides what the server tracks.
-    let permit = gate.begin();
-    let client = client.clone();
-    let tx = tx.clone();
-
-    // Stamps the loading indicator's delay gate (`PendingRead::APPEAR_DELAY_MS`,
-    // `crates/core/src/state/open.rs`). `update()` has no clock of its own
-    // (ADR-0011); this is the one moment the shell actually knows when the
-    // read was dispatched. Best-effort: a dropped send (the channel full)
-    // just leaves the read unstamped, which the render layer already treats
-    // as "not yet worth mentioning" — never a crash, never a wrong timestamp.
-    let issued_at_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let _ = tx.try_send(Msg::ReadIssued {
-        token,
-        at_ms: issued_at_ms,
-    });
-
-    tokio::spawn(async move {
-        let at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let Some(result) = permit
-            .run(crate::redis::read::read_value(
-                &client, &name, pane_width, arming,
-            ))
-            .await
-        else {
-            return;
-        };
-
-        // `read_value` sends `CLIENT CACHING YES` in one pipeline with its
-        // first read and returns early with `?` if either fails, so any Ok(_)
-        // here means arming already succeeded on the wire — this message is
-        // what makes that fact reach the core.
-        if arming == crate::redis::read::Arming::Enabled && result.is_ok() {
-            let _ = tx.send(Msg::TrackingArmed).await;
+impl Reconnect {
+    /// Attempt one reconnect after `after_ms`, cancelling whatever backoff sleep
+    /// or in-flight attempt was already running — `r` while disconnected retries
+    /// immediately (ADR-0009) rather than racing the timer.
+    ///
+    /// Success reaches the loop through [`Reconnect::landed`]. Failure is
+    /// ordinary shell-reported state — `Msg::Failed` for what went wrong,
+    /// `Msg::ReconnectScheduled` for when to try again — and needs no special
+    /// channel.
+    fn schedule(&mut self, after_ms: u64, tx: &mpsc::Sender<Msg>, clock: &Arc<dyn Clock>) {
+        self.attempt += 1;
+        if let Some(previous) = self.cancel.take() {
+            previous.cancel();
         }
-
-        let msg = match result {
-            Ok(Some(read)) => Msg::ValueLoaded {
-                token,
-                index,
-                name: String::from_utf8_lossy(&name).into_owned(),
-                value: read.value,
-                ttl_seconds: read.ttl_seconds,
-                size_bytes: read.size_bytes,
-                at_ms,
-            },
-            Ok(None) => Msg::ValueGone {
-                token,
-                index,
-                name: String::from_utf8_lossy(&name).into_owned(),
-                at_ms,
-            },
-            // Never swallowed: a Redis error that produces no visible effect is
-            // indistinguishable from the app deciding to do nothing (R7.4).
-            //
-            // Deliberately carries no token, so it is never dropped as stale. A
-            // read that failed, failed — the key it names is in the message, and
-            // suppressing it because the reader has moved on would be swallowing
-            // an error on a technicality (R7.4).
-            Err(e) => Msg::Failed {
-                command: format!("reading {}", String::from_utf8_lossy(&name)),
-                detail: e.details().to_string(),
-                at_ms,
-            },
-        };
-        let _ = tx.send(msg).await;
-    });
-}
-
-fn area_width(term: &Terminal<CrosstermBackend<Stdout>>) -> usize {
-    term.size()
-        .map(|s| (s.width / 2).max(20) as usize)
-        .unwrap_or(40)
-}
-
-fn start_scan(
-    client: &Client,
-    pattern: Option<String>,
-    tx: &mpsc::Sender<Msg>,
-    slot: &mut Option<CancellationToken>,
-) {
-    if let Some(previous) = slot.take() {
-        previous.cancel();
-    }
-    let token = CancellationToken::new();
-    *slot = Some(token.clone());
-    let client = client.clone();
-    let tx = tx.clone();
-    tokio::spawn(async move {
-        crate::redis::scan::stream_keys(&client, pattern.as_deref(), tx, token).await;
-    });
-}
-
-/// Subscribe to a client's link-level streams: reconnect notifications, wire
-/// errors, and (while tracking is supported) invalidation pushes. Tied to the
-/// `Client` instance passed in, so this has to be called again after every
-/// successful reconnect — a subscription opened on the old, now-dead client
-/// delivers nothing about the new one.
-fn spawn_link_watchers(client: &Client, tx: &mpsc::Sender<Msg>, tracking: bool) {
-    // fred reconnects underneath us on its own schedule if it has a
-    // `ReconnectPolicy` (this app sets none, so in practice this fires only
-    // if that ever changes) — and the server on the other side remembers
-    // nothing about what we were watching. Telling the core lets it drop the
-    // liveness claim and re-arm, the invariant ADR-0009 exists for.
-    {
-        let mut reconnects = client.reconnect_rx();
-        let tx = tx.clone();
-        let probe = client.clone();
+        let token = CancellationToken::new();
+        self.cancel = Some(token.clone());
+        let (dial, credentials, attempt) =
+            (self.dial.clone(), self.credentials.clone(), self.attempt);
+        let (landed, tx, clock) = (self.landed.clone(), tx.clone(), clock.clone());
         tokio::spawn(async move {
-            while reconnects.recv().await.is_ok() {
-                // A fresh connection tracks nothing, so capability must be
-                // re-probed rather than remembered.
-                let tracking = crate::redis::probe_tracking_public(&probe).await;
-                let (read_only, condition) = crate::redis::server_conditions(&probe).await;
-                let _ = tx
-                    .send(Msg::ServerState {
-                        read_only,
-                        condition,
-                    })
-                    .await;
-                if tx
-                    .send(Msg::Connected {
-                        version: String::new(),
-                        tracking_supported: tracking,
-                    })
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
+            tokio::select! {
+                biased;
+                () = token.cancelled() => {}
+                () = async {
+                    tokio::time::sleep(std::time::Duration::from_millis(after_ms)).await;
+                    match crate::redis::connect_with(&dial, &credentials).await {
+                        Ok((client, established)) => {
+                            // A refused INFO on this connection must be as
+                            // visible as it is at startup (review M1); it must
+                            // not be quietly presented as a clean ServerState.
+                            match &established.server_state_error {
+                                None => {
+                                    let _ = tx
+                                        .send(Msg::ServerState {
+                                            read_only: established.read_only,
+                                            condition: established.condition,
+                                        })
+                                        .await;
+                                }
+                                Some(detail) => {
+                                    let _ = tx
+                                        .send(Msg::Failed {
+                                            command: "INFO (replica and write-rejection checks)"
+                                                .into(),
+                                            detail: detail.clone(),
+                                            at_ms: clock.now_epoch_ms(),
+                                        })
+                                        .await;
+                                }
+                            }
+                            let _ = landed.send((client, established)).await;
+                        }
+                        Err(err) => {
+                            let next = attempt + 1;
+                            let retry_in_ms = crate::redis::backoff_for(next).as_millis() as u64;
+                            let _ = tx
+                                .send(Msg::Failed {
+                                    command: "reconnecting".into(),
+                                    detail: err.to_string(),
+                                    at_ms: clock.now_epoch_ms(),
+                                })
+                                .await;
+                            let _ = tx
+                                .send(Msg::ReconnectScheduled {
+                                    attempt: next,
+                                    retry_in_ms,
+                                })
+                                .await;
+                        }
+                    }
+                } => {}
             }
         });
     }
-    {
-        let mut errors = client.error_rx();
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            while let Ok((error, _server)) = errors.recv().await {
-                // A connection-level error means the link is gone; anything
-                // else is a command failure and belongs in a notification.
-                let msg = if matches!(error.kind(), fred::error::ErrorKind::IO) {
-                    Msg::ConnectionLost
-                } else {
-                    Msg::Failed {
-                        command: "connection".into(),
-                        detail: error.details().to_string(),
-                        at_ms: 0,
-                    }
-                };
-                if tx.send(msg).await.is_err() {
-                    return;
-                }
-            }
-        });
-    }
-
-    // Invalidation pushes arrive on their own task and become messages like
-    // everything else. This is what makes a value update with no keypress —
-    // and it is the whole reason this project exists (ADR-0006).
-    if tracking {
-        let mut invalidations = fred::interfaces::TrackingInterface::invalidation_rx(client);
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            while let Ok(_invalidation) = invalidations.recv().await {
-                // The server has told us the open key changed, which also
-                // consumed the arming. Refetching is what re-arms, and the core
-                // decides whether the result lands or is announced.
-                if tx.send(Msg::Invalidated).await.is_err() {
-                    return;
-                }
-            }
-        });
-    }
-}
-
-/// Attempt one reconnect after `after_ms`, cancellable by a fresh call — `r`
-/// while disconnected retries immediately (ADR-0009) by cancelling whatever
-/// backoff sleep or in-flight attempt was already running rather than racing
-/// it, the same discipline `start_scan` applies to `scan_cancel`.
-///
-/// Success reaches `run`'s own locals through `reconnected`, never through a
-/// `Msg`: a fresh `Client` cannot travel through the core's message type
-/// without giving the core a dependency on `fred`, which the core/shell
-/// boundary (ADR-0011) forbids. Failure is ordinary shell-reported state —
-/// `Msg::Failed` for what went wrong, `Msg::ReconnectScheduled` for when to
-/// try again — and needs no special channel.
-#[allow(clippy::too_many_arguments)]
-fn spawn_reconnect_attempt(
-    dial: String,
-    credentials: Credentials,
-    after_ms: u64,
-    attempt: u32,
-    tx: mpsc::Sender<Msg>,
-    reconnected: mpsc::Sender<(Client, Established)>,
-    slot: &mut Option<CancellationToken>,
-) {
-    if let Some(previous) = slot.take() {
-        previous.cancel();
-    }
-    let token = CancellationToken::new();
-    *slot = Some(token.clone());
-    tokio::spawn(async move {
-        tokio::select! {
-            biased;
-            () = token.cancelled() => {}
-            () = async {
-                tokio::time::sleep(std::time::Duration::from_millis(after_ms)).await;
-                match crate::redis::connect_with(&dial, &credentials).await {
-                    Ok((client, established)) => {
-                        let _ = tx
-                            .send(Msg::ServerState {
-                                read_only: established.read_only,
-                                condition: established.condition,
-                            })
-                            .await;
-                        let _ = reconnected.send((client, established)).await;
-                    }
-                    Err(err) => {
-                        let next = attempt + 1;
-                        let retry_in_ms = crate::redis::backoff_for(next).as_millis() as u64;
-                        let at_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(0);
-                        let _ = tx
-                            .send(Msg::Failed {
-                                command: "reconnecting".into(),
-                                detail: err.to_string(),
-                                at_ms,
-                            })
-                            .await;
-                        let _ = tx
-                            .send(Msg::ReconnectScheduled {
-                                attempt: next,
-                                retry_in_ms,
-                            })
-                            .await;
-                    }
-                }
-            } => {}
-        }
-    });
 }
 
 /// What the terminal can display. A real probe belongs in M0.3's follow-up;

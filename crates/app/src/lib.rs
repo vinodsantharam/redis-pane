@@ -11,7 +11,6 @@ pub mod clipboard;
 pub mod config_io;
 pub mod redis;
 pub mod secret;
-pub mod state_file;
 pub mod terminal;
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -36,7 +35,7 @@ pub mod exit {
 pub struct SystemClock;
 
 impl Clock for SystemClock {
-    fn now_ms(&self) -> u64 {
+    fn now_epoch_ms(&self) -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)

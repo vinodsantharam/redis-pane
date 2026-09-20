@@ -118,7 +118,7 @@ async fn main() {
             Msg::MetadataBatch {
                 entries,
                 gone,
-                at_ms: clock.now_ms(),
+                at_ms: clock.now_epoch_ms(),
             },
         );
     }
@@ -149,7 +149,7 @@ async fn main() {
     } else {
         redis_pane::redis::read::Arming::Unsupported
     };
-    let read_result = redis_pane::redis::read::read_value(&client, &name, 50, arming).await;
+    let read_result = redis_pane::redis::read::read_value(&client, &name, arming).await;
     let read_ms = t3.elapsed();
     // This is exactly what terminal.rs's open_key must also do: Ok(_) after
     // Arming::Enabled means CLIENT CACHING YES already succeeded on the wire.
@@ -165,11 +165,11 @@ async fn main() {
                 // command loop, so it stamps the token the core is holding.
                 token,
                 index: Some(target),
-                name: String::from_utf8_lossy(&name).into_owned(),
+                name: name.clone().into(),
                 value: read.value,
                 ttl_seconds: read.ttl_seconds,
                 size_bytes: read.size_bytes,
-                at_ms: clock.now_ms(),
+                at_ms: clock.now_epoch_ms(),
             },
         );
     }

@@ -40,11 +40,6 @@ use self::mouse::*;
 use self::scan::*;
 use self::viewer::*;
 
-/// Takes a message, returns new state plus commands for a shell to execute.
-///
-/// Pure: no I/O, no clock, no randomness. Time arrives inside the message
-/// (see [`Msg::ReadCompleted`]) rather than being read here, which is what
-/// keeps a frame a function of state alone (ADR-0011).
 /// Mint the token for a read about to be issued, superseding any in flight.
 ///
 /// Every read goes through here, for the same reason every read goes through
@@ -132,6 +127,11 @@ fn paste(mut state: State, text: String) -> (State, Vec<Command>) {
     }
 }
 
+/// Takes a message, returns new state plus commands for a shell to execute.
+///
+/// Pure: no I/O, no clock, no randomness. Time arrives inside the message
+/// (see [`Msg::ReadCompleted`]) rather than being read here, which is what
+/// keeps a frame a function of state alone (ADR-0011).
 pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
     match msg {
         Msg::Key(key) => key_press(state, key),

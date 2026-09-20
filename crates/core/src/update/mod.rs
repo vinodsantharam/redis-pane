@@ -18,6 +18,28 @@ use crate::state::{
 };
 use crate::{Command, Msg, State};
 
+mod confirm;
+mod editor;
+mod keys;
+mod link;
+mod mouse;
+mod scan;
+mod viewer;
+
+// Every submodule is `pub(super)`, never `pub`: `update()` stays the only way
+// into this module from outside it (the split plan's invariant 1). These
+// globs exist so a test module's `use super::*` keeps resolving every helper
+// it used before the split — see `docs/plans/review-m2-update-module-split.md`,
+// "The trick that makes this low-risk". A child module (a `#[cfg(test)]` mod
+// below) can see a private `use` in its parent, so nothing here needs `pub`.
+use self::confirm::*;
+use self::editor::*;
+use self::keys::*;
+use self::link::*;
+use self::mouse::*;
+use self::scan::*;
+use self::viewer::*;
+
 /// Takes a message, returns new state plus commands for a shell to execute.
 ///
 /// Pure: no I/O, no clock, no randomness. Time arrives inside the message
@@ -74,6 +96,42 @@ fn epoch_secs(at_ms: u64) -> u32 {
     (at_ms / 1000) as u32
 }
 
+/// `Msg::ReadIssued`: timestamp the pending read for the loading indicator's
+/// delay gate. A token that no longer names the outstanding read — already
+/// superseded, or already answered — is ignored, the same discipline
+/// `ValueLoaded`/`ValueGone` already apply to a stale token.
+fn read_issued(mut state: State, token: ReadToken, at_ms: u64) -> (State, Vec<Command>) {
+    if let Some(pending) = &mut state.open_pending
+        && pending.token == token
+    {
+        pending.issued_at_ms = Some(at_ms);
+    }
+    (state, Vec::new())
+}
+
+/// `Msg::Paste`: a bracketed paste (ADR-0014). Routed by which capture mode,
+/// if any, is active — the inline editor's name part, its body, or the
+/// filter — rather than owned by either `editor` or `keys`, since it is the
+/// one message that can land in either.
+fn paste(mut state: State, text: String) -> (State, Vec<Command>) {
+    if let Some(editor) = state.open.as_mut().and_then(OpenKey::typing_mut) {
+        if editor.active_part() == Some(FieldPart::Name) {
+            let stripped: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+            editor.name_push_str(&stripped);
+        } else {
+            editor.insert_str(&text);
+        }
+        (state, Vec::new())
+    } else if state.filtering {
+        let stripped: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+        state.list.filter.push_str(&stripped);
+        state.rebuild_list();
+        after_move(state)
+    } else {
+        (state, Vec::new())
+    }
+}
+
 pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
     match msg {
         Msg::Key(key) => key_press(state, key),
@@ -96,307 +154,52 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             state.last_read_ms = Some(at_ms);
             (state, Vec::new())
         }
-        Msg::ReadIssued { token, at_ms } => {
-            // A token that no longer names the outstanding read — already
-            // superseded, or already answered — is ignored, the same
-            // discipline `ValueLoaded`/`ValueGone` already apply to a stale
-            // token.
-            if let Some(pending) = &mut state.open_pending
-                && pending.token == token
-            {
-                pending.issued_at_ms = Some(at_ms);
-            }
-            (state, Vec::new())
-        }
+        Msg::ReadIssued { token, at_ms } => read_issued(state, token, at_ms),
         Msg::Connected {
             version,
             tracking_supported,
-        } => {
-            // Connected is never live on its own. Tracking starts Available at
-            // best, and only an accepted arming moves it to Armed — which is
-            // ADR-0009's invariant expressed as a state transition rather than
-            // as a comment somebody has to remember.
-            state.link = Link::Up {
-                version,
-                tracking: if tracking_supported {
-                    Tracking::Available
-                } else {
-                    Tracking::Unsupported
-                },
-            };
-            let commands = if tracking_supported {
-                refetch(&mut state)
-            } else {
-                Vec::new()
-            };
-            (state, commands)
-        }
-        Msg::ConnectionLost => {
-            // No countdown: nothing has scheduled a retry yet, and the shell
-            // may never schedule one. The header shows the Read age instead,
-            // which is the fact ADR-0009 actually asks for in this state and
-            // the only one that is true.
-            //
-            // Whatever read was in flight will never answer over this link,
-            // so its loading indicator is cleared here rather than left to
-            // read `⟳ fetching…` until the process exits.
-            state.open_pending = None;
-            state.link = Link::Reconnecting {
-                attempt: 1,
-                retry_in_ms: None,
-            };
-            (state, vec![Command::Reconnect { after_ms: 0 }])
-        }
+        } => connected(state, version, tracking_supported),
+        Msg::ConnectionLost => connection_lost(state),
         Msg::ReconnectScheduled {
             attempt,
             retry_in_ms,
-        } => {
-            state.link = Link::Reconnecting {
-                attempt,
-                retry_in_ms: Some(retry_in_ms),
-            };
-            (
-                state,
-                vec![Command::Reconnect {
-                    after_ms: retry_in_ms,
-                }],
-            )
-        }
-        Msg::TrackingArmed => {
-            if let Link::Up { tracking, .. } = &mut state.link
-                && *tracking != Tracking::Unsupported
-            {
-                *tracking = Tracking::Armed;
-            }
-            (state, Vec::new())
-        }
-        Msg::Invalidated => {
-            // The push consumed the arming. Refetching is what re-arms, and
-            // there is only one command that can do it.
-            if let Link::Up { tracking, .. } = &mut state.link
-                && *tracking == Tracking::Armed
-            {
-                *tracking = Tracking::Consumed;
-            }
-            let commands = refetch(&mut state);
-            (state, commands)
-        }
-        Msg::ScanStarted { estimated_total } => {
-            state.keys.clear();
-            // The Open key survives a rescan; its *index* must not. `SCAN` has
-            // no stable order, so the same number will address a different key
-            // once the set refills, and every use of it — the tombstone
-            // writeback, the row marker in the keys pane — would then be
-            // confidently wrong rather than merely absent. It is re-resolved by
-            // name in `scan_batch` when the key comes back.
-            if let Some(open) = &mut state.open {
-                open.index = None;
-            }
-            state.rebuild_list();
-            state.scan = ScanState::Running {
-                scanned: 0,
-                estimated_total,
-            };
-            (state, Vec::new())
-        }
+        } => reconnect_scheduled(state, attempt, retry_in_ms),
+        Msg::TrackingArmed => tracking_armed(state),
+        Msg::Invalidated => invalidated(state),
+        Msg::ScanStarted { estimated_total } => scan_started(state, estimated_total),
         Msg::ScanBatch { keys } => scan_batch(state, keys),
         Msg::MetadataBatch {
             entries,
             gone,
             at_ms,
-        } => {
-            let read_at_s = epoch_secs(at_ms);
-            let open_index = state.open.as_ref().and_then(|open| open.index);
-            let mut row_says_alive = false;
-            for e in entries {
-                state.keys.set_kind(e.index, e.kind);
-                state.keys.set_ttl(e.index, e.ttl_seconds, read_at_s);
-                state.keys.set_size(e.index, e.size_bytes);
-                row_says_alive |= Some(e.index) == open_index;
-            }
-            // A deleted key keeps its row and its last-known TTL and size; only
-            // the type byte gives way to the tombstone. Removing the row would
-            // renumber everything below the cursor between one frame and the
-            // next, which is a worse lie than a row that says it is gone.
-            let mut row_says_gone = false;
-            for index in gone {
-                state.keys.set_gone(index);
-                row_says_gone |= Some(index) == open_index;
-            }
-
-            // 958b311 taught the row what the Viewer knew. This is the other
-            // direction, which it did not cover: a tombstoned row has no type,
-            // so it matches `rows_needing_metadata` forever and the next cursor
-            // move refetches it — and a key that was deleted and then written
-            // again came back to `● string 64 B ∞` in the list while the Viewer
-            // still read `✕ deleted 40s ago`. With tracking off nothing ever
-            // corrected it, and the list is the more believable of the two
-            // because it is the one that looks untouched.
-            //
-            // Both directions of the disagreement are resolved the same way,
-            // and not by copying one pane's opinion onto the other: ask the
-            // server. The read path already dates its own answer and re-arms
-            // tracking (ADR-0006), so whichever pane was wrong is corrected by
-            // evidence rather than by inference.
-            let viewer_says_gone = state
-                .open
-                .as_ref()
-                .is_some_and(|open| open.deleted_at_ms.is_some());
-            if (row_says_alive && viewer_says_gone) || (row_says_gone && !viewer_says_gone) {
-                let commands = refetch(&mut state);
-                return (state, commands);
-            }
-            (state, Vec::new())
-        }
-        Msg::ScanComplete => {
-            // A cap reached mid-scan already told its own story; completing
-            // afterwards must not overwrite it with a smaller truth.
-            if !matches!(state.scan, ScanState::Capped { .. }) {
-                state.scan = ScanState::Complete {
-                    total: state.keys.len() as u64,
-                };
-            }
-            (state, Vec::new())
-        }
-        Msg::ScanCancelled => {
-            if !matches!(state.scan, ScanState::Capped { .. }) {
-                state.scan = ScanState::Cancelled {
-                    scanned: state.keys.len() as u64,
-                };
-            }
-            (state, Vec::new())
-        }
-        Msg::ScanFailed { error } => {
-            state.scan = ScanState::Failed { error };
-            (state, Vec::new())
-        }
+        } => metadata_batch(state, entries, gone, at_ms),
+        Msg::ScanComplete => scan_complete(state),
+        Msg::ScanCancelled => scan_cancelled(state),
+        Msg::ScanFailed { error } => scan_failed(state, error),
         Msg::ValueLoaded {
             token,
             index,
             name,
-            mut value,
+            value,
             ttl_seconds,
             size_bytes,
             at_ms,
-        } => {
-            // Only the answer to the question actually being asked may change
-            // what is open. Without this, opening a slow key and then a fast one
-            // put the slow one's reply in the Viewer when it finally landed —
-            // the value pane showing a key the reader had left. The value in
-            // that reply was correct; it simply answered an older question.
-            if token != state.read_token {
-                return (state, Vec::new());
-            }
-            // Wrapped to the pane it is about to be drawn in; the shell does not
-            // know that width, and should not (review M4).
-            value.rewrap(state.value_wrap_width());
-            // The question this reply answers is the one currently in
-            // flight, so it is no longer in flight. Whether `Enter` asked
-            // for the cursor the moment this landed travels with it — read
-            // once here, since the pending read is dropped either way.
-            let (activate_cursor, own_write) = state
-                .open_pending
-                .as_ref()
-                .map_or((false, false), |p| (p.activate_cursor, p.own_write));
-            state.open_pending = None;
-            // A value came back, so the key is there. Says so on the row too —
-            // the same two-pane agreement `ValueGone` keeps in the other
-            // direction, and what un-badges a key that was deleted and then
-            // written again. Setting the kind rather than merely clearing the
-            // tombstone means the row is right immediately instead of showing
-            // a pending placeholder until the next scroll refetches it.
-            //
-            // Guarded by the name, not just by the token: a rescan between the
-            // read and its reply renumbers the Loaded set, and this index would
-            // then describe an unrelated key in confident detail.
-            if let Some(index) = index
-                && state.keys.name(index) == Some(name.as_bytes())
-            {
-                state.keys.set_kind(index, value.kind());
-                state.keys.set_ttl(index, ttl_seconds, epoch_secs(at_ms));
-                state.keys.set_size(index, size_bytes);
-            }
-            match &mut state.open {
-                // A read of the key already open is an update, and where it
-                // lands depends on where the reader is (ADR-0006).
-                Some(open) if open.name == name => {
-                    // This session's own write is exactly what the reader
-                    // asked to see, so it is not an update to hold (ADR-0006).
-                    if own_write {
-                        open.apply(value, ttl_seconds, size_bytes, at_ms);
-                    } else {
-                        open.absorb(value, ttl_seconds, size_bytes, at_ms);
-                    }
-                    if activate_cursor {
-                        open.cursor_active = true;
-                    }
-                }
-                _ => {
-                    let mut opened =
-                        OpenKey::new(index, name, value, ttl_seconds, size_bytes, at_ms);
-                    opened.cursor_active = activate_cursor;
-                    state.open = Some(opened);
-                    // A newly opened key has to find its row before either pane
-                    // can point at it.
-                    state.relocate_open_key();
-                }
-            }
-            (state, Vec::new())
-        }
+        } => value_loaded(
+            state,
+            token,
+            index,
+            name,
+            value,
+            ttl_seconds,
+            size_bytes,
+            at_ms,
+        ),
         Msg::ValueGone {
             token,
             index,
             name,
             at_ms,
-        } => {
-            if token != state.read_token {
-                return (state, Vec::new());
-            }
-            state.open_pending = None;
-            // The row this reply is actually about — never `open.index`. A
-            // token-only version of this message shipped once and used
-            // `open.index` here, which meant a gone reply for a *different*
-            // key than the one already open tombstoned the wrong row: a
-            // perfectly healthy key marked `✕ … gone`, with nothing
-            // afterwards to correct it (metadata is refetched only for rows
-            // of unknown type, and this one's was known and wrong).
-            //
-            // Guarded by name, the same way `ValueLoaded`'s metadata
-            // writeback is: a rescan between the read and its reply
-            // renumbers the Loaded set, and this index would then describe
-            // an unrelated key in confident detail.
-            if let Some(index) = index
-                && state.keys.name(index) == Some(name.as_bytes())
-            {
-                state.keys.set_gone(index);
-            }
-            match &mut state.open {
-                // The key already open is the one that came back gone —
-                // whether it had a value or was already this same
-                // placeholder. This is ADR-0006's actual case: a value was
-                // read, and the reader is watching it get deleted. The last
-                // value stays on screen, badged. During an incident the
-                // question is almost always what was in it, and this is the
-                // moment that answer becomes unrecoverable.
-                Some(open) if open.name == name => {
-                    open.deleted_at_ms = Some(at_ms);
-                    open.pending = None;
-                    staged_edit_found_key_gone(&mut state, &name, at_ms);
-                }
-                // A different key than whatever is open — including nothing
-                // open at all. There is no "what was in it" to preserve here;
-                // nothing was ever read. A fresh, minimal placeholder replaces
-                // whatever was open, the same way `ValueLoaded`'s `_` arm
-                // replaces the Viewer wholesale when a different key
-                // succeeds — the two messages now agree on how a key changes
-                // identity, not just on how it changes value.
-                _ => {
-                    state.open = Some(OpenKey::gone(index, name, at_ms));
-                    state.relocate_open_key();
-                }
-            }
-            (state, Vec::new())
-        }
+        } => value_gone(state, token, index, name, at_ms),
         Msg::Copied { label, at_ms } => {
             state.notice = Some((format!("copied {label}"), at_ms));
             (state, Vec::new())
@@ -408,47 +211,13 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
         Msg::ServerState {
             read_only,
             condition,
-        } => {
-            // A replica outranks an Environment guard: that reason cannot be
-            // lifted, so claiming the weaker one would offer a toggle the
-            // server will refuse anyway (ADR-0009). A user-imposed guard is
-            // never taken away by the server changing its mind.
-            state.read_only = match (read_only, state.read_only) {
-                (Some(reason), _) => Some(reason),
-                (None, Some(ReadOnlyReason::Replica)) => state
-                    .connection
-                    .environment
-                    .read_only_by_default()
-                    .then_some(ReadOnlyReason::Environment),
-                (None, existing) => existing,
-            };
-            state.condition = condition;
-            (state, Vec::new())
-        }
+        } => server_state(state, read_only, condition),
         Msg::Failed {
             command,
             detail,
             at_ms,
         } => failed(state, command, detail, at_ms),
-        Msg::Paste(text) => {
-            if let Some(editor) = state.open.as_mut().and_then(OpenKey::typing_mut) {
-                if editor.active_part() == Some(FieldPart::Name) {
-                    let stripped: String =
-                        text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
-                    editor.name_push_str(&stripped);
-                } else {
-                    editor.insert_str(&text);
-                }
-                (state, Vec::new())
-            } else if state.filtering {
-                let stripped: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
-                state.list.filter.push_str(&stripped);
-                state.rebuild_list();
-                after_move(state)
-            } else {
-                (state, Vec::new())
-            }
-        }
+        Msg::Paste(text) => paste(state, text),
         Msg::MutationSettled {
             mutation,
             index,
@@ -456,55 +225,6 @@ pub fn update(mut state: State, msg: Msg) -> (State, Vec<Command>) {
             at_ms,
         } => mutation_settled(state, mutation, index, result, at_ms),
         Msg::Quit => quit(state),
-    }
-}
-
-/// Absorb a page of keys, stopping the traversal if the cap is reached.
-///
-/// This is the single place the cap is enforced, so there is no path that grows
-/// the Loaded set past it (ADR-0010).
-fn scan_batch(mut state: State, keys: Vec<Vec<u8>>) -> (State, Vec<Command>) {
-    // A rescan took the Open key's index away (`ScanStarted`). Watch for the
-    // name coming back so it can be restored — here rather than by searching
-    // the arena afterwards, because the index is simply the length before the
-    // push, and this is the one place that knows it.
-    let looking_for = match &state.open {
-        Some(open) if open.index.is_none() => Some(open.name.clone()),
-        _ => None,
-    };
-    for key in keys {
-        let index = state.keys.len();
-        if !state.keys.push(&key) {
-            state.scan = ScanState::Capped {
-                at: state.keys.len(),
-            };
-            return (state, vec![Command::CancelScan]);
-        }
-        // Only after the push succeeded: a key the cap refused has no index,
-        // and claiming one would point the Open key at a row that is not there.
-        if looking_for.as_ref().map(KeyName::as_bytes) == Some(key.as_slice())
-            && let Some(open) = &mut state.open
-        {
-            open.index = Some(index);
-        }
-    }
-    if let ScanState::Running {
-        estimated_total, ..
-    } = state.scan
-    {
-        state.scan = ScanState::Running {
-            scanned: state.keys.len() as u64,
-            estimated_total,
-        };
-    }
-    state.rebuild_list();
-    // Keys render as they arrive; their metadata should follow, but only for
-    // the rows a reader can actually see.
-    let indices = state.rows_needing_metadata();
-    if indices.is_empty() {
-        (state, Vec::new())
-    } else {
-        (state, vec![Command::FetchMetadata { indices }])
     }
 }
 
@@ -582,86 +302,8 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             state.help_open = !state.help_open;
             (state, Vec::new())
         }
-        Action::Cancel => {
-            // Esc backs out of the nearest thing first: an overlay, then an
-            // error, then an in-flight scan. One keypress, one meaning.
-            if state.help_open {
-                state.help_open = false;
-                return (state, Vec::new());
-            }
-            if state.error.is_some() {
-                state.error = None;
-                return (state, Vec::new());
-            }
-            // The "pop" half of stack navigation: back to the list you were
-            // just looking at, before an unrelated background scan. Also
-            // exits value-cursor mode if it was active — the same keypress,
-            // since there is nothing left to pop before it. The value stays
-            // open and unchanged either way; only where plain movement is
-            // aimed changes.
-            if state.focus == Pane::Value {
-                state.focus = Pane::Keys;
-                if let Some(open) = &mut state.open {
-                    open.cursor_active = false;
-                }
-                return (state, Vec::new());
-            }
-            // Every in-flight operation is cancellable (PRD R7.3).
-            if state.scan.is_running() {
-                return (state, vec![Command::CancelScan]);
-            }
-            (state, Vec::new())
-        }
-        Action::Refetch => {
-            // A dropped link, not merely `Link::Connecting` (before the first
-            // connect): there is nothing to refetch or rescan over a dead
-            // connection, only a reconnect to retry. ADR-0009: "`r` retries
-            // immediately rather than waiting out the timer." Checked before
-            // the pane-focus split below, which presupposes a connection to
-            // act over.
-            //
-            // Deliberately narrower than `Liveness::Disconnected`, which also
-            // covers `Link::Connecting` — real startup never renders an
-            // interactive frame in that state (the shell connects before the
-            // event loop starts), but a great many tests build off
-            // `State::default()`, whose `Link` defaults to `Connecting`, and
-            // never mean to be testing reconnection at all.
-            if matches!(state.link, Link::Reconnecting { .. }) {
-                return (state, vec![Command::Reconnect { after_ms: 0 }]);
-            }
-            // `r` acts on the focused pane and nothing else (R2.7), and the
-            // hint bar names which half is in force. The keys pane is not
-            // push-live — the deletions it can detect for free arrive with the
-            // metadata it was already fetching, and anything else needs the
-            // keyspace walked again (DESIGN §9).
-            //
-            // The held-update branch below used to sit *above* this check, so
-            // `r` in the keys pane with an update waiting in the Viewer applied
-            // that update and did not rescan — while the hint bar said
-            // `r rescan`. The list did not move, no scan readout appeared, and
-            // a value in the other pane changed instead: no error, no feedback,
-            // nothing to explain it. That is the same defect 6d665a3 fixed,
-            // surviving in the one branch that ran before the focus check.
-            if state.keys_pane_focused() {
-                // `None` is the same traversal the session opened with: the
-                // scan has never been server-side filtered, `/` narrows the
-                // Loaded set on this side, and so the active filter survives a
-                // rescan without being mentioned here.
-                return (state, vec![Command::StartScan { pattern: None }]);
-            }
-            // In the Viewer, a held update is the cheapest possible answer:
-            // applying what the server has already sent is the one thing `r`
-            // must never re-ask for.
-            if let Some(open) = &mut state.open
-                && open.pending.is_some()
-            {
-                open.take_pending();
-                open.at_rest = true;
-                return (state, Vec::new());
-            }
-            let commands = refetch(&mut state);
-            (state, commands)
-        }
+        Action::Cancel => cancel(state),
+        Action::Refetch => refetch_action(state),
         Action::CyclePane => {
             // Focus only ever moves to a pane there is something to focus.
             // With no key open the Viewer has nothing in it, and below 70
@@ -699,45 +341,8 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
         // `d` is focus-dependent (D4, PLAN M2 task 6), like `c`: the keys
         // pane's Selected-key delete below is unchanged; the Viewer's
         // Hash-field delete is new.
-        Action::Delete if state.keys_pane_focused() => {
-            // The Selected key, not the Open key — the same target every
-            // other keys-pane action takes. A gone row has nothing left to
-            // delete.
-            let Some(index) = state.selected_key() else {
-                return (state, Vec::new());
-            };
-            if state.keys.is_gone(index) {
-                return (state, Vec::new());
-            }
-            let Some(name) = state.keys.name(index).map(KeyName::from) else {
-                return (state, Vec::new());
-            };
-            state.confirm = Some(PendingMutation::DeleteKey { index, name });
-            (state, Vec::new())
-        }
-        Action::Delete => {
-            let notify = |text: &str| vec![Command::Notify { text: text.into() }];
-            let Some(open) = state.open.as_ref() else {
-                return (state, notify("nothing to remove here"));
-            };
-            let Some(Value::Hash(pairs)) = &open.value else {
-                return (state, notify("nothing to remove here"));
-            };
-            if !open.cursor_active {
-                return (state, notify("Enter to pick a field"));
-            }
-            let Some((field, _)) = pairs.pairs.get(open.cursor).cloned() else {
-                return (state, notify("Enter to pick a field"));
-            };
-            let last_field = pairs.total == 1;
-            let name = open.name.clone();
-            state.confirm = Some(PendingMutation::DeleteHashField {
-                name,
-                field,
-                last_field,
-            });
-            (state, Vec::new())
-        }
+        Action::Delete if state.keys_pane_focused() => delete_selected_key(state),
+        Action::Delete => delete_hash_field(state),
         // Nothing is staged — `key_press` intercepts every keypress before
         // this match while `state.confirm` is `Some`, so `y` only ever
         // reaches here with nothing to confirm.
@@ -770,120 +375,8 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             state.view.selected = state.row_count().saturating_sub(1);
             after_move(state)
         }
-        Action::Open => {
-            // While the value cursor is active, Left/Right are not bound to
-            // anything in the value pane (only Up/Down/PgUp/PgDn/Home/End
-            // move the cursor there) — but the key list underneath is still
-            // "selected" in the state-machine sense, so without this guard
-            // Right/Left would silently walk the tree selection out from
-            // under the open value. Esc, not an arrow key, is what leaves
-            // cursor mode (`Action::Cancel`'s handler).
-            if cursor_active(&state) {
-                return (state, Vec::new());
-            }
-            // Right on a group row: expand it if collapsed, or step into its
-            // first child if it is already expanded. Right never collapses —
-            // `CollapseGroup` is the only key that does — matching the
-            // standard treeview Right-arrow behavior (VS Code, macOS/Windows
-            // outline views, the WAI-ARIA treeview pattern).
-            if state.tree_mode
-                && let Some(crate::state::tree::Row::Group { expanded, .. }) =
-                    state.tree.row(state.view.selected)
-            {
-                if expanded {
-                    return move_selection(state, 1);
-                }
-                if let Some(prefix) = group_prefix_at(&state, state.view.selected) {
-                    state.tree.toggle(&prefix);
-                    state.rebuild_list();
-                }
-                return after_move(state);
-            }
-            let Some(index) = state.selected_key() else {
-                return (state, Vec::new());
-            };
-            let Some(name) = state.keys.name(index).map(KeyName::from) else {
-                return (state, Vec::new());
-            };
-            // Opening a key moves focus onto it, at every width. Below 70
-            // columns that is the "push" half of stack navigation (DESIGN §2);
-            // above it both panes already show and this decides only which one
-            // a pane-scoped key acts on. `Tab` and `Esc` both move it back
-            // without closing the key — `Esc` additionally exits value-cursor
-            // mode first, if it was active (`Action::Cancel`'s handler).
-            state.focus = Pane::Value;
-            let token = issue_read(&mut state);
-            state.open_pending = Some(PendingRead {
-                name: name.clone(),
-                token,
-                index: Some(index),
-                issued_at_ms: None,
-                activate_cursor: false,
-                own_write: false,
-            });
-            let command = read_key(&state, name, Some(index), token);
-            (state, vec![command])
-        }
-        Action::EnterValueCursor => {
-            // A no-op on a group row: Enter only ever means "put a cursor in
-            // the Selected key's value," and a group has no value of its own
-            // to move through — `Right` (`Action::Open`) is what expands or
-            // steps into one. Every row is implicitly a leaf outside tree
-            // mode, so this only ever excludes a Group row.
-            if state.tree_mode
-                && !matches!(
-                    state.tree.row(state.view.selected),
-                    Some(crate::state::tree::Row::Key { .. })
-                )
-            {
-                return (state, Vec::new());
-            }
-            let Some(index) = state.selected_key() else {
-                return (state, Vec::new());
-            };
-
-            if matches!(state.attachment(), Some(Attachment::Attached)) {
-                let open = state.open.as_mut().expect("Attached implies Some");
-                // Nothing to move a cursor through: a key confirmed gone
-                // before it ever loaded has no body, and one confirmed gone
-                // since has nothing worth re-reading on every Enter — `r` is
-                // the deliberate way to check again (ADR-0006: there is no
-                // silent refresh button).
-                if open.value.is_none() {
-                    return (state, Vec::new());
-                }
-                // Fast path: the Open key is already the Selected key and
-                // already has a value on screen, so there is nothing to
-                // fetch — just drop the cursor into what is already there.
-                open.cursor_active = true;
-                state.focus = Pane::Value;
-                return (state, Vec::new());
-            }
-
-            // Otherwise the Selected key is not the Open key (or nothing is
-            // open at all): open it exactly like `Action::Open` does, except
-            // the reply also activates the cursor the moment it lands — the
-            // "open and dive in" this action exists to shortcut over `→`
-            // then `Enter`. `state.open` itself is left untouched until then,
-            // same as `Action::Open`: the previous value stays on screen,
-            // correctly badged detached, rather than being blanked out for
-            // the read's duration.
-            let Some(name) = state.keys.name(index).map(KeyName::from) else {
-                return (state, Vec::new());
-            };
-            state.focus = Pane::Value;
-            let token = issue_read(&mut state);
-            state.open_pending = Some(PendingRead {
-                name: name.clone(),
-                token,
-                index: Some(index),
-                issued_at_ms: None,
-                activate_cursor: true,
-                own_write: false,
-            });
-            let command = read_key(&state, name, Some(index), token);
-            (state, vec![command])
-        }
+        Action::Open => open_selected(state),
+        Action::EnterValueCursor => enter_value_cursor(state),
         Action::Copy => {
             // Which pane the reader is looking at decides what `y` copies —
             // no mnemonic to remember, no chord to get half right (DESIGN §4).
@@ -905,54 +398,9 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             state.filtering = true;
             (state, Vec::new())
         }
-        Action::Sort => {
-            // Folding needs name order to group consecutive keys in one pass
-            // (`Tree::rebuild`'s doc comment); cycling to another sort while
-            // folded fragments every group into repeated headers with
-            // undercounted descendants. `rebuild_list` would snap the sort
-            // back to Name immediately anyway, so this is a no-op either way —
-            // guarding here just avoids advertising a key that visibly does
-            // nothing.
-            if state.tree_mode {
-                return (state, Vec::new());
-            }
-            state.list.sort = state.list.sort.next();
-            state.rebuild_list();
-            after_move(state)
-        }
-        Action::ToggleTree => {
-            state.tree_mode = !state.tree_mode;
-            state.view.selected = 0;
-            state.view.offset = 0;
-            state.rebuild_list();
-            after_move(state)
-        }
-        Action::CollapseGroup => {
-            // See the matching guard in `Action::Open` above.
-            if cursor_active(&state) {
-                return (state, Vec::new());
-            }
-            // Left never expands (`Open` is the only key that does):
-            // collapses an expanded group in place; a group that is already
-            // collapsed, or a key row (which has no children of its own to
-            // collapse), moves the cursor to the parent group instead. A
-            // top-level group with nothing left to collapse has no parent to
-            // go to either, so this is a no-op — the standard treeview
-            // Left-arrow behavior.
-            if state.tree_mode {
-                if let Some(crate::state::tree::Row::Group { expanded: true, .. }) =
-                    state.tree.row(state.view.selected)
-                {
-                    if let Some(prefix) = group_prefix_at(&state, state.view.selected) {
-                        state.tree.toggle(&prefix);
-                        state.rebuild_list();
-                    }
-                } else if let Some(parent) = parent_row(&state, state.view.selected) {
-                    state.view.selected = parent;
-                }
-            }
-            after_move(state)
-        }
+        Action::Sort => cycle_sort(state),
+        Action::ToggleTree => toggle_tree(state),
+        Action::CollapseGroup => collapse_group(state),
         Action::ToggleReadOnly => {
             // A replica will refuse writes whatever we believe, so this is not
             // a toggle the user gets to win (ADR-0009).
@@ -966,587 +414,87 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
     }
 }
 
-/// The row of the parent of `row` — the nearest *preceding* row one depth
-/// shallower — or `None` at depth 0, which has no parent.
-///
-/// True by construction: `Tree::rebuild` pushes rows in a single
-/// left-to-right pass and only ever reuses an already-pushed ancestor rather
-/// than duplicating it, so the nearest preceding row at each shallower depth
-/// is always the immediate parent. Works the same for a Key row or a Group
-/// row — `Row::depth` is defined for both — which is what lets `Left`
-/// (`Action::CollapseGroup`) treat "collapse, then go to parent" as one walk
-/// regardless of what row it started on.
-fn parent_row(state: &State, row: usize) -> Option<usize> {
-    use crate::state::tree::Row;
-    let depth = state.tree.row(row)?.depth();
-    if depth == 0 {
-        return None;
+/// `Esc`: back out of the nearest thing first — an overlay, then an error,
+/// then value-cursor mode, then an in-flight scan. One keypress, one
+/// meaning.
+fn cancel(mut state: State) -> (State, Vec<Command>) {
+    if state.help_open {
+        state.help_open = false;
+        return (state, Vec::new());
     }
-    (0..row)
-        .rev()
-        .find(|&r| matches!(state.tree.row(r), Some(Row::Group { depth: d, .. }) if d == depth - 1))
+    if state.error.is_some() {
+        state.error = None;
+        return (state, Vec::new());
+    }
+    // The "pop" half of stack navigation: back to the list you were
+    // just looking at, before an unrelated background scan. Also
+    // exits value-cursor mode if it was active — the same keypress,
+    // since there is nothing left to pop before it. The value stays
+    // open and unchanged either way; only where plain movement is
+    // aimed changes.
+    if state.focus == Pane::Value {
+        state.focus = Pane::Keys;
+        if let Some(open) = &mut state.open {
+            open.cursor_active = false;
+        }
+        return (state, Vec::new());
+    }
+    // Every in-flight operation is cancellable (PRD R7.3).
+    if state.scan.is_running() {
+        return (state, vec![Command::CancelScan]);
+    }
+    (state, Vec::new())
 }
 
-/// The prefix a group row stands for, e.g. `user:profile:` for a depth-1
-/// group under `user:`.
-///
-/// Built from the rows themselves — this row and each ancestor Group row
-/// above it via [`parent_row`], every one of which already carries its own
-/// segment's arena location — so it needs nothing *beneath* `row` to exist.
-/// An earlier version reconstructed the prefix by searching forward for the
-/// first visible Key row under the group instead, which broke the moment the
-/// group was collapsed: `Tree::row` hides a collapsed group's children
-/// entirely, so the search skipped straight past them onto a *different*
-/// group's key (or found nothing), reconstructing the wrong prefix or none
-/// at all — folding a group worked, unfolding it from the same row didn't
-/// (#16).
-fn group_prefix_at(state: &State, row: usize) -> Option<String> {
-    use crate::state::tree::Row;
-    let Some(Row::Group { .. }) = state.tree.row(row) else {
-        return None;
-    };
-
-    let mut rows = vec![row];
-    let mut r = row;
-    while let Some(parent) = parent_row(state, r) {
-        rows.push(parent);
-        r = parent;
+/// `r`: retry a dropped link, rescan the keys pane, apply a held Viewer
+/// update, or Refetch the Open key — whichever applies, in that order.
+fn refetch_action(mut state: State) -> (State, Vec<Command>) {
+    // A dropped link, not merely `Link::Connecting` (before the first
+    // connect): there is nothing to refetch or rescan over a dead
+    // connection, only a reconnect to retry. ADR-0009: "`r` retries
+    // immediately rather than waiting out the timer." Checked before
+    // the pane-focus split below, which presupposes a connection to
+    // act over.
+    //
+    // Deliberately narrower than `Liveness::Disconnected`, which also
+    // covers `Link::Connecting` — real startup never renders an
+    // interactive frame in that state (the shell connects before the
+    // event loop starts), but a great many tests build off
+    // `State::default()`, whose `Link` defaults to `Connecting`, and
+    // never mean to be testing reconnection at all.
+    if matches!(state.link, Link::Reconnecting { .. }) {
+        return (state, vec![Command::Reconnect { after_ms: 0 }]);
     }
-    rows.reverse();
-
-    let sep = state.tree.separator;
-    let mut out = String::new();
-    for r in rows {
-        let Some(Row::Group { offset, len, .. }) = state.tree.row(r) else {
-            return None;
-        };
-        out.push_str(&String::from_utf8_lossy(
-            state.keys.arena_slice(offset, len)?,
-        ));
-        out.push(sep);
-    }
-    Some(out)
-}
-
-/// Builds the clipboard payload for `y` (key or value, by focus) and `Action::CopyCommand`.
-fn build_copy(state: State, what: CopyWhat) -> (State, Vec<Command>) {
-    // The key name is copyable from the list alone; the other two need an open
-    // value, because there is nothing to copy until the server has said what it
-    // holds (ADR-0006).
-    let nothing_open = || {
-        vec![Command::Notify {
-            text: "nothing open to copy".into(),
-        }]
-    };
-    // A key confirmed gone before it was ever loaded has a name but no value —
-    // there was never anything for the server to say. Distinct wording from
-    // `nothing_open()`: something *is* open, it simply has nothing behind it.
-    let gone = || {
-        vec![Command::Notify {
-            text: "gone — nothing to copy".into(),
-        }]
-    };
-    let mut label = what.label().to_string();
-    let text = match what {
-        CopyWhat::Key => match state.open.as_ref().map(|o| o.name.display().into_owned()) {
-            Some(name) => name,
-            None => match state.selected_key().and_then(|i| state.keys.name_str(i)) {
-                Some(name) => name.into_owned(),
-                None => return (state, nothing_open()),
-            },
-        },
-        CopyWhat::Value => match state.open.as_ref().map(|open| (open, open.value.as_ref())) {
-            Some((open, Some(value))) => {
-                // A windowed read brought back a slice, and the clipboard shows
-                // no seams: 500 rows of a 12,000-item list look exactly like a
-                // complete copy once pasted. The Viewer header already states
-                // this fact about the same value (`12,000 items · 500 shown`);
-                // the confirmation states it about the copy, in the same words,
-                // rather than saying `copied value` and leaving the paste
-                // buffer to be discovered as a prefix later.
-                let viewer = value.viewer();
-                if let Some(shown) = viewer.window() {
-                    label = format!("{label} ({shown} of {})", viewer.measure());
-                }
-                value_text(value, open.read_at_ms)
-            }
-            Some((_, None)) => return (state, gone()),
-            None => return (state, nothing_open()),
-        },
-        CopyWhat::Command => match state.open.as_ref().map(|open| (open, open.value.as_ref())) {
-            Some((open, Some(value))) => {
-                redis_cli_command(&state.connection.target, &open.name, value)
-            }
-            Some((_, None)) => return (state, gone()),
-            None => return (state, nothing_open()),
-        },
-    };
-
-    (state, vec![Command::CopyToClipboard { text, label }])
-}
-
-/// Stages `e`: opens the inline editor on the Open value's whole body
-/// (R3.2, R4.1, ADR-0014).
-///
-/// Only `Value::Str` and `Value::Json` are editable this way — a text editor
-/// is not guaranteed to round-trip arbitrary bytes, so `Value::Binary` and
-/// every collection type are refused with a notice rather than risking silent
-/// corruption of a value nobody asked to have reformatted. Values over
-/// [`crate::state::editor::MAX_EDIT_BYTES`] are refused the same way.
-///
-/// Emits no command: the buffer lives entirely in the core until it is
-/// staged. Read-only Mode does not block opening — refusal stays at the
-/// confirm dialog's `y`, so the reader always sees the real command before
-/// learning whether they are allowed to run it (DESIGN §6.5).
-fn open_editor(mut state: State) -> (State, Vec<Command>) {
-    let notify = |text: &str| vec![Command::Notify { text: text.into() }];
-    // `e`/`a`/`d` are all focus-dependent (G, PLAN M2 task 6 follow-up): with
-    // the keys pane focused, moving the cursor there fetches nothing, so
-    // acting on whatever key happens to be open in the Viewer would be acting
-    // on a key the reader may not even be looking at. `pane_is_on_screen`
-    // still lets this action through in that case (there may be no value pane
-    // to focus at all, below 70 columns) — the notice, not silence, is what
-    // tells the reader to `Tab` over.
+    // `r` acts on the focused pane and nothing else (R2.7), and the
+    // hint bar names which half is in force. The keys pane is not
+    // push-live — the deletions it can detect for free arrive with the
+    // metadata it was already fetching, and anything else needs the
+    // keyspace walked again (DESIGN §9).
+    //
+    // The held-update branch below used to sit *above* this check, so
+    // `r` in the keys pane with an update waiting in the Viewer applied
+    // that update and did not rescan — while the hint bar said
+    // `r rescan`. The list did not move, no scan readout appeared, and
+    // a value in the other pane changed instead: no error, no feedback,
+    // nothing to explain it. That is the same defect 6d665a3 fixed,
+    // surviving in the one branch that ran before the focus check.
     if state.keys_pane_focused() {
-        let text = if state.open.is_some() {
-            "Tab to the value pane to edit"
-        } else {
-            "open a key first"
-        };
-        return (state, notify(text));
+        // `None` is the same traversal the session opened with: the
+        // scan has never been server-side filtered, `/` narrows the
+        // Loaded set on this side, and so the active filter survives a
+        // rescan without being mentioned here.
+        return (state, vec![Command::StartScan { pattern: None }]);
     }
-    let Some(open) = state.open.as_ref() else {
-        return (state, notify("nothing open to edit"));
-    };
-    if open.deleted_at_ms.is_some() {
-        return (state, notify("gone — nothing to edit"));
-    }
-    // The previous edit's `SET` has not been read back yet; a new buffer
-    // opened now would be replaced by that read the moment it lands.
-    if open.is_editing() {
-        return (state, notify("still saving the last edit"));
-    }
-    let Some(value) = open.value.as_ref() else {
-        return (state, notify("nothing open to edit"));
-    };
-    // A Hash has no "whole value" to edit in place — `e` picks the field the
-    // value cursor is on instead (D4, PLAN M2 task 6). `Enter`
-    // (`Action::EnterValueCursor`) is what puts a cursor on a row at all, so
-    // without one there is nothing to have picked.
-    if let Value::Hash(pairs) = value {
-        if !open.cursor_active {
-            return (state, notify("Enter to pick a field"));
-        }
-        let Some((field, field_value)) = pairs.pairs.get(open.cursor).cloned() else {
-            return (state, notify("Enter to pick a field"));
-        };
-        return match EditBuffer::for_hash_field(&field, &field_value) {
-            Ok(buffer) => {
-                if let Some(open) = state.open.as_mut() {
-                    open.begin_edit(buffer);
-                }
-                (state, Vec::new())
-            }
-            Err(text) => (state, notify(text)),
-        };
-    }
-    match EditBuffer::from_value(value, open.cursor) {
-        Ok(buffer) => {
-            if let Some(open) = state.open.as_mut() {
-                open.begin_edit(buffer);
-            }
-            (state, Vec::new())
-        }
-        Err(text) => (state, notify(text)),
-    }
-}
-
-/// Stages `a`: opens the two-part `FIELD`/`VALUE` add form on the Open Hash,
-/// on the name part (PLAN M2 task 6 follow-up, F). No cursor prerequisite —
-/// a new field has no row to have picked yet, unlike `e`.
-///
-/// Emits no command: the form lives entirely in the core, the same as every
-/// other inline edit. `editing` is set from the moment it opens — there is no
-/// longer a name-only capture stage before an [`EditBuffer`] exists, so this
-/// is also the moment one is created.
-fn begin_add_field(mut state: State) -> (State, Vec<Command>) {
-    let notify = |text: &str| vec![Command::Notify { text: text.into() }];
-    if state.keys_pane_focused() {
-        let text = if state.open.is_some() {
-            "Tab to the value pane to edit"
-        } else {
-            "open a key first"
-        };
-        return (state, notify(text));
-    }
-    let Some(open) = state.open.as_ref() else {
-        return (state, notify("nothing open to edit"));
-    };
-    if open.deleted_at_ms.is_some() {
-        return (state, notify("gone — nothing to edit"));
-    }
-    if open.is_editing() {
-        return (state, notify("still saving the last edit"));
-    }
-    if !matches!(open.value, Some(Value::Hash(_))) {
-        return (state, notify("fields can only be added to a hash"));
-    }
-    if let Some(open) = state.open.as_mut() {
-        open.begin_edit(EditBuffer::new_hash_field());
-    }
-    (state, Vec::new())
-}
-
-/// Whether `Enter`, `↓` and `⌃S` are blocked on the add form's name part
-/// (PLAN M2 task 6 follow-up, D): an empty name, or one already in the
-/// fetched window. `true` with nothing to check at all, so a caller need not
-/// re-verify `open`/`editor` exist first.
-fn hash_add_blocked(state: &State) -> bool {
-    let Some(open) = &state.open else {
-        return true;
-    };
-    let Some(name) = open.editor().and_then(EditBuffer::field_name) else {
-        return true;
-    };
-    name.is_empty() || open.hash_field_shown_duplicate()
-}
-
-/// Keys read while the add form's name part is active (PLAN M2 task 6
-/// follow-up, F/N) — shaped like the old field-name capture it replaces:
-/// plain characters append, Backspace removes one, Paste appends with
-/// newlines stripped (handled in `update`'s `Msg::Paste` arm, not here).
-/// `Enter`/`↓` advance to the value part and `⌃S` stages directly from here,
-/// all three gated by [`hash_add_blocked`]; `Esc` discards the whole add.
-fn name_part_key(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
-    if let Some(action) = state.keymap.action_for(&key) {
-        match action {
-            Action::EditorStage => {
-                if hash_add_blocked(&state) {
-                    return (state, Vec::new());
-                }
-                return stage_editor(state);
-            }
-            // Esc always discards the buffer entirely, the same as every
-            // other Esc in the app — never a return to a prior draft.
-            Action::Cancel => {
-                if let Some(open) = &mut state.open {
-                    open.end_edit();
-                }
-                return (state, Vec::new());
-            }
-            _ => {}
-        }
-    }
-    match key.code {
-        KeyCode::Enter | KeyCode::Down => {
-            if !hash_add_blocked(&state)
-                && let Some(editor) = state.open.as_mut().and_then(OpenKey::typing_mut)
-            {
-                editor.advance_to_value();
-            }
-            (state, Vec::new())
-        }
-        KeyCode::Backspace => {
-            if let Some(editor) = state.open.as_mut().and_then(OpenKey::typing_mut) {
-                editor.name_pop();
-            }
-            (state, Vec::new())
-        }
-        KeyCode::Char(c) if !key.ctrl && !key.alt => {
-            if let Some(editor) = state.open.as_mut().and_then(OpenKey::typing_mut) {
-                editor.name_push(c);
-            }
-            (state, Vec::new())
-        }
-        _ => (state, Vec::new()),
-    }
-}
-
-/// `⌃S`: stage the inline editor's buffer for confirmation, or close it
-/// silently if nothing changed (ADR-0014).
-///
-/// `editing` stays true when something is staged — R3.8's guard needs to hold
-/// until the write settles, not just until the buffer closes, or this
-/// very `SET`'s own Refetch would find `editing` false and apply its own
-/// reply immediately instead of going through the confirm dialog first.
-fn stage_editor(mut state: State) -> (State, Vec<Command>) {
-    let Some(open) = state.open.as_mut() else {
-        return (state, Vec::new());
-    };
-    let Some(editor) = open.typing() else {
-        return (state, Vec::new());
-    };
-    // A brand-new field has no prior value to be unchanged from — an empty
-    // value is a real value Redis allows, not "nothing to save" (D1).
-    let is_new_field = matches!(editor.target(), EditTarget::NewHashField { .. });
-    if !is_new_field && !editor.is_dirty() {
-        open.end_edit();
-        return (state, Vec::new());
-    }
-    let name = open.name.clone();
-    // Staged, not closed: the pane keeps showing what is about to be
-    // written under the dialog, instead of the value it replaces.
-    let Some(editor) = open.stage_edit() else {
-        return (state, Vec::new());
-    };
-    let original = editor.original().to_vec();
-    let new = editor.text();
-    let was_json = editor.was_json();
-    let mutation = match editor.target().clone() {
-        EditTarget::Value => PendingMutation::SetString {
-            name,
-            old: original,
-            new,
-            was_json,
-        },
-        EditTarget::HashField { field } => PendingMutation::SetHashField {
-            name,
-            field: field.into_bytes(),
-            old: original,
-            new,
-            was_json,
-        },
-        EditTarget::NewHashField { field, .. } => PendingMutation::AddHashField {
-            name,
-            field: field.into_bytes(),
-            value: new,
-        },
-    };
-    state.confirm = Some(mutation);
-    (state, Vec::new())
-}
-
-/// Keys read while the inline editor holds a buffer (ADR-0014), routed first
-/// by which part of the add form is active — the name part is a capture mode
-/// of its own ([`name_part_key`]), and everything else (a plain String, an
-/// existing field's value, or the add form's own value part) shares this
-/// function.
-///
-/// Keymap-resolved actions (`EditorStage`/`EditorUndo`/`EditorRedo`/`Cancel`)
-/// are checked first, so a rebinding takes effect here too; everything else
-/// is routed by raw `KeyCode`, the same discipline `filter_key` uses for its
-/// own capture mode, since a text editor's movement and insertion keys are
-/// not meaningfully "actions" a user would rebind one at a time.
-fn editor_key(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
-    if state
-        .open
-        .as_ref()
-        .and_then(OpenKey::typing)
-        .is_some_and(|e| e.active_part() == Some(FieldPart::Name))
+    // In the Viewer, a held update is the cheapest possible answer:
+    // applying what the server has already sent is the one thing `r`
+    // must never re-ask for.
+    if let Some(open) = &mut state.open
+        && open.pending.is_some()
     {
-        return name_part_key(state, key);
-    }
-    if let Some(action) = state.keymap.action_for(&key) {
-        match action {
-            Action::EditorStage => return stage_editor(state),
-            Action::EditorUndo => {
-                if let Some(editor) = state.open.as_mut().and_then(OpenKey::typing_mut) {
-                    editor.undo();
-                }
-                return (state, Vec::new());
-            }
-            Action::EditorRedo => {
-                if let Some(editor) = state.open.as_mut().and_then(OpenKey::typing_mut) {
-                    editor.redo();
-                }
-                return (state, Vec::new());
-            }
-            // Esc always discards the buffer entirely — never a return to a
-            // prior draft, consistent with every other Esc in the app.
-            Action::Cancel => {
-                if let Some(open) = &mut state.open {
-                    open.end_edit();
-                }
-                return (state, Vec::new());
-            }
-            _ => {}
-        }
-    }
-    let Some(editor) = state.open.as_mut().and_then(OpenKey::typing_mut) else {
-        return (state, Vec::new());
-    };
-    match key.code {
-        // On the add form's value part, `↑` returns to the name part once the
-        // cursor genuinely has nowhere left to go — the top screen row,
-        // including inside a wrapped first line (PLAN M2 task 6 follow-up,
-        // N). Everywhere else (an existing field, a plain String) `↑` is
-        // ordinary movement with nothing to leave to.
-        KeyCode::Up if editor.active_part() == Some(FieldPart::Value) => {
-            let before = editor.cursor();
-            editor.move_cursor(CursorMove::Up);
-            if editor.cursor() == before {
-                editor.return_to_name();
-            }
-        }
-        KeyCode::Up => editor.move_cursor(CursorMove::Up),
-        KeyCode::Down => editor.move_cursor(CursorMove::Down),
-        KeyCode::Left => editor.move_cursor(CursorMove::Back),
-        KeyCode::Right => editor.move_cursor(CursorMove::Forward),
-        KeyCode::Home => editor.move_cursor(CursorMove::Head),
-        KeyCode::End => editor.move_cursor(CursorMove::End),
-        KeyCode::PageUp => {
-            for _ in 0..VALUE_PAGE_ROWS {
-                editor.move_cursor(CursorMove::Up);
-            }
-        }
-        KeyCode::PageDown => {
-            for _ in 0..VALUE_PAGE_ROWS {
-                editor.move_cursor(CursorMove::Down);
-            }
-        }
-        KeyCode::Enter => editor.insert_newline(),
-        KeyCode::Tab => editor.insert_tab(),
-        KeyCode::Backspace => editor.backspace(),
-        KeyCode::Delete => editor.delete_forward(),
-        KeyCode::Char(c) if !key.ctrl && !key.alt => editor.insert_char(c),
-        // Ctrl/Alt chars not bound to an action above are ignored, rather
-        // than falling through to insertion — a modifier chord the keymap
-        // does not recognize is not the reader asking to type its letter.
-        _ => {}
-    }
-    (state, Vec::new())
-}
-
-/// Keys read while a mutation preview is on screen. Only `y` confirms and
-/// only Esc dismisses; every other key is ignored rather than discarding, so
-/// a stray or leaked keystroke can never silently throw away a staged
-/// mutation (ADR-0014) — spelled out here rather than resolved through the
-/// keymap because a confirm dialog, like filter capture, is a mode of its
-/// own rather than an ordinary action (R4.4, R4.6).
-fn confirm_key(mut state: State, pending: PendingMutation, key: KeyPress) -> (State, Vec<Command>) {
-    match key.code {
-        KeyCode::Char('y') if !key.ctrl && !key.alt => {
-            // Read-only Mode refuses here, at confirm, not at the keypress
-            // that staged the preview — the reader has already seen the real
-            // command and its blast radius by the time this fires
-            // (DESIGN §6.5).
-            if let Some(reason) = state.read_only {
-                clear_editing(&mut state);
-                let notice = format!("read-only ({}): not executed", reason.label());
-                return (state, vec![Command::Notify { text: notice }]);
-            }
-            // A confirmed `SetString` stays `editing` on purpose: R3.8's
-            // guard needs to hold until the write settles (`write_landed`
-            // clears it), not just until the dialog closes — otherwise
-            // this very `SET`'s own Refetch would find `editing` still true
-            // and hold its own reply instead of applying it. Delete never
-            // sets `editing` in the first place, so this is a no-op for it.
-            (state, vec![pending.into_command()])
-        }
-        KeyCode::Esc => {
-            // A deliberate full discard, never a return to the editor —
-            // consistent with every other Esc in the app, at the cost of
-            // losing a draft to a misplaced keypress.
-            clear_editing(&mut state);
-            (state, Vec::new())
-        }
-        _ => {
-            // Not the dialog's vocabulary. `key_press` already `take()`s
-            // `state.confirm` before calling here, so it must go back rather
-            // than vanish — this is the fix for the vim OSC 10/11
-            // colour-query leak (PLAN M2 task 4 rework): a `y` swallowed by
-            // this branch used to discard the preview silently.
-            state.confirm = Some(pending);
-            (state, Vec::new())
-        }
-    }
-}
-
-/// `Msg::MutationSettled`: the one place a write's outcome is given meaning
-/// (review H1). The shell only reports what the server said.
-fn mutation_settled(
-    state: State,
-    mutation: Mutation,
-    index: Option<usize>,
-    result: Result<MutationOutcome, String>,
-    at_ms: u64,
-) -> (State, Vec<Command>) {
-    match result {
-        Err(detail) => failed(state, mutation.command_label(), detail, at_ms),
-        Ok(MutationOutcome::Done) => match mutation {
-            Mutation::DeleteKey { key } => key_deleted(state, index, key, at_ms),
-            written => write_landed(state, written.key()),
-        },
-        Ok(MutationOutcome::NotWritten(why)) => not_written(state, &mutation, why, at_ms),
-        Ok(MutationOutcome::NothingToRemove) => nothing_to_remove(state, &mutation, at_ms),
-    }
-}
-
-/// A delete completed: the key is gone, whether it still existed at the
-/// moment `DEL` ran or was already gone by then (R4.3).
-///
-/// Exactly the "gone" state ADR-0006 already has words and a badge for — the
-/// row `set_gone`, and if this was the Open key, its last read value stays on
-/// screen, tombstoned, never silently cleared. Guarded by name for the same
-/// reason `ValueGone` is: a rescan between staging and confirming renumbers
-/// the Loaded set, and an unguarded index would then tombstone an unrelated
-/// key.
-fn key_deleted(
-    mut state: State,
-    index: Option<usize>,
-    name: KeyName,
-    at_ms: u64,
-) -> (State, Vec<Command>) {
-    if let Some(index) = index
-        && state.keys.name(index) == Some(name.as_bytes())
-    {
-        state.keys.set_gone(index);
-    }
-    match &mut state.open {
-        Some(open) if open.name == name => {
-            open.deleted_at_ms = Some(at_ms);
-            open.pending = None;
-            staged_edit_found_key_gone(&mut state, &name, at_ms);
-        }
-        _ => {}
-    }
-    state.notice = Some((format!("deleted {name}"), at_ms));
-    (state, Vec::new())
-}
-
-/// A write landed (R4.1).
-///
-/// What follows is the same Refetch every other change to the open key goes
-/// through: the reply is what reaches the Viewer, never the bytes this session
-/// already knew it sent (ADR-0006: no value cache, not even a
-/// one-message-long one). Guarded by the key: the reader may have moved on to
-/// a different key by the time this lands.
-fn write_landed(mut state: State, key: &KeyName) -> (State, Vec<Command>) {
-    if !state.open.as_ref().is_some_and(|o| o.name == *key) {
+        open.take_pending();
+        open.at_rest = true;
         return (state, Vec::new());
     }
-    // Clear *before* minting the Refetch, not after its reply lands —
-    // `refetch`'s own `Command::ReadKey` is answered by `Msg::ValueLoaded`,
-    // which applies immediately only if `may_apply()` is already true by the
-    // time it arrives.
-    if let Some(open) = state.open.as_mut() {
-        open.write_landed();
-    }
-    let commands = refetch(&mut state);
-    if let Some(pending) = &mut state.open_pending {
-        pending.own_write = true;
-    }
-    (state, commands)
-}
-
-/// `HDEL` found the field already gone (PLAN M2 task 6, D1, D4).
-///
-/// Not an error, and not a refusal: `HDEL` did exactly what was asked and
-/// found nothing to remove, and there is no buffer to hand anything back to —
-/// `Delete` never opens one. Reported as a notice, then a Refetch, the same way
-/// every other change to the open key is (ADR-0006).
-fn nothing_to_remove(mut state: State, mutation: &Mutation, at_ms: u64) -> (State, Vec<Command>) {
-    if !state
-        .open
-        .as_ref()
-        .is_some_and(|o| o.name == *mutation.key())
-    {
-        return (state, Vec::new());
-    }
-    state.notice = Some((
-        format!("{}: field already gone", mutation.command_label()),
-        at_ms,
-    ));
     let commands = refetch(&mut state);
     (state, commands)
 }
@@ -1572,108 +520,6 @@ fn failed(mut state: State, command: String, detail: String, at_ms: u64) -> (Sta
     (state, Vec::new())
 }
 
-/// A guarded write's precondition was no longer true by the time it reached
-/// the server (PLAN M2 task 6, D1, ADR-0014, ADR-0015).
-///
-/// `KeyGone` is exactly the String path's old behaviour: tombstone the key,
-/// as surely as a read saying so would, and hand the edited text back to the
-/// buffer since no read can recover it. `FieldGone`/`FieldExists` are not a
-/// tombstone — the key is still there — so instead of ending the edit this
-/// hands the buffer back and re-reads: R3.8 holds the reply, because the
-/// buffer is open again by the time it lands.
-fn not_written(
-    mut state: State,
-    mutation: &Mutation,
-    why: NotWritten,
-    at_ms: u64,
-) -> (State, Vec<Command>) {
-    let name = mutation.key();
-    if !state.open.as_ref().is_some_and(|o| o.name == *name) {
-        return (state, Vec::new());
-    }
-    // The mutation names its own command, so the error cannot disagree with
-    // what was actually sent (review H1).
-    let command = mutation.command_label();
-    match why {
-        NotWritten::KeyGone => {
-            let open = state.open.as_mut().expect("checked above");
-            open.deleted_at_ms = Some(at_ms);
-            open.pending = None;
-            let kept = open.editor().is_some();
-            if kept {
-                open.unstage_buffer();
-            } else {
-                open.end_edit();
-            }
-            if let Some(index) = open.index
-                && state.keys.name(index) == Some(name.as_bytes())
-            {
-                state.keys.set_gone(index);
-            }
-            let tail = if kept { ", edit kept" } else { "" };
-            state.error = Some((
-                format!("{command}: key no longer exists — nothing written{tail}"),
-                at_ms,
-            ));
-            (state, Vec::new())
-        }
-        NotWritten::FieldGone | NotWritten::FieldExists => {
-            if let Some(open) = state.open.as_mut() {
-                open.unstage_buffer();
-            }
-            let reason = if why == NotWritten::FieldGone {
-                "field no longer exists"
-            } else {
-                "field already exists"
-            };
-            state.error = Some((
-                format!("{command}: {reason} — nothing written, edit kept"),
-                at_ms,
-            ));
-            let commands = refetch(&mut state);
-            (state, commands)
-        }
-    }
-}
-
-/// The Open key came back gone while an edit of it may be staged (ADR-0014).
-///
-/// Under the confirm dialog there is no key left for `SET … XX` to write to,
-/// so the dialog closes and the buffer is handed back to be typed into: the
-/// reader's text is the one thing on screen no read can recover. With the
-/// `SET` already sent, its own `Msg::MutationSettled` decides. Once the
-/// write has landed, a staged buffer was
-/// only standing in for the read back, and goes.
-fn staged_edit_found_key_gone(state: &mut State, name: &KeyName, at_ms: u64) {
-    // Every mutation that names this key, not just `SetString` — a
-    // `SetHashField`/`AddHashField` dialog closes and hands its buffer back
-    // exactly the same way; a `DeleteHashField` dialog simply closes with the
-    // notice, since it never had a buffer to hand back (`unstage_buffer` is a
-    // no-op with none).
-    let dialog_up = matches!(
-        &state.confirm,
-        Some(
-            PendingMutation::SetString { name: staged, .. }
-            | PendingMutation::SetHashField { name: staged, .. }
-            | PendingMutation::AddHashField { name: staged, .. }
-            | PendingMutation::DeleteHashField { name: staged, .. }
-        ) if staged == name
-    );
-    let Some(open) = state.open.as_mut().filter(|o| o.name == *name) else {
-        return;
-    };
-    if dialog_up {
-        open.unstage_buffer();
-        state.confirm = None;
-        state.notice = Some((
-            format!("{name} is gone — nothing written, edit kept"),
-            at_ms,
-        ));
-    } else if !open.is_editing() {
-        open.drop_staged_buffer();
-    }
-}
-
 /// Ends the edit a dialog was confirming, if there is one. Harmless (and a
 /// no-op) for mutations that never open an edit, such as `DeleteKey` — safe to
 /// call unconditionally from both of `confirm_key`'s non-executing branches.
@@ -1681,237 +527,6 @@ fn clear_editing(state: &mut State) {
     if let Some(open) = &mut state.open {
         open.end_edit();
     }
-}
-
-/// Keys typed while the filter is capturing.
-fn filter_key(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
-    match key.code {
-        KeyCode::Esc => {
-            // Esc abandons the filter entirely rather than keeping a partial
-            // pattern nobody typed on purpose.
-            state.filtering = false;
-            state.list.filter.clear();
-            state.rebuild_list();
-            after_move(state)
-        }
-        KeyCode::Enter => {
-            state.filtering = false;
-            (state, Vec::new())
-        }
-        KeyCode::Backspace => {
-            state.list.filter.pop();
-            state.rebuild_list();
-            after_move(state)
-        }
-        KeyCode::Char(c) if !key.ctrl && !key.alt => {
-            state.list.filter.push(c);
-            state.rebuild_list();
-            after_move(state)
-        }
-        _ => (state, Vec::new()),
-    }
-}
-
-/// How many rows one wheel notch moves — a handful, not one: on a 500-entry
-/// zset, one row per notch would take a hundred notches to cross the
-/// viewport, and a mouse wheel step is coarser than an arrow key on purpose.
-const MOUSE_SCROLL_ROWS: isize = 3;
-
-/// Turn a mouse action into the same state changes a click or a key would
-/// have produced — R7.3, and the last of the three things it names.
-///
-/// This is the one place `update` computes a [`layout::Layout`]. Doing it
-/// here rather than threading pane rectangles through `Msg` keeps the
-/// boundary in the same place as everywhere else: the shell reports what
-/// happened in terminal cells, the core is the only thing that knows what a
-/// cell means. `layout` is a pure function of `(area, focus, split_adjust)`
-/// — no clock, no I/O — so calling it here does not reach outside the
-/// functional core (ADR-0011); it is exactly the geometry the render side
-/// computed for the frame the reader is looking at.
-fn mouse_action(mut state: State, action: MouseAction) -> (State, Vec<Command>) {
-    let area = ratatui::layout::Rect::new(0, 0, state.cols, state.rows);
-    let plan = layout::layout(area, state.focus, state.split_adjust);
-
-    match action {
-        MouseAction::Down { col, row } => {
-            // Grabbing the divider begins a resize-drag; anywhere else in a
-            // pane focuses it. The two share one gesture the way dragging a
-            // window's edge and clicking inside it share "mouse down" in any
-            // GUI. Below 70 columns there is no divider to grab (one pane
-            // fills the screen), so only the focus half can apply there.
-            if state.split_is_adjustable()
-                && let Some(value) = plan.value
-                && col == value.x.saturating_sub(1)
-                && row >= plan.keys.y
-                && row < plan.keys.y + plan.keys.height
-            {
-                state.resizing_split = true;
-                return (state, Vec::new());
-            }
-            if let Some(pane) = pane_at(&plan, col, row) {
-                state.focus = pane;
-            }
-            (state, Vec::new())
-        }
-        MouseAction::Drag { col, .. } => {
-            if state.resizing_split {
-                // The offset is relative to the density's own base width, not
-                // to the absolute column — that is what `split_adjust` means
-                // everywhere else it is read, including a `⌃←`/`⌃→` nudge
-                // landing on top of a drag that came before it.
-                let base = layout::layout(area, state.focus, 0).keys.width;
-                state.split_adjust = i32::from(col) as i16 - base as i16;
-                state.rewrap_open();
-            }
-            (state, Vec::new())
-        }
-        MouseAction::Up => {
-            state.resizing_split = false;
-            (state, Vec::new())
-        }
-        // Scrolling acts on whatever pane is under the cursor, focus or not —
-        // the ordinary convention (a window manager does not require a click
-        // first either) — and moves focus to match, so a keyboard action
-        // right after does not silently land somewhere else (the same
-        // reasoning `pane_visible` gates keyboard actions on).
-        MouseAction::ScrollUp { col, row } => scroll_at(state, &plan, col, row, -1),
-        MouseAction::ScrollDown { col, row } => scroll_at(state, &plan, col, row, 1),
-    }
-}
-
-/// Which pane, if any, a cell belongs to.
-fn pane_at(plan: &layout::Layout, col: u16, row: u16) -> Option<Pane> {
-    let contains = |r: ratatui::layout::Rect| {
-        col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
-    };
-    if contains(plan.keys) {
-        Some(Pane::Keys)
-    } else if plan.value.is_some_and(contains) {
-        Some(Pane::Value)
-    } else {
-        None
-    }
-}
-
-/// Scroll whichever pane the wheel was over, `dir` notches of
-/// [`MOUSE_SCROLL_ROWS`] each.
-fn scroll_at(
-    mut state: State,
-    plan: &layout::Layout,
-    col: u16,
-    row: u16,
-    dir: isize,
-) -> (State, Vec<Command>) {
-    match pane_at(plan, col, row) {
-        Some(Pane::Keys) => {
-            state.focus = Pane::Keys;
-            move_selection(state, dir * MOUSE_SCROLL_ROWS)
-        }
-        Some(Pane::Value) => {
-            state.focus = Pane::Value;
-            if let Some(open) = &mut state.open {
-                open.cursor_active = true;
-            }
-            move_cursor(state, dir * MOUSE_SCROLL_ROWS)
-        }
-        None => (state, Vec::new()),
-    }
-}
-
-/// Move the selection, clamped to the Loaded set.
-fn move_selection(mut state: State, by: isize) -> (State, Vec<Command>) {
-    if state.row_count() == 0 {
-        return (state, Vec::new());
-    }
-    let last = state.row_count() as isize - 1;
-    let next = (state.view.selected as isize + by).clamp(0, last);
-    state.view.selected = next as usize;
-    after_move(state)
-}
-
-/// Scrolling reveals rows whose metadata has not been fetched, so every move
-/// asks for what is newly visible — and only what is visible (R2.4).
-fn after_move(mut state: State) -> (State, Vec<Command>) {
-    // Moving in the key list is not scrolling the value, so the Viewer returns
-    // to rest: whatever arrives next may land without asking.
-    if let Some(open) = &mut state.open
-        && open.offset == 0
-    {
-        open.at_rest = true;
-    }
-    let height = state.visible_rows();
-    state.view = state.view.scrolled_to_selection(height);
-    let indices = state.rows_needing_metadata();
-    if indices.is_empty() {
-        (state, Vec::new())
-    } else {
-        (state, vec![Command::FetchMetadata { indices }])
-    }
-}
-
-/// Whether plain movement currently drives the value cursor rather than the
-/// key list (`Action::EnterValueCursor` sets this; `Action::Cancel` clears
-/// it). A tiny helper so the six movement handlers read as a guard, not a
-/// chain of `state.open.as_ref()...`.
-fn cursor_active(state: &State) -> bool {
-    state.open.as_ref().is_some_and(|o| o.cursor_active)
-}
-
-/// A fixed stand-in for the value pane's visible row count, in the same
-/// spirit the old `Ctrl+PgUp`/`PgDn` page size was ("the viewer does not know
-/// its own rendered height here, and a fixed page beats no paging at all for
-/// a 500-entry zset or a large hex dump") — `update()` has no access to the
-/// layout the render pass computes (ADR-0011), so this is an approximation,
-/// used both for paging and for keeping the cursor inside the visible window.
-const VALUE_PAGE_ROWS: usize = 20;
-
-/// Move the value cursor by `by` rows, clamped to the value's length. Shared
-/// by every viewer, because the frame around a value is one abstraction
-/// (R3.1) — a hex dump and a hash pane both move this way.
-fn move_cursor(mut state: State, by: isize) -> (State, Vec<Command>) {
-    let Some(open) = &mut state.open else {
-        return (state, Vec::new());
-    };
-    let Some(value) = &open.value else {
-        return (state, Vec::new());
-    };
-    let last = value.viewer().row_count().saturating_sub(1);
-    open.cursor = (open.cursor as isize + by).clamp(0, last as isize) as usize;
-    after_cursor_move(state)
-}
-
-/// Move the value cursor straight to `to`, clamped; `usize::MAX` means "the
-/// end".
-fn cursor_to(mut state: State, to: usize) -> (State, Vec<Command>) {
-    let Some(open) = &mut state.open else {
-        return (state, Vec::new());
-    };
-    let Some(value) = &open.value else {
-        return (state, Vec::new());
-    };
-    let last = value.viewer().row_count().saturating_sub(1);
-    open.cursor = to.min(last);
-    after_cursor_move(state)
-}
-
-/// Keep the cursor's row inside the visible window — reusing the key list's
-/// own scroll-follow utility rather than re-deriving it — and hold live
-/// updates once the cursor has moved off the top (ADR-0006). Moving back to
-/// the top does not by itself undo that: the reader chooses when a held
-/// update lands, the same discipline the old raw-offset scroll used.
-fn after_cursor_move(mut state: State) -> (State, Vec<Command>) {
-    if let Some(open) = &mut state.open {
-        let viewport = crate::render::keys::Viewport {
-            offset: open.offset,
-            selected: open.cursor,
-        }
-        .scrolled_to_selection(VALUE_PAGE_ROWS);
-        open.offset = viewport.offset;
-        if open.cursor > 0 {
-            open.at_rest = false;
-        }
-    }
-    (state, Vec::new())
 }
 
 fn quit(mut state: State) -> (State, Vec<Command>) {

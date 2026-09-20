@@ -51,11 +51,11 @@ pub fn frame(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect) -> Buf
     if state.help_open {
         help_overlay(state, theme, area, &mut buf);
     }
-    if mode(state) == Mode::Confirm {
-        let pending = state
-            .confirm
-            .as_ref()
-            .expect("Mode::Confirm implies confirm");
+    // Not `mode()`: drawing the dialog is not a precedence question. The
+    // overlay is drawn last, so it is on top whenever one is staged, and
+    // asking the mode here would only buy an `expect` on the way to the
+    // `PendingMutation` this needs anyway.
+    if let Some(pending) = &state.confirm {
         confirm_overlay(state, pending, theme, area, &mut buf);
     }
     buf

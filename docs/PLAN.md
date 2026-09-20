@@ -43,14 +43,14 @@ redis-pane/
 │   │   ├── msg.rs             Msg — everything that can happen
 │   │   ├── command.rs         Command — everything the shells must do
 │   │   ├── update/            update(State, Msg) -> (State, Vec<Command>)
-│   │   │   ├── mod.rs          update(), key_press(), Mode + mode(), shared read helpers
-│   │   │   ├── link.rs         Connected, ConnectionLost, TrackingArmed, Invalidated, ServerState
-│   │   │   ├── scan.rs         ScanStarted/Batch/Complete/Cancelled/Failed, MetadataBatch
-│   │   │   ├── keys.rs         selection, filter capture, tree fold, sort, move_selection
-│   │   │   ├── viewer.rs       ValueLoaded, ValueGone, cursor movement and scroll, build_copy
-│   │   │   ├── editor.rs       open_editor, begin_add_field, stage_editor, editor_key
-│   │   │   ├── confirm.rs      confirm_key, mutation_settled, key_deleted, write_landed
-│   │   │   └── mouse.rs        mouse_action, pane_at, scroll_at
+│   │   │   ├── mod.rs          update(), key_press(), Mode + mode(), read helpers
+│   │   │   ├── link.rs         connection, tracking and server-condition messages
+│   │   │   ├── scan.rs         scan and metadata batches; the Loaded set cap
+│   │   │   ├── keys.rs         selection, filter capture, tree fold, sort
+│   │   │   ├── viewer.rs       value replies, cursor movement and scroll, copy
+│   │   │   ├── editor.rs       inline edits: open, type, stage
+│   │   │   ├── confirm.rs      the dialog, and what a settled mutation does
+│   │   │   └── mouse.rs        clicks, scroll, divider drags
 │   │   ├── render/            panes, Viewers, title bar, hint bar
 │   │   ├── theme/             semantic tokens, palettes, capability degradation
 │   │   ├── keymap/            bindings as data

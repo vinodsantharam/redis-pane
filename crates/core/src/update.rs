@@ -508,11 +508,19 @@ fn scan_batch(mut state: State, keys: Vec<Vec<u8>>) -> (State, Vec<Command>) {
     }
 }
 
-/// Resolve a keypress through the keymap, never against hard-coded keys.
-///
-/// The hint bar and help overlay read the same map, so what is shown is always
-/// the effective binding after user overrides (R7.5).
-fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
+/// Which input mode is active. Derived from `State`, never stored: two
+/// fields that must agree are two fields that can disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mode {
+    Confirm,
+    Editing,
+    Filtering,
+    Normal,
+}
+
+/// The one place mode precedence is decided — confirm dialog, then editor,
+/// then filter, then Normal.
+pub(crate) fn mode(state: &State) -> Mode {
     // A staged mutation is a modal dialog: it is the only thing on screen
     // that can act on the keypress until it is confirmed or dismissed,
     // exactly as `state.filtering`, below, is the only thing capturing text.
@@ -520,20 +528,39 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
     // that staged the mutation — so the preview always shows the real
     // command and its blast radius before the reader learns whether they
     // are allowed to run it (R4.4, DESIGN §6.5).
-    if let Some(pending) = state.confirm.take() {
-        return confirm_key(state, pending, key);
+    if state.confirm.is_some() {
+        return Mode::Confirm;
     }
     // The inline editor is a mode of its own too (ADR-0014), ranked above the
     // filter: both capture ordinary characters as text, and a key open for
     // editing outranks a filter that could only have been left running in
     // the background.
     if state.open.as_ref().and_then(OpenKey::typing).is_some() {
-        return editor_key(state, key);
+        return Mode::Editing;
     }
     // While the filter is capturing, ordinary characters are text rather than
     // commands. Only Esc and Enter mean anything else.
     if state.filtering {
-        return filter_key(state, key);
+        return Mode::Filtering;
+    }
+    Mode::Normal
+}
+
+/// Resolve a keypress through the keymap, never against hard-coded keys.
+///
+/// The hint bar and help overlay read the same map, so what is shown is always
+/// the effective binding after user overrides (R7.5).
+fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
+    match mode(&state) {
+        Mode::Confirm => {
+            // `confirm_key` needs the `PendingMutation` by value: `mode` only
+            // answers which mode is active, so the take() still happens here.
+            let pending = state.confirm.take().expect("Mode::Confirm implies confirm");
+            return confirm_key(state, pending, key);
+        }
+        Mode::Editing => return editor_key(state, key),
+        Mode::Filtering => return filter_key(state, key),
+        Mode::Normal => {}
     }
     let Some(action) = state.keymap.action_for(&key) else {
         return (state, Vec::new());
@@ -3397,6 +3424,50 @@ mod tests {
         state.keys.push(b"k");
         state.rebuild_list();
         state
+    }
+
+    fn open_with_live_editor() -> State {
+        let value = crate::state::Value::Hash(crate::state::value::PairValue {
+            pairs: vec![("f".into(), "v".into())],
+            total: 1,
+        });
+        let mut open = OpenKey::new(Some(0), "k".into(), value, -1, 0, 0);
+        open.edit = crate::state::EditPhase::Typing(EditBuffer::new_hash_field());
+        State {
+            open: Some(open),
+            ..State::default()
+        }
+    }
+
+    #[test]
+    fn confirm_outranks_a_live_editor() {
+        let mut s = open_with_live_editor();
+        s.confirm = Some(PendingMutation::DeleteKey {
+            index: 0,
+            name: "k".into(),
+        });
+        assert_eq!(mode(&s), Mode::Confirm);
+    }
+
+    #[test]
+    fn editor_outranks_the_filter() {
+        let mut s = open_with_live_editor();
+        s.filtering = true;
+        assert_eq!(mode(&s), Mode::Editing);
+    }
+
+    #[test]
+    fn filter_alone_is_filtering() {
+        let s = State {
+            filtering: true,
+            ..State::default()
+        };
+        assert_eq!(mode(&s), Mode::Filtering);
+    }
+
+    #[test]
+    fn bare_state_is_normal() {
+        assert_eq!(mode(&State::default()), Mode::Normal);
     }
 }
 

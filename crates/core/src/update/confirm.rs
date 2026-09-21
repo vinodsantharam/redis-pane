@@ -130,12 +130,16 @@ pub(super) fn write_landed(mut state: State, key: &KeyName) -> (State, Vec<Comma
     (state, commands)
 }
 
-/// `HDEL` found the field already gone (PLAN M2 task 6, D1, D4).
+/// `HDEL`/`SREM` found the field or member already gone (PLAN M2 task 6, D1,
+/// D4; PLAN M2 task 7, D5, ADR-0016).
 ///
-/// Not an error, and not a refusal: `HDEL` did exactly what was asked and
-/// found nothing to remove, and there is no buffer to hand anything back to —
-/// `Delete` never opens one. Reported as a notice, then a Refetch, the same way
-/// every other change to the open key is (ADR-0006).
+/// Not an error, and not a refusal: the command did exactly what was asked
+/// and found nothing to remove, and there is no buffer to hand anything back
+/// to — `Delete` never opens one. Reported as a notice, then a Refetch, the
+/// same way every other change to the open key is (ADR-0006). Which noun the
+/// notice uses is decided here, once, from the `Mutation` itself — the same
+/// discipline `NotWritten::reason` uses to keep a member from being reported
+/// in a field's words (CLAUDE.md's glossary distinction).
 pub(super) fn nothing_to_remove(
     mut state: State,
     mutation: &Mutation,
@@ -148,8 +152,12 @@ pub(super) fn nothing_to_remove(
     {
         return (state, Vec::new());
     }
+    let what = match mutation {
+        Mutation::DeleteSetMember { .. } => "member",
+        _ => "field",
+    };
     state.notice = Some((
-        format!("{}: field already gone", mutation.command_label()),
+        format!("{}: {what} already gone", mutation.command_label()),
         at_ms,
     ));
     let commands = refetch(&mut state);

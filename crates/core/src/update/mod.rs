@@ -342,7 +342,8 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
         }
         // `d` is focus-dependent (D4, PLAN M2 task 6), like `c`: the keys
         // pane's Selected-key delete below is unchanged; the Viewer's
-        // Hash-field delete is new.
+        // Hash-field/Set-member delete (D5, PLAN M2 task 7, ADR-0016) is
+        // `delete_hash_field`'s job, which tells the two apart itself.
         Action::Delete if state.keys_pane_focused() => delete_selected_key(state),
         Action::Delete => delete_hash_field(state),
         // Nothing is staged — `key_press` intercepts every keypress before

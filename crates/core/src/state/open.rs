@@ -563,6 +563,28 @@ impl OpenKey {
         }
         matches!(&self.value, Some(Value::Hash(pairs)) if pairs.has_field(name))
     }
+
+    /// Whether the reader's typed Set member, while adding one, matches a
+    /// member already in the fetched window (PLAN M2 task 7, D3, ADR-0016) —
+    /// exact byte equality. `false` with nothing to check: no editor, or a
+    /// target other than [`super::EditTarget::NewSetMember`]. A Set member has
+    /// no name to compare the way [`OpenKey::hash_field_shown_duplicate`]
+    /// compares a field name — the typed bytes *are* the identity, so this
+    /// compares the buffer's whole text against every shown member instead. An
+    /// empty typed member is still checked: Redis allows an empty member, so
+    /// one could genuinely already be shown. A hidden duplicate outside the
+    /// window is not this function's job; the `SADD` guard at write time is
+    /// what catches those.
+    pub fn set_member_shown_duplicate(&self) -> bool {
+        let Some(editor) = self.editor() else {
+            return false;
+        };
+        if !matches!(editor.target(), super::EditTarget::NewSetMember) {
+            return false;
+        }
+        let text = editor.text();
+        matches!(&self.value, Some(Value::Set(members)) if members.members.contains(&text))
+    }
 }
 
 fn ago(now_ms: u64, then_ms: u64) -> String {

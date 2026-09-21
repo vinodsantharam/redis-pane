@@ -274,3 +274,29 @@ None of this wires a keypress to either new mutation — `a`/`d`/`e` on a Set st
 before this phase, since nothing in `update/keys.rs` or `update/mod.rs`'s dispatch constructs
 `EditTarget::NewSetMember` or stages `DeleteSetMember`. Phase 3 is still the phase that makes any
 of this reachable.
+
+**Phase 3.** Two places where D3's wording needed a judgment call the ADR did not fully settle,
+plus one bug the wiring exposed:
+
+- D3 says the shown-duplicate guard "blocks `Enter`/`Ctrl-S` while typing," echoing ADR-0015's
+  words for the Hash *name part*. But `EditTarget::NewSetMember` has no `FieldPart` — `active_part()`
+  returns `None` — so it never routes through `name_part_key`, the only place `Enter` means
+  "advance/stage" rather than "insert a newline." Blocking literal `Enter` on the Set add form's
+  single `TextArea` would just prevent multi-line members, which is not what a duplicate guard is
+  for. Implemented: the guard blocks `⌃S` (`Action::EditorStage`) only —
+  `crates/core/src/update/editor.rs`'s `set_member_blocked`, called from `editor_key`'s
+  `Action::EditorStage` arm — and `Enter` keeps its ordinary meaning (insert a newline) for every
+  `EditTarget`, Set included. If literal `Enter`-as-stage is wanted for the Set form, that is a
+  follow-up, not a read of D3 phase 3 could safely make unilaterally.
+- D4 ("binary members are refused ... 'binary members aren't editable here yet'") does not say
+  where this notice appears, since D1 already refuses `e` on every Set row unconditionally. Read it
+  as governing `e`'s *wording*: a non-UTF-8 member gets D4's notice, a UTF-8 one gets D1's
+  rename-notice — mirroring how Hash's `for_hash_field` only special-cases binary content, never a
+  blanket refusal. Implemented in `open_editor` (`crates/core/src/update/editor.rs`).
+- `crates/core/src/update/confirm.rs:151` (`nothing_to_remove`) hard-coded "field already gone" for
+  every `MutationOutcome::NothingToRemove`, including a `DeleteSetMember` whose `SREM` found the
+  member already gone. Phase 2 could not have caught this — nothing staged a `DeleteSetMember`
+  yet — but it is exactly the kind of member/field wording bug CLAUDE.md's glossary section warns
+  about, and phase 3's own `d`-wiring is what makes it reachable. Fixed in this phase: the notice
+  now reads "member already gone" for `DeleteSetMember`, "field already gone" for everything else,
+  decided once from the `Mutation` itself.

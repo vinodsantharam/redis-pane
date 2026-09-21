@@ -152,9 +152,17 @@ the add form is open.
 
 **Checkpoint 3.** Same three commands. Report counts.
 
-### Phase 4 — The shell, and Docker-backed proof
+### Phase 4 — Docker-backed proof of the shell
 
-`SET_MEMBER_ADD_SCRIPT`, `add_set_member`, `delete_set_member`, and the two `execute` arms.
+**The shell code already exists.** `SET_MEMBER_ADD_SCRIPT`, `add_set_member`, `delete_set_member`,
+the `MemberAdd` enum and both `execute` arms landed in phase 2: adding a `Mutation` variant makes
+`execute`'s match non-exhaustive, and the honest options there were a real implementation or a
+`todo!()` that CLAUDE.md forbids. The phase boundary was drawn in the wrong place — `Mutation` *is*
+the seam between core and shell, so a phase that adds a variant cannot stop at the crate edge. See
+"Found while building".
+
+So phase 4 is proof, not construction. **Read `redis/mutate.rs` first and extend it only if a test
+finds it wrong** — do not rewrite what is there.
 
 Integration tests in `crates/app/tests/integration.rs`, every one `#[ignore]`d, proving against a
 real server: the add script never recreates a gone key; it refuses a duplicate without writing;

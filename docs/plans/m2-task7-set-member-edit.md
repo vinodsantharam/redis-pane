@@ -77,8 +77,16 @@ added. Remove is `SREM key member`, with `0` removed reported as a notice exactl
 The Hash add form is a two-part `FIELD`/`VALUE` form because a field has a name *and* a value. A
 Set member is only a value, so `EditTarget::NewSetMember` carries no `FieldPart` and the form is a
 single capture. The shown-duplicate guard still applies — exact byte equality against a member in
-the fetched window blocks `Enter`/`Ctrl-S` while typing — and a duplicate hidden outside the 500
-window is still caught at write time by `SADD` returning 0, the same division ADR-0015 accepted.
+the fetched window blocks staging — and a duplicate hidden outside the 500 window is still caught
+at write time by `SADD` returning 0, the same division ADR-0015 accepted.
+
+**The guard blocks `Ctrl-S`, not `Enter`** — corrected during phase 3, where this decision
+originally said both. `Enter`'s job in the Hash add form is to *advance from the name part to the
+value part*, not to submit; with one part there is nothing to advance to, so `Enter` keeps its
+ordinary editor meaning and inserts a newline, exactly as it does in a String buffer. `Ctrl-S`
+(`Action::EditorStage`) is the stage key in every buffer, and it is the one the guard belongs on.
+A member that picks up a stray newline this way is not silently written: the confirm dialog shows
+it before anything runs, which is what R4.4's preview is for.
 
 **D4. Binary members are refused**, with a notice, exactly as binary Hash fields are
 (`editor.rs`: "binary fields aren't editable here yet"). Wording: "binary members aren't editable

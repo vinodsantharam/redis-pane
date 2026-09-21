@@ -133,6 +133,42 @@ returning `0` — the same division ADR-0015 accepted for a hidden duplicate fie
   `delete_set_member`, and a `MemberAdd` result enum, plumbed through the same
   `Command::Execute`/`Msg::MutationSettled` shape review M2 (H1) already generalized Hash's writes
   onto — no new `Command`/`Msg` variants are needed for this type.
+- The hint bar (`crates/core/src/render/mod.rs`) gains a Set-shaped arm alongside the Hash one:
+  `a add · d remove`, with no `edit` — D1 means `e` never opens a buffer for a Set, so the hint
+  must not promise a mode `open_editor` never gives it.
+
+**Phase boundary corrected while building** (see the plan's "Found while building" for the full
+account): planning drew the shell (`crates/app/src/redis/mutate.rs`) as phase 4's work and the
+core types as phase 2's. Rust's exhaustive-match checking made that split unbuildable — the moment
+`Mutation::{AddSetMember, DeleteSetMember}` existed, every `match` over `Mutation` anywhere in the
+workspace, including the shell's `redis::mutate::execute`, had to cover them or the crate failed to
+build, whether or not anything could reach the new arms yet. `Mutation` is the seam between core
+and shell (review H1), so a phase that adds a variant to it cannot stop at the crate edge. `phase
+2`'s commit therefore already contains `SET_MEMBER_ADD_SCRIPT`, `add_set_member`,
+`delete_set_member` and the `MemberAdd` enum — a real implementation, not a stub, since a
+`todo!()` on an unreachable path is still the `panic!` CLAUDE.md forbids and an `Err(_)` arm would
+misreport a future success as a failure. Phase 4 proved this code against a real server rather than
+writing it.
+
+**D3 was corrected in phase 3: the shown-duplicate guard blocks `Ctrl-S` alone, not
+`Enter`/`Ctrl-S`.** The decision as drafted echoed ADR-0015's wording for the Hash *name* part,
+where `Enter` means "advance to the value part." A Set member has no name part —
+`EditTarget::NewSetMember` carries no `FieldPart`, so `active_part()` returns `None` and the buffer
+never routes through the name-part key handler that gives `Enter` that meaning. On the Set add
+form's single `TextArea`, `Enter` keeps the ordinary editor meaning it has everywhere else —
+insert a newline — and only `Ctrl-S` (`Action::EditorStage`) is gated by
+`crates/core/src/update/editor.rs`'s `set_member_blocked`. A member that picks up a stray newline
+this way is still caught before anything runs: the confirm dialog shows it in the `+` side of the
+diff, which is what R4.4's preview is for.
+
+**A member/field wording bug in `crates/core/src/update/confirm.rs`'s `nothing_to_remove`, found
+and fixed in phase 3.** Before `d` on a Set was wired, every `MutationOutcome::NothingToRemove`
+reported "field already gone" — correct for `DeleteHashField`, wrong for the `DeleteSetMember` this
+ADR adds. Fixed to decide the noun from the `Mutation` itself, once. The match still ends in a `_
+=> "field"` fallback rather than an exhaustive one, so it does not force the same decision on a
+future `DeleteZSetMember` (task 9) the way an exhaustive match would — see the M3 inventory
+(`docs/reviews/2026-09-13-codebase-design-review.md` §9) for the exact line and why it was left
+that way rather than fixed here.
 
 ## Sources
 

@@ -897,9 +897,6 @@ fn confirm_overlay(
         }
         // Guarded Set write (D2, D3, ADR-0016): same shape as the Hash add
         // above, one part narrower — a member has no name half to show.
-        // Neither dialog is reachable yet (PLAN M2 task 7 phase 3 wires the
-        // keypresses that stage these); the arms exist because this match
-        // must be exhaustive the moment the variants do.
         PendingMutation::AddSetMember { member, .. } => {
             lines.push((pending.command_text(), Token::Text));
             if let Some(guard) = pending.guard_text() {
@@ -1214,6 +1211,21 @@ pub fn hint_bar(state: &State) -> String {
         let add = state.keymap.hint(Action::Add).unwrap_or_default();
         let remove = state.keymap.hint(Action::Delete).unwrap_or_default();
         return format!("{edit} edit · {add} add · {remove} remove");
+    }
+    // A Set with the value cursor on a row, and the value pane focused: only
+    // `a`/`d` mean anything (D1, ADR-0016) — `e` always refuses, since a
+    // member has no name half to keep while "the value changes" and there is
+    // no in-place edit to hint at. Naming `edit` here would promise a mode
+    // `open_editor` never opens.
+    if !state.keys_pane_focused()
+        && state
+            .open
+            .as_ref()
+            .is_some_and(|o| o.cursor_active && matches!(o.value, Some(Value::Set(_))))
+    {
+        let add = state.keymap.hint(Action::Add).unwrap_or_default();
+        let remove = state.keymap.hint(Action::Delete).unwrap_or_default();
+        return format!("{add} add · {remove} remove");
     }
     [
         Action::Cancel,

@@ -196,7 +196,7 @@ pub(super) fn not_written(
             }
             let tail = if kept { ", edit kept" } else { "" };
             state.error = Some((
-                format!("{command}: key no longer exists — nothing written{tail}"),
+                format!("{command}: {} — nothing written{tail}", why.reason()),
                 at_ms,
             ));
             (state, Vec::new())
@@ -205,19 +205,13 @@ pub(super) fn not_written(
             if let Some(open) = state.open.as_mut() {
                 open.unstage_buffer();
             }
-            // Set member add isn't wired to any keypress yet (PLAN M2 task 7
-            // phase 3), so `MemberExists` cannot reach this arm in practice
-            // today — this arm exists only because `NotWritten` must be
-            // matched exhaustively the moment the variant exists at all
-            // (ADR-0016).
-            let reason = match why {
-                NotWritten::FieldGone => "field no longer exists",
-                NotWritten::FieldExists => "field already exists",
-                NotWritten::MemberExists => "member already exists",
-                NotWritten::KeyGone => "field no longer exists",
-            };
+            // The guards that refuse without the key going anywhere: the
+            // write is dropped, the buffer comes back, and the Viewer
+            // re-reads. `MemberExists` cannot arrive here until `a` on a Set
+            // is wired (PLAN M2 task 7 phase 3); the arm is here because
+            // `NotWritten` is matched exhaustively.
             state.error = Some((
-                format!("{command}: {reason} — nothing written, edit kept"),
+                format!("{command}: {} — nothing written, edit kept", why.reason()),
                 at_ms,
             ));
             let commands = refetch(&mut state);

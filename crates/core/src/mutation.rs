@@ -106,6 +106,25 @@ pub enum NotWritten {
     MemberExists,
 }
 
+impl NotWritten {
+    /// What to tell the reader, in the notification that names the refused
+    /// command (R7.4).
+    ///
+    /// Here rather than at the two places that report it, so a new guard
+    /// forces a wording decision once instead of silently inheriting a
+    /// neighbour's — the shape the reporting code had before this, where a
+    /// nested match needed an arm for a variant it could never see and gave
+    /// it another guard's words.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            NotWritten::KeyGone => "key no longer exists",
+            NotWritten::FieldGone => "field no longer exists",
+            NotWritten::FieldExists => "field already exists",
+            NotWritten::MemberExists => "member already exists",
+        }
+    }
+}
+
 /// What the server made of a [`Mutation`].
 ///
 /// None of these is an error: the server did exactly as asked. An error is the

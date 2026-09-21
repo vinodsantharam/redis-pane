@@ -2066,3 +2066,195 @@ async fn a_bytey_field_name_can_be_edited_without_touching_a_decoy() {
     let _ = client.quit().await;
     let _ = writer.quit().await;
 }
+
+// ── M2 task 7 — guarded Set member writes (D2, ADR-0016) ─────────────────
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn adding_a_set_member_to_a_gone_key_does_not_recreate_it() {
+    // The whole reason `SET_MEMBER_ADD_SCRIPT` exists (ADR-0016 D2): a plain
+    // `SADD` would bring a key that expired or was deleted under the confirm
+    // dialog back to life with a single member.
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer.sadd("set:1", "alpha").await.unwrap();
+    let deleted: i64 = writer.del("set:1").await.unwrap();
+    assert_eq!(deleted, 1, "setup: the key must actually have existed");
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::mutate::add_set_member(&client, b"set:1", b"beta")
+        .await
+        .unwrap();
+    assert_eq!(outcome, redis_pane::redis::mutate::MemberAdd::KeyGone);
+
+    let exists: i64 = writer.exists("set:1").await.unwrap();
+    assert_eq!(exists, 0, "the key must not be recreated");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn adding_a_duplicate_set_member_refuses_without_writing() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer.sadd("set:2", "alpha").await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::mutate::add_set_member(&client, b"set:2", b"alpha")
+        .await
+        .unwrap();
+    assert_eq!(outcome, redis_pane::redis::mutate::MemberAdd::MemberExists);
+
+    let members: Vec<String> = writer.smembers("set:2").await.unwrap();
+    assert_eq!(members, vec!["alpha".to_string()], "must be unchanged");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn adding_a_new_set_member_adds_it() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer.sadd("set:3", "alpha").await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::mutate::add_set_member(&client, b"set:3", b"beta")
+        .await
+        .unwrap();
+    assert_eq!(outcome, redis_pane::redis::mutate::MemberAdd::Added);
+
+    let is_member: bool = writer.sismember("set:3", "beta").await.unwrap();
+    assert!(is_member, "the new member must be present");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn removing_the_last_set_member_deletes_the_key() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer.sadd("set:4", "only").await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let removed = redis_pane::redis::mutate::delete_set_member(&client, b"set:4", b"only")
+        .await
+        .unwrap();
+    assert!(removed);
+
+    let exists: i64 = writer.exists("set:4").await.unwrap();
+    assert_eq!(exists, 0, "the key must be gone once its last member is");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn deleting_an_already_gone_set_member_reports_false() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer.sadd("set:5", "alpha").await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let removed = redis_pane::redis::mutate::delete_set_member(&client, b"set:5", b"missing")
+        .await
+        .unwrap();
+    assert!(!removed);
+
+    let members: Vec<String> = writer.smembers("set:5").await.unwrap();
+    assert_eq!(members, vec!["alpha".to_string()], "untouched");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn a_binary_set_member_round_trips_through_add_and_delete() {
+    // Review C2: members are `Vec<u8>`, never `String`. A member containing
+    // invalid UTF-8 must survive both the add script's ARGV and SREM's
+    // member argument unchanged.
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let member: &[u8] = b"m\xff\x80";
+    let _: () = writer.sadd("set:bin", "plain").await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::mutate::add_set_member(&client, b"set:bin", member)
+        .await
+        .unwrap();
+    assert_eq!(outcome, redis_pane::redis::mutate::MemberAdd::Added);
+
+    let is_member: bool = writer.sismember("set:bin", member).await.unwrap();
+    assert!(is_member, "the binary member must round-trip through add");
+
+    let removed = redis_pane::redis::mutate::delete_set_member(&client, b"set:bin", member)
+        .await
+        .unwrap();
+    assert!(removed);
+
+    let is_member_after: bool = writer.sismember("set:bin", member).await.unwrap();
+    assert!(
+        !is_member_after,
+        "the binary member must round-trip through delete"
+    );
+    let plain_still_there: bool = writer.sismember("set:bin", "plain").await.unwrap();
+    assert!(plain_still_there, "the other member is untouched");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn adding_a_set_member_against_a_wrong_type_key_surfaces_an_error_not_a_panic() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer
+        .set("str:1", "hello", None, None, false)
+        .await
+        .unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let err = redis_pane::redis::mutate::add_set_member(&client, b"str:1", b"x")
+        .await
+        .expect_err("SADD against a String key is WRONGTYPE");
+    assert!(err.details().contains("WRONGTYPE"), "{err}");
+
+    let value: Option<String> = writer.get("str:1").await.unwrap();
+    assert_eq!(
+        value.as_deref(),
+        Some("hello"),
+        "untouched by the failed write"
+    );
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}

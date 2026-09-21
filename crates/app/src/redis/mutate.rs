@@ -49,6 +49,18 @@ pub async fn execute(client: &Client, mutation: &Mutation) -> Result<MutationOut
                 MutationOutcome::NothingToRemove
             }
         }
+        Mutation::AddSetMember { member, .. } => match add_set_member(client, key, member).await? {
+            MemberAdd::Added => MutationOutcome::Done,
+            MemberAdd::MemberExists => MutationOutcome::NotWritten(NotWritten::MemberExists),
+            MemberAdd::KeyGone => MutationOutcome::NotWritten(NotWritten::KeyGone),
+        },
+        Mutation::DeleteSetMember { member, .. } => {
+            if delete_set_member(client, key, member).await? {
+                MutationOutcome::Done
+            } else {
+                MutationOutcome::NothingToRemove
+            }
+        }
     })
 }
 
@@ -264,5 +276,68 @@ pub async fn delete_hash_field(client: &Client, name: &[u8], field: &[u8]) -> Re
     let key = fred::types::Key::from(name);
     let field_key = fred::types::Key::from(field);
     let removed: i64 = client.hdel(key, field_key).await?;
+    Ok(removed > 0)
+}
+
+/// Lua guard for adding a Set member, never recreating a key that is gone
+/// (PLAN M2 task 7, D2, ADR-0016).
+///
+/// `KEYS[1]` is the set key; `ARGV[1]` is the member, binary-safe. Returns
+/// `-1` if the key is already gone (never recreated), or `SADD`'s own `0`/`1`
+/// otherwise — `0` means the member was already there, including one outside
+/// the 500-member read window. Unlike the Hash edit script, there is no
+/// per-member TTL to preserve (`HEXPIRE` is Hash-only, ADR-0016) — the only
+/// thing this guards is the key's own existence.
+const SET_MEMBER_ADD_SCRIPT: &str = r#"
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return -1
+end
+return redis.call('SADD', KEYS[1], ARGV[1])
+"#;
+
+/// What a guarded member add did on the server ([`add_set_member`], D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberAdd {
+    /// The member did not exist and was added.
+    Added,
+    /// The member already existed; nothing was written.
+    MemberExists,
+    /// The key was already gone; nothing was written, nothing recreated.
+    KeyGone,
+}
+
+/// Add a new Set member, never recreating a key that is gone (`EVAL`, PLAN M2
+/// task 7, D2, ADR-0016).
+///
+/// `name` and `member` travel the same binary-safe way [`set_hash_field`]'s
+/// `name`/`field` do — see its doc comment for the `Vec<u8>` conversion traps
+/// this avoids, on both the key side and the `EVAL` args side.
+pub async fn add_set_member(
+    client: &Client,
+    name: &[u8],
+    member: &[u8],
+) -> Result<MemberAdd, Error> {
+    let key = fred::types::Key::from(name);
+    let result: i64 = client
+        .eval(SET_MEMBER_ADD_SCRIPT, vec![key], vec![member.to_vec()])
+        .await?;
+    Ok(match result {
+        -1 => MemberAdd::KeyGone,
+        0 => MemberAdd::MemberExists,
+        _ => MemberAdd::Added,
+    })
+}
+
+/// Remove one Set member (`SREM`, PLAN M2 task 7, ADR-0016).
+///
+/// `false` means the member was already gone — including the case where the
+/// whole key is gone, since `SREM` on a missing key is simply zero members
+/// removed, the same "already true" shape [`delete_hash_field`] reports for
+/// `HDEL`. Deleting the last member deletes the key itself; that is Redis's
+/// own behaviour, not something this function arranges.
+pub async fn delete_set_member(client: &Client, name: &[u8], member: &[u8]) -> Result<bool, Error> {
+    let key = fred::types::Key::from(name);
+    let member_key = fred::types::Key::from(member);
+    let removed: i64 = client.srem(key, member_key).await?;
     Ok(removed > 0)
 }

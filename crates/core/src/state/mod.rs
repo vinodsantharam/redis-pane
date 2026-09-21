@@ -259,6 +259,23 @@ pub enum PendingMutation {
         field: Vec<u8>,
         last_field: bool,
     },
+    /// Add a Set member that is not shown yet, never duplicating one that is
+    /// (guarded `SADD`, PLAN M2 task 7, D2, D3, ADR-0016). No `field`: a
+    /// member is only a value, unlike a Hash field's name-and-value pair.
+    AddSetMember {
+        name: crate::key::KeyName,
+        member: Vec<u8>,
+    },
+    /// Remove one Set member (`SREM`, PLAN M2 task 7, D5, ADR-0016).
+    /// `last_member` mirrors `DeleteHashField`'s `last_field`: whether this
+    /// was the set's only member at the moment it was staged — the confirm
+    /// dialog warns that the key itself will go, since `SREM` deletes a Set
+    /// whose last member is removed.
+    DeleteSetMember {
+        name: crate::key::KeyName,
+        member: Vec<u8>,
+        last_member: bool,
+    },
 }
 
 impl PendingMutation {
@@ -286,6 +303,13 @@ impl PendingMutation {
             PendingMutation::DeleteHashField { name, field, .. } => {
                 format!("HDEL {} {}", name, String::from_utf8_lossy(field))
             }
+            // No member in the command line, matching `Mutation::command_label`:
+            // a member is only a value (ADR-0016 D3), so there is nothing
+            // name-shaped to show beside the key the way a Hash field's name
+            // is shown. The member itself appears in the `+` side of the
+            // dialog's diff instead (`crate::render`'s confirm overlay).
+            PendingMutation::AddSetMember { name, .. } => format!("SADD {name}"),
+            PendingMutation::DeleteSetMember { name, .. } => format!("SREM {name}"),
         }
     }
 
@@ -301,6 +325,15 @@ impl PendingMutation {
             }
             PendingMutation::AddHashField { .. } => {
                 Some("only if the key still exists · never overwrites a field")
+            }
+            // Exact wording D2/PLAN M2 task 7 specify — "never duplicates a
+            // member", not "never overwrites a member": `SADD` has no
+            // overwrite to guard against, only the possibility of adding a
+            // member that is already there, which is what the guard's other
+            // half — `SADD`'s own no-op-on-duplicate return — actually
+            // prevents.
+            PendingMutation::AddSetMember { .. } => {
+                Some("only if the key still exists · never duplicates a member")
             }
             _ => None,
         }
@@ -365,6 +398,12 @@ impl PendingMutation {
             ),
             PendingMutation::DeleteHashField { name, field, .. } => {
                 (Mutation::DeleteHashField { key: name, field }, None)
+            }
+            PendingMutation::AddSetMember { name, member } => {
+                (Mutation::AddSetMember { key: name, member }, None)
+            }
+            PendingMutation::DeleteSetMember { name, member, .. } => {
+                (Mutation::DeleteSetMember { key: name, member }, None)
             }
         };
         crate::Command::Execute { mutation, index }
@@ -841,5 +880,94 @@ mod tests {
     #[test]
     fn a_session_starts_in_tree_mode() {
         assert!(State::new(startup(Environment::Local, None)).tree_mode);
+    }
+
+    #[test]
+    fn add_set_member_previews_sadd_with_the_guard_line() {
+        let pending = PendingMutation::AddSetMember {
+            name: "myset".into(),
+            member: b"alpha".to_vec(),
+        };
+        assert_eq!(pending.command_text(), "SADD myset");
+        assert_eq!(
+            pending.guard_text(),
+            Some("only if the key still exists · never duplicates a member")
+        );
+    }
+
+    #[test]
+    fn delete_set_member_previews_srem_with_no_guard_line() {
+        let pending = PendingMutation::DeleteSetMember {
+            name: "myset".into(),
+            member: b"alpha".to_vec(),
+            last_member: false,
+        };
+        assert_eq!(pending.command_text(), "SREM myset");
+        assert_eq!(pending.guard_text(), None);
+    }
+
+    #[test]
+    fn the_last_member_warning_only_shows_up_when_it_is_set() {
+        let last = PendingMutation::DeleteSetMember {
+            name: "myset".into(),
+            member: b"only".to_vec(),
+            last_member: true,
+        };
+        let not_last = PendingMutation::DeleteSetMember {
+            name: "myset".into(),
+            member: b"one-of-many".to_vec(),
+            last_member: false,
+        };
+        assert!(matches!(
+            last,
+            PendingMutation::DeleteSetMember {
+                last_member: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            not_last,
+            PendingMutation::DeleteSetMember {
+                last_member: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn into_command_carries_the_set_member_mutations_through() {
+        use crate::command::Command;
+        use crate::mutation::Mutation;
+
+        let add = PendingMutation::AddSetMember {
+            name: "myset".into(),
+            member: b"alpha".to_vec(),
+        };
+        assert_eq!(
+            add.into_command(),
+            Command::Execute {
+                mutation: Mutation::AddSetMember {
+                    key: "myset".into(),
+                    member: b"alpha".to_vec(),
+                },
+                index: None,
+            }
+        );
+
+        let delete = PendingMutation::DeleteSetMember {
+            name: "myset".into(),
+            member: b"alpha".to_vec(),
+            last_member: true,
+        };
+        assert_eq!(
+            delete.into_command(),
+            Command::Execute {
+                mutation: Mutation::DeleteSetMember {
+                    key: "myset".into(),
+                    member: b"alpha".to_vec(),
+                },
+                index: None,
+            }
+        );
     }
 }

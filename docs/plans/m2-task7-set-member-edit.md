@@ -231,3 +231,38 @@ cargo run -p redis-pane
 ## Found while building
 
 _(Executor: append anything noticed but deliberately not fixed, with `file:line`.)_
+
+**Phase 2.** Rust's exhaustive-match checking forced touching files outside phase 2's declared
+scope (`mutation.rs`, `state/mod.rs`, `state/editor.rs`, `keymap/mod.rs`) the moment the new
+`Mutation`/`PendingMutation`/`NotWritten`/`EditTarget` variants existed at all — every `match` over
+one of these four types anywhere in the workspace has to be exhaustive or the crate that owns it
+fails to build, regardless of whether anything can reach the new arm yet. Rather than leave the
+build red for two phases, each of the following got the minimal arm needed to compile, each
+commented as unreachable-for-now and citing ADR-0016/D3 so phase 3/4's author knows why it is
+there and can extend it rather than re-derive it:
+
+- `crates/core/src/render/mod.rs` (`confirm_overlay`) — `AddSetMember`/`DeleteSetMember` dialog
+  lines, mirroring the Hash add/last-field arms. No golden frame exercises them (nothing stages
+  either variant yet), so the golden count is unaffected.
+- `crates/core/src/update/confirm.rs` (`not_written`) — `NotWritten::MemberExists` folded into the
+  existing field-refusal arm with member-specific wording.
+- `crates/core/src/update/editor.rs` (`stage_editor`) — `EditTarget::NewSetMember` staged as
+  `PendingMutation::AddSetMember`, one field narrower than `NewHashField`'s arm. Nothing opens this
+  `EditTarget` yet (that is phase 3's `a`-on-a-Set wiring), so this arm is currently dead code
+  reachable only by a future caller.
+- `crates/core/src/state/open.rs` (`edit_verb`) — `"✎ adding member"` for `NewSetMember`, alongside
+  the existing Hash verbs.
+- `crates/app/src/redis/mutate.rs` (`execute`) — this is the one that actually crosses the
+  `crates/app` boundary the phase description asked to leave alone. `Mutation::AddSetMember`/
+  `DeleteSetMember` needed real arms, not stubs (a `todo!()`/panic would violate CLAUDE.md's "never
+  panic on a Redis error" even for an unreachable path, and an `Err(_)` arm would misreport a
+  success as a failure the moment phase 3 makes it reachable). Implemented the guarded add exactly
+  as ADR-0016 D2 specifies — `SET_MEMBER_ADD_SCRIPT`, `add_set_member`, `delete_set_member`, and a
+  `MemberAdd` enum — which happens to be the exact shape the "New and changed types" table assigns
+  to phase 4. No integration test was added; phase 4 should treat this as already done and add the
+  `#[ignore]`d proof against a real server rather than rewriting it.
+
+None of this wires a keypress to either new mutation — `a`/`d`/`e` on a Set still behave exactly as
+before this phase, since nothing in `update/keys.rs` or `update/mod.rs`'s dispatch constructs
+`EditTarget::NewSetMember` or stages `DeleteSetMember`. Phase 3 is still the phase that makes any
+of this reachable.

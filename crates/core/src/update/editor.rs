@@ -230,6 +230,12 @@ pub(super) fn stage_editor(mut state: State) -> (State, Vec<Command>) {
             field: field.into_bytes(),
             value: new,
         },
+        // Not reachable yet — nothing opens a `NewSetMember` buffer until
+        // `a` on a Set is wired (PLAN M2 task 7 phase 3, ADR-0016 D3). The
+        // arm exists because this match must be exhaustive the moment the
+        // `EditTarget` variant does; the staging shape mirrors
+        // `NewHashField`'s, one field narrower.
+        EditTarget::NewSetMember => PendingMutation::AddSetMember { name, member: new },
     };
     state.confirm = Some(mutation);
     (state, Vec::new())

@@ -895,6 +895,27 @@ fn confirm_overlay(
                 ));
             }
         }
+        // Guarded Set write (D2, D3, ADR-0016): same shape as the Hash add
+        // above, one part narrower — a member has no name half to show.
+        // Neither dialog is reachable yet (PLAN M2 task 7 phase 3 wires the
+        // keypresses that stage these); the arms exist because this match
+        // must be exhaustive the moment the variants do.
+        PendingMutation::AddSetMember { member, .. } => {
+            lines.push((pending.command_text(), Token::Text));
+            if let Some(guard) = pending.guard_text() {
+                lines.push((guard.to_string(), Token::Muted));
+            }
+            push_diff_side(&mut lines, "+", member, Token::Ok);
+        }
+        PendingMutation::DeleteSetMember { last_member, .. } => {
+            lines.push((pending.command_text(), Token::Text));
+            if *last_member {
+                lines.push((
+                    "last member — the key will be deleted".to_string(),
+                    Token::Warn,
+                ));
+            }
+        }
     }
     let hint_token = if refused.is_some() {
         Token::Danger
@@ -1190,7 +1211,7 @@ pub fn hint_bar(state: &State) -> String {
             .is_some_and(|o| o.cursor_active && matches!(o.value, Some(Value::Hash(_))))
     {
         let edit = state.keymap.hint(Action::Edit).unwrap_or_default();
-        let add = state.keymap.hint(Action::AddField).unwrap_or_default();
+        let add = state.keymap.hint(Action::Add).unwrap_or_default();
         let remove = state.keymap.hint(Action::Delete).unwrap_or_default();
         return format!("{edit} edit · {add} add · {remove} remove");
     }

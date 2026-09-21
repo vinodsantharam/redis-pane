@@ -391,7 +391,7 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
         }
         Action::CopyCommand => build_copy(state, CopyWhat::Command),
         Action::Edit => open_editor(state),
-        Action::AddField => begin_add_field(state),
+        Action::Add => begin_add_field(state),
         // Nothing is open to edit: `key_press` intercepts every keypress
         // before this match while an editor buffer or a field-name capture
         // exists, so these only ever reach here with neither to act on.

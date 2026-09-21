@@ -201,14 +201,20 @@ pub(super) fn not_written(
             ));
             (state, Vec::new())
         }
-        NotWritten::FieldGone | NotWritten::FieldExists => {
+        NotWritten::FieldGone | NotWritten::FieldExists | NotWritten::MemberExists => {
             if let Some(open) = state.open.as_mut() {
                 open.unstage_buffer();
             }
-            let reason = if why == NotWritten::FieldGone {
-                "field no longer exists"
-            } else {
-                "field already exists"
+            // Set member add isn't wired to any keypress yet (PLAN M2 task 7
+            // phase 3), so `MemberExists` cannot reach this arm in practice
+            // today — this arm exists only because `NotWritten` must be
+            // matched exhaustively the moment the variant exists at all
+            // (ADR-0016).
+            let reason = match why {
+                NotWritten::FieldGone => "field no longer exists",
+                NotWritten::FieldExists => "field already exists",
+                NotWritten::MemberExists => "member already exists",
+                NotWritten::KeyGone => "field no longer exists",
             };
             state.error = Some((
                 format!("{command}: {reason} — nothing written, edit kept"),

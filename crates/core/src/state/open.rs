@@ -540,6 +540,10 @@ impl OpenKey {
         match self.editor().map(super::EditBuffer::target) {
             Some(super::EditTarget::NewHashField { .. }) => "✎ adding field",
             Some(super::EditTarget::HashField { .. }) => "✎ editing field",
+            // Not reachable yet (PLAN M2 task 7 phase 3 wires `a` on a Set to
+            // this buffer); the arm exists because this match must be
+            // exhaustive the moment `NewSetMember` does (ADR-0016, D3).
+            Some(super::EditTarget::NewSetMember) => "✎ adding member",
             Some(super::EditTarget::Value) | None => "✎ editing",
         }
     }

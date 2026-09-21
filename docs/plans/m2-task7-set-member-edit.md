@@ -1,8 +1,8 @@
 # M2 task 7: add and remove Set members
 
-Status: **planned 2026-09-21**, decisions D1–D6 below drafted by the planning agent and **not yet
-confirmed by the user**. Execution by a Sonnet subagent, phase by phase, stopping at each
-checkpoint.
+Status: **decisions D1–D6 confirmed by the user 2026-09-21**, after phase 1 verified every Redis
+fact they rest on against a live server ([ADR-0016](../adr/0016-set-members-are-added-and-removed.md)).
+Execution by a Sonnet subagent, phase by phase, stopping at each checkpoint. Phase 1 is done.
 
 **Base branch.** This stacks on `split-update-module` (PR #35, review M2), not on `main`. Phase 3
 edits `crates/core/src/update/editor.rs`, which only exists after that split. If #35 merges first,

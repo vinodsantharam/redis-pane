@@ -171,9 +171,11 @@ already carries.
 
 Guard lines for the dialog:
 
-- score edit — **"only if that member still exists · keeps its rank order"** *(phase 1: confirm the
-  second clause is honest — `ZADD XX` recomputes rank from the new score, so say what is actually
-  true rather than implying the rank is preserved)*
+- score edit — **"only if that member still exists · keeps the key's TTL"** *(phase 1 settled this:
+  "keeps its rank order" was false — `ZADD XX` recomputes rank from the new score, and a score edit
+  can move a member past every other member's rank; TTL preservation is the thing the script
+  actually and verifiably guarantees beyond the existence checks, mirroring ADR-0015's Hash-field
+  edit guard for the same reason. See ADR-0018.)*
 - add — **"only if the key still exists · never overwrites a member's score"**
 - remove — no guard line, as `DeleteSetMember` has none
 

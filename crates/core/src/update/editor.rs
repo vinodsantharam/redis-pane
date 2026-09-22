@@ -247,7 +247,9 @@ pub(super) fn stage_editor(mut state: State) -> (State, Vec<Command>) {
     // (D1, and ADR-0016 D3 for the Set member one field narrower).
     let is_new_field = matches!(
         editor.target(),
-        EditTarget::NewHashField { .. } | EditTarget::NewSetMember
+        EditTarget::NewHashField { .. }
+            | EditTarget::NewSetMember
+            | EditTarget::NewListElement { .. }
     );
     if !is_new_field && !editor.is_dirty() {
         open.end_edit();
@@ -285,6 +287,23 @@ pub(super) fn stage_editor(mut state: State) -> (State, Vec<Command>) {
         // shape mirrors `NewHashField`'s, one field narrower — no field name
         // to carry, since a member is only a value.
         EditTarget::NewSetMember => PendingMutation::AddSetMember { name, member: new },
+        // `e`/`a` on a List (PLAN M2 task 8 phase 3, ADR-0017 D2/D6): not
+        // reachable until `open_editor`/`begin_add_field` construct these
+        // targets — the arms exist now because `EditTarget` is matched
+        // exhaustively. `old`/`original` is the guard's `expected` half
+        // (ADR-0017 D2's compare-and-set); `end` is D6's Head/Tail toggle.
+        EditTarget::ListElement { index } => PendingMutation::SetListElement {
+            name,
+            index,
+            old: original,
+            new,
+            was_json,
+        },
+        EditTarget::NewListElement { end } => PendingMutation::AddListElement {
+            name,
+            end,
+            value: new,
+        },
     };
     state.confirm = Some(mutation);
     (state, Vec::new())
@@ -1367,7 +1386,7 @@ mod hash_field_edit_tests {
         }
         assert_eq!(s.confirm.as_ref().unwrap().command_text(), "HSET k f");
         assert_eq!(
-            s.confirm.as_ref().unwrap().guard_text(),
+            s.confirm.as_ref().unwrap().guard_text().as_deref(),
             Some("only if the field still exists · keeps its TTL")
         );
         let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
@@ -1509,7 +1528,7 @@ mod hash_field_edit_tests {
         }
         assert_eq!(s.confirm.as_ref().unwrap().command_text(), "HSETNX k new");
         assert_eq!(
-            s.confirm.as_ref().unwrap().guard_text(),
+            s.confirm.as_ref().unwrap().guard_text().as_deref(),
             Some("only if the key still exists · never overwrites a field")
         );
     }
@@ -2198,7 +2217,7 @@ mod set_member_edit_tests {
         }
         assert_eq!(s.confirm.as_ref().unwrap().command_text(), "SADD k");
         assert_eq!(
-            s.confirm.as_ref().unwrap().guard_text(),
+            s.confirm.as_ref().unwrap().guard_text().as_deref(),
             Some("only if the key still exists · never duplicates a member")
         );
         let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));

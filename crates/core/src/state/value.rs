@@ -277,6 +277,17 @@ impl Viewer for IndexedValue {
     }
 }
 
+/// Which end of a List `a` adds a new element to (PLAN M2 task 8, D6,
+/// ADR-0017). Defaults to [`ListEnd::Tail`] — appending is the common case,
+/// and the one that does not renumber the rows the reader is looking at,
+/// unlike a head push, which shifts every existing index by one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ListEnd {
+    Head,
+    #[default]
+    Tail,
+}
+
 // ── set ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

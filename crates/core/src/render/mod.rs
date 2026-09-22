@@ -914,6 +914,38 @@ fn confirm_overlay(
                 ));
             }
         }
+        // Guarded List writes (D2, D3, D5, D6, ADR-0017): the same shape as
+        // the Hash/Set arms above. Not reachable until PLAN M2 task 8 phase
+        // 3 wires `e`/`a`/`d` for a List — no golden frame exercises these
+        // yet, since nothing stages any of the three variants — the arms
+        // exist now because `PendingMutation` is matched exhaustively.
+        PendingMutation::SetListElement { old, new, .. } => {
+            lines.push((pending.command_text(), Token::Text));
+            if let Some(guard) = pending.guard_text() {
+                lines.push((guard, Token::Muted));
+            }
+            push_diff_side(&mut lines, "-", old, Token::Danger);
+            push_diff_side(&mut lines, "+", new, Token::Ok);
+            if pending.json_warning() == Some(true) {
+                lines.push(("⚠ no longer valid JSON".to_string(), Token::Warn));
+            }
+        }
+        PendingMutation::AddListElement { value, .. } => {
+            lines.push((pending.command_text(), Token::Text));
+            if let Some(guard) = pending.guard_text() {
+                lines.push((guard, Token::Muted));
+            }
+            push_diff_side(&mut lines, "+", value, Token::Ok);
+        }
+        PendingMutation::DeleteListElement { last_element, .. } => {
+            lines.push((pending.command_text(), Token::Text));
+            if *last_element {
+                lines.push((
+                    "last element — the key will be deleted".to_string(),
+                    Token::Warn,
+                ));
+            }
+        }
     }
     let hint_token = if refused.is_some() {
         Token::Danger

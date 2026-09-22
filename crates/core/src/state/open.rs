@@ -541,6 +541,11 @@ impl OpenKey {
             Some(super::EditTarget::NewHashField { .. }) => "✎ adding field",
             Some(super::EditTarget::HashField { .. }) => "✎ editing field",
             Some(super::EditTarget::NewSetMember) => "✎ adding member",
+            // PLAN M2 task 8, D8: not reachable until phase 3's `e`/`a`
+            // wiring for a List (ADR-0017) — the arm exists now because
+            // `EditTarget` is matched exhaustively.
+            Some(super::EditTarget::ListElement { .. }) => "✎ editing element",
+            Some(super::EditTarget::NewListElement { .. }) => "✎ adding element",
             Some(super::EditTarget::Value) | None => "✎ editing",
         }
     }

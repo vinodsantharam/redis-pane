@@ -209,15 +209,20 @@ pub(super) fn not_written(
             ));
             (state, Vec::new())
         }
-        NotWritten::FieldGone | NotWritten::FieldExists | NotWritten::MemberExists => {
+        NotWritten::FieldGone
+        | NotWritten::FieldExists
+        | NotWritten::MemberExists
+        | NotWritten::ElementMoved => {
             if let Some(open) = state.open.as_mut() {
                 open.unstage_buffer();
             }
             // The guards that refuse without the key going anywhere: the
             // write is dropped, the buffer comes back, and the Viewer
             // re-reads. `MemberExists` cannot arrive here until `a` on a Set
-            // is wired (PLAN M2 task 7 phase 3); the arm is here because
-            // `NotWritten` is matched exhaustively.
+            // is wired (PLAN M2 task 7 phase 3); `ElementMoved` cannot arrive
+            // until `e`/`a`/`d` on a List are wired (PLAN M2 task 8 phase 3,
+            // ADR-0017) — both arms are here because `NotWritten` is matched
+            // exhaustively.
             state.error = Some((
                 format!("{command}: {} — nothing written, edit kept", why.reason()),
                 at_ms,

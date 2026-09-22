@@ -6,8 +6,12 @@
 //! different way a write can land on the wrong thing — and stay public so the
 //! integration suite can pin each guard against a real server.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use fred::prelude::*;
 use redis_pane_core::mutation::{Mutation, MutationOutcome, NotWritten};
+use redis_pane_core::state::value::ListEnd;
 
 /// Execute a confirmed write.
 ///
@@ -61,6 +65,31 @@ pub async fn execute(client: &Client, mutation: &Mutation) -> Result<MutationOut
                 MutationOutcome::NothingToRemove
             }
         }
+        Mutation::SetListElement {
+            index,
+            expected,
+            value,
+            ..
+        } => match set_list_element(client, key, *index, expected, value).await? {
+            ListElementWrite::Written => MutationOutcome::Done,
+            ListElementWrite::ElementMoved => MutationOutcome::NotWritten(NotWritten::ElementMoved),
+            ListElementWrite::KeyGone => MutationOutcome::NotWritten(NotWritten::KeyGone),
+        },
+        Mutation::AddListElement { end, value, .. } => {
+            match add_list_element(client, key, *end, value).await? {
+                ListElementAdd::Added => MutationOutcome::Done,
+                ListElementAdd::KeyGone => MutationOutcome::NotWritten(NotWritten::KeyGone),
+            }
+        }
+        Mutation::DeleteListElement {
+            index, expected, ..
+        } => match delete_list_element(client, key, *index, expected).await? {
+            ListElementDelete::Removed => MutationOutcome::Done,
+            ListElementDelete::ElementMoved => {
+                MutationOutcome::NotWritten(NotWritten::ElementMoved)
+            }
+            ListElementDelete::KeyGone => MutationOutcome::NotWritten(NotWritten::KeyGone),
+        },
     })
 }
 
@@ -340,4 +369,233 @@ pub async fn delete_set_member(client: &Client, name: &[u8], member: &[u8]) -> R
     let member_key = fred::types::Key::from(member);
     let removed: i64 = client.srem(key, member_key).await?;
     Ok(removed > 0)
+}
+
+/// Lua guard for editing an existing List element's value by index (PLAN M2
+/// task 8, D2, ADR-0017).
+///
+/// `KEYS[1]` is the list key; `ARGV[1]` is the index as a decimal string,
+/// `ARGV[2]` the bytes the read found there, `ARGV[3]` the new value.
+/// Returns `-1` if the key is already gone (`LSET` on a missing key errors
+/// rather than recreating it, so this guard exists purely to *report* that
+/// case apart from the next one), `-2` if the element at the index no
+/// longer holds `ARGV[2]` — the list shifted under a concurrent push, pop or
+/// edit — or `1` on success.
+///
+/// Unlike [`HASH_FIELD_EDIT_SCRIPT`], there is no per-element TTL to
+/// preserve: Redis 7.4's field expiry is Hash-only, and a key's own TTL is
+/// untouched by `LSET`/`LPUSH`/`RPUSH`/`LREM` (ADR-0017's verified facts).
+const LIST_ELEMENT_EDIT_SCRIPT: &str = r#"
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return -1
+end
+if redis.call('LINDEX', KEYS[1], ARGV[1]) ~= ARGV[2] then
+  return -2
+end
+redis.call('LSET', KEYS[1], ARGV[1], ARGV[3])
+return 1
+"#;
+
+/// Lua guard for a duplicate-safe remove-by-index (PLAN M2 task 8, D2,
+/// ADR-0017).
+///
+/// `KEYS[1]` is the list key; `ARGV[1]` the index, `ARGV[2]` the bytes the
+/// read found there, `ARGV[3]` a disposable per-call sentinel (never a
+/// constant — see [`delete_list_element`]'s doc comment). Same `-1`/`-2`/`1`
+/// shape as [`LIST_ELEMENT_EDIT_SCRIPT`]. Redis has no remove-by-index
+/// primitive: a plain `LREM key 1 value` removes the *first* match from the
+/// head, which is the wrong element whenever an earlier duplicate exists
+/// (ADR-0017's verified fact on `[x, y, x, z]`). `LSET`ing the target to a
+/// sentinel first, then `LREM`ing the sentinel, is what makes the remove
+/// exact regardless of duplicates — and because the script runs atomically,
+/// no other client can ever observe the list in its momentary sentinel
+/// state.
+const LIST_ELEMENT_DELETE_SCRIPT: &str = r#"
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return -1
+end
+if redis.call('LINDEX', KEYS[1], ARGV[1]) ~= ARGV[2] then
+  return -2
+end
+redis.call('LSET', KEYS[1], ARGV[1], ARGV[3])
+redis.call('LREM', KEYS[1], 1, ARGV[3])
+return 1
+"#;
+
+/// Lua guard for adding a List element at either end, never recreating a key
+/// that is gone (PLAN M2 task 8, D2, D6, ADR-0017).
+///
+/// `KEYS[1]` is the list key; `ARGV[1]` is the literal command name —
+/// `"LPUSH"` or `"RPUSH"`, chosen by the caller from
+/// [`redis_pane_core::state::value::ListEnd`] — and `ARGV[2]` the new
+/// element. Returns `-1` if the key is already gone (never recreated,
+/// unlike a bare `LPUSH`/`RPUSH`, which would), or the pushed length
+/// otherwise. No compare-and-set half: an add addresses no existing element,
+/// so there is nothing to compare against.
+const LIST_ELEMENT_ADD_SCRIPT: &str = r#"
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return -1
+end
+return redis.call(ARGV[1], KEYS[1], ARGV[2])
+"#;
+
+/// What a guarded element edit did on the server ([`set_list_element`], D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListElementWrite {
+    /// The element was overwritten.
+    Written,
+    /// The element at the index no longer held the expected bytes; the list
+    /// shifted underneath the stage (ADR-0017 D3).
+    ElementMoved,
+    /// The key was already gone; nothing was written, nothing recreated.
+    KeyGone,
+}
+
+/// What a guarded element delete did on the server ([`delete_list_element`],
+/// D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListElementDelete {
+    /// The element was removed; if it was the list's only element, the key
+    /// went with it (Redis's own behaviour, not something this arranges).
+    Removed,
+    /// The element at the index no longer held the expected bytes; the list
+    /// shifted underneath the stage (ADR-0017 D3).
+    ElementMoved,
+    /// The key was already gone; nothing was written, nothing recreated.
+    KeyGone,
+}
+
+/// What a guarded element add did on the server ([`add_list_element`], D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListElementAdd {
+    /// The element was pushed to the requested end.
+    Added,
+    /// The key was already gone; nothing was written, nothing recreated.
+    KeyGone,
+}
+
+/// Process-lifetime counter feeding [`list_delete_sentinel`] — see its doc
+/// comment for why a sentinel is minted per call rather than a constant.
+static LIST_SENTINEL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Mint a fresh `__redis-pane-rp:<suffix>` sentinel for one delete call
+/// (PLAN M2 task 8, D2, ADR-0017).
+///
+/// **Minted in the shell, not the core.** `Mutation::DeleteListElement`
+/// carries the key, the index and the bytes that were read — no sentinel
+/// field — because the core has no randomness source: `update()`'s contract
+/// is no I/O, no clock, no randomness, and there is no `rand` dependency
+/// anywhere in the workspace. This is a detail of *how* `mutate.rs`
+/// implements a delete-by-index Redis has no primitive for, not something
+/// the reader asked for.
+///
+/// The suffix needs to be unlikely to equal a real element of one list, not
+/// cryptographically random, so it is the wall clock's nanoseconds paired
+/// with a process-lifetime [`AtomicU64`] counter — no new dependency, and a
+/// constant sentinel would be wrong the moment two elements of a list ever
+/// happened to equal it, however unlikely (ADR-0017 D2).
+fn list_delete_sentinel() -> Vec<u8> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let count = LIST_SENTINEL_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("__redis-pane-rp:{nanos}-{count}").into_bytes()
+}
+
+/// Edit an existing List element's value by index, refusing unless it still
+/// holds `expected` (`EVAL`, PLAN M2 task 8, D2, ADR-0017).
+///
+/// `name` is built as a binary-safe `Key` exactly like [`set_hash_field`] —
+/// see its doc comment for the `Vec<u8>` conversion traps this avoids, on
+/// both the key side and the `EVAL` args side. `index` travels as a decimal
+/// string `ARGV` entry: Lua's `LINDEX`/`LSET` take a numeric index, and
+/// `EVAL`'s `ARGV` is binary-safe strings, not integers.
+///
+/// The caller must not treat [`ListElementWrite::Written`] as the value now
+/// on screen — the read path is always re-run afterward (ADR-0006), same as
+/// [`set_value`].
+pub async fn set_list_element(
+    client: &Client,
+    name: &[u8],
+    index: usize,
+    expected: &[u8],
+    new: &[u8],
+) -> Result<ListElementWrite, Error> {
+    let key = fred::types::Key::from(name);
+    let result: i64 = client
+        .eval(
+            LIST_ELEMENT_EDIT_SCRIPT,
+            vec![key],
+            vec![
+                index.to_string().into_bytes(),
+                expected.to_vec(),
+                new.to_vec(),
+            ],
+        )
+        .await?;
+    Ok(match result {
+        -1 => ListElementWrite::KeyGone,
+        -2 => ListElementWrite::ElementMoved,
+        _ => ListElementWrite::Written,
+    })
+}
+
+/// Add a new List element at either end, never recreating a key that is gone
+/// (`EVAL`, PLAN M2 task 8, D2, D6, ADR-0017).
+///
+/// `end` picks the literal command name the script runs — `LPUSH` for
+/// [`ListEnd::Head`], `RPUSH` for [`ListEnd::Tail`] — travelling as an
+/// `ARGV` entry the same way [`LIST_ELEMENT_ADD_SCRIPT`]'s doc comment
+/// describes.
+pub async fn add_list_element(
+    client: &Client,
+    name: &[u8],
+    end: ListEnd,
+    value: &[u8],
+) -> Result<ListElementAdd, Error> {
+    let key = fred::types::Key::from(name);
+    let command: &[u8] = match end {
+        ListEnd::Head => b"LPUSH",
+        ListEnd::Tail => b"RPUSH",
+    };
+    let result: i64 = client
+        .eval(
+            LIST_ELEMENT_ADD_SCRIPT,
+            vec![key],
+            vec![command.to_vec(), value.to_vec()],
+        )
+        .await?;
+    Ok(match result {
+        -1 => ListElementAdd::KeyGone,
+        _ => ListElementAdd::Added,
+    })
+}
+
+/// Remove one List element by index, duplicate-safely, refusing unless it
+/// still holds `expected` (`EVAL`, PLAN M2 task 8, D2, ADR-0017).
+///
+/// Mints a fresh [`list_delete_sentinel`] for this call alone — see its doc
+/// comment for why the sentinel is generated here, per call, rather than
+/// being a constant or living in the core's `Mutation`.
+pub async fn delete_list_element(
+    client: &Client,
+    name: &[u8],
+    index: usize,
+    expected: &[u8],
+) -> Result<ListElementDelete, Error> {
+    let key = fred::types::Key::from(name);
+    let sentinel = list_delete_sentinel();
+    let result: i64 = client
+        .eval(
+            LIST_ELEMENT_DELETE_SCRIPT,
+            vec![key],
+            vec![index.to_string().into_bytes(), expected.to_vec(), sentinel],
+        )
+        .await?;
+    Ok(match result {
+        -1 => ListElementDelete::KeyGone,
+        -2 => ListElementDelete::ElementMoved,
+        _ => ListElementDelete::Removed,
+    })
 }

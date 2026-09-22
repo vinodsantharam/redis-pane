@@ -374,3 +374,59 @@ recorded in ADR-0017 D3: `ElementMoved` is expected to be the *routine* refusal 
 (any concurrent write anywhere in the list can shift an index, not just a write to the same
 element), so it needs to read as "look again," and naming the mechanism ("the list changed
 underneath it") avoids implying the element's own value raced, which is the less common case.
+
+**Phase 2.** As task 7's phase 2 note warned, Rust's exhaustive-match checking forced touching
+files outside the four declared in "New and changed types" the moment `Mutation::{SetListElement,
+AddListElement, DeleteListElement}`, `NotWritten::ElementMoved`,
+`PendingMutation::{SetListElement, AddListElement, DeleteListElement}` and
+`EditTarget::{ListElement, NewListElement}` existed at all. Every arm added is real, working code —
+not a stub — commented as unreachable-for-now and citing ADR-0017, exactly as task 7's phase 2 did,
+since nothing in `update/`'s dispatch constructs any of these types yet:
+
+- `crates/core/src/state/open.rs` (`edit_verb`) — `"✎ editing element"` / `"✎ adding element"` arms
+  alongside the Hash/Set verbs.
+- `crates/core/src/update/editor.rs` (`stage_editor`) — `EditTarget::ListElement` stages
+  `PendingMutation::SetListElement`, `EditTarget::NewListElement` stages `AddListElement`, both the
+  same shape their Hash/Set counterparts use. Also extended `is_new_field` (the "no prior value to
+  be unchanged from" check a few lines above) to include `NewListElement`, for the same reason it
+  already includes `NewHashField`/`NewSetMember` — a brand-new element has no original to be dirty
+  against, and Redis allows an empty element the same as an empty Hash field value or Set member.
+- `crates/core/src/update/confirm.rs` (`not_written`) — `NotWritten::ElementMoved` folded into the
+  same arm as `FieldGone`/`FieldExists`/`MemberExists`: the write is dropped, the buffer comes back,
+  and the Viewer re-reads. This is the correct behaviour for a stale-index refusal too, not merely
+  the arm that happened to compile.
+- `crates/core/src/render/mod.rs` (`confirm_overlay`) — `SetListElement`/`AddListElement`/
+  `DeleteListElement` dialog lines, mirroring the Hash/Set add and last-element arms. No golden frame
+  exercises them (nothing stages any of the three variants yet), so the golden count is unchanged
+  from baseline.
+
+Two sites the D8 table names as reached by this phase — `PendingMutation::guard_text` and
+`EditBuffer::active_part` — were given their exhaustive form as asked, not a `_ => None` fallback.
+`guard_text` also changed its return type from `Option<&'static str>` to `Option<String>`: the List
+guard's wording carries the staged index ("only if that element is still there · index 3"), which no
+`'static` string literal can hold. Every existing call site and test was updated (`.as_deref()` in
+tests, `guard.to_string()`/`guard` in `render/mod.rs`, which compiles unchanged against either
+return type). `active_part` stays `Option<FieldPart>` — a List target answers `None` explicitly now,
+rather than through the wildcard, but D6's Head/Tail toggle is *not* a `FieldPart` and gets no
+mechanism in this phase; phase 3 wires `Tab` some other way.
+
+`crates/core/src/update/editor.rs`'s `staged_edit_found_key_gone` (`dialog_up`, ~line 437) matches
+on `PendingMutation` with an or-pattern inside a `matches!` macro, which is not exhaustiveness-
+checked — it compiles fine without a List arm, and silently treats a staged List mutation as "no
+dialog up" (falls through to the `!open.is_editing()` branch). Not fixed here: nothing constructs a
+List `PendingMutation` via a live dialog yet, so it is unreachable, but phase 3's `d`/`e`/`a` wiring
+should add `SetListElement`/`AddListElement`/`DeleteListElement` to that pattern when it makes the
+dialogs reachable — flagging it now so phase 3 does not have to rediscover it
+(`crates/core/src/update/editor.rs:437`).
+
+The five other D8 sites (`nothing_to_remove`, `open_editor`, `begin_add_field`, `delete_hash_field`,
+`hint_bar`) use a wildcard `_` or a sequential `if let`, not an exhaustive match — they compile
+unchanged and were deliberately left alone, per the plan's explicit instruction not to patch them
+with a fallback. They remain phase 3's job.
+
+Counts at checkpoint 2: `cargo fmt --all -- --check` clean, `cargo clippy --workspace --all-targets
+-- -D warnings` clean, `cargo test --workspace` — core 448 (baseline 439, +9: `command_label`/`key`
+table rows, the `ElementMoved` wording test, `list_element`/`new_list_element` constructor tests, and
+the `PendingMutation` `command_text`/`guard_text`/`last_element`/`into_command` tests), golden 129
+(baseline 129, unchanged — no wiring, no new frames), app 38 (baseline 38, unchanged). The boundary
+check (`cargo tree -p redis-pane-core -e normal | grep -iE 'crossterm|tokio|fred'`) printed nothing.

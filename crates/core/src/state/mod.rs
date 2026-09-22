@@ -211,7 +211,12 @@ impl ReadOnlyReason {
 /// to do before they learn they are not allowed to (DESIGN §6.5) — never at
 /// the keypress that staged it, so the chokepoint has exactly one place that
 /// decides whether a mutation may proceed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Eq` is implemented by hand below, not derived: `SetZSetScore`/
+/// `AddZSetMember` carry a score as `f64`, which has no `Eq` (`NaN != NaN`).
+/// Safe here the same way [`crate::mutation::Mutation`]'s manual `Eq` is —
+/// D4/ADR-0018 rejects `nan` before a score can ever be staged.
+#[derive(Debug, Clone, PartialEq)]
 pub enum PendingMutation {
     /// Delete one key outright (`DEL`). `index` is the Loaded set row it came
     /// from, carried the same way `Msg::ValueGone` carries it, so a rescan
@@ -306,7 +311,40 @@ pub enum PendingMutation {
         element: Vec<u8>,
         last_element: bool,
     },
+    /// Overwrite one ZSet member's score, refusing unless the member is
+    /// still there (guarded `ZADD ... XX`, PLAN M2 task 9, D1, D2, ADR-0018).
+    /// No byte-diff `old`/`new`/`was_json` the way `SetHashField`/
+    /// `SetListElement` carry: the thing changing here is a score, a number,
+    /// not bytes, so the confirm dialog's diff is a score `old → new`, not a
+    /// `-`/`+` byte diff (ADR-0018's preview requirement). `member` is the
+    /// identity the write is keyed on, captured when the row was picked —
+    /// D7: rank is not identity, so this addresses the same member no
+    /// matter how the set has reordered under the dialog.
+    SetZSetScore {
+        name: crate::key::KeyName,
+        member: Vec<u8>,
+        old_score: f64,
+        new_score: f64,
+    },
+    /// Add a ZSet member+score that is not shown yet, never duplicating one
+    /// that is and never overwriting an existing member's score (guarded
+    /// `ZADD ... NX`, PLAN M2 task 9, D2, D3, D6, ADR-0018).
+    AddZSetMember {
+        name: crate::key::KeyName,
+        member: Vec<u8>,
+        score: f64,
+    },
+    /// Remove one ZSet member (`ZREM`, PLAN M2 task 9, D8, ADR-0018).
+    /// `last_member` mirrors `DeleteSetMember`'s: whether this was the set's
+    /// only member at the moment it was staged.
+    DeleteZSetMember {
+        name: crate::key::KeyName,
+        member: Vec<u8>,
+        last_member: bool,
+    },
 }
+
+impl Eq for PendingMutation {}
 
 impl PendingMutation {
     /// The literal command this will send, shown at preview (R4.4).
@@ -355,6 +393,18 @@ impl PendingMutation {
             PendingMutation::DeleteListElement { name, index, .. } => {
                 format!("LREM {name} {index}")
             }
+            // The member, matching `Mutation::command_label`: it is the
+            // identity being named, the same reasoning that shows a Hash
+            // field's name (ADR-0018). The score belongs in the diff below,
+            // not the command line.
+            PendingMutation::SetZSetScore { name, member, .. } => {
+                format!("ZADD {name} {}", String::from_utf8_lossy(member))
+            }
+            // No member on the command line, mirroring `AddSetMember` above
+            // (ADR-0016 D3): a member is only a value. It appears in the `+`
+            // side of the dialog's diff instead.
+            PendingMutation::AddZSetMember { name, .. } => format!("ZADD {name} NX"),
+            PendingMutation::DeleteZSetMember { name, .. } => format!("ZREM {name}"),
         }
     }
 
@@ -394,7 +444,10 @@ impl PendingMutation {
             PendingMutation::DeleteKey { .. }
             | PendingMutation::SetString { .. }
             | PendingMutation::DeleteHashField { .. }
-            | PendingMutation::DeleteSetMember { .. } => None,
+            | PendingMutation::DeleteSetMember { .. }
+            // Plain `ZREM`, no guard — `DeleteSetMember` has none either
+            // (ADR-0018).
+            | PendingMutation::DeleteZSetMember { .. } => None,
             // ADR-0017 D2: the guard is a compare-and-set on the element at
             // `index`, not `EXISTS` alone — the wording says so and names
             // the index, since a stale index is the expected, routine
@@ -408,6 +461,22 @@ impl PendingMutation {
             PendingMutation::AddListElement { .. } => {
                 Some("only if the key still exists".to_string())
             }
+            // ADR-0018: settled to one clause, not two. The plan's draft
+            // second clause — "keeps its rank order" — is false: `ZADD XX`
+            // recomputes the member's rank from its new score, so a score
+            // edit routinely moves that member past others. A guard line
+            // names what the script *checks*, and rank order is not
+            // something this script checks or protects.
+            PendingMutation::SetZSetScore { .. } => {
+                Some("only if that member still exists".to_string())
+            }
+            // ADR-0018 D2: the `NX` half never overwrites an existing
+            // member's score, the same "never duplicates" wording
+            // `AddSetMember`'s guard uses, one word wider to say what the
+            // duplicate leaves untouched.
+            PendingMutation::AddZSetMember { .. } => Some(
+                "only if the key still exists · never overwrites a member's score".to_string(),
+            ),
         }
     }
 
@@ -518,6 +587,34 @@ impl PendingMutation {
                 },
                 None,
             ),
+            PendingMutation::SetZSetScore {
+                name,
+                member,
+                new_score,
+                ..
+            } => (
+                Mutation::SetZSetScore {
+                    key: name,
+                    member,
+                    score: new_score,
+                },
+                None,
+            ),
+            PendingMutation::AddZSetMember {
+                name,
+                member,
+                score,
+            } => (
+                Mutation::AddZSetMember {
+                    key: name,
+                    member,
+                    score,
+                },
+                None,
+            ),
+            PendingMutation::DeleteZSetMember { name, member, .. } => {
+                (Mutation::DeleteZSetMember { key: name, member }, None)
+            }
         };
         crate::Command::Execute { mutation, index }
     }
@@ -1220,6 +1317,132 @@ mod tests {
                     key: "mylist".into(),
                     index: 2,
                     expected: b"gone".to_vec(),
+                },
+                index: None,
+            }
+        );
+    }
+
+    #[test]
+    fn set_zset_score_previews_zadd_with_the_member_and_one_clause_guard() {
+        let pending = PendingMutation::SetZSetScore {
+            name: "myzset".into(),
+            member: b"alpha".to_vec(),
+            old_score: 1.0,
+            new_score: 10.0,
+        };
+        assert_eq!(pending.command_text(), "ZADD myzset alpha");
+        assert_eq!(
+            pending.guard_text().as_deref(),
+            Some("only if that member still exists"),
+            "one clause, no second one — ADR-0018"
+        );
+    }
+
+    #[test]
+    fn add_zset_member_previews_zadd_nx_with_its_guard() {
+        let pending = PendingMutation::AddZSetMember {
+            name: "myzset".into(),
+            member: b"alpha".to_vec(),
+            score: 1.0,
+        };
+        assert_eq!(pending.command_text(), "ZADD myzset NX");
+        assert_eq!(
+            pending.guard_text().as_deref(),
+            Some("only if the key still exists · never overwrites a member's score")
+        );
+    }
+
+    #[test]
+    fn delete_zset_member_previews_zrem_with_no_guard_line() {
+        let pending = PendingMutation::DeleteZSetMember {
+            name: "myzset".into(),
+            member: b"alpha".to_vec(),
+            last_member: false,
+        };
+        assert_eq!(pending.command_text(), "ZREM myzset");
+        assert_eq!(pending.guard_text(), None);
+    }
+
+    #[test]
+    fn the_last_member_warning_only_shows_up_when_set_for_a_zset_delete() {
+        let last = PendingMutation::DeleteZSetMember {
+            name: "myzset".into(),
+            member: b"only".to_vec(),
+            last_member: true,
+        };
+        let not_last = PendingMutation::DeleteZSetMember {
+            name: "myzset".into(),
+            member: b"one-of-many".to_vec(),
+            last_member: false,
+        };
+        assert!(matches!(
+            last,
+            PendingMutation::DeleteZSetMember {
+                last_member: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            not_last,
+            PendingMutation::DeleteZSetMember {
+                last_member: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn into_command_carries_the_zset_mutations_through() {
+        use crate::command::Command;
+        use crate::mutation::Mutation;
+
+        let set = PendingMutation::SetZSetScore {
+            name: "myzset".into(),
+            member: b"alpha".to_vec(),
+            old_score: 1.0,
+            new_score: 10.0,
+        };
+        assert_eq!(
+            set.into_command(),
+            Command::Execute {
+                mutation: Mutation::SetZSetScore {
+                    key: "myzset".into(),
+                    member: b"alpha".to_vec(),
+                    score: 10.0,
+                },
+                index: None,
+            }
+        );
+
+        let add = PendingMutation::AddZSetMember {
+            name: "myzset".into(),
+            member: b"beta".to_vec(),
+            score: 2.0,
+        };
+        assert_eq!(
+            add.into_command(),
+            Command::Execute {
+                mutation: Mutation::AddZSetMember {
+                    key: "myzset".into(),
+                    member: b"beta".to_vec(),
+                    score: 2.0,
+                },
+                index: None,
+            }
+        );
+
+        let delete = PendingMutation::DeleteZSetMember {
+            name: "myzset".into(),
+            member: b"gamma".to_vec(),
+            last_member: true,
+        };
+        assert_eq!(
+            delete.into_command(),
+            Command::Execute {
+                mutation: Mutation::DeleteZSetMember {
+                    key: "myzset".into(),
+                    member: b"gamma".to_vec(),
                 },
                 index: None,
             }

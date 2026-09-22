@@ -340,3 +340,77 @@ cargo run -p redis-pane -- --url redis://127.0.0.1:6379
 ## Found while building
 
 _(Executor: append anything noticed but deliberately not fixed, with `file:line`.)_
+
+**Phase 2.** All three types built per the table: `Mutation::{SetZSetScore, AddZSetMember,
+DeleteZSetMember}` and `NotWritten::MemberGone` (`crates/core/src/mutation.rs`);
+`PendingMutation::{SetZSetScore, AddZSetMember, DeleteZSetMember { last_member }}` with
+`command_text()`/`guard_text()`/`into_command()` (`crates/core/src/state/mod.rs`);
+`EditTarget::{ZSetScore { member }, NewZSetMember { member, part }}` and
+`EditBuffer::{zset_score, new_zset_member}` (`crates/core/src/state/editor.rs`); the real
+`ZSET_SCORE_EDIT_SCRIPT`/`ZSET_MEMBER_ADD_SCRIPT` and `set_zset_score`/`add_zset_member`/
+`delete_zset_member`, plus three arms in `execute` (`crates/app/src/redis/mutate.rs`).
+
+**`f64` has no `Eq`, and both `Mutation` and `PendingMutation` used to derive it.** Not anticipated
+by the plan's type table. Both enums now implement `Eq` by hand (`impl Eq for Mutation {}` /
+`impl Eq for PendingMutation {}`, right after their `#[derive(Debug, Clone, PartialEq)]`), the same
+way `crates/core/src/state/value.rs`'s `ScoredValue` already does — safe because D4/ADR-0018 rejects
+`nan` before a score can ever be staged, so every `f64` either type holds compares reflexively.
+
+**The seven D8 sites: three forced a compile error, four did not — exactly as task 8's phase 2
+found for List, not a regression in task 8's exhaustiveness fix.** Forced:
+`PendingMutation::guard_text` and `EditBuffer::active_part` (both exhaustive over the type gaining
+new variants), and `update/confirm.rs`'s `nothing_to_remove` (exhaustive over `Mutation`).
+`EditBuffer::active_part` is exactly the case the M3 inventory predicted — `NewZSetMember { part,
+.. } => Some(*part)` is a real `Some(..)`, not a wildcard's `None`. Not forced, because all four are
+`if let`/sequential-`matches!` chains over `Value` rather than exhaustive matches over
+`EditTarget`/`Mutation`/`PendingMutation`/`NotWritten`, and `Value` itself is unchanged this phase
+(ZSet was already one of its variants): `open_editor`, `begin_add_entry`
+(`crates/core/src/update/editor.rs`), `delete_value_row` (`crates/core/src/update/viewer.rs`,
+unmodified — `git diff` on it is empty) and `hint_bar` (`crates/core/src/render/mod.rs`). This
+matches PLAN M2 task 8's phase 2 report precisely: List's phase 2 also forced only `guard_text` and
+`active_part`, with the other five (including these same four) reached only once phase 3 wired
+`e`/`a`/`d`'s dispatch. Left untouched here for the same reason and by the same "no wiring into
+`update/`'s dispatch" instruction — phase 3's job.
+
+**Two more exhaustive matches were forced beyond the plan's declared four files**, the same way task
+8's phase 2 also touched files outside its own table: `crates/core/src/state/open.rs`'s `edit_verb`
+(matches `Option<&EditTarget>` with `Some(EditTarget::Value) | None` as its last arm, not a
+wildcard) and `crates/core/src/update/editor.rs`'s `stage_editor` (matches `EditTarget` by name,
+turning it into the matching `PendingMutation`) and `staged_edit_found_key_gone`'s `dialog_up`
+check (an or-pattern under `Some(...)` with `Some(DeleteKey) | None` as the rest — task 8 phase 3
+had already converted this from a bare `matches!` to a real exhaustive `match`, so it forced an
+error here too, one phase earlier than task 8 needed it to). All three got real arms, not stubs, and
+are unreachable today for the same reason the List ones were at task 8 phase 2: nothing in
+`update/`'s dispatch constructs a ZSet `EditTarget` yet. `render/mod.rs`'s `confirm_overlay` (also
+exhaustive over `PendingMutation`) was likewise forced and given real preview lines — this is where
+D2's guard-line wording and the score-diff-vs-membership-diff distinction (ADR-0018's preview
+requirement) actually live; no golden frame exercises them yet since nothing stages these three
+variants.
+
+**`stage_editor`'s parse-back fallback uses `f64::NAN`, not `0.0`, deliberately.** Turning a staged
+score's raw text back into `f64` for `PendingMutation::SetZSetScore`/`AddZSetMember` can only fail
+if it is ever reached with text D4's `is_valid_zset_score` would have rejected — which phase 3's
+`⌃S` guard is what actually prevents, and phase 2 does not wire. `unwrap_or(f64::NAN)` was chosen
+over `unwrap_or(0.0)` so that if this fallback is ever reached despite the guard, the write is
+refused visibly by the server (`ERR value is not a valid float`) rather than silently staging a
+fabricated `0.0` nobody typed — CLAUDE.md's "never swallow a bad write silently" extended to a
+theoretical path, not just the real ones.
+
+**`format_score` round-trip: lossless for the cases D4 asked for, with one caveat not in scope.**
+`format_score_round_trips_losslessly` (`crates/core/src/state/value.rs`) pins `0.0`, `±3.0`,
+`100.0`, an integral value near the `1e15` cutoff, `1.5`, `0.1`, `1.0000000000000002`, and both
+infinities — all exact via plain `==`. Not tested: `-0.0`. `format_score(-0.0)` takes the integral
+branch (`(-0.0).fract() == 0.0` is true) and prints `"0"` via `-0.0 as i64` → `0i64`, so the text
+loses the sign bit — `parsed == s` still holds (`0.0 == -0.0` is `true` in IEEE 754), but
+`parsed.to_bits() != s.to_bits()`. Not a defect against what D4/ADR-0018 actually claim (numeric
+losslessness, verified for `1.0000000000000002` and `0.1`), and not fixed here — noted because it
+is a genuine asymmetry in `format_score`'s two branches, and a future caller that compares scores by
+bits rather than by value should know about it (`crates/core/src/state/value.rs`, `format_score`,
+around the `s.fract() == 0.0` branch).
+
+**`NewZSetMember`'s `Enter`-advance/typing mechanics (`name_push`/`name_push_str`/`name_pop`/
+`advance_to_value`/`return_to_name`) are untouched** — they still only match
+`EditTarget::NewHashField`. These are `if let`, not exhaustive matches, so they compiled clean
+without a ZSet arm and are correctly phase 3's job (D6's `Enter` advance from `MEMBER` to `SCORE`),
+not this phase's — flagging here only so phase 3 does not have to rediscover which mechanics still
+need wiring, the same courtesy task 8's phase 2 note extended to `staged_edit_found_key_gone`.

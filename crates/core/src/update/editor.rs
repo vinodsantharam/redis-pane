@@ -286,6 +286,7 @@ pub(super) fn stage_editor(mut state: State) -> (State, Vec<Command>) {
         EditTarget::NewHashField { .. }
             | EditTarget::NewSetMember
             | EditTarget::NewListElement { .. }
+            | EditTarget::NewZSetMember { .. }
     );
     if !is_new_field && !editor.is_dirty() {
         open.end_edit();
@@ -341,6 +342,44 @@ pub(super) fn stage_editor(mut state: State) -> (State, Vec<Command>) {
             end,
             value: new,
         },
+        // `e` on a ZSet (PLAN M2 task 9 phase 3, ADR-0018 D1, D2): not
+        // reachable until `open_editor` constructs this target — the arm
+        // exists now because `EditTarget` is matched exhaustively (PLAN M2
+        // task 8, D8). The buffer holds the score's text, seeded and
+        // validated as an f64 elsewhere (D4); `original` is the score's
+        // text as read, parsed back for the guard's `old_score`. `member`
+        // is the identity the write is keyed on — D7: rank is not identity,
+        // so a reorder under the dialog cannot misdirect this.
+        EditTarget::ZSetScore { member } => {
+            // `unwrap_or(NaN)`, not `0.0`: phase 3's `⌃S` guard (D4) is what
+            // actually keeps invalid text from ever reaching here, so this
+            // fallback is unreachable in practice, not a silent-corruption
+            // path standing in for validation — if it were ever reached, a
+            // `NaN` score makes the server refuse the write with a visible
+            // error (CLAUDE.md: never swallow a bad write silently), rather
+            // than staging a fabricated `0.0` a reader never typed.
+            let parse = |bytes: &[u8]| -> f64 {
+                String::from_utf8_lossy(bytes).parse().unwrap_or(f64::NAN)
+            };
+            PendingMutation::SetZSetScore {
+                name,
+                member,
+                old_score: parse(&original),
+                new_score: parse(&new),
+            }
+        }
+        // `a` on a ZSet (PLAN M2 task 9 phase 3, ADR-0018 D2, D6): not
+        // reachable until `begin_add_entry` constructs this target, for the
+        // same reason the arm above is not. Same `NaN`-not-`0.0` fallback
+        // reasoning.
+        EditTarget::NewZSetMember { member, .. } => {
+            let score: f64 = String::from_utf8_lossy(&new).parse().unwrap_or(f64::NAN);
+            PendingMutation::AddZSetMember {
+                name,
+                member: member.into_bytes(),
+                score,
+            }
+        }
     };
     state.confirm = Some(mutation);
     (state, Vec::new())
@@ -519,7 +558,10 @@ pub(super) fn staged_edit_found_key_gone(state: &mut State, name: &KeyName, at_m
             | PendingMutation::DeleteSetMember { name: staged, .. }
             | PendingMutation::SetListElement { name: staged, .. }
             | PendingMutation::AddListElement { name: staged, .. }
-            | PendingMutation::DeleteListElement { name: staged, .. },
+            | PendingMutation::DeleteListElement { name: staged, .. }
+            | PendingMutation::SetZSetScore { name: staged, .. }
+            | PendingMutation::AddZSetMember { name: staged, .. }
+            | PendingMutation::DeleteZSetMember { name: staged, .. },
         ) => staged == name,
         // `DeleteKey` never opens a buffer and is handled entirely by
         // `key_deleted` (`update/confirm.rs`), not this function — the key

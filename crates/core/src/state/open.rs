@@ -557,6 +557,11 @@ impl OpenKey {
                 };
                 format!("✎ adding element ({end})")
             }
+            // D1, ADR-0018: `e` on a ZSet edits the score, never the member —
+            // "score", not "edit", so the header does not promise `e` opens
+            // the member.
+            Some(super::EditTarget::ZSetScore { .. }) => "✎ editing score".to_string(),
+            Some(super::EditTarget::NewZSetMember { .. }) => "✎ adding member".to_string(),
             Some(super::EditTarget::Value) | None => "✎ editing".to_string(),
         }
     }

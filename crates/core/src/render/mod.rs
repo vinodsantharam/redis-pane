@@ -15,7 +15,7 @@ use ratatui::widgets::Widget;
 
 use crate::clock::Clock;
 use crate::keymap::{Action, key_label};
-use crate::state::value::Value;
+use crate::state::value::{Value, format_score};
 use crate::state::{
     Attachment, EditBuffer, EditTarget, FieldPart, Link, Liveness, PendingMutation, PendingRead,
     State,
@@ -942,6 +942,72 @@ fn confirm_overlay(
             if *last_element {
                 lines.push((
                     "last element — the key will be deleted".to_string(),
+                    Token::Warn,
+                ));
+            }
+        }
+        // ZSet score edit (D1, D2, D7, ADR-0018): not reachable until PLAN
+        // M2 task 9 phase 3 wires `e` for a ZSet — no golden frame exercises
+        // this yet, since nothing stages `SetZSetScore` — the arm exists now
+        // because `PendingMutation` is matched exhaustively (PLAN M2 task 8,
+        // D8). A score diff, deliberately distinct from a membership diff
+        // (ADR-0018's preview requirement, PLAN row 9's "Proves"): the
+        // member is shown once, plainly, since it never changes (D1) — not
+        // as a `-`/`+` side, which would misread as the member itself being
+        // replaced — and only the score gets an `old → new` line.
+        PendingMutation::SetZSetScore {
+            member,
+            old_score,
+            new_score,
+            ..
+        } => {
+            lines.push((pending.command_text(), Token::Text));
+            if let Some(guard) = pending.guard_text() {
+                lines.push((guard, Token::Muted));
+            }
+            lines.push((
+                format!("member {}", String::from_utf8_lossy(member)),
+                Token::Text,
+            ));
+            lines.push((
+                format!(
+                    "score {} → {}",
+                    format_score(*old_score),
+                    format_score(*new_score)
+                ),
+                Token::Text,
+            ));
+        }
+        // ZSet add (D2, D3, D6, ADR-0018): same shape as the Hash/Set add
+        // arms above — the `+` side carries the whole member+score pair,
+        // since both are new (ADR-0018's preview requirement).
+        PendingMutation::AddZSetMember { member, score, .. } => {
+            lines.push((pending.command_text(), Token::Text));
+            if let Some(guard) = pending.guard_text() {
+                lines.push((guard, Token::Muted));
+            }
+            push_diff_side(
+                &mut lines,
+                "+",
+                format!(
+                    "{} {}",
+                    String::from_utf8_lossy(member),
+                    format_score(*score)
+                )
+                .as_bytes(),
+                Token::Ok,
+            );
+        }
+        PendingMutation::DeleteZSetMember {
+            member,
+            last_member,
+            ..
+        } => {
+            lines.push((pending.command_text(), Token::Text));
+            push_diff_side(&mut lines, "-", member, Token::Danger);
+            if *last_member {
+                lines.push((
+                    "last member — the key will be deleted".to_string(),
                     Token::Warn,
                 ));
             }

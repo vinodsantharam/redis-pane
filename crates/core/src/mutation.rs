@@ -15,7 +15,13 @@ use crate::key::KeyName;
 use crate::state::value::ListEnd;
 
 /// A write, exactly as the shell executes it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Eq` is implemented by hand below, not derived: `SetZSetScore`/
+/// `AddZSetMember` carry a `score: f64`, and `f64` has no `Eq` (`NaN != NaN`).
+/// Safe here the same way [`crate::state::value::ScoredValue`]'s manual `Eq`
+/// is: D4/ADR-0018 rejects `nan` before a score can ever be staged, so every
+/// `f64` this type ever holds compares reflexively.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Mutation {
     /// `DEL key` (R4.3).
     DeleteKey { key: KeyName },
@@ -86,7 +92,31 @@ pub enum Mutation {
         index: usize,
         expected: Vec<u8>,
     },
+    /// Guarded `ZADD key XX <score> <member>`, refusing unless `member` still
+    /// exists (ADR-0018 D2). `ZADD XX` already refuses on its own to create a
+    /// key that is gone — unlike `HSET`/`SADD`/`LPUSH` — so the guard's real
+    /// job is telling a gone member apart from an unchanged score, which
+    /// `ZADD XX CH` cannot do (ADR-0018 D2's "why a script").
+    SetZSetScore {
+        key: KeyName,
+        member: Vec<u8>,
+        score: f64,
+    },
+    /// Guarded `ZADD key NX <score> <member>`, never recreating a gone key
+    /// and never overwriting an existing member's score (ADR-0018 D2). No
+    /// compare-and-set the way `SetZSetScore` needs one — an add addresses
+    /// no existing member.
+    AddZSetMember {
+        key: KeyName,
+        member: Vec<u8>,
+        score: f64,
+    },
+    /// `ZREM key member`. Removing the last member removes the key: Redis's
+    /// own behaviour, not something this arranges (ADR-0018).
+    DeleteZSetMember { key: KeyName, member: Vec<u8> },
 }
+
+impl Eq for Mutation {}
 
 impl Mutation {
     /// The key this writes to.
@@ -101,7 +131,10 @@ impl Mutation {
             | Mutation::DeleteSetMember { key, .. }
             | Mutation::SetListElement { key, .. }
             | Mutation::AddListElement { key, .. }
-            | Mutation::DeleteListElement { key, .. } => key,
+            | Mutation::DeleteListElement { key, .. }
+            | Mutation::SetZSetScore { key, .. }
+            | Mutation::AddZSetMember { key, .. }
+            | Mutation::DeleteZSetMember { key, .. } => key,
         }
     }
 
@@ -132,6 +165,15 @@ impl Mutation {
                 ListEnd::Tail => format!("RPUSH {key}"),
             },
             Mutation::DeleteListElement { key, index, .. } => format!("LREM {key} {index}"),
+            // The member, not the score: the member is the identity being
+            // named, the same reasoning that puts a Hash field's name on its
+            // line (ADR-0018). The score itself belongs in the confirm
+            // dialog's diff, not an error line.
+            Mutation::SetZSetScore { key, member: m, .. } => format!("ZADD {key} {}", field(m)),
+            // No member here, mirroring `AddSetMember` (ADR-0016 D3): a
+            // member is only a value, and an error line is no place for one.
+            Mutation::AddZSetMember { key, .. } => format!("ZADD {key} NX"),
+            Mutation::DeleteZSetMember { key, .. } => format!("ZREM {key}"),
         }
     }
 }
@@ -163,6 +205,11 @@ pub enum NotWritten {
     /// same element), so it gets its own variant and its own wording rather
     /// than borrowing a neighbour's "gone" framing.
     ElementMoved,
+    /// A `SetZSetScore` found the member already gone (ADR-0018 D3). Not
+    /// [`NotWritten::FieldGone`] — CLAUDE.md's glossary keeps a field and a
+    /// member distinct, so this gets its own variant and its own wording
+    /// rather than borrowing a Hash-shaped one.
+    MemberGone,
 }
 
 impl NotWritten {
@@ -187,6 +234,9 @@ impl NotWritten {
             NotWritten::ElementMoved => {
                 "that element moved — the list changed underneath it, look again"
             }
+            // ADR-0018 D3: a member, not a field — the glossary's distinction
+            // is load-bearing, so this does not borrow `FieldGone`'s words.
+            NotWritten::MemberGone => "member no longer exists",
         }
     }
 }
@@ -292,6 +342,29 @@ mod tests {
                 },
                 "LREM user:1 2",
             ),
+            (
+                Mutation::SetZSetScore {
+                    key: key.clone(),
+                    member: b"alpha".to_vec(),
+                    score: 10.0,
+                },
+                "ZADD user:1 alpha",
+            ),
+            (
+                Mutation::AddZSetMember {
+                    key: key.clone(),
+                    member: b"alpha".to_vec(),
+                    score: 1.0,
+                },
+                "ZADD user:1 NX",
+            ),
+            (
+                Mutation::DeleteZSetMember {
+                    key: key.clone(),
+                    member: b"alpha".to_vec(),
+                },
+                "ZREM user:1",
+            ),
         ];
         for (mutation, label) in cases {
             assert_eq!(mutation.command_label(), label);
@@ -305,6 +378,15 @@ mod tests {
         assert_eq!(
             reason,
             "that element moved — the list changed underneath it, look again"
+        );
+    }
+
+    #[test]
+    fn member_gone_does_not_borrow_field_gones_wording() {
+        assert_eq!(NotWritten::MemberGone.reason(), "member no longer exists");
+        assert_ne!(
+            NotWritten::MemberGone.reason(),
+            NotWritten::FieldGone.reason()
         );
     }
 }

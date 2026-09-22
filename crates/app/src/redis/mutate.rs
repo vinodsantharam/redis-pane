@@ -90,6 +90,29 @@ pub async fn execute(client: &Client, mutation: &Mutation) -> Result<MutationOut
             }
             ListElementDelete::KeyGone => MutationOutcome::NotWritten(NotWritten::KeyGone),
         },
+        Mutation::SetZSetScore { member, score, .. } => {
+            match set_zset_score(client, key, member, *score).await? {
+                ZSetScoreWrite::Written => MutationOutcome::Done,
+                ZSetScoreWrite::MemberGone => MutationOutcome::NotWritten(NotWritten::MemberGone),
+                ZSetScoreWrite::KeyGone => MutationOutcome::NotWritten(NotWritten::KeyGone),
+            }
+        }
+        Mutation::AddZSetMember { member, score, .. } => {
+            match add_zset_member(client, key, member, *score).await? {
+                ZSetMemberAdd::Added => MutationOutcome::Done,
+                ZSetMemberAdd::MemberExists => {
+                    MutationOutcome::NotWritten(NotWritten::MemberExists)
+                }
+                ZSetMemberAdd::KeyGone => MutationOutcome::NotWritten(NotWritten::KeyGone),
+            }
+        }
+        Mutation::DeleteZSetMember { member, .. } => {
+            if delete_zset_member(client, key, member).await? {
+                MutationOutcome::Done
+            } else {
+                MutationOutcome::NothingToRemove
+            }
+        }
     })
 }
 
@@ -598,4 +621,151 @@ pub async fn delete_list_element(
         -2 => ListElementDelete::ElementMoved,
         _ => ListElementDelete::Removed,
     })
+}
+
+/// Lua guard for editing an existing ZSet member's score (PLAN M2 task 9,
+/// D2, ADR-0018).
+///
+/// `KEYS[1]` is the ZSet key; `ARGV[1]` is the member, binary-safe;
+/// `ARGV[2]` the new score, as a decimal string. Returns `-1` if the key is
+/// already gone, `-2` if the member is already gone, or `1` on success.
+///
+/// **`ZADD XX` already refuses on its own to create a key that is gone** —
+/// unlike `HSET`/`SADD`/`LPUSH` — so the `EXISTS` half is redundant for
+/// safety; it is kept only so a gone key can be *reported* apart from a gone
+/// member, the same reason [`LIST_ELEMENT_EDIT_SCRIPT`] keeps its redundant
+/// `EXISTS`. The `ZSCORE` half is not redundant, and is the real reason for
+/// the script: `ZADD XX CH` returns the count of elements *changed*, so it
+/// answers `0` both when the member is absent **and** when it is present
+/// with that score already — two completely different things to tell the
+/// reader, which a bare `ZADD` cannot separate (ADR-0018 D2).
+const ZSET_SCORE_EDIT_SCRIPT: &str = r#"
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return -1
+end
+if redis.call('ZSCORE', KEYS[1], ARGV[1]) == false then
+  return -2
+end
+redis.call('ZADD', KEYS[1], 'XX', ARGV[2], ARGV[1])
+return 1
+"#;
+
+/// Lua guard for adding a ZSet member+score, never recreating a key that is
+/// gone and never overwriting an existing member's score (PLAN M2 task 9,
+/// D2, ADR-0018).
+///
+/// `KEYS[1]` is the ZSet key; `ARGV[1]` the member, binary-safe; `ARGV[2]`
+/// the score, as a decimal string. Returns `-1` if the key is already gone
+/// (never recreated), or `ZADD NX`'s own `0`/`1` otherwise — `0` means the
+/// member was already there, including one outside the 500-member read
+/// window, and its score was left untouched.
+const ZSET_MEMBER_ADD_SCRIPT: &str = r#"
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return -1
+end
+return redis.call('ZADD', KEYS[1], 'NX', ARGV[2], ARGV[1])
+"#;
+
+/// What a guarded score edit did on the server ([`set_zset_score`], D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZSetScoreWrite {
+    /// The score was overwritten.
+    Written,
+    /// The member was already gone; nothing was written.
+    MemberGone,
+    /// The key was already gone; nothing was written, nothing recreated.
+    KeyGone,
+}
+
+/// What a guarded member add did on the server ([`add_zset_member`], D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZSetMemberAdd {
+    /// The member did not exist and was added with the given score.
+    Added,
+    /// The member already existed; its score was left untouched.
+    MemberExists,
+    /// The key was already gone; nothing was written, nothing recreated.
+    KeyGone,
+}
+
+/// Edit an existing ZSet member's score, refusing unless the member is
+/// still there (`EVAL`, PLAN M2 task 9, D1, D2, ADR-0018).
+///
+/// `name` and `member` travel the same binary-safe way [`set_hash_field`]'s
+/// `name`/`field` do — see its doc comment for the `Vec<u8>` conversion
+/// traps this avoids. `score` travels as a decimal-string `ARGV` entry via
+/// `f64`'s `Display`, which is Rust's shortest-round-trip representation —
+/// the same guarantee [`crate::state::value::format_score`] (in
+/// `redis-pane-core`) relies on for the Viewer's SCORE column, so what
+/// reaches the server is exactly the value that was staged, never a
+/// precision-lossy approximation of it.
+///
+/// The caller must not treat [`ZSetScoreWrite::Written`] as the value now on
+/// screen — the read path is always re-run afterward (ADR-0006), same as
+/// [`set_value`].
+pub async fn set_zset_score(
+    client: &Client,
+    name: &[u8],
+    member: &[u8],
+    score: f64,
+) -> Result<ZSetScoreWrite, Error> {
+    let key = fred::types::Key::from(name);
+    let result: i64 = client
+        .eval(
+            ZSET_SCORE_EDIT_SCRIPT,
+            vec![key],
+            vec![member.to_vec(), score.to_string().into_bytes()],
+        )
+        .await?;
+    Ok(match result {
+        -1 => ZSetScoreWrite::KeyGone,
+        -2 => ZSetScoreWrite::MemberGone,
+        _ => ZSetScoreWrite::Written,
+    })
+}
+
+/// Add a new ZSet member+score, never recreating a key that is gone and
+/// never overwriting an existing member's score (`EVAL`, PLAN M2 task 9, D2,
+/// ADR-0018).
+///
+/// Guards the same gone-key hazard as [`set_zset_score`] — see its doc
+/// comment for the binary-safety and score-formatting notes, which apply
+/// here unchanged.
+pub async fn add_zset_member(
+    client: &Client,
+    name: &[u8],
+    member: &[u8],
+    score: f64,
+) -> Result<ZSetMemberAdd, Error> {
+    let key = fred::types::Key::from(name);
+    let result: i64 = client
+        .eval(
+            ZSET_MEMBER_ADD_SCRIPT,
+            vec![key],
+            vec![member.to_vec(), score.to_string().into_bytes()],
+        )
+        .await?;
+    Ok(match result {
+        -1 => ZSetMemberAdd::KeyGone,
+        0 => ZSetMemberAdd::MemberExists,
+        _ => ZSetMemberAdd::Added,
+    })
+}
+
+/// Remove one ZSet member (`ZREM`, PLAN M2 task 9, D2, D8, ADR-0018).
+///
+/// `false` means the member was already gone — including the case where the
+/// whole key is gone, since `ZREM` on a missing key is simply zero members
+/// removed, the same "already true" shape [`delete_set_member`] reports for
+/// `SREM`. Deleting the last member deletes the key itself; that is Redis's
+/// own behaviour, not something this function arranges.
+pub async fn delete_zset_member(
+    client: &Client,
+    name: &[u8],
+    member: &[u8],
+) -> Result<bool, Error> {
+    let key = fred::types::Key::from(name);
+    let member_key = fred::types::Key::from(member);
+    let removed: i64 = client.zrem(key, member_key).await?;
+    Ok(removed > 0)
 }

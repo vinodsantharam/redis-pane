@@ -38,6 +38,14 @@ pub enum Mutation {
     /// `HDEL key field`. Removing the last field removes the key: Redis's own
     /// behaviour, not something this arranges.
     DeleteHashField { key: KeyName, field: Vec<u8> },
+    /// Guarded `SADD key member`, never recreating the key (ADR-0016 D2). A
+    /// Set member has no name/value split the way a Hash field does — it is
+    /// only bytes — so unlike `AddHashField` there is nothing here but the
+    /// member itself (PLAN M2 task 7, D3).
+    AddSetMember { key: KeyName, member: Vec<u8> },
+    /// `SREM key member`. Removing the last member removes the key: Redis's
+    /// own behaviour, not something this arranges (ADR-0016).
+    DeleteSetMember { key: KeyName, member: Vec<u8> },
 }
 
 impl Mutation {
@@ -48,7 +56,9 @@ impl Mutation {
             | Mutation::SetString { key, .. }
             | Mutation::SetHashField { key, .. }
             | Mutation::AddHashField { key, .. }
-            | Mutation::DeleteHashField { key, .. } => key,
+            | Mutation::DeleteHashField { key, .. }
+            | Mutation::AddSetMember { key, .. }
+            | Mutation::DeleteSetMember { key, .. } => key,
         }
     }
 
@@ -66,6 +76,11 @@ impl Mutation {
             Mutation::SetHashField { key, field: f, .. } => format!("HSET {key} {}", field(f)),
             Mutation::AddHashField { key, field: f, .. } => format!("HSETNX {key} {}", field(f)),
             Mutation::DeleteHashField { key, field: f } => format!("HDEL {key} {}", field(f)),
+            // No member in the label, unlike a Hash field's name: a member is
+            // only a value (ADR-0016 D3), and an error line is no place for
+            // one any more than it is for a String's value.
+            Mutation::AddSetMember { key, .. } => format!("SADD {key}"),
+            Mutation::DeleteSetMember { key, .. } => format!("SREM {key}"),
         }
     }
 }
@@ -83,6 +98,31 @@ pub enum NotWritten {
     FieldGone,
     /// An `AddHashField` found the field already there.
     FieldExists,
+    /// An `AddSetMember` found the member already there (ADR-0016 D2). Not
+    /// [`NotWritten::FieldExists`] — a Set has no fields, and CLAUDE.md's
+    /// glossary treats a member and a field as different things, so the
+    /// error type keeps the distinction rather than blurring it (PLAN M2
+    /// task 7).
+    MemberExists,
+}
+
+impl NotWritten {
+    /// What to tell the reader, in the notification that names the refused
+    /// command (R7.4).
+    ///
+    /// Here rather than at the two places that report it, so a new guard
+    /// forces a wording decision once instead of silently inheriting a
+    /// neighbour's — the shape the reporting code had before this, where a
+    /// nested match needed an arm for a variant it could never see and gave
+    /// it another guard's words.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            NotWritten::KeyGone => "key no longer exists",
+            NotWritten::FieldGone => "field no longer exists",
+            NotWritten::FieldExists => "field already exists",
+            NotWritten::MemberExists => "member already exists",
+        }
+    }
 }
 
 /// What the server made of a [`Mutation`].
@@ -138,6 +178,20 @@ mod tests {
                     field: b"token".to_vec(),
                 },
                 "HDEL user:1 token",
+            ),
+            (
+                Mutation::AddSetMember {
+                    key: key.clone(),
+                    member: b"alpha".to_vec(),
+                },
+                "SADD user:1",
+            ),
+            (
+                Mutation::DeleteSetMember {
+                    key: key.clone(),
+                    member: b"alpha".to_vec(),
+                },
+                "SREM user:1",
             ),
         ];
         for (mutation, label) in cases {

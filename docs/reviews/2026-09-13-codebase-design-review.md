@@ -636,6 +636,52 @@ Ordered by blast radius and by what each fix unblocks, not strictly by severity:
   metadata fetch, a clipboard error — switched R3.8's guard off under unsaved text (`59a56b0`).
 - Copying a wrapped String pasted the wrap's line breaks into the clipboard (`effa1d1`).
 
+**M3 inventory, collected 2026-09-21 (PLAN M2 task 7, phase 5).** M3 was deferred "until a second
+collection type becomes editable" (above). Set member add/remove (ADR-0016) is that second type.
+This is not M3's fix — it is the list M3 was deferred to produce, collected now while a Hash arm
+and a Set arm sitting side by side in the same function is still fresh, rather than re-derived from
+a cold read later. Every entry below is a place that would gain a third arm — or a third `if`
+block, for the two that aren't `match`es — the day List (task 8) or ZSet (task 9) becomes editable.
+`file:line` points at the match/function as it stands on this branch.
+
+| Where | What's there now | What a third type costs |
+|---|---|---|
+| `crates/core/src/mutation.rs:18` (`enum Mutation`) | `SetHashField`/`AddHashField`/`DeleteHashField` beside `AddSetMember`/`DeleteSetMember` | A new variant per write the type supports |
+| `crates/core/src/mutation.rs:53` (`Mutation::key`) | One giant or-pattern arm, all seven variants folded into it | Adding to the or-pattern (cheap; the exhaustiveness check catches an omission) |
+| `crates/core/src/mutation.rs:71` (`Mutation::command_label`) | One arm per variant, Hash's four beside Set's two | A new arm per write (exhaustive; compiler-enforced) |
+| `crates/core/src/mutation.rs:93` (`enum NotWritten`) | `FieldGone`/`FieldExists` beside `MemberExists` | A new variant per guard the type's writes can trip |
+| `crates/core/src/mutation.rs:118` (`NotWritten::reason`) | One arm per variant | A new arm (exhaustive; compiler-enforced) |
+| `crates/core/src/state/mod.rs:215` (`enum PendingMutation`) | `SetHashField`/`AddHashField`/`DeleteHashField { last_field }` beside `AddSetMember`/`DeleteSetMember { last_member }` | A new variant per write, each already needing its own `{ last_X }`-shaped bool if the type's delete can empty the key |
+| `crates/core/src/state/mod.rs:289` (`PendingMutation::command_text`) | One arm per variant | A new arm (exhaustive; compiler-enforced) |
+| `crates/core/src/state/mod.rs:321` (`PendingMutation::guard_text`) | `SetHashField`/`AddHashField`/`AddSetMember` arms, then **`_ => None`** | A silent `None` for a future guarded write unless the fallback is replaced with an explicit arm — the same shape of gap `nothing_to_remove` had (see below), just not yet tripped because nothing walks through it unnoticed |
+| `crates/core/src/state/mod.rs:368` (`PendingMutation::into_command`) | One arm per variant, no fallback | A new arm (exhaustive; compiler-enforced) |
+| `crates/core/src/state/editor.rs:29` (`enum EditTarget`) | `HashField`/`NewHashField { field, part }` beside `NewSetMember` | A new variant for the type's add form, plus a rename-in-place variant if the type ever gets one |
+| `crates/core/src/state/editor.rs:244` (`EditBuffer::field_name`) | `HashField`/`NewHashField` arm returning `Some`, `Value`/`NewSetMember` arm returning `None` | A new arm choosing which side of that split the type falls on (exhaustive; compiler-enforced) |
+| `crates/core/src/state/editor.rs:254` (`EditBuffer::active_part`) | `NewHashField` arm, **`_ => None`** | A silent `None` for any type without a name/value split (correct for Set today; would also be correct, silently, for a ZSet score/member split unless someone notices it needs `Some`) |
+| `crates/core/src/update/editor.rs:20` (`open_editor`) | Sequential `if let Value::Hash(pairs) = value` (line 55) then `if let Value::Set(members) = value` (line 80), not a `match` | A third `if let` block; nothing forces it to be written — a missing one falls through to the generic `EditBuffer::from_value` path silently, which is exactly the class of bug D1's Set refusal exists to avoid for collections |
+| `crates/core/src/update/editor.rs:116` (`begin_add_field`) | `match &open.value { Some(Value::Hash(_)) => .., Some(Value::Set(_)) => .., _ => notify(..) }` | A new arm before the `_`, which otherwise silently gives the new type the same "fields can only be added to a hash, members to a set" refusal a real add form should replace |
+| `crates/core/src/update/editor.rs:265` (`stage_editor`'s `match editor.target().clone()`) | `HashField`/`NewHashField` arms beside `NewSetMember`, no fallback | A new arm per `EditTarget` variant added above (exhaustive; compiler-enforced) |
+| `crates/core/src/update/viewer.rs:343` (`delete_hash_field`) | `match &open.value { Some(Value::Hash(pairs)) => .., Some(Value::Set(members)) => .., _ => notify(..) }` | A new arm before the `_`, same silent-fallback risk as `begin_add_field` above |
+| `crates/core/src/render/mod.rs:839` (`confirm_overlay`'s `match pending`) | `SetHashField`/`AddHashField`/`DeleteHashField` beside `AddSetMember`/`DeleteSetMember`, no fallback | A new arm per `PendingMutation` variant (exhaustive; compiler-enforced) |
+| `crates/core/src/render/mod.rs:1161` (`hint_bar`) | Two sequential `if !state.keys_pane_focused() && … matches!(o.value, Some(Value::Hash(_)))` / `Some(Value::Set(_)))` blocks (added this phase), not a `match` | A third `if` block; a missing one silently falls through to the generic Cancel/Refetch/… hint, exactly the gap this phase's Set hint fixed for Set itself |
+| `crates/core/src/update/confirm.rs:143` (`nothing_to_remove`) | `match mutation { Mutation::DeleteSetMember { .. } => "member", _ => "field" }` | **Left unfixed, deliberately, per this phase's brief.** The `_ => "field"` fallback means a future `Mutation::DeleteZSetMember` (task 9) would silently report a member deleted in a field's words — the same class of defect `NotWritten::reason` (`mutation.rs:118`) was written to prevent by forcing an explicit arm per variant. Fixing it now would mean inventing a `DeleteZSetMember`-shaped noun with no real caller yet; M3 (or task 9 itself) is where that arm belongs. |
+
+Two patterns recur enough to be worth naming for whoever picks up M3:
+
+- **Exhaustive `match`es on `Mutation`, `PendingMutation` or `EditTarget` are self-defending** — a
+  third type forces a compile error at every site above with no wildcard, which is why none of
+  them has silently drifted. The risk is entirely in the sites that *do* have a `_`/fallback arm
+  or that are sequential `if let`s instead of a `match`: `guard_text`, `active_part`,
+  `nothing_to_remove`, `open_editor`, `begin_add_field`, `delete_hash_field`, and `hint_bar`. Any
+  design M3 lands on should prefer turning these into exhaustive matches over `Value`'s or
+  `EditTarget`'s own type — the compiler doing the reminding, rather than a reviewer.
+- **The type-dispatch logic and the wire-format logic live in the same functions** — `begin_add_field`
+  and `delete_hash_field` in particular decide *both* "which type is this" and "what does opening
+  the add form / staging the delete mean for it" in one place, one editable-collection type per
+  arm. M3's actual redesign question is whether that dispatch belongs on the `Viewer` trait (or a
+  sibling trait for the mutable half) instead of in `update/`'s free functions — this inventory is
+  the concrete list of call sites such a trait would need to replace.
+
 ---
 
 ## Sources

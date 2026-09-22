@@ -1964,6 +1964,115 @@ fn the_hash_field_hint_does_not_claim_remove_when_the_keys_pane_is_focused() {
     );
 }
 
+// ── PLAN M2 task 7: adding/removing Set members (D1–D5, ADR-0016) ──────────
+
+fn set_value() -> Value {
+    Value::Set(MemberValue {
+        members: vec!["alpha".into(), "beta".into(), "gamma".into()],
+        total: 3,
+    })
+}
+
+#[test]
+fn golden_set_add_form_empty_shows_the_single_capture() {
+    let mut state = opened("user:8812:session", set_value(), 2_537);
+    let open = state.open.as_mut().unwrap();
+    open.begin_edit(EditBuffer::new_set_member());
+    assert_golden("set_form_add_empty", &draw(&state, 130, 22));
+}
+
+#[test]
+fn golden_set_add_form_typed_shows_the_text_in_the_single_part() {
+    let mut state = opened("user:8812:session", set_value(), 2_537);
+    let open = state.open.as_mut().unwrap();
+    open.begin_edit(EditBuffer::new_set_member());
+    let editor = open.typing_mut().unwrap();
+    editor.insert_str("delta");
+    assert_golden("set_form_add_typed", &draw(&state, 130, 22));
+}
+
+#[test]
+fn golden_set_add_form_shown_duplicate_blocks_staging() {
+    let mut state = opened("user:8812:session", set_value(), 2_537);
+    let open = state.open.as_mut().unwrap();
+    open.begin_edit(EditBuffer::new_set_member());
+    let editor = open.typing_mut().unwrap();
+    // "alpha" is one of `set_value()`'s members — a shown duplicate.
+    editor.insert_str("alpha");
+    assert_golden("set_form_add_duplicate", &draw(&state, 130, 22));
+}
+
+#[test]
+fn golden_confirm_add_set_member_shows_the_guard_and_only_a_plus_side() {
+    let mut state = opened("user:8812:session", set_value(), 2_537);
+    state.focus = Pane::Value;
+    let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+    let mut state = state;
+    let editor = state.open.as_mut().unwrap().typing_mut().unwrap();
+    editor.insert_str("delta");
+    let (state, _) = update(state, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+    assert!(matches!(
+        state.confirm,
+        Some(PendingMutation::AddSetMember { .. })
+    ));
+    assert_golden("confirm_add_set_member", &draw(&state, 130, 22));
+}
+
+#[test]
+fn golden_confirm_delete_set_member_shows_the_effective_command() {
+    let mut state = opened("user:8812:session", set_value(), 2_537);
+    // `d` is focus-dependent (D5): without this, `opened()`'s default focus
+    // (the keys pane) makes `d` stage `DeleteKey`, not `DeleteSetMember`.
+    state.focus = Pane::Value;
+    state.open.as_mut().unwrap().cursor_active = true;
+    let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+    assert!(matches!(
+        state.confirm,
+        Some(PendingMutation::DeleteSetMember {
+            last_member: false,
+            ..
+        })
+    ));
+    assert_golden("confirm_delete_set_member", &draw(&state, 130, 22));
+}
+
+#[test]
+fn golden_confirm_delete_set_member_warns_when_it_is_the_last_member() {
+    let mut state = opened(
+        "user:8812:session",
+        Value::Set(MemberValue {
+            members: vec!["only".into()],
+            total: 1,
+        }),
+        600,
+    );
+    state.focus = Pane::Value;
+    state.open.as_mut().unwrap().cursor_active = true;
+    let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+    assert!(matches!(
+        state.confirm,
+        Some(PendingMutation::DeleteSetMember {
+            last_member: true,
+            ..
+        })
+    ));
+    assert_golden(
+        "confirm_delete_set_member_last_member",
+        &draw(&state, 130, 22),
+    );
+}
+
+/// D1: `e` on a Set never opens a buffer — only `a`/`d` mean anything for a
+/// Set (ADR-0016), so the hint bar must not promise an `edit` mode
+/// `open_editor` never opens.
+#[test]
+fn golden_hint_bar_names_only_add_and_remove_for_a_set_with_a_cursor_active() {
+    let mut state = opened("user:8812:session", set_value(), 2_537);
+    state.focus = Pane::Value;
+    state.open.as_mut().unwrap().cursor_active = true;
+    assert_eq!(hint_bar(&state), "a add · d remove");
+}
+
 // ── UI task: type colour dots and the selection bar (style-verified) ────────
 
 use redis_pane_core::theme::Token;

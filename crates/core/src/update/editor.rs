@@ -69,6 +69,28 @@ pub(super) fn open_editor(mut state: State) -> (State, Vec<Command>) {
             Err(text) => (state, notify(text)),
         };
     }
+    // A Set member is never edited in place (D1, ADR-0016): its bytes are its
+    // whole identity, so "editing" one is a rename — `SREM old` + `SADD new`
+    // — which belongs with Hash field rename at PLAN M2 task 14, not here.
+    // `e` always refuses; which notice depends on whether there is a row to
+    // refuse *about* yet (D4/ADR-0015's gating, one collection type over) and
+    // on whether that row's bytes are even nameable in a notice — a
+    // non-UTF-8 member gets the same wording a binary Hash field's failed
+    // `for_hash_field` gives, since neither can be shown as text either way.
+    if let Value::Set(members) = value {
+        if !open.cursor_active {
+            return (state, notify("Enter to pick a member"));
+        }
+        let Some(member) = members.members.get(open.cursor) else {
+            return (state, notify("Enter to pick a member"));
+        };
+        let text = if std::str::from_utf8(member).is_ok() {
+            "a member can't be edited in place — remove it, then add the new one"
+        } else {
+            "binary members aren't editable here yet"
+        };
+        return (state, notify(text));
+    }
     match EditBuffer::from_value(value, open.cursor) {
         Ok(buffer) => {
             if let Some(open) = state.open.as_mut() {
@@ -80,9 +102,12 @@ pub(super) fn open_editor(mut state: State) -> (State, Vec<Command>) {
     }
 }
 
-/// Stages `a`: opens the two-part `FIELD`/`VALUE` add form on the Open Hash,
-/// on the name part (PLAN M2 task 6 follow-up, F). No cursor prerequisite —
-/// a new field has no row to have picked yet, unlike `e`.
+/// Stages `a`: opens the add form on the Open Hash or Set — the two-part
+/// `FIELD`/`VALUE` form on the name part for a Hash (PLAN M2 task 6
+/// follow-up, F), or the single-part capture for a Set (PLAN M2 task 7, D3,
+/// ADR-0016), since a member has no name half to type first. No cursor
+/// prerequisite either way — a new field or member has no row to have picked
+/// yet, unlike `e`.
 ///
 /// Emits no command: the form lives entirely in the core, the same as every
 /// other inline edit. `editing` is set from the moment it opens — there is no
@@ -107,11 +132,18 @@ pub(super) fn begin_add_field(mut state: State) -> (State, Vec<Command>) {
     if open.is_editing() {
         return (state, notify("still saving the last edit"));
     }
-    if !matches!(open.value, Some(Value::Hash(_))) {
-        return (state, notify("fields can only be added to a hash"));
-    }
+    let buffer = match &open.value {
+        Some(Value::Hash(_)) => EditBuffer::new_hash_field(),
+        Some(Value::Set(_)) => EditBuffer::new_set_member(),
+        _ => {
+            return (
+                state,
+                notify("fields can only be added to a hash, members to a set"),
+            );
+        }
+    };
     if let Some(open) = state.open.as_mut() {
-        open.begin_edit(EditBuffer::new_hash_field());
+        open.begin_edit(buffer);
     }
     (state, Vec::new())
 }
@@ -128,6 +160,21 @@ pub(super) fn hash_add_blocked(state: &State) -> bool {
         return true;
     };
     name.is_empty() || open.hash_field_shown_duplicate()
+}
+
+/// Whether `⌃S` is blocked on the Set add form (PLAN M2 task 7, D3,
+/// ADR-0016): a shown duplicate, exact byte equality against a member
+/// already in the fetched window. Unlike [`hash_add_blocked`], an empty
+/// member does *not* block staging — Redis allows an empty Set member, the
+/// same courtesy [`EditBuffer::new_set_member`] extends, so there is no
+/// name-emptiness half to check the way a Hash field's name has. `false`
+/// with nothing to check, so a caller need not re-verify `open`/`editor`
+/// exist or that the buffer is even a Set add before calling this.
+pub(super) fn set_member_blocked(state: &State) -> bool {
+    state
+        .open
+        .as_ref()
+        .is_some_and(OpenKey::set_member_shown_duplicate)
 }
 
 /// Keys read while the add form's name part is active (PLAN M2 task 6
@@ -195,9 +242,13 @@ pub(super) fn stage_editor(mut state: State) -> (State, Vec<Command>) {
     let Some(editor) = open.typing() else {
         return (state, Vec::new());
     };
-    // A brand-new field has no prior value to be unchanged from — an empty
-    // value is a real value Redis allows, not "nothing to save" (D1).
-    let is_new_field = matches!(editor.target(), EditTarget::NewHashField { .. });
+    // A brand-new field or member has no prior value to be unchanged from —
+    // an empty value is a real value Redis allows, not "nothing to save"
+    // (D1, and ADR-0016 D3 for the Set member one field narrower).
+    let is_new_field = matches!(
+        editor.target(),
+        EditTarget::NewHashField { .. } | EditTarget::NewSetMember
+    );
     if !is_new_field && !editor.is_dirty() {
         open.end_edit();
         return (state, Vec::new());
@@ -230,6 +281,10 @@ pub(super) fn stage_editor(mut state: State) -> (State, Vec<Command>) {
             field: field.into_bytes(),
             value: new,
         },
+        // `a` on a Set (PLAN M2 task 7 phase 3, ADR-0016 D3): the staging
+        // shape mirrors `NewHashField`'s, one field narrower — no field name
+        // to carry, since a member is only a value.
+        EditTarget::NewSetMember => PendingMutation::AddSetMember { name, member: new },
     };
     state.confirm = Some(mutation);
     (state, Vec::new())
@@ -257,7 +312,21 @@ pub(super) fn editor_key(mut state: State, key: KeyPress) -> (State, Vec<Command
     }
     if let Some(action) = state.keymap.action_for(&key) {
         match action {
-            Action::EditorStage => return stage_editor(state),
+            // The Set add form's shown-duplicate guard (D3, ADR-0016) is
+            // checked here, not in `stage_editor` itself — `stage_editor` is
+            // also how a confirmed `y` at the dialog is *not* reached (that
+            // goes through `confirm_key`), so the one call site that can
+            // actually short-circuit staging on a duplicate is this key
+            // handler, the same way `hash_add_blocked` gates `⌃S` from the
+            // Hash name part in `name_part_key` above. Every other
+            // `EditTarget` leaves `set_member_blocked` `false`, so this adds
+            // nothing to the String/Hash-field/Hash-add paths.
+            Action::EditorStage => {
+                if set_member_blocked(&state) {
+                    return (state, Vec::new());
+                }
+                return stage_editor(state);
+            }
             Action::EditorUndo => {
                 if let Some(editor) = state.open.as_mut().and_then(OpenKey::typing_mut) {
                     editor.undo();
@@ -336,10 +405,10 @@ pub(super) fn editor_key(mut state: State, key: KeyPress) -> (State, Vec<Command
 /// only standing in for the read back, and goes.
 pub(super) fn staged_edit_found_key_gone(state: &mut State, name: &KeyName, at_ms: u64) {
     // Every mutation that names this key, not just `SetString` — a
-    // `SetHashField`/`AddHashField` dialog closes and hands its buffer back
-    // exactly the same way; a `DeleteHashField` dialog simply closes with the
-    // notice, since it never had a buffer to hand back (`unstage_buffer` is a
-    // no-op with none).
+    // `SetHashField`/`AddHashField`/`AddSetMember` dialog closes and hands
+    // its buffer back exactly the same way; a `DeleteHashField`/
+    // `DeleteSetMember` dialog simply closes with the notice, since neither
+    // ever had a buffer to hand back (`unstage_buffer` is a no-op with none).
     let dialog_up = matches!(
         &state.confirm,
         Some(
@@ -347,6 +416,8 @@ pub(super) fn staged_edit_found_key_gone(state: &mut State, name: &KeyName, at_m
             | PendingMutation::SetHashField { name: staged, .. }
             | PendingMutation::AddHashField { name: staged, .. }
             | PendingMutation::DeleteHashField { name: staged, .. }
+            | PendingMutation::AddSetMember { name: staged, .. }
+            | PendingMutation::DeleteSetMember { name: staged, .. }
         ) if staged == name
     );
     let Some(open) = state.open.as_mut().filter(|o| o.name == *name) else {
@@ -1838,6 +1909,517 @@ mod hash_field_edit_tests {
             s.open.as_ref().unwrap().cursor,
             0,
             "clamped once the row it was on disappeared"
+        );
+    }
+}
+
+#[cfg(test)]
+mod set_member_edit_tests {
+    //! `e`/`a`/`d` on a Set member (PLAN M2 task 7, D1, D3, D4, D5,
+    //! ADR-0016): adding a member, removing one, and refusing to edit one in
+    //! place — one field narrower than the Hash tests above, and sharing the
+    //! same chokepoint and R3.8 guard.
+
+    use super::*;
+    use crate::msg::KeyCode;
+    use crate::state::value::MemberValue;
+
+    fn open_with_set(members: &[&str], total: usize) -> State {
+        let value = crate::state::Value::Set(MemberValue {
+            members: members.iter().map(|m| m.as_bytes().to_vec()).collect(),
+            total,
+        });
+        let mut state = State {
+            cols: 130,
+            rows: 40,
+            focus: Pane::Value,
+            open: Some(OpenKey::new(Some(0), "k".into(), value, -1, 10, 0)),
+            ..State::default()
+        };
+        state.keys.push(b"k");
+        state.rebuild_list();
+        state
+    }
+
+    fn with_cursor(mut s: State, row: usize) -> State {
+        let open = s.open.as_mut().unwrap();
+        open.cursor_active = true;
+        open.cursor = row;
+        s
+    }
+
+    fn type_text(mut s: State, text: &str) -> State {
+        for c in text.chars() {
+            (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char(c))));
+        }
+        s
+    }
+
+    // ── D1: `e` never opens a buffer on a Set row ───────────────────────────
+
+    #[test]
+    fn e_without_a_cursor_on_a_set_gives_the_pick_a_member_notice() {
+        let s = open_with_set(&["alpha"], 1);
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        assert!(!s.open.unwrap().is_editing());
+        assert!(
+            matches!(cmds.as_slice(), [Command::Notify { text }] if text == "Enter to pick a member"),
+            "{cmds:?}"
+        );
+    }
+
+    #[test]
+    fn e_on_a_set_row_refuses_with_d1s_notice_not_a_buffer() {
+        let s = with_cursor(open_with_set(&["alpha"], 1), 0);
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let open = s.open.unwrap();
+        assert!(!open.is_editing());
+        assert!(open.editor().is_none());
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Command::Notify { text }]
+                    if text == "a member can't be edited in place — remove it, then add the new one"
+            ),
+            "{cmds:?}"
+        );
+    }
+
+    #[test]
+    fn e_on_a_binary_set_row_gives_d4s_notice_instead() {
+        let value = crate::state::Value::Set(MemberValue {
+            members: vec![vec![0xff, 0x80]],
+            total: 1,
+        });
+        let mut s = State {
+            cols: 130,
+            rows: 40,
+            focus: Pane::Value,
+            open: Some(OpenKey::new(Some(0), "k".into(), value, -1, 10, 0)),
+            ..State::default()
+        };
+        s.keys.push(b"k");
+        s.rebuild_list();
+        let s = with_cursor(s, 0);
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        assert!(!s.open.unwrap().is_editing());
+        assert!(
+            matches!(cmds.as_slice(), [Command::Notify { text }] if text == "binary members aren't editable here yet"),
+            "{cmds:?}"
+        );
+    }
+
+    // ── Focus gating (ADR-0015 D4, mirrored for Sets) ───────────────────────
+
+    #[test]
+    fn e_in_the_keys_pane_with_a_set_open_gives_the_tab_notice() {
+        let mut s = open_with_set(&["alpha"], 1);
+        s.focus = Pane::Keys;
+        let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        assert!(
+            matches!(cmds.as_slice(), [Command::Notify { text }] if text == "Tab to the value pane to edit")
+        );
+    }
+
+    #[test]
+    fn a_in_the_keys_pane_with_a_set_open_gives_the_tab_notice() {
+        let mut s = open_with_set(&["alpha"], 1);
+        s.focus = Pane::Keys;
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        assert!(s.open.as_ref().unwrap().editor().is_none());
+        assert!(
+            matches!(cmds.as_slice(), [Command::Notify { text }] if text == "Tab to the value pane to edit")
+        );
+    }
+
+    #[test]
+    fn d_without_a_cursor_on_a_set_gives_the_pick_a_member_notice() {
+        let s = open_with_set(&["alpha"], 1);
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        assert!(s.confirm.is_none());
+        assert!(
+            matches!(cmds.as_slice(), [Command::Notify { text }] if text == "Enter to pick a member")
+        );
+    }
+
+    // ── D3: the add form is a single capture, and `a` needs no cursor ──────
+
+    #[test]
+    fn a_opens_a_single_part_buffer_with_no_cursor_needed() {
+        let s = open_with_set(&["alpha"], 1);
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        assert!(cmds.is_empty());
+        let open = s.open.as_ref().unwrap();
+        assert!(open.is_editing(), "R3.8's guard is up immediately");
+        let editor = open.editor().unwrap();
+        assert_eq!(editor.target(), &EditTarget::NewSetMember);
+        assert_eq!(editor.active_part(), None, "no FIELD/VALUE split");
+        assert_eq!(editor.field_name(), None);
+        assert_eq!(editor.text(), b"");
+    }
+
+    #[test]
+    fn typing_and_ctrl_s_stage_add_set_member() {
+        let s = open_with_set(&["alpha"], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "beta");
+        let (s, cmds) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(cmds.is_empty());
+        match &s.confirm {
+            Some(PendingMutation::AddSetMember { name, member }) => {
+                assert_eq!(name, b"k");
+                assert_eq!(member, b"beta");
+            }
+            other => panic!("expected a staged AddSetMember, got {other:?}"),
+        }
+        assert_eq!(s.confirm.as_ref().unwrap().command_text(), "SADD k");
+        assert_eq!(
+            s.confirm.as_ref().unwrap().guard_text(),
+            Some("only if the key still exists · never duplicates a member")
+        );
+        let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        assert_eq!(
+            cmds,
+            vec![Command::Execute {
+                mutation: Mutation::AddSetMember {
+                    key: "k".into(),
+                    member: b"beta".to_vec(),
+                },
+                index: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn ctrl_s_on_an_untouched_empty_buffer_still_stages_an_empty_member() {
+        // Redis allows an empty Set member, the same courtesy the Hash add
+        // form's value part gets — an unmodified empty buffer is a real
+        // member to add, not "nothing to save" (D3's doc comment on
+        // `EditBuffer::new_set_member`).
+        let s = open_with_set(&["alpha"], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        match &s.confirm {
+            Some(PendingMutation::AddSetMember { member, .. }) => assert!(member.is_empty()),
+            other => panic!("expected a staged AddSetMember, got {other:?}"),
+        }
+    }
+
+    // ── The shown-duplicate guard (D3) ───────────────────────────────────────
+
+    #[test]
+    fn a_shown_duplicate_member_blocks_ctrl_s() {
+        let s = open_with_set(&["dup"], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "dup");
+        let (s, cmds) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(cmds.is_empty());
+        assert!(s.confirm.is_none(), "⌃S blocked");
+        assert!(
+            s.open.as_ref().unwrap().is_editing(),
+            "the buffer stays open, not discarded"
+        );
+    }
+
+    #[test]
+    fn removing_a_character_unblocks_a_duplicate_member() {
+        let s = open_with_set(&["dup"], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "dup");
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Backspace)));
+        // "du" is not a shown member.
+        let (s, cmds) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(cmds.is_empty());
+        assert!(s.confirm.is_some(), "no longer blocked");
+    }
+
+    #[test]
+    fn a_non_duplicate_member_stages_fine() {
+        let s = open_with_set(&["alpha", "beta"], 2);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "gamma");
+        let (s, cmds) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(cmds.is_empty());
+        assert!(matches!(
+            s.confirm,
+            Some(PendingMutation::AddSetMember { .. })
+        ));
+    }
+
+    // ── D5: `d` in the value pane stages `DeleteSetMember` ─────────────────
+
+    #[test]
+    fn d_in_the_value_pane_stages_delete_set_member_and_marks_the_last_member() {
+        let s = with_cursor(open_with_set(&["only"], 1), 0);
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        assert!(cmds.is_empty());
+        match &s.confirm {
+            Some(PendingMutation::DeleteSetMember {
+                name,
+                member,
+                last_member,
+            }) => {
+                assert_eq!(name, b"k");
+                assert_eq!(member, b"only");
+                assert!(*last_member);
+            }
+            other => panic!("expected a staged DeleteSetMember, got {other:?}"),
+        }
+        assert_eq!(s.confirm.as_ref().unwrap().command_text(), "SREM k");
+    }
+
+    #[test]
+    fn d_with_more_than_one_member_left_is_not_marked_as_the_last() {
+        let s = with_cursor(open_with_set(&["a", "b"], 2), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        match &s.confirm {
+            Some(PendingMutation::DeleteSetMember { last_member, .. }) => assert!(!last_member),
+            other => panic!("expected a staged DeleteSetMember, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn d_in_the_keys_pane_still_stages_delete_key_with_a_set_open() {
+        let mut s = open_with_set(&["a"], 1);
+        s.focus = Pane::Keys;
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        assert!(matches!(s.confirm, Some(PendingMutation::DeleteKey { .. })));
+    }
+
+    #[test]
+    fn confirming_a_delete_set_member_issues_srem() {
+        let s = with_cursor(open_with_set(&["only"], 1), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        assert_eq!(
+            cmds,
+            vec![Command::Execute {
+                mutation: Mutation::DeleteSetMember {
+                    key: "k".into(),
+                    member: b"only".to_vec(),
+                },
+                index: None,
+            }]
+        );
+    }
+
+    // ── Read-only Mode refuses at confirm, never at the keypress ───────────
+
+    #[test]
+    fn read_only_refuses_both_set_mutations_at_confirm_not_at_the_keypress() {
+        let mutations = [
+            PendingMutation::AddSetMember {
+                name: b"k".to_vec().into(),
+                member: b"m".to_vec(),
+            },
+            PendingMutation::DeleteSetMember {
+                name: b"k".to_vec().into(),
+                member: b"m".to_vec(),
+                last_member: false,
+            },
+        ];
+        for mutation in mutations {
+            let s = State {
+                read_only: Some(ReadOnlyReason::User),
+                confirm: Some(mutation.clone()),
+                ..State::default()
+            };
+            let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+            assert!(s.confirm.is_none(), "{mutation:?}");
+            assert!(
+                matches!(cmds.as_slice(), [Command::Notify { text }] if text.contains("read-only")),
+                "{mutation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_mode_does_not_refuse_a_on_a_set_only_at_y() {
+        let s = State {
+            read_only: Some(ReadOnlyReason::Environment),
+            ..open_with_set(&["alpha"], 1)
+        };
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        assert!(
+            s.open.as_ref().unwrap().editor().is_some(),
+            "opening the add form is never refused"
+        );
+        assert!(cmds.is_empty());
+        let s = type_text(s, "beta");
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(s.confirm.is_some(), "the preview is composed anyway");
+        let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        assert!(
+            !cmds.iter().any(|c| matches!(
+                c,
+                Command::Execute {
+                    mutation: Mutation::AddSetMember { .. },
+                    ..
+                }
+            )),
+            "but nothing was actually sent to the server"
+        );
+    }
+
+    // ── `NotWritten::MemberExists` hands the buffer back and re-reads ──────
+
+    #[test]
+    fn not_written_member_exists_names_sadd_and_hands_the_buffer_back() {
+        let s = open_with_set(&["alpha"], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "beta");
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        let (s, cmds) = update(
+            s,
+            Msg::MutationSettled {
+                mutation: Mutation::AddSetMember {
+                    key: "k".into(),
+                    member: b"beta".to_vec(),
+                },
+                index: None,
+                result: Ok(MutationOutcome::NotWritten(NotWritten::MemberExists)),
+                at_ms: 5_000,
+            },
+        );
+        assert!(matches!(cmds.as_slice(), [Command::ReadKey { .. }]));
+        let (text, _) = s.error.as_ref().unwrap();
+        assert!(text.contains("SADD k"), "{text}");
+        assert!(text.contains("member already exists"), "{text}");
+        let open = s.open.as_ref().unwrap();
+        assert!(
+            open.is_editing(),
+            "held under R3.8 — the buffer is open again"
+        );
+        assert_eq!(open.editor().unwrap().text(), b"beta");
+    }
+
+    #[test]
+    fn not_written_key_gone_tombstones_and_hands_the_set_add_back() {
+        let s = open_with_set(&["alpha"], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "beta");
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        let (s, cmds) = update(
+            s,
+            Msg::MutationSettled {
+                mutation: Mutation::AddSetMember {
+                    key: "k".into(),
+                    member: b"beta".to_vec(),
+                },
+                index: None,
+                result: Ok(MutationOutcome::NotWritten(NotWritten::KeyGone)),
+                at_ms: 6_000,
+            },
+        );
+        assert!(cmds.is_empty(), "never retried, never recreated");
+        let open = s.open.as_ref().unwrap();
+        assert_eq!(open.deleted_at_ms, Some(6_000));
+        assert!(open.is_editing(), "the buffer is open again");
+        assert_eq!(open.editor().unwrap().text(), b"beta");
+    }
+
+    #[test]
+    fn key_gone_under_a_staged_add_set_member_dialog_closes_and_hands_the_buffer_back() {
+        let s = open_with_set(&["alpha"], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "beta");
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(s.confirm.is_some());
+        let token = s.read_token;
+        let (s, _) = update(
+            s,
+            Msg::ValueGone {
+                token,
+                index: None,
+                name: "k".into(),
+                at_ms: 7_000,
+            },
+        );
+        assert!(s.confirm.is_none());
+        let open = s.open.as_ref().unwrap();
+        assert_eq!(open.deleted_at_ms, Some(7_000));
+        assert_eq!(open.editor().unwrap().text(), b"beta");
+    }
+
+    #[test]
+    fn key_gone_under_a_staged_delete_set_member_dialog_simply_closes() {
+        let s = with_cursor(open_with_set(&["a"], 1), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        assert!(s.confirm.is_some());
+        let token = s.read_token;
+        let (s, _) = update(
+            s,
+            Msg::ValueGone {
+                token,
+                index: None,
+                name: "k".into(),
+                at_ms: 7_000,
+            },
+        );
+        assert!(s.confirm.is_none());
+        assert!(s.notice.is_some());
+        let open = s.open.as_ref().unwrap();
+        assert_eq!(open.deleted_at_ms, Some(7_000));
+        assert!(open.editor().is_none(), "delete never had a buffer");
+    }
+
+    #[test]
+    fn a_delete_set_member_srem_returning_zero_says_member_not_field() {
+        // `nothing_to_remove` is shared with `DeleteHashField`'s "field
+        // already gone" notice — this is the regression test for keeping a
+        // member from being reported in a field's words.
+        let s = open_with_set(&["a"], 1);
+        let (s, cmds) = update(
+            s,
+            Msg::MutationSettled {
+                mutation: Mutation::DeleteSetMember {
+                    key: "k".into(),
+                    member: b"a".to_vec(),
+                },
+                index: None,
+                result: Ok(MutationOutcome::NothingToRemove),
+                at_ms: 5_000,
+            },
+        );
+        assert!(matches!(cmds.as_slice(), [Command::ReadKey { .. }]));
+        assert!(s.error.is_none(), "not an error");
+        let (text, _) = s.notice.as_ref().unwrap();
+        assert!(text.contains("SREM k"), "{text}");
+        assert!(text.contains("member already gone"), "{text}");
+        assert!(!text.contains("field"), "{text}");
+    }
+
+    // ── R3.8: a live update arriving while the add form is open is held ────
+
+    #[test]
+    fn an_update_arriving_while_the_set_add_form_is_open_is_held() {
+        let s = open_with_set(&["alpha"], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "beta");
+        assert!(s.open.as_ref().unwrap().is_editing());
+        let (s, _) = update(
+            s,
+            Msg::ValueLoaded {
+                token: crate::command::ReadToken::default(),
+                index: Some(0),
+                name: "k".into(),
+                value: crate::state::Value::Set(MemberValue {
+                    members: vec![b"alpha".to_vec(), b"changed-under-the-editor".to_vec()],
+                    total: 2,
+                }),
+                ttl_seconds: -1,
+                size_bytes: 10,
+                at_ms: 9_000,
+            },
+        );
+        let open = s.open.as_ref().unwrap();
+        assert!(open.pending.is_some(), "held, not applied");
+        assert_eq!(
+            open.editor().unwrap().text(),
+            b"beta",
+            "the buffer is never touched (R3.8)"
         );
     }
 }

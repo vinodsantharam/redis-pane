@@ -130,12 +130,16 @@ pub(super) fn write_landed(mut state: State, key: &KeyName) -> (State, Vec<Comma
     (state, commands)
 }
 
-/// `HDEL` found the field already gone (PLAN M2 task 6, D1, D4).
+/// `HDEL`/`SREM` found the field or member already gone (PLAN M2 task 6, D1,
+/// D4; PLAN M2 task 7, D5, ADR-0016).
 ///
-/// Not an error, and not a refusal: `HDEL` did exactly what was asked and
-/// found nothing to remove, and there is no buffer to hand anything back to —
-/// `Delete` never opens one. Reported as a notice, then a Refetch, the same way
-/// every other change to the open key is (ADR-0006).
+/// Not an error, and not a refusal: the command did exactly what was asked
+/// and found nothing to remove, and there is no buffer to hand anything back
+/// to — `Delete` never opens one. Reported as a notice, then a Refetch, the
+/// same way every other change to the open key is (ADR-0006). Which noun the
+/// notice uses is decided here, once, from the `Mutation` itself — the same
+/// discipline `NotWritten::reason` uses to keep a member from being reported
+/// in a field's words (CLAUDE.md's glossary distinction).
 pub(super) fn nothing_to_remove(
     mut state: State,
     mutation: &Mutation,
@@ -148,8 +152,12 @@ pub(super) fn nothing_to_remove(
     {
         return (state, Vec::new());
     }
+    let what = match mutation {
+        Mutation::DeleteSetMember { .. } => "member",
+        _ => "field",
+    };
     state.notice = Some((
-        format!("{}: field already gone", mutation.command_label()),
+        format!("{}: {what} already gone", mutation.command_label()),
         at_ms,
     ));
     let commands = refetch(&mut state);
@@ -196,22 +204,22 @@ pub(super) fn not_written(
             }
             let tail = if kept { ", edit kept" } else { "" };
             state.error = Some((
-                format!("{command}: key no longer exists — nothing written{tail}"),
+                format!("{command}: {} — nothing written{tail}", why.reason()),
                 at_ms,
             ));
             (state, Vec::new())
         }
-        NotWritten::FieldGone | NotWritten::FieldExists => {
+        NotWritten::FieldGone | NotWritten::FieldExists | NotWritten::MemberExists => {
             if let Some(open) = state.open.as_mut() {
                 open.unstage_buffer();
             }
-            let reason = if why == NotWritten::FieldGone {
-                "field no longer exists"
-            } else {
-                "field already exists"
-            };
+            // The guards that refuse without the key going anywhere: the
+            // write is dropped, the buffer comes back, and the Viewer
+            // re-reads. `MemberExists` cannot arrive here until `a` on a Set
+            // is wired (PLAN M2 task 7 phase 3); the arm is here because
+            // `NotWritten` is matched exhaustively.
             state.error = Some((
-                format!("{command}: {reason} — nothing written, edit kept"),
+                format!("{command}: {} — nothing written, edit kept", why.reason()),
                 at_ms,
             ));
             let commands = refetch(&mut state);

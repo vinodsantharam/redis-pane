@@ -39,6 +39,12 @@ pub enum EditTarget {
     /// follow-up, F). `field` is itself being typed while `part` is
     /// [`FieldPart::Name`].
     NewHashField { field: String, part: FieldPart },
+    /// A brand-new member of the Open Set, not yet on the server (`SADD`,
+    /// guarded) — PLAN M2 task 7, D3, ADR-0016. Carries no [`FieldPart`]: a
+    /// Set member has no name/value split the way a Hash field does — it is
+    /// only bytes — so the add form is a single capture, not the Hash add
+    /// form's two-part `FIELD`/`VALUE` shape.
+    NewSetMember,
 }
 
 /// Which half of the add form (`FIELD`/`VALUE`) is active, while adding a new
@@ -207,18 +213,38 @@ impl EditBuffer {
         }
     }
 
+    /// An empty buffer for a member that does not exist on the server yet
+    /// (`a` on a Set, PLAN M2 task 7, D3, ADR-0016). A single capture, unlike
+    /// [`EditBuffer::new_hash_field`]'s two-part name/value form — a Set
+    /// member has no name to type first, so the form opens straight onto the
+    /// value. Redis allows an empty member, the same as it allows an empty
+    /// Hash field value, so an unmodified empty buffer still stages an `SADD`
+    /// with an empty member rather than being treated as "nothing to save".
+    pub fn new_set_member() -> EditBuffer {
+        let mut area = TextArea::new(vec![String::new()]);
+        area.set_wrap_mode(WrapMode::WordOrGlyph);
+        area.set_cursor_line_style(ratatui::style::Style::default());
+        EditBuffer {
+            area,
+            original: Vec::new(),
+            was_json: false,
+            target: EditTarget::NewSetMember,
+        }
+    }
+
     /// What this buffer writes back when staged.
     pub fn target(&self) -> &EditTarget {
         &self.target
     }
 
     /// The Hash field name, being typed ([`EditTarget::NewHashField`]) or
-    /// fixed ([`EditTarget::HashField`]). `None` for a plain String edit,
-    /// which has no field of its own.
+    /// fixed ([`EditTarget::HashField`]). `None` for a plain String edit or a
+    /// Set member, neither of which has a field of its own — a Set member is
+    /// only a value (D3, ADR-0016).
     pub fn field_name(&self) -> Option<&str> {
         match &self.target {
             EditTarget::HashField { field } | EditTarget::NewHashField { field, .. } => Some(field),
-            EditTarget::Value => None,
+            EditTarget::Value | EditTarget::NewSetMember => None,
         }
     }
 
@@ -514,6 +540,16 @@ mod tests {
             EditBuffer::for_hash_field(b"f", b"\x80").unwrap_err(),
             refused
         );
+    }
+
+    #[test]
+    fn new_set_member_opens_a_single_part_form_with_no_field() {
+        let buf = EditBuffer::new_set_member();
+        assert_eq!(buf.target(), &EditTarget::NewSetMember);
+        assert_eq!(buf.field_name(), None, "a member has no field name");
+        assert_eq!(buf.active_part(), None, "no FIELD/VALUE split for a member");
+        assert_eq!(buf.text(), b"");
+        assert!(!buf.was_json());
     }
 
     #[test]

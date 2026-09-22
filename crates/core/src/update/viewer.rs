@@ -334,30 +334,56 @@ pub(super) fn enter_value_cursor(mut state: State) -> (State, Vec<Command>) {
     (state, vec![command])
 }
 
-/// `d` with the value pane focused: delete the field the cursor is on, in an
-/// open Hash (D4, PLAN M2 task 6).
+/// `d` with the value pane focused: delete the field or member the cursor is
+/// on, in an open Hash (D4, PLAN M2 task 6) or Set (D5, PLAN M2 task 7,
+/// ADR-0016) — the name stays `delete_hash_field` (the Hash was first), but
+/// the function now stages either mutation depending on what is open, the
+/// same way `begin_add_field` above serves both types under its own
+/// unchanged name.
 pub(super) fn delete_hash_field(mut state: State) -> (State, Vec<Command>) {
     let notify = |text: &str| vec![Command::Notify { text: text.into() }];
     let Some(open) = state.open.as_ref() else {
         return (state, notify("nothing to remove here"));
     };
-    let Some(Value::Hash(pairs)) = &open.value else {
-        return (state, notify("nothing to remove here"));
-    };
-    if !open.cursor_active {
-        return (state, notify("Enter to pick a field"));
+    match &open.value {
+        Some(Value::Hash(pairs)) => {
+            if !open.cursor_active {
+                return (state, notify("Enter to pick a field"));
+            }
+            let Some((field, _)) = pairs.pairs.get(open.cursor).cloned() else {
+                return (state, notify("Enter to pick a field"));
+            };
+            let last_field = pairs.total == 1;
+            let name = open.name.clone();
+            state.confirm = Some(PendingMutation::DeleteHashField {
+                name,
+                field,
+                last_field,
+            });
+            (state, Vec::new())
+        }
+        Some(Value::Set(members)) => {
+            if !open.cursor_active {
+                return (state, notify("Enter to pick a member"));
+            }
+            let Some(member) = members.members.get(open.cursor).cloned() else {
+                return (state, notify("Enter to pick a member"));
+            };
+            // D5, ADR-0016: whether this is the set's only member *at the
+            // moment it was staged* — the same `total == 1` snapshot
+            // `last_field` above takes, not re-checked when the dialog's `y`
+            // actually runs.
+            let last_member = members.total == 1;
+            let name = open.name.clone();
+            state.confirm = Some(PendingMutation::DeleteSetMember {
+                name,
+                member,
+                last_member,
+            });
+            (state, Vec::new())
+        }
+        _ => (state, notify("nothing to remove here")),
     }
-    let Some((field, _)) = pairs.pairs.get(open.cursor).cloned() else {
-        return (state, notify("Enter to pick a field"));
-    };
-    let last_field = pairs.total == 1;
-    let name = open.name.clone();
-    state.confirm = Some(PendingMutation::DeleteHashField {
-        name,
-        field,
-        last_field,
-    });
-    (state, Vec::new())
 }
 
 #[cfg(test)]

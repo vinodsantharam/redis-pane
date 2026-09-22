@@ -83,11 +83,15 @@ pub enum Action {
     /// like `Copy`; a Hash needs the value cursor active on a row first —
     /// there is no "the whole hash" to edit in place of one field.
     Edit,
-    /// Add a field to the Open Hash (PLAN M2 task 6, D1, D4): captures a
-    /// field name, then opens the inline editor on an empty value targeting
-    /// it. Value-pane scoped, like `Edit` — it needs no cursor, since a new
-    /// field has no row yet to pick.
-    AddField,
+    /// Add a field to the Open Hash (PLAN M2 task 6, D1, D4), or a member to
+    /// the Open Set (PLAN M2 task 7, D3, ADR-0016): captures a field name
+    /// then opens the inline editor on an empty value targeting it, or for a
+    /// Set, opens straight onto a single-part capture — a member has no name
+    /// half to type first. Value-pane scoped, like `Edit` — it needs no
+    /// cursor, since a new field or member has no row yet to pick. Named
+    /// `Add`, not `AddField` (PLAN M2 task 7, D6): it now serves both
+    /// collection types, and the label was already the neutral "add".
+    Add,
     /// Stage the inline editor's buffer for confirmation, or close it
     /// silently if nothing changed (ADR-0014).
     EditorStage,
@@ -146,7 +150,7 @@ impl Action {
             // than acting on whatever key happens to be open), so route them
             // the same way — following focus, not merely "is the value pane
             // drawn at all".
-            Action::Edit | Action::AddField => {
+            Action::Edit | Action::Add => {
                 if state.keys_pane_focused() {
                     state.pane_visible(Pane::Keys)
                 } else {
@@ -197,7 +201,7 @@ impl Action {
             Action::Delete => "delete",
             Action::ConfirmMutation => "confirm",
             Action::Edit => "edit",
-            Action::AddField => "add",
+            Action::Add => "add",
             Action::EditorStage => "stage",
             Action::EditorUndo => "undo",
             Action::EditorRedo => "redo",
@@ -392,7 +396,7 @@ impl Default for Keymap {
                 },
                 Binding {
                     key: KeyPress::plain(KeyCode::Char('a')),
-                    action: Action::AddField,
+                    action: Action::Add,
                 },
                 // Ctrl+S is reliable in raw mode on every platform this ships
                 // for (IXON cleared on Unix, processed input off on Windows).
@@ -569,7 +573,7 @@ mod tests {
             Action::Delete,
             Action::ConfirmMutation,
             Action::Edit,
-            Action::AddField,
+            Action::Add,
             Action::EditorStage,
             Action::EditorUndo,
             Action::EditorRedo,

@@ -461,6 +461,27 @@ member is the *whole buffer text* with no name/value split at all (ADR-0016 D3).
 `hash_field_shown_duplicate` one type over, not `set_member_shown_duplicate`, per D6's own framing
 ("mirrors the Hash add form's `FIELD`/`VALUE` shape").
 
-**Nothing noticed but left unfixed this phase** — the four D8-flagged `Value`-matching sites
-(`open_editor`, `begin_add_entry`, `delete_value_row`, `hint_bar`) all got real ZSet arms as this
-phase's actual job, not stubs, and every arm is now exercised by a passing test.
+The four D8-flagged `Value`-matching sites (`open_editor`, `begin_add_entry`, `delete_value_row`,
+`hint_bar`) all got real ZSet arms as this phase's actual job, not stubs, and every arm is now
+exercised by a passing test.
+
+**Left unfixed, and it is not only a test gotcha: a seeded editor opens with the cursor at
+position 0, so typing prepends.** `e` on a score of `1`, then typing `9.5`, leaves `9.51` — the new
+digits inserted in front of the old score rather than replacing it. A bare `Backspace` right after
+`e` also deletes nothing, there being nothing to the cursor's left. The phase-3 tests do not show
+this because their `retype_score` helper clears the buffer first; **needing that helper is the
+symptom, not the workaround.**
+
+This is **not** ZSet-specific and was not introduced here. `EditBuffer::for_hash_field` and
+`EditBuffer::list_element` seed the same way — `TextArea::new` starts at `(0, 0)` and nothing moves
+it — so Hash field values and List elements have always behaved like this. It is more acutely wrong
+for a score than for the others: a score is a short scalar a reader replaces wholesale, where a
+Hash value is often a document they want to position a cursor inside.
+
+**Deliberately not fixed here, because there is no contained correct fix.** Seeding at the end
+would make `Backspace` behave but still appends (`19.5`), so neither end of the line gives
+type-to-replace; that wants a selection or a replace-on-first-keystroke mode the editor does not
+have. And changing only ZSet's seeding would make it inconsistent with the two types beside it,
+while changing all three is a cross-type behaviour change well outside a ZSet row's scope. Raised
+for a decision rather than settled unilaterally — it belongs with task 5's `$EDITOR` work or its own
+row, not here.

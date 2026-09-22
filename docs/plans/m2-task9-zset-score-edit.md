@@ -171,11 +171,13 @@ already carries.
 
 Guard lines for the dialog:
 
-- score edit — **"only if that member still exists · keeps the key's TTL"** *(phase 1 settled this:
-  "keeps its rank order" was false — `ZADD XX` recomputes rank from the new score, and a score edit
-  can move a member past every other member's rank; TTL preservation is the thing the script
-  actually and verifiably guarantees beyond the existence checks, mirroring ADR-0015's Hash-field
-  edit guard for the same reason. See ADR-0018.)*
+- score edit — **"only if that member still exists"**, one clause and no second *(settled in two
+  steps. Phase 1 found the draft's "keeps its rank order" false — `ZADD XX` recomputes rank from the
+  new score, verifiably moving a member past others — and proposed "keeps the key's TTL" instead.
+  That was rejected on review: a guard line names what the script **checks**, and ADR-0015 earns its
+  "keeps its TTL" by actually reading `HPEXPIRETIME` and reapplying it against a real hazard, where
+  `ZADD` could not clear a key's TTL if it tried. Claiming the protection would invite the reader to
+  see a guard where there is only Redis behaving normally. See ADR-0018.)*
 - add — **"only if the key still exists · never overwrites a member's score"**
 - remove — no guard line, as `DeleteSetMember` has none
 

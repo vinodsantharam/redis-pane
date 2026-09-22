@@ -135,16 +135,28 @@ Remove is `ZREM key member`, with `0` removed reported as a notice exactly as `H
 cache to manage, no fallback path for a cache miss on a fresh connection, and atomicity that
 doesn't need a connection reserved for `WATCH`.
 
-**The score-edit guard line's second clause, settled.** The plan's draft — "only if that member
-still exists · keeps its rank order" — is not true: `ZADD XX` recomputes the member's rank from
-its new score, so a score edit *routinely* changes that member's own rank, and verifiably can move
-it past every other member's rank too (see Context). The line must not claim rank is preserved.
-What the script *does* actually and verifiably guarantee, beyond the existence checks already
-named in the first clause, is that the key's own TTL survives the write — the same property
-ADR-0015's Hash-field edit guard names for the identical reason (`ZADD`/`ZREM` never touch a key's
-TTL; see the Context fact above). The guard line is therefore:
+**The score-edit guard line has no second clause, settled.** The plan's draft — "only if that
+member still exists · keeps its rank order" — is not true: `ZADD XX` recomputes the member's rank
+from its new score, so a score edit *routinely* changes that member's own rank, and verifiably can
+move it past every other member's (see Context: editing `beta` from `2` to `100` took it from rank
+1 to rank 2, past `gamma`). The line must not claim rank is preserved.
 
-> **only if that member still exists · keeps the key's TTL**
+"keeps the key's TTL" was considered as the replacement and rejected, because it would be a
+different kind of untrue. A guard line names what the script *checks* — the things that could have
+gone wrong and did not. ADR-0015's Hash-field edit earns its "keeps its TTL" clause: `HSET` would
+otherwise clear a field's own TTL, so the script reads `HPEXPIRETIME` and reapplies it with
+`HPEXPIREAT`, and that clause reports real work done under a real hazard. Here there is no hazard
+and no work: `ZADD` simply never touches a key's TTL, and no version of this script could make it
+do so. Telling the reader their TTL is being protected, at the moment they are deciding whether to
+run a write, would invite them to read protection into a line that is only describing the weather.
+
+So the guard line is the first clause alone:
+
+> **only if that member still exists**
+
+That is exactly what the script checks and all it checks. A guard line that overstates what is
+guaranteed is worse than a short one, and "shorter than its siblings" is not a defect — it is
+ZSet's edit genuinely having one hazard where Hash's has two.
 
 **D3 — two `NotWritten` variants, one new.** `MemberExists` is reused as is from ADR-0016 — a ZSet
 add that finds the member present means exactly what a Set add finding it present means. `KeyGone`
@@ -228,7 +240,8 @@ under a staged edit and proves the write still lands on the intended member.
   and a Hash field are different things in this codebase's glossary (CONTEXT.md).
 - `crates/core/src/state/mod.rs` gains `PendingMutation::{SetZSetScore, AddZSetMember,
   DeleteZSetMember { last_member } }`, each with `command_text()` and `guard_text()`:
-  - score edit — "only if that member still exists · keeps the key's TTL"
+  - score edit — "only if that member still exists" (one clause; see above for why it has no
+    second one)
   - add — "only if the key still exists · never overwrites a member's score"
   - remove — no guard line, as `DeleteSetMember` has none
 

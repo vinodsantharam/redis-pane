@@ -531,3 +531,23 @@ phase 3 already recorded (`crates/core/src/state/editor.rs`, `EditBuffer::zset_s
 `for_hash_field`/`list_element`) has no integration-suite angle — it is a UI/`EditBuffer` behaviour,
 not something a headless `mutate::execute` call against a real server can observe. Left as phase 3
 left it.
+
+**A pre-existing integration test is flaky, found while verifying this phase.**
+`a_freshly_added_entry_reads_as_just_added` (`crates/app/tests/integration.rs:1071`) failed on a
+review re-run of the full `--ignored` suite, and passed on its own immediately afterwards. Phase 4's
+own run had it passing, so it is a genuine intermittent, not a regression — and nothing on this
+branch touches it (`git diff main..HEAD` on that file does not mention it).
+
+**Cause.** `stream_entry_age` (`crates/core/src/state/value.rs:418`) returns `"just now"` only for
+`secs == 0`, so the test has to complete an `XADD`, a full `read_value` round trip (`TYPE` plus the
+metadata pipeline) *and* its own `SystemTime::now()` inside **one second**. Under full-suite load
+with container startup contention, that window is missed. The test is correct about what it wants to
+prove — that a Redis-assigned stream ID really does carry wall-clock epoch millis — it is just
+asserting it through a sub-second deadline it does not control.
+
+**Deliberately not fixed here**, because it is unrelated to ZSet and rewriting another feature's
+test inside this row would bury it. The fix is small when someone takes it: assert the *shape* of a
+recent age rather than the exact string — accept `"just now"` or `"Ns ago"` for a small `N` — which
+still proves the ID parses as epoch millis without racing a one-second boundary. **Worth doing
+soon**: CLAUDE.md has the integration job running on every push and nightly, so this will redden CI
+at random, and an intermittently red suite is how people learn to stop reading it.

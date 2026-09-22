@@ -14,7 +14,7 @@ use crate::state::copy::{CopyWhat, redis_cli_command, value_text};
 use crate::state::value::Value;
 use crate::state::{
     Attachment, EditBuffer, EditTarget, FieldPart, Link, OpenKey, PendingMutation, PendingRead,
-    ReadOnlyReason, ScanState, Tracking,
+    ReadOnlyReason, ScanState, Tracking, is_valid_zset_score,
 };
 use crate::{Command, Msg, State};
 

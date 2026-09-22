@@ -292,6 +292,35 @@ pub(super) fn stage_editor(mut state: State) -> (State, Vec<Command>) {
         open.end_edit();
         return (state, Vec::new());
     }
+    // A ZSet score is the one edit whose text can be *invalid* rather than
+    // merely unwanted (ADR-0018 D4), and the one `PendingMutation` payload
+    // that is a number rather than bytes. Parse it here, before anything is
+    // staged, and refuse to stage at all if it will not parse.
+    //
+    // `⌃S` is already guarded on D4, so this should be unreachable — but
+    // "unreachable" is not a good enough reason to pick a fallback value,
+    // because there is no honest one to pick. A fabricated `0.0` is a score
+    // the reader never typed, and a `NaN` cannot live in these types at all:
+    // `Mutation` and `PendingMutation` implement `Eq` by hand, `Eq` promises
+    // `a == a`, and `NaN` is the one `f64` that breaks it. Refusing to stage
+    // keeps both out and leaves `Eq` true by construction rather than by
+    // assumption.
+    let score = |bytes: &[u8]| -> Option<f64> {
+        let text = String::from_utf8_lossy(bytes).into_owned();
+        is_valid_zset_score(&text).then(|| text.parse().ok())?
+    };
+    let (old_score, new_score) = match editor.target() {
+        EditTarget::ZSetScore { .. } => match (score(editor.original()), score(&editor.text())) {
+            (Some(old), Some(new)) => (old, new),
+            _ => return (state, Vec::new()),
+        },
+        EditTarget::NewZSetMember { .. } => match score(&editor.text()) {
+            Some(new) => (0.0, new),
+            None => return (state, Vec::new()),
+        },
+        // Every other target's payload is bytes, which cannot fail to parse.
+        _ => (0.0, 0.0),
+    };
     let name = open.name.clone();
     // Staged, not closed: the pane keeps showing what is about to be
     // written under the dialog, instead of the value it replaces.
@@ -350,36 +379,23 @@ pub(super) fn stage_editor(mut state: State) -> (State, Vec<Command>) {
         // text as read, parsed back for the guard's `old_score`. `member`
         // is the identity the write is keyed on — D7: rank is not identity,
         // so a reorder under the dialog cannot misdirect this.
-        EditTarget::ZSetScore { member } => {
-            // `unwrap_or(NaN)`, not `0.0`: phase 3's `⌃S` guard (D4) is what
-            // actually keeps invalid text from ever reaching here, so this
-            // fallback is unreachable in practice, not a silent-corruption
-            // path standing in for validation — if it were ever reached, a
-            // `NaN` score makes the server refuse the write with a visible
-            // error (CLAUDE.md: never swallow a bad write silently), rather
-            // than staging a fabricated `0.0` a reader never typed.
-            let parse = |bytes: &[u8]| -> f64 {
-                String::from_utf8_lossy(bytes).parse().unwrap_or(f64::NAN)
-            };
-            PendingMutation::SetZSetScore {
-                name,
-                member,
-                old_score: parse(&original),
-                new_score: parse(&new),
-            }
-        }
+        // Both scores were parsed above, before anything was staged — an
+        // unparseable one returned early rather than reaching here, so these
+        // are the reader's own numbers and never a stand-in.
+        EditTarget::ZSetScore { member } => PendingMutation::SetZSetScore {
+            name,
+            member,
+            old_score,
+            new_score,
+        },
         // `a` on a ZSet (PLAN M2 task 9 phase 3, ADR-0018 D2, D6): not
         // reachable until `begin_add_entry` constructs this target, for the
-        // same reason the arm above is not. Same `NaN`-not-`0.0` fallback
-        // reasoning.
-        EditTarget::NewZSetMember { member, .. } => {
-            let score: f64 = String::from_utf8_lossy(&new).parse().unwrap_or(f64::NAN);
-            PendingMutation::AddZSetMember {
-                name,
-                member: member.into_bytes(),
-                score,
-            }
-        }
+        // same reason the arm above is not.
+        EditTarget::NewZSetMember { member, .. } => PendingMutation::AddZSetMember {
+            name,
+            member: member.into_bytes(),
+            score: new_score,
+        },
     };
     state.confirm = Some(mutation);
     (state, Vec::new())
@@ -3445,6 +3461,88 @@ mod list_element_edit_tests {
             open.editor().unwrap().text(),
             b"beta",
             "the buffer is never touched (R3.8)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod zset_score_staging_tests {
+    //! Staging a ZSet score (PLAN M2 task 9, ADR-0018 D1/D4).
+    //!
+    //! `e` on a ZSet row is not wired until phase 3, so these build the
+    //! buffer directly and call `stage_editor`, which is the seam the
+    //! behaviour under test lives on.
+
+    use super::*;
+    use crate::msg::KeyCode;
+    use crate::state::value::ScoredValue;
+
+    fn editing_score(member: &[u8], score: f64, typed: &str) -> State {
+        let value = crate::state::Value::ZSet(ScoredValue {
+            entries: vec![(member.to_vec(), score)],
+            total: 1,
+        });
+        let mut state = State {
+            cols: 130,
+            rows: 40,
+            focus: Pane::Value,
+            open: Some(OpenKey::new(Some(0), "k".into(), value, -1, 10, 0)),
+            ..State::default()
+        };
+        state.keys.push(b"k");
+        state.rebuild_list();
+        state
+            .open
+            .as_mut()
+            .unwrap()
+            .begin_edit(EditBuffer::zset_score(member, score));
+        for c in typed.chars() {
+            (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char(c))));
+        }
+        state
+    }
+
+    /// Typing garbage into the score must leave nothing staged.
+    ///
+    /// D4's `⌃S` guard (phase 3) is the real gate, so this path should be
+    /// unreachable in the finished feature. It is pinned anyway because the
+    /// only alternative to refusing is inventing a score: a `0.0` nobody
+    /// typed, or a `NaN`, which `Mutation`/`PendingMutation` cannot hold
+    /// honestly — both implement `Eq` by hand, and `NaN != NaN`.
+    #[test]
+    fn an_unparseable_score_refuses_to_stage_rather_than_inventing_one() {
+        let (state, cmds) = stage_editor(editing_score(b"beta", 2.0, "abc"));
+        assert!(
+            state.confirm.is_none(),
+            "an unparseable score must not reach the confirm dialog"
+        );
+        assert!(cmds.is_empty(), "{cmds:?}");
+    }
+
+    /// `nan` parses as an `f64` but Redis refuses it, and it is the one
+    /// value that would break `Eq` — so it must not stage either.
+    #[test]
+    fn nan_refuses_to_stage_even_though_it_parses() {
+        let (state, _) = stage_editor(editing_score(b"beta", 2.0, "nan"));
+        assert!(state.confirm.is_none(), "nan must not reach the dialog");
+    }
+
+    /// A valid score stages, and the staged mutation equals itself.
+    ///
+    /// The reflexivity assertion is the point: a hand-written `Eq` on a type
+    /// carrying an `f64` is sound only while no `NaN` can get in.
+    #[test]
+    fn a_valid_score_stages_and_the_staged_mutation_equals_itself() {
+        let (state, _) = stage_editor(editing_score(b"beta", 2.0, "9"));
+        let staged = state.confirm.as_ref().expect("a valid score stages");
+        assert_eq!(staged, staged, "Eq must be reflexive for a staged score");
+        assert!(
+            matches!(
+                staged,
+                PendingMutation::SetZSetScore { member, old_score, .. }
+                    if member == b"beta" && *old_score == 2.0
+            ),
+            "{staged:?}"
         );
     }
 }

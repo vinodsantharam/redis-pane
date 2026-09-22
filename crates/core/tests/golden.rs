@@ -2073,6 +2073,149 @@ fn golden_hint_bar_names_only_add_and_remove_for_a_set_with_a_cursor_active() {
     assert_eq!(hint_bar(&state), "a add · d remove");
 }
 
+// ── PLAN M2 task 8: editing List elements (D1–D8, ADR-0017) ────────────────
+
+fn list_value() -> Value {
+    Value::List(IndexedValue {
+        items: vec!["alpha".into(), "beta".into(), "gamma".into()],
+        total: 3,
+    })
+}
+
+#[test]
+fn golden_list_form_edit_element_shows_the_raw_value_by_index() {
+    let mut state = opened("user:8812:session", list_value(), 2_537);
+    let open = state.open.as_mut().unwrap();
+    open.cursor_active = true;
+    open.cursor = 1; // "beta"
+    open.begin_edit(EditBuffer::list_element(1, b"beta").unwrap());
+    assert_golden("list_form_edit_element", &draw(&state, 130, 22));
+}
+
+/// D6: the add form defaults to `Tail` — appending is the common case, and
+/// the one that does not renumber the rows the reader is already looking at.
+#[test]
+fn golden_list_add_form_shows_tail_by_default() {
+    let mut state = opened("user:8812:session", list_value(), 2_537);
+    state.focus = Pane::Value;
+    let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+    let mut state = state;
+    let editor = state.open.as_mut().unwrap().typing_mut().unwrap();
+    editor.insert_str("delta");
+    assert_golden("list_form_add_tail", &draw(&state, 130, 22));
+}
+
+/// D6: `Tab` flips the end, and the form's label must say so — this frame
+/// and the one above must be visibly different, not just internally
+/// different, or the toggle is invisible to the reader using it.
+#[test]
+fn golden_list_add_form_shows_head_after_tab_toggles_it() {
+    let mut state = opened("user:8812:session", list_value(), 2_537);
+    state.focus = Pane::Value;
+    let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+    let mut state = state;
+    let editor = state.open.as_mut().unwrap().typing_mut().unwrap();
+    editor.insert_str("delta");
+    editor.toggle_list_end();
+    let frame = draw(&state, 130, 22);
+    assert!(
+        frame.contains("head"),
+        "the toggled form must say which end is active:\n{frame}"
+    );
+    assert_golden("list_form_add_head", &frame);
+}
+
+#[test]
+fn golden_confirm_set_list_element_shows_the_effective_command_and_its_guard() {
+    let mut state = opened("user:8812:session", list_value(), 2_537);
+    // `e` is focus-gated (ADR-0015 D4, mirrored for Lists); `opened()` leaves
+    // focus on the keys pane.
+    state.focus = Pane::Value;
+    let open = state.open.as_mut().unwrap();
+    open.cursor_active = true;
+    open.cursor = 1; // "beta"
+    let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+    let mut state = state;
+    let editor = state.open.as_mut().unwrap().typing_mut().unwrap();
+    editor.insert_str("!");
+    let (state, _) = update(state, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+    assert!(matches!(
+        state.confirm,
+        Some(PendingMutation::SetListElement { .. })
+    ));
+    assert_golden("confirm_set_list_element", &draw(&state, 130, 22));
+}
+
+#[test]
+fn golden_confirm_add_list_element_shows_the_guard_and_only_a_plus_side() {
+    let mut state = opened("user:8812:session", list_value(), 2_537);
+    state.focus = Pane::Value;
+    let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+    let mut state = state;
+    let editor = state.open.as_mut().unwrap().typing_mut().unwrap();
+    editor.insert_str("delta");
+    let (state, _) = update(state, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+    assert!(matches!(
+        state.confirm,
+        Some(PendingMutation::AddListElement { .. })
+    ));
+    assert_golden("confirm_add_list_element", &draw(&state, 130, 22));
+}
+
+#[test]
+fn golden_confirm_delete_list_element_shows_the_effective_command() {
+    let mut state = opened("user:8812:session", list_value(), 2_537);
+    // `d` is focus-dependent (D5): without this, `opened()`'s default focus
+    // (the keys pane) makes `d` stage `DeleteKey`, not `DeleteListElement`.
+    state.focus = Pane::Value;
+    let open = state.open.as_mut().unwrap();
+    open.cursor_active = true;
+    open.cursor = 1; // "beta"
+    let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+    assert!(matches!(
+        state.confirm,
+        Some(PendingMutation::DeleteListElement {
+            last_element: false,
+            ..
+        })
+    ));
+    assert_golden("confirm_delete_list_element", &draw(&state, 130, 22));
+}
+
+#[test]
+fn golden_confirm_delete_list_element_warns_when_it_is_the_last_element() {
+    let mut state = opened(
+        "user:8812:session",
+        Value::List(IndexedValue {
+            items: vec!["only".into()],
+            total: 1,
+        }),
+        600,
+    );
+    state.focus = Pane::Value;
+    state.open.as_mut().unwrap().cursor_active = true;
+    let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+    assert!(matches!(
+        state.confirm,
+        Some(PendingMutation::DeleteListElement {
+            last_element: true,
+            ..
+        })
+    ));
+    assert_golden(
+        "confirm_delete_list_element_last_element",
+        &draw(&state, 130, 22),
+    );
+}
+
+#[test]
+fn golden_hint_bar_names_all_three_list_element_actions_with_a_cursor_active() {
+    let mut state = opened("user:8812:session", list_value(), 2_537);
+    state.focus = Pane::Value;
+    state.open.as_mut().unwrap().cursor_active = true;
+    assert_eq!(hint_bar(&state), "e edit · a add · d remove");
+}
+
 // ── UI task: type colour dots and the selection bar (style-verified) ────────
 
 use redis_pane_core::theme::Token;

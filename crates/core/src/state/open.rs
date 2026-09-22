@@ -500,7 +500,7 @@ impl OpenKey {
         // this exists so the header is correct the day one lands, rather than
         // silently wrong from the first edit built.
         if self.is_editing() {
-            return self.edit_verb().into();
+            return self.edit_verb();
         }
         // What the last read found, while it is still news. This is the half
         // ADR-0006 named and the app did not have: without it, a Refetch that
@@ -536,12 +536,28 @@ impl OpenKey {
     /// follow-up, F). `None` editor (the `editing_indicator_tests` forward
     /// plumbing, and any future editor-less use of the flag) falls back to
     /// the plain form.
-    fn edit_verb(&self) -> &'static str {
+    ///
+    /// Returns an owned `String`, not `&'static str`: the List add form's
+    /// label carries D6's Head/Tail toggle state, which no `'static` literal
+    /// can hold — the same reason [`super::PendingMutation::guard_text`]
+    /// became owned in phase 2. This is D6's "the form's label must show
+    /// which end is active" — the toggle changes what `Tab` does, so the
+    /// header is the one place that has to say so, rather than leaving the
+    /// reader to remember or rediscover it by trying `⌃S`.
+    fn edit_verb(&self) -> String {
         match self.editor().map(super::EditBuffer::target) {
-            Some(super::EditTarget::NewHashField { .. }) => "✎ adding field",
-            Some(super::EditTarget::HashField { .. }) => "✎ editing field",
-            Some(super::EditTarget::NewSetMember) => "✎ adding member",
-            Some(super::EditTarget::Value) | None => "✎ editing",
+            Some(super::EditTarget::NewHashField { .. }) => "✎ adding field".to_string(),
+            Some(super::EditTarget::HashField { .. }) => "✎ editing field".to_string(),
+            Some(super::EditTarget::NewSetMember) => "✎ adding member".to_string(),
+            Some(super::EditTarget::ListElement { .. }) => "✎ editing element".to_string(),
+            Some(super::EditTarget::NewListElement { end }) => {
+                let end = match end {
+                    super::value::ListEnd::Head => "head",
+                    super::value::ListEnd::Tail => "tail",
+                };
+                format!("✎ adding element ({end})")
+            }
+            Some(super::EditTarget::Value) | None => "✎ editing".to_string(),
         }
     }
 

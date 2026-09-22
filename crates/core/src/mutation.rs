@@ -12,6 +12,7 @@
 //! form that previews it, and the shell's one `execute`.
 
 use crate::key::KeyName;
+use crate::state::value::ListEnd;
 
 /// A write, exactly as the shell executes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +47,45 @@ pub enum Mutation {
     /// `SREM key member`. Removing the last member removes the key: Redis's
     /// own behaviour, not something this arranges (ADR-0016).
     DeleteSetMember { key: KeyName, member: Vec<u8> },
+    /// Guarded `LSET key index value`, refusing unless the element at
+    /// `index` still holds `expected` (ADR-0017 D2). A List element has no
+    /// recreate-the-key hazard the way `HSET`/`SADD` do — `LSET` cannot
+    /// recreate a gone key — so the guard is a compare-and-set on the
+    /// element itself, not `EXISTS` alone: a concurrent push/pop anywhere in
+    /// the list shifts every index, and a plain `LSET` staged against a
+    /// stale index would silently overwrite whatever moved into that slot.
+    SetListElement {
+        key: KeyName,
+        index: usize,
+        expected: Vec<u8>,
+        value: Vec<u8>,
+    },
+    /// Guarded `LPUSH`/`RPUSH key value`, never recreating the key
+    /// (ADR-0017 D2). No compare-and-set half: an add addresses no existing
+    /// element, so there is nothing to compare against — only the ordinary
+    /// `EXISTS` guard, because `LPUSH`/`RPUSH` (unlike `LSET`) do recreate a
+    /// gone key.
+    AddListElement {
+        key: KeyName,
+        end: ListEnd,
+        value: Vec<u8>,
+    },
+    /// Duplicate-safe remove-by-index (`LREM`, via a disposable per-call
+    /// sentinel, ADR-0017 D2), refusing unless the element at `index` still
+    /// holds `expected`. Redis has no remove-by-index primitive — a plain
+    /// `LREM key 1 value` removes the *first* match from the head, which is
+    /// the wrong element whenever the list has an earlier duplicate — so the
+    /// shell's script `LSET`s the target to a sentinel first, then `LREM`s
+    /// the sentinel. **The sentinel itself is minted in the shell**
+    /// (`crates/app/src/redis/mutate.rs`), not here: the core has no
+    /// randomness source (`update()`'s contract is no I/O, no clock, no
+    /// randomness) and none should be added for this — see ADR-0017's
+    /// "sentinel is minted in the shell" note.
+    DeleteListElement {
+        key: KeyName,
+        index: usize,
+        expected: Vec<u8>,
+    },
 }
 
 impl Mutation {
@@ -58,7 +98,10 @@ impl Mutation {
             | Mutation::AddHashField { key, .. }
             | Mutation::DeleteHashField { key, .. }
             | Mutation::AddSetMember { key, .. }
-            | Mutation::DeleteSetMember { key, .. } => key,
+            | Mutation::DeleteSetMember { key, .. }
+            | Mutation::SetListElement { key, .. }
+            | Mutation::AddListElement { key, .. }
+            | Mutation::DeleteListElement { key, .. } => key,
         }
     }
 
@@ -81,6 +124,14 @@ impl Mutation {
             // one any more than it is for a String's value.
             Mutation::AddSetMember { key, .. } => format!("SADD {key}"),
             Mutation::DeleteSetMember { key, .. } => format!("SREM {key}"),
+            // The index, not the element: an index is a position, safe to
+            // show, unlike a value that could be arbitrarily large (ADR-0017).
+            Mutation::SetListElement { key, index, .. } => format!("LSET {key} {index}"),
+            Mutation::AddListElement { key, end, .. } => match end {
+                ListEnd::Head => format!("LPUSH {key}"),
+                ListEnd::Tail => format!("RPUSH {key}"),
+            },
+            Mutation::DeleteListElement { key, index, .. } => format!("LREM {key} {index}"),
         }
     }
 }
@@ -104,6 +155,14 @@ pub enum NotWritten {
     /// error type keeps the distinction rather than blurring it (PLAN M2
     /// task 7).
     MemberExists,
+    /// A `SetListElement` or `DeleteListElement` found the element at the
+    /// staged index no longer held the bytes it was staged against (ADR-0017
+    /// D2/D3). Not [`NotWritten::FieldGone`] — a stale index is expected to
+    /// be the *routine* refusal on a busy list (any concurrent push, pop or
+    /// edit anywhere in the list shifts every index, not just a write to the
+    /// same element), so it gets its own variant and its own wording rather
+    /// than borrowing a neighbour's "gone" framing.
+    ElementMoved,
 }
 
 impl NotWritten {
@@ -121,6 +180,13 @@ impl NotWritten {
             NotWritten::FieldGone => "field no longer exists",
             NotWritten::FieldExists => "field already exists",
             NotWritten::MemberExists => "member already exists",
+            // ADR-0017 D3: deliberately longer than the others — this is
+            // the refusal a reader sees routinely on a list under churn, so
+            // it names the mechanism and tells them to look again rather
+            // than reading as "the write itself is broken".
+            NotWritten::ElementMoved => {
+                "that element moved — the list changed underneath it, look again"
+            }
         }
     }
 }
@@ -193,10 +259,52 @@ mod tests {
                 },
                 "SREM user:1",
             ),
+            (
+                Mutation::SetListElement {
+                    key: key.clone(),
+                    index: 3,
+                    expected: b"old".to_vec(),
+                    value: b"new".to_vec(),
+                },
+                "LSET user:1 3",
+            ),
+            (
+                Mutation::AddListElement {
+                    key: key.clone(),
+                    end: ListEnd::Head,
+                    value: b"new".to_vec(),
+                },
+                "LPUSH user:1",
+            ),
+            (
+                Mutation::AddListElement {
+                    key: key.clone(),
+                    end: ListEnd::Tail,
+                    value: b"new".to_vec(),
+                },
+                "RPUSH user:1",
+            ),
+            (
+                Mutation::DeleteListElement {
+                    key: key.clone(),
+                    index: 2,
+                    expected: b"gone".to_vec(),
+                },
+                "LREM user:1 2",
+            ),
         ];
         for (mutation, label) in cases {
             assert_eq!(mutation.command_label(), label);
             assert_eq!(mutation.key(), &key);
         }
+    }
+
+    #[test]
+    fn element_moved_reads_as_look_again_not_it_failed() {
+        let reason = NotWritten::ElementMoved.reason();
+        assert_eq!(
+            reason,
+            "that element moved — the list changed underneath it, look again"
+        );
     }
 }

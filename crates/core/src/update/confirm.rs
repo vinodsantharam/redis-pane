@@ -152,9 +152,32 @@ pub(super) fn nothing_to_remove(
     {
         return (state, Vec::new());
     }
+    // Exhaustive over `Mutation`, not a wildcard fallback (PLAN M2 task 8,
+    // D8): only `HDEL`/`SREM` ever settle with `NothingToRemove` today — the
+    // shell's `execute` (`crates/app/src/redis/mutate.rs`) maps every List
+    // write's "not written" case onto `NotWritten::ElementMoved`/`KeyGone`
+    // instead, since ADR-0017 D2's compare-and-set makes "already gone"
+    // indistinguishable from "moved" for an index-addressed element. Naming
+    // every variant here, rather than `_ => "field"`, means a future write
+    // that starts reporting `NothingToRemove` (a ZSet member removed twice,
+    // task 9) has to pick its own noun instead of silently inheriting
+    // "field".
     let what = match mutation {
+        Mutation::DeleteHashField { .. } => "field",
         Mutation::DeleteSetMember { .. } => "member",
-        _ => "field",
+        // Unreachable today — ADR-0017 D2's compare-and-set reports a missing
+        // element as `ElementMoved`, never `NothingToRemove` — but it gets the
+        // noun a List actually uses rather than sharing the catch-all below.
+        // Costing nothing now is the point: if a later write does start
+        // settling this way, it already says "element".
+        Mutation::DeleteListElement { .. } => "element",
+        Mutation::DeleteKey { .. }
+        | Mutation::SetString { .. }
+        | Mutation::SetHashField { .. }
+        | Mutation::AddHashField { .. }
+        | Mutation::AddSetMember { .. }
+        | Mutation::SetListElement { .. }
+        | Mutation::AddListElement { .. } => "entry",
     };
     state.notice = Some((
         format!("{}: {what} already gone", mutation.command_label()),
@@ -209,15 +232,20 @@ pub(super) fn not_written(
             ));
             (state, Vec::new())
         }
-        NotWritten::FieldGone | NotWritten::FieldExists | NotWritten::MemberExists => {
+        NotWritten::FieldGone
+        | NotWritten::FieldExists
+        | NotWritten::MemberExists
+        | NotWritten::ElementMoved => {
             if let Some(open) = state.open.as_mut() {
                 open.unstage_buffer();
             }
             // The guards that refuse without the key going anywhere: the
             // write is dropped, the buffer comes back, and the Viewer
             // re-reads. `MemberExists` cannot arrive here until `a` on a Set
-            // is wired (PLAN M2 task 7 phase 3); the arm is here because
-            // `NotWritten` is matched exhaustively.
+            // is wired (PLAN M2 task 7 phase 3); `ElementMoved` cannot arrive
+            // until `e`/`a`/`d` on a List are wired (PLAN M2 task 8 phase 3,
+            // ADR-0017) — both arms are here because `NotWritten` is matched
+            // exhaustively.
             state.error = Some((
                 format!("{command}: {} — nothing written, edit kept", why.reason()),
                 at_ms,

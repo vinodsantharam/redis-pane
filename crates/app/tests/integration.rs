@@ -2258,3 +2258,366 @@ async fn adding_a_set_member_against_a_wrong_type_key_surfaces_an_error_not_a_pa
     let _ = client.quit().await;
     let _ = writer.quit().await;
 }
+
+// ── PLAN M2 task 8 — List element edit, add, delete (ADR-0017) ─────────────
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn editing_a_list_element_overwrites_it_and_keeps_the_keys_ttl() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: i64 = writer
+        .rpush("l:1", &["alpha", "beta", "gamma"])
+        .await
+        .unwrap();
+    let _: bool = writer.expire("l:1", 600, None).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::mutate::set_list_element(&client, b"l:1", 1, b"beta", b"new")
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        redis_pane::redis::mutate::ListElementWrite::Written
+    );
+
+    let now: Option<String> = writer.lindex("l:1", 1).await.unwrap();
+    assert_eq!(now.as_deref(), Some("new"));
+    let ttl: i64 = writer.ttl("l:1").await.unwrap();
+    assert!((1..=600).contains(&ttl), "key TTL must survive, got {ttl}");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+/// The test the whole task exists for (D2, ADR-0017). A second client shifts
+/// every index by pushing a new head between the read the dialog staged
+/// against and the write; the guard must refuse rather than silently
+/// overwriting whatever index 1 now holds, and the list must be provably
+/// unchanged by the refused call.
+///
+/// This exercises the real race, not a simulation of it: the second client's
+/// `LPUSH` genuinely runs, on the real server, strictly between the read this
+/// test performs (to learn what "the dialog staged against" would have seen)
+/// and the guarded `EVAL` this test issues against that now-stale index and
+/// now-stale expected bytes. Determinism comes from sequencing two real
+/// commands on two real connections in program order — `await`ing the
+/// `LPUSH` to completion before calling `set_list_element` — rather than from
+/// timing or sleeps, so there is no flakiness to add margin for.
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn editing_a_list_element_refuses_without_writing_when_the_list_shifted_under_it() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: i64 = writer
+        .rpush("l:2", &["alpha", "beta", "gamma"])
+        .await
+        .unwrap();
+    let _: bool = writer.expire("l:2", 600, None).await.unwrap();
+
+    // The dialog reads the list and stages an edit of "beta" at index 1.
+    let staged_index = 1usize;
+    let staged_expected: Vec<u8> = writer
+        .lindex::<Option<String>, _>("l:2", staged_index as i64)
+        .await
+        .unwrap()
+        .unwrap()
+        .into_bytes();
+    assert_eq!(staged_expected, b"beta");
+
+    // A second client — a different connection, standing in for a second
+    // session — pushes a new head before the dialog is confirmed. Every
+    // index shifts: "beta" is now at index 2, and index 1 holds "alpha".
+    let second_client = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    second_client.init().await.unwrap();
+    let _: i64 = second_client.lpush("l:2", "head").await.unwrap();
+    let _ = second_client.quit().await;
+
+    // The staged write executes against the original index and the
+    // original expected bytes — exactly what a confirm dialog opened before
+    // the push, and confirmed after it, would send.
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::mutate::set_list_element(
+        &client,
+        b"l:2",
+        staged_index,
+        &staged_expected,
+        b"CORRUPTED",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        outcome,
+        redis_pane::redis::mutate::ListElementWrite::ElementMoved,
+        "a shifted index must refuse, not silently overwrite whatever moved into slot 1"
+    );
+
+    // The list must be provably unchanged by the refused write: still the
+    // four elements the push left, in the shifted order, with nothing
+    // replaced by "CORRUPTED" anywhere.
+    let all: Vec<String> = writer.lrange("l:2", 0, -1).await.unwrap();
+    assert_eq!(
+        all,
+        vec![
+            "head".to_string(),
+            "alpha".to_string(),
+            "beta".to_string(),
+            "gamma".to_string(),
+        ],
+        "the refused write must not have touched any element"
+    );
+    assert!(
+        !all.iter().any(|e| e == "CORRUPTED"),
+        "the new value must never have been written anywhere in the list"
+    );
+    let ttl: i64 = writer.ttl("l:2").await.unwrap();
+    assert!((1..=600).contains(&ttl), "key TTL must survive, got {ttl}");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn editing_a_list_element_on_a_gone_key_does_not_recreate_it() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome =
+        redis_pane::redis::mutate::set_list_element(&client, b"l:gone", 0, b"anything", b"new")
+            .await
+            .unwrap();
+    assert_eq!(
+        outcome,
+        redis_pane::redis::mutate::ListElementWrite::KeyGone
+    );
+
+    let exists: i64 = writer.exists("l:gone").await.unwrap();
+    assert_eq!(exists, 0, "the key must not be recreated");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn adding_a_list_element_to_a_gone_key_does_not_recreate_it() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::mutate::add_list_element(
+        &client,
+        b"l:gone2",
+        redis_pane_core::state::value::ListEnd::Tail,
+        b"x",
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, redis_pane::redis::mutate::ListElementAdd::KeyGone);
+
+    let exists: i64 = writer.exists("l:gone2").await.unwrap();
+    assert_eq!(exists, 0, "the key must not be recreated");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn adding_a_list_element_lands_at_the_correct_end_for_head_and_tail() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: i64 = writer.rpush("l:3", &["middle"]).await.unwrap();
+    let _: bool = writer.expire("l:3", 600, None).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+
+    let head_outcome = redis_pane::redis::mutate::add_list_element(
+        &client,
+        b"l:3",
+        redis_pane_core::state::value::ListEnd::Head,
+        b"first",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        head_outcome,
+        redis_pane::redis::mutate::ListElementAdd::Added
+    );
+
+    let tail_outcome = redis_pane::redis::mutate::add_list_element(
+        &client,
+        b"l:3",
+        redis_pane_core::state::value::ListEnd::Tail,
+        b"last",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        tail_outcome,
+        redis_pane::redis::mutate::ListElementAdd::Added
+    );
+
+    let all: Vec<String> = writer.lrange("l:3", 0, -1).await.unwrap();
+    assert_eq!(
+        all,
+        vec![
+            "first".to_string(),
+            "middle".to_string(),
+            "last".to_string()
+        ],
+        "Head must land at index 0 and Tail must land at the end"
+    );
+    let ttl: i64 = writer.ttl("l:3").await.unwrap();
+    assert!((1..=600).contains(&ttl), "key TTL must survive, got {ttl}");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn deleting_a_list_element_removes_the_right_duplicate() {
+    // ADR-0017 D2's whole reason for the sentinel technique: `LREM key 1
+    // <value>` removes the *first* match from the head, which on
+    // `[x, y, x, z]` is index 0, not index 2. Deleting index 2 must leave
+    // `[x, y, z]`.
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: i64 = writer.rpush("l:4", &["x", "y", "x", "z"]).await.unwrap();
+    let _: bool = writer.expire("l:4", 600, None).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::mutate::delete_list_element(&client, b"l:4", 2, b"x")
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        redis_pane::redis::mutate::ListElementDelete::Removed
+    );
+
+    let all: Vec<String> = writer.lrange("l:4", 0, -1).await.unwrap();
+    assert_eq!(
+        all,
+        vec!["x".to_string(), "y".to_string(), "z".to_string()],
+        "must remove the second x (index 2), not the first"
+    );
+    let ttl: i64 = writer.ttl("l:4").await.unwrap();
+    assert!((1..=600).contains(&ttl), "key TTL must survive, got {ttl}");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn deleting_the_last_list_element_deletes_the_key() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: i64 = writer.rpush("l:5", &["solo"]).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::mutate::delete_list_element(&client, b"l:5", 0, b"solo")
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        redis_pane::redis::mutate::ListElementDelete::Removed
+    );
+
+    let exists: i64 = writer.exists("l:5").await.unwrap();
+    assert_eq!(exists, 0, "the key must go with its last element");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn a_binary_list_element_round_trips_through_edit_and_read() {
+    // Review C2: `IndexedValue.items` is `Vec<Vec<u8>>`, never `String`. A
+    // binary element must survive both the compare-and-set guard's ARGV and
+    // the LSET it performs, unchanged.
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let original: &[u8] = b"m\xff\x80";
+    let edited: &[u8] = b"e\xff\x802";
+    let _: i64 = writer.rpush("l:6", vec![original]).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::mutate::set_list_element(&client, b"l:6", 0, original, edited)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        redis_pane::redis::mutate::ListElementWrite::Written
+    );
+
+    let now: Option<Vec<u8>> = writer.lindex("l:6", 0).await.unwrap();
+    assert_eq!(
+        now.as_deref(),
+        Some(edited),
+        "the binary element must round-trip through the edit unchanged"
+    );
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn editing_a_list_element_against_a_wrong_type_key_surfaces_an_error_not_a_panic() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer
+        .set("str:2", "hello", None, None, false)
+        .await
+        .unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let err = redis_pane::redis::mutate::set_list_element(&client, b"str:2", 0, b"hello", b"x")
+        .await
+        .expect_err("LSET/LINDEX against a String key is WRONGTYPE");
+    assert!(err.details().contains("WRONGTYPE"), "{err}");
+
+    let value: Option<String> = writer.get("str:2").await.unwrap();
+    assert_eq!(
+        value.as_deref(),
+        Some("hello"),
+        "untouched by the failed write"
+    );
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}

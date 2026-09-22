@@ -91,6 +91,29 @@ pub(super) fn open_editor(mut state: State) -> (State, Vec<Command>) {
         };
         return (state, notify(text));
     }
+    // A List element *is* edited in place (D1, ADR-0017): unlike a Set
+    // member, an element has an identity — its index — that survives its
+    // bytes changing, so `LSET` is a real edit, not a rename. `index` is the
+    // row's position within the fetched window, which is also its absolute
+    // Redis index (D7 — the window always starts at 0), so no arithmetic is
+    // needed to key ADR-0017 D2's compare-and-set guard.
+    if let Value::List(items) = value {
+        if !open.cursor_active {
+            return (state, notify("Enter to pick an element"));
+        }
+        let Some(element) = items.items.get(open.cursor) else {
+            return (state, notify("Enter to pick an element"));
+        };
+        return match EditBuffer::list_element(open.cursor, element) {
+            Ok(buffer) => {
+                if let Some(open) = state.open.as_mut() {
+                    open.begin_edit(buffer);
+                }
+                (state, Vec::new())
+            }
+            Err(text) => (state, notify(text)),
+        };
+    }
     match EditBuffer::from_value(value, open.cursor) {
         Ok(buffer) => {
             if let Some(open) = state.open.as_mut() {
@@ -102,18 +125,23 @@ pub(super) fn open_editor(mut state: State) -> (State, Vec<Command>) {
     }
 }
 
-/// Stages `a`: opens the add form on the Open Hash or Set — the two-part
-/// `FIELD`/`VALUE` form on the name part for a Hash (PLAN M2 task 6
+/// Stages `a`: opens the add form on the Open Hash, Set or List — the
+/// two-part `FIELD`/`VALUE` form on the name part for a Hash (PLAN M2 task 6
 /// follow-up, F), or the single-part capture for a Set (PLAN M2 task 7, D3,
-/// ADR-0016), since a member has no name half to type first. No cursor
-/// prerequisite either way — a new field or member has no row to have picked
-/// yet, unlike `e`.
+/// ADR-0016) or a List (PLAN M2 task 8, D6, ADR-0017), since neither a member
+/// nor an element has a name half to type first. No cursor prerequisite
+/// either way — a new field, member or element has no row to have picked yet,
+/// unlike `e`.
+///
+/// Named for what it actually does, not for the type it was first written
+/// against (PLAN M2 task 8, D8) — `begin_add_field` was accurate for one
+/// collection type and misleading for three.
 ///
 /// Emits no command: the form lives entirely in the core, the same as every
 /// other inline edit. `editing` is set from the moment it opens — there is no
 /// longer a name-only capture stage before an [`EditBuffer`] exists, so this
 /// is also the moment one is created.
-pub(super) fn begin_add_field(mut state: State) -> (State, Vec<Command>) {
+pub(super) fn begin_add_entry(mut state: State) -> (State, Vec<Command>) {
     let notify = |text: &str| vec![Command::Notify { text: text.into() }];
     if state.keys_pane_focused() {
         let text = if state.open.is_some() {
@@ -132,13 +160,21 @@ pub(super) fn begin_add_field(mut state: State) -> (State, Vec<Command>) {
     if open.is_editing() {
         return (state, notify("still saving the last edit"));
     }
+    // Exhaustive over `Value`, not a wildcard fallback (PLAN M2 task 8, D8):
+    // a fourth addable type (ZSet, task 9) has to make this same decision
+    // here, once, rather than silently falling through to this refusal the
+    // way a `_` arm would let it.
     let buffer = match &open.value {
+        None => return (state, notify("nothing open to edit")),
         Some(Value::Hash(_)) => EditBuffer::new_hash_field(),
         Some(Value::Set(_)) => EditBuffer::new_set_member(),
-        _ => {
+        Some(Value::List(_)) => EditBuffer::new_list_element(),
+        Some(
+            Value::Str(_) | Value::ZSet(_) | Value::Stream(_) | Value::Json(_) | Value::Binary(_),
+        ) => {
             return (
                 state,
-                notify("fields can only be added to a hash, members to a set"),
+                notify("fields can only be added to a hash, members to a set, elements to a list"),
             );
         }
     };
@@ -247,7 +283,9 @@ pub(super) fn stage_editor(mut state: State) -> (State, Vec<Command>) {
     // (D1, and ADR-0016 D3 for the Set member one field narrower).
     let is_new_field = matches!(
         editor.target(),
-        EditTarget::NewHashField { .. } | EditTarget::NewSetMember
+        EditTarget::NewHashField { .. }
+            | EditTarget::NewSetMember
+            | EditTarget::NewListElement { .. }
     );
     if !is_new_field && !editor.is_dirty() {
         open.end_edit();
@@ -285,6 +323,24 @@ pub(super) fn stage_editor(mut state: State) -> (State, Vec<Command>) {
         // shape mirrors `NewHashField`'s, one field narrower — no field name
         // to carry, since a member is only a value.
         EditTarget::NewSetMember => PendingMutation::AddSetMember { name, member: new },
+        // `e`/`a` on a List (PLAN M2 task 8 phase 3, ADR-0017 D2/D6):
+        // `open_editor`/`begin_add_entry` construct these targets. `old`/
+        // `original` is the guard's `expected` half (ADR-0017 D2's
+        // compare-and-set); `end` is D6's Head/Tail toggle, current at the
+        // moment `⌃S`/`Enter` stages — `Tab` (`editor_key`, below) is what
+        // changes it while the form is open.
+        EditTarget::ListElement { index } => PendingMutation::SetListElement {
+            name,
+            index,
+            old: original,
+            new,
+            was_json,
+        },
+        EditTarget::NewListElement { end } => PendingMutation::AddListElement {
+            name,
+            end,
+            value: new,
+        },
     };
     state.confirm = Some(mutation);
     (state, Vec::new())
@@ -408,6 +464,12 @@ pub(super) fn editor_key(mut state: State, key: KeyPress) -> (State, Vec<Command
             }
         }
         KeyCode::Enter => editor.insert_newline(),
+        // `Tab` flips D6's Head/Tail toggle on the List add form, rather
+        // than inserting a tab character — the only target where `Tab`
+        // means something other than "insert a tab" (ADR-0017 D6).
+        KeyCode::Tab if matches!(editor.target(), EditTarget::NewListElement { .. }) => {
+            editor.toggle_list_end();
+        }
         KeyCode::Tab => editor.insert_tab(),
         KeyCode::Backspace => editor.backspace(),
         KeyCode::Delete => editor.delete_forward(),
@@ -430,12 +492,24 @@ pub(super) fn editor_key(mut state: State, key: KeyPress) -> (State, Vec<Command
 /// only standing in for the read back, and goes.
 pub(super) fn staged_edit_found_key_gone(state: &mut State, name: &KeyName, at_ms: u64) {
     // Every mutation that names this key, not just `SetString` — a
-    // `SetHashField`/`AddHashField`/`AddSetMember` dialog closes and hands
-    // its buffer back exactly the same way; a `DeleteHashField`/
-    // `DeleteSetMember` dialog simply closes with the notice, since neither
-    // ever had a buffer to hand back (`unstage_buffer` is a no-op with none).
-    let dialog_up = matches!(
-        &state.confirm,
+    // `SetHashField`/`AddHashField`/`AddSetMember`/`SetListElement`/
+    // `AddListElement` dialog closes and hands its buffer back exactly the
+    // same way; a `DeleteHashField`/`DeleteSetMember`/`DeleteListElement`
+    // dialog simply closes with the notice, since none of the three ever had
+    // a buffer to hand back (`unstage_buffer` is a no-op with none).
+    //
+    // A real `match`, not `matches!` with an or-pattern inside it (task 8
+    // phase 2's "found while building" note, and PLAN M2 task 8, D8 above
+    // it): `matches!` always expands to a `match` with a trailing `_ =>
+    // false` arm, so an or-pattern inside it is never exhaustiveness-checked
+    // against `PendingMutation` — it compiled fine without the three List
+    // variants below and would have silently taken the wrong branch for a
+    // staged List mutation the moment `e`/`a`/`d` could reach one. Matching
+    // every variant by name here, with no wildcard arm, makes a future
+    // `PendingMutation` variant (ZSet, task 9) a compile error in this
+    // function until it is given the same decision, rather than a bug that
+    // only shows up under a race.
+    let dialog_up = match &state.confirm {
         Some(
             PendingMutation::SetString { name: staged, .. }
             | PendingMutation::SetHashField { name: staged, .. }
@@ -443,8 +517,16 @@ pub(super) fn staged_edit_found_key_gone(state: &mut State, name: &KeyName, at_m
             | PendingMutation::DeleteHashField { name: staged, .. }
             | PendingMutation::AddSetMember { name: staged, .. }
             | PendingMutation::DeleteSetMember { name: staged, .. }
-        ) if staged == name
-    );
+            | PendingMutation::SetListElement { name: staged, .. }
+            | PendingMutation::AddListElement { name: staged, .. }
+            | PendingMutation::DeleteListElement { name: staged, .. },
+        ) => staged == name,
+        // `DeleteKey` never opens a buffer and is handled entirely by
+        // `key_deleted` (`update/confirm.rs`), not this function — the key
+        // going gone under its own staged `DEL` is that path's job, not a
+        // buffer to hand back. `None`: no dialog is up at all.
+        Some(PendingMutation::DeleteKey { .. }) | None => false,
+    };
     let Some(open) = state.open.as_mut().filter(|o| o.name == *name) else {
         return;
     };
@@ -1367,7 +1449,7 @@ mod hash_field_edit_tests {
         }
         assert_eq!(s.confirm.as_ref().unwrap().command_text(), "HSET k f");
         assert_eq!(
-            s.confirm.as_ref().unwrap().guard_text(),
+            s.confirm.as_ref().unwrap().guard_text().as_deref(),
             Some("only if the field still exists · keeps its TTL")
         );
         let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
@@ -1509,7 +1591,7 @@ mod hash_field_edit_tests {
         }
         assert_eq!(s.confirm.as_ref().unwrap().command_text(), "HSETNX k new");
         assert_eq!(
-            s.confirm.as_ref().unwrap().guard_text(),
+            s.confirm.as_ref().unwrap().guard_text().as_deref(),
             Some("only if the key still exists · never overwrites a field")
         );
     }
@@ -2198,7 +2280,7 @@ mod set_member_edit_tests {
         }
         assert_eq!(s.confirm.as_ref().unwrap().command_text(), "SADD k");
         assert_eq!(
-            s.confirm.as_ref().unwrap().guard_text(),
+            s.confirm.as_ref().unwrap().guard_text().as_deref(),
             Some("only if the key still exists · never duplicates a member")
         );
         let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
@@ -2582,6 +2664,732 @@ mod set_member_edit_tests {
                 name: "k".into(),
                 value: crate::state::Value::Set(MemberValue {
                     members: vec![b"alpha".to_vec(), b"changed-under-the-editor".to_vec()],
+                    total: 2,
+                }),
+                ttl_seconds: -1,
+                size_bytes: 10,
+                at_ms: 9_000,
+            },
+        );
+        let open = s.open.as_ref().unwrap();
+        assert!(open.pending.is_some(), "held, not applied");
+        assert_eq!(
+            open.editor().unwrap().text(),
+            b"beta",
+            "the buffer is never touched (R3.8)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod list_element_edit_tests {
+    //! `e`/`a`/`d` on a List element (PLAN M2 task 8, D1–D8, ADR-0017):
+    //! editing an element in place, adding one at either end, removing one,
+    //! and the D6 Head/Tail toggle — the third case of the same chokepoint
+    //! and R3.8 guard the Hash and Set tests above already proved.
+
+    use super::*;
+    use crate::msg::KeyCode;
+    use crate::state::value::{IndexedValue, ListEnd};
+
+    fn open_with_list(items: &[&str], total: usize) -> State {
+        let value = crate::state::Value::List(IndexedValue {
+            items: items.iter().map(|i| i.as_bytes().to_vec()).collect(),
+            total,
+        });
+        let mut state = State {
+            cols: 130,
+            rows: 40,
+            focus: Pane::Value,
+            open: Some(OpenKey::new(Some(0), "k".into(), value, -1, 10, 0)),
+            ..State::default()
+        };
+        state.keys.push(b"k");
+        state.rebuild_list();
+        state
+    }
+
+    fn with_cursor(mut s: State, row: usize) -> State {
+        let open = s.open.as_mut().unwrap();
+        open.cursor_active = true;
+        open.cursor = row;
+        s
+    }
+
+    fn type_text(mut s: State, text: &str) -> State {
+        for c in text.chars() {
+            (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char(c))));
+        }
+        s
+    }
+
+    // ── D1/D2: `e` edits a row in place ─────────────────────────────────────
+
+    #[test]
+    fn e_without_a_cursor_on_a_list_gives_the_pick_an_element_notice() {
+        let s = open_with_list(&["alpha"], 1);
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        assert!(!s.open.unwrap().is_editing());
+        assert!(
+            matches!(cmds.as_slice(), [Command::Notify { text }] if text == "Enter to pick an element"),
+            "{cmds:?}"
+        );
+    }
+
+    #[test]
+    fn e_on_a_list_row_opens_the_raw_element_keyed_on_its_index() {
+        let s = with_cursor(open_with_list(&["alpha", "beta", "gamma"], 3), 1);
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        assert!(cmds.is_empty());
+        let open = s.open.as_ref().unwrap();
+        assert!(open.is_editing(), "R3.8's guard is up immediately");
+        let editor = open.editor().unwrap();
+        assert_eq!(editor.target(), &EditTarget::ListElement { index: 1 });
+        assert_eq!(editor.text(), b"beta");
+        assert_eq!(editor.field_name(), None, "an element has no field name");
+        assert_eq!(editor.active_part(), None, "no FIELD/VALUE split");
+    }
+
+    // ── D4: a non-UTF-8 element refuses with a notice, not a buffer ────────
+
+    #[test]
+    fn e_on_a_binary_list_row_gives_d4s_notice_instead_of_a_buffer() {
+        let value = crate::state::Value::List(IndexedValue {
+            items: vec![vec![0xff, 0x80]],
+            total: 1,
+        });
+        let mut s = State {
+            cols: 130,
+            rows: 40,
+            focus: Pane::Value,
+            open: Some(OpenKey::new(Some(0), "k".into(), value, -1, 10, 0)),
+            ..State::default()
+        };
+        s.keys.push(b"k");
+        s.rebuild_list();
+        let s = with_cursor(s, 0);
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let open = s.open.unwrap();
+        assert!(!open.is_editing());
+        assert!(open.editor().is_none());
+        assert!(
+            matches!(cmds.as_slice(), [Command::Notify { text }] if text == "binary elements aren't editable here yet"),
+            "{cmds:?}"
+        );
+    }
+
+    // ── Focus gating (ADR-0015 D4, mirrored for Lists) ──────────────────────
+
+    #[test]
+    fn e_in_the_keys_pane_with_a_list_open_gives_the_tab_notice() {
+        let mut s = open_with_list(&["alpha"], 1);
+        s.focus = Pane::Keys;
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        assert!(s.open.as_ref().unwrap().editor().is_none());
+        assert!(
+            matches!(cmds.as_slice(), [Command::Notify { text }] if text == "Tab to the value pane to edit")
+        );
+    }
+
+    #[test]
+    fn a_in_the_keys_pane_with_a_list_open_gives_the_tab_notice() {
+        let mut s = open_with_list(&["alpha"], 1);
+        s.focus = Pane::Keys;
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        assert!(s.open.as_ref().unwrap().editor().is_none());
+        assert!(
+            matches!(cmds.as_slice(), [Command::Notify { text }] if text == "Tab to the value pane to edit")
+        );
+    }
+
+    #[test]
+    fn d_without_a_cursor_on_a_list_gives_the_pick_an_element_notice() {
+        let s = open_with_list(&["alpha"], 1);
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        assert!(s.confirm.is_none());
+        assert!(
+            matches!(cmds.as_slice(), [Command::Notify { text }] if text == "Enter to pick an element")
+        );
+    }
+
+    // ── D6: the add form is a single capture defaulting to Tail, with a Tab toggle ──
+
+    #[test]
+    fn a_opens_a_single_part_buffer_defaulting_to_tail_with_no_cursor_needed() {
+        let s = open_with_list(&["alpha"], 1);
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        assert!(cmds.is_empty());
+        let open = s.open.as_ref().unwrap();
+        assert!(open.is_editing(), "R3.8's guard is up immediately");
+        let editor = open.editor().unwrap();
+        assert_eq!(
+            editor.target(),
+            &EditTarget::NewListElement { end: ListEnd::Tail }
+        );
+        assert_eq!(editor.active_part(), None, "no FIELD/VALUE split");
+        assert_eq!(editor.field_name(), None);
+        assert_eq!(editor.text(), b"");
+    }
+
+    #[test]
+    fn tab_toggles_head_and_tail_while_the_add_form_is_open() {
+        let s = open_with_list(&["alpha"], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        assert_eq!(
+            s.open.as_ref().unwrap().editor().unwrap().target(),
+            &EditTarget::NewListElement { end: ListEnd::Tail }
+        );
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Tab)));
+        assert!(cmds.is_empty(), "toggling emits no command");
+        assert_eq!(
+            s.open.as_ref().unwrap().editor().unwrap().target(),
+            &EditTarget::NewListElement { end: ListEnd::Head },
+            "one Tab flips to Head"
+        );
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Tab)));
+        assert_eq!(
+            s.open.as_ref().unwrap().editor().unwrap().target(),
+            &EditTarget::NewListElement { end: ListEnd::Tail },
+            "a second Tab flips back to Tail"
+        );
+    }
+
+    #[test]
+    fn tab_does_not_toggle_an_existing_elements_edit() {
+        // Only the add form has an end to toggle — `Tab` on an in-place edit
+        // still inserts a tab character, exactly as it does for every other
+        // target.
+        let s = with_cursor(open_with_list(&["alpha"], 1), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let before = s.open.as_ref().unwrap().editor().unwrap().text();
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Tab)));
+        let after = s.open.as_ref().unwrap().editor().unwrap().text();
+        assert!(
+            after.len() > before.len(),
+            "Tab still inserts (spaces, per `insert_tab`), it just does not toggle an end"
+        );
+        assert_eq!(
+            s.open.as_ref().unwrap().editor().unwrap().target(),
+            &EditTarget::ListElement { index: 0 },
+            "target unchanged — there is no end on this variant to toggle"
+        );
+    }
+
+    #[test]
+    fn typing_and_ctrl_s_stage_add_list_element_at_the_tail_by_default() {
+        let s = open_with_list(&["alpha"], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "beta");
+        let (s, cmds) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(cmds.is_empty());
+        match &s.confirm {
+            Some(PendingMutation::AddListElement { name, end, value }) => {
+                assert_eq!(name, b"k");
+                assert_eq!(*end, ListEnd::Tail);
+                assert_eq!(value, b"beta");
+            }
+            other => panic!("expected a staged AddListElement, got {other:?}"),
+        }
+        assert_eq!(s.confirm.as_ref().unwrap().command_text(), "RPUSH k");
+        assert_eq!(
+            s.confirm.as_ref().unwrap().guard_text().as_deref(),
+            Some("only if the key still exists")
+        );
+        let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        assert_eq!(
+            cmds,
+            vec![Command::Execute {
+                mutation: Mutation::AddListElement {
+                    key: "k".into(),
+                    end: ListEnd::Tail,
+                    value: b"beta".to_vec(),
+                },
+                index: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn tab_then_ctrl_s_stages_add_list_element_at_the_head() {
+        let s = open_with_list(&["alpha"], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Tab)));
+        let s = type_text(s, "beta");
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        match &s.confirm {
+            Some(PendingMutation::AddListElement { end, .. }) => assert_eq!(*end, ListEnd::Head),
+            other => panic!("expected a staged AddListElement, got {other:?}"),
+        }
+        assert_eq!(s.confirm.as_ref().unwrap().command_text(), "LPUSH k");
+    }
+
+    #[test]
+    fn enter_stages_add_list_element_exactly_like_ctrl_s() {
+        let s = open_with_list(&["alpha"], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "beta");
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+        assert!(cmds.is_empty(), "Enter only opens the confirm dialog");
+        assert!(matches!(
+            s.confirm,
+            Some(PendingMutation::AddListElement { .. })
+        ));
+    }
+
+    #[test]
+    fn ctrl_s_on_an_untouched_empty_buffer_still_stages_an_empty_element() {
+        let s = open_with_list(&["alpha"], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        match &s.confirm {
+            Some(PendingMutation::AddListElement { value, .. }) => assert!(value.is_empty()),
+            other => panic!("expected a staged AddListElement, got {other:?}"),
+        }
+    }
+
+    // ── The header names the active end (D6) ────────────────────────────────
+
+    #[test]
+    fn the_header_names_which_end_the_add_form_is_pointed_at() {
+        let s = open_with_list(&["alpha"], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let currency = s.open.as_ref().unwrap().currency(true, 0);
+        assert!(currency.contains("tail"), "{currency}");
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Tab)));
+        let currency = s.open.as_ref().unwrap().currency(true, 0);
+        assert!(currency.contains("head"), "{currency}");
+    }
+
+    // ── D5/D2: `e` on a set of `LSET key <i>` and stages a compare-and-set ─
+
+    #[test]
+    fn ctrl_s_stages_set_list_element_with_the_expected_bytes_and_index() {
+        let s = with_cursor(open_with_list(&["alpha", "beta"], 2), 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let s = type_text(s, "!");
+        let (s, cmds) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(cmds.is_empty());
+        match &s.confirm {
+            Some(PendingMutation::SetListElement {
+                name,
+                index,
+                old,
+                new,
+                was_json,
+            }) => {
+                assert_eq!(name, b"k");
+                assert_eq!(*index, 1);
+                assert_eq!(old, b"beta");
+                assert_eq!(new, b"!beta");
+                assert!(!was_json);
+            }
+            other => panic!("expected a staged SetListElement, got {other:?}"),
+        }
+        assert_eq!(s.confirm.as_ref().unwrap().command_text(), "LSET k 1");
+        assert_eq!(
+            s.confirm.as_ref().unwrap().guard_text().as_deref(),
+            Some("only if that element is still there · index 1")
+        );
+        let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        assert_eq!(
+            cmds,
+            vec![Command::Execute {
+                mutation: Mutation::SetListElement {
+                    key: "k".into(),
+                    index: 1,
+                    expected: b"beta".to_vec(),
+                    value: b"!beta".to_vec(),
+                },
+                index: None,
+            }]
+        );
+    }
+
+    /// Regression: `PendingMutation::json_warning` originally matched only
+    /// `SetString`/`SetHashField`, so a List element edit that broke JSON
+    /// carried `was_json: true` all the way to the confirm dialog and the
+    /// dialog's `if pending.json_warning() == Some(true)` check (`render/
+    /// mod.rs`) silently never fired — found while writing phase 5's golden
+    /// frame for this exact dialog, since nothing before this phase ever
+    /// rendered a staged `SetListElement` through `confirm_overlay`.
+    #[test]
+    fn a_json_element_edited_into_something_invalid_warns() {
+        let s = with_cursor(open_with_list(&["{\"a\":1}"], 1), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        assert!(s.open.as_ref().unwrap().editor().unwrap().was_json());
+        let s = type_text(s, "x"); // breaks the JSON
+        let (s, cmds) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(cmds.is_empty());
+        assert_eq!(s.confirm.as_ref().unwrap().json_warning(), Some(true));
+    }
+
+    // ── D5: `d` in the value pane stages `DeleteListElement` ───────────────
+
+    #[test]
+    fn d_in_the_value_pane_stages_delete_list_element_and_marks_the_last_element() {
+        let s = with_cursor(open_with_list(&["only"], 1), 0);
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        assert!(cmds.is_empty());
+        match &s.confirm {
+            Some(PendingMutation::DeleteListElement {
+                name,
+                index,
+                element,
+                last_element,
+            }) => {
+                assert_eq!(name, b"k");
+                assert_eq!(*index, 0);
+                assert_eq!(element, b"only");
+                assert!(*last_element);
+            }
+            other => panic!("expected a staged DeleteListElement, got {other:?}"),
+        }
+        assert_eq!(s.confirm.as_ref().unwrap().command_text(), "LREM k 0");
+    }
+
+    #[test]
+    fn d_with_more_than_one_element_left_is_not_marked_as_the_last() {
+        let s = with_cursor(open_with_list(&["x", "y"], 2), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        match &s.confirm {
+            Some(PendingMutation::DeleteListElement { last_element, .. }) => {
+                assert!(!last_element);
+            }
+            other => panic!("expected a staged DeleteListElement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn d_removes_the_row_the_cursor_is_actually_on_not_the_first_match() {
+        // The whole reason ADR-0017 D2 exists: `LREM` alone would remove the
+        // *first* `x`, not the one at the selected row. Staging carries the
+        // index the cursor was on, and `crates/app/src/redis/mutate.rs`'s
+        // sentinel technique is what makes acting on it duplicate-safe.
+        let s = with_cursor(open_with_list(&["x", "y", "x", "z"], 4), 2);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        match &s.confirm {
+            Some(PendingMutation::DeleteListElement { index, element, .. }) => {
+                assert_eq!(*index, 2);
+                assert_eq!(element, b"x");
+            }
+            other => panic!("expected a staged DeleteListElement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn d_in_the_keys_pane_still_stages_delete_key_with_a_list_open() {
+        let mut s = open_with_list(&["a"], 1);
+        s.focus = Pane::Keys;
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        assert!(matches!(s.confirm, Some(PendingMutation::DeleteKey { .. })));
+    }
+
+    #[test]
+    fn confirming_a_delete_list_element_issues_lrem() {
+        let s = with_cursor(open_with_list(&["only"], 1), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        assert_eq!(
+            cmds,
+            vec![Command::Execute {
+                mutation: Mutation::DeleteListElement {
+                    key: "k".into(),
+                    index: 0,
+                    expected: b"only".to_vec(),
+                },
+                index: None,
+            }]
+        );
+    }
+
+    // ── D7: a row inside the window behaves identically whatever `total` is ─
+
+    #[test]
+    fn a_long_lists_total_past_the_window_does_not_change_what_e_does_to_a_row_inside_it() {
+        let items: Vec<String> = (0..500).map(|i| format!("item-{i}")).collect();
+        let refs: Vec<&str> = items.iter().map(String::as_str).collect();
+        let s = with_cursor(open_with_list(&refs, 12_000), 499);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let editor = s.open.as_ref().unwrap().editor().unwrap();
+        assert_eq!(editor.target(), &EditTarget::ListElement { index: 499 });
+        assert_eq!(editor.text(), b"item-499");
+    }
+
+    #[test]
+    fn a_long_lists_total_past_the_window_does_not_change_what_d_does_to_a_row_inside_it() {
+        let items: Vec<String> = (0..500).map(|i| format!("item-{i}")).collect();
+        let refs: Vec<&str> = items.iter().map(String::as_str).collect();
+        let s = with_cursor(open_with_list(&refs, 12_000), 250);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        match &s.confirm {
+            Some(PendingMutation::DeleteListElement {
+                index,
+                element,
+                last_element,
+                ..
+            }) => {
+                assert_eq!(*index, 250);
+                assert_eq!(element, b"item-250");
+                assert!(
+                    !last_element,
+                    "12,000 items total — nowhere near the list's last element"
+                );
+            }
+            other => panic!("expected a staged DeleteListElement, got {other:?}"),
+        }
+    }
+
+    // ── Read-only Mode refuses at confirm, never at the keypress ───────────
+
+    #[test]
+    fn read_only_refuses_all_three_list_mutations_at_confirm_not_at_the_keypress() {
+        let mutations = [
+            PendingMutation::SetListElement {
+                name: b"k".to_vec().into(),
+                index: 0,
+                old: b"old".to_vec(),
+                new: b"new".to_vec(),
+                was_json: false,
+            },
+            PendingMutation::AddListElement {
+                name: b"k".to_vec().into(),
+                end: ListEnd::Tail,
+                value: b"m".to_vec(),
+            },
+            PendingMutation::DeleteListElement {
+                name: b"k".to_vec().into(),
+                index: 0,
+                element: b"m".to_vec(),
+                last_element: false,
+            },
+        ];
+        for mutation in mutations {
+            let s = State {
+                read_only: Some(ReadOnlyReason::User),
+                confirm: Some(mutation.clone()),
+                ..State::default()
+            };
+            let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+            assert!(s.confirm.is_none(), "{mutation:?}");
+            assert!(
+                matches!(cmds.as_slice(), [Command::Notify { text }] if text.contains("read-only")),
+                "{mutation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_mode_does_not_refuse_e_on_a_list_only_at_y() {
+        let s = State {
+            read_only: Some(ReadOnlyReason::Environment),
+            ..with_cursor(open_with_list(&["alpha"], 1), 0)
+        };
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        assert!(
+            s.open.as_ref().unwrap().editor().is_some(),
+            "opening is never refused"
+        );
+        assert!(cmds.is_empty());
+        let s = type_text(s, "!");
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(s.confirm.is_some(), "the preview is composed anyway");
+        let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        assert!(
+            !cmds.iter().any(|c| matches!(
+                c,
+                Command::Execute {
+                    mutation: Mutation::SetListElement { .. },
+                    ..
+                }
+            )),
+            "but nothing was actually sent to the server"
+        );
+    }
+
+    // ── `NotWritten::ElementMoved` hands the buffer back and re-reads ──────
+
+    #[test]
+    fn not_written_element_moved_names_lset_and_hands_the_buffer_back() {
+        let s = with_cursor(open_with_list(&["alpha", "beta"], 2), 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let s = type_text(s, "!");
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        let (s, cmds) = update(
+            s,
+            Msg::MutationSettled {
+                mutation: Mutation::SetListElement {
+                    key: "k".into(),
+                    index: 1,
+                    expected: b"beta".to_vec(),
+                    value: b"!beta".to_vec(),
+                },
+                index: None,
+                result: Ok(MutationOutcome::NotWritten(NotWritten::ElementMoved)),
+                at_ms: 5_000,
+            },
+        );
+        assert!(matches!(cmds.as_slice(), [Command::ReadKey { .. }]));
+        let (text, _) = s.error.as_ref().unwrap();
+        assert!(text.contains("LSET k 1"), "{text}");
+        assert!(
+            text.contains("that element moved — the list changed underneath it, look again"),
+            "{text}"
+        );
+        let open = s.open.as_ref().unwrap();
+        assert!(
+            open.is_editing(),
+            "held under R3.8 — the buffer is open again"
+        );
+        assert_eq!(open.editor().unwrap().text(), b"!beta");
+    }
+
+    #[test]
+    fn not_written_key_gone_tombstones_and_hands_the_list_edit_back() {
+        let s = with_cursor(open_with_list(&["alpha"], 1), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let s = type_text(s, "!");
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        let (s, cmds) = update(
+            s,
+            Msg::MutationSettled {
+                mutation: Mutation::SetListElement {
+                    key: "k".into(),
+                    index: 0,
+                    expected: b"alpha".to_vec(),
+                    value: b"!alpha".to_vec(),
+                },
+                index: None,
+                result: Ok(MutationOutcome::NotWritten(NotWritten::KeyGone)),
+                at_ms: 6_000,
+            },
+        );
+        assert!(cmds.is_empty(), "never retried, never recreated");
+        let open = s.open.as_ref().unwrap();
+        assert_eq!(open.deleted_at_ms, Some(6_000));
+        assert!(open.is_editing(), "the buffer is open again");
+        assert_eq!(open.editor().unwrap().text(), b"!alpha");
+    }
+
+    #[test]
+    fn key_gone_under_a_staged_set_list_element_dialog_closes_and_hands_the_buffer_back() {
+        let s = with_cursor(open_with_list(&["alpha"], 1), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let s = type_text(s, "!");
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(s.confirm.is_some());
+        let token = s.read_token;
+        let (s, _) = update(
+            s,
+            Msg::ValueGone {
+                token,
+                index: None,
+                name: "k".into(),
+                at_ms: 7_000,
+            },
+        );
+        assert!(
+            s.confirm.is_none(),
+            "the compiler-enforced `dialog_up` match in \
+             `staged_edit_found_key_gone` must recognize SetListElement"
+        );
+        let open = s.open.as_ref().unwrap();
+        assert_eq!(open.deleted_at_ms, Some(7_000));
+        assert_eq!(open.editor().unwrap().text(), b"!alpha");
+    }
+
+    #[test]
+    fn key_gone_under_a_staged_add_list_element_dialog_closes_and_hands_the_buffer_back() {
+        let s = open_with_list(&["alpha"], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "beta");
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(s.confirm.is_some());
+        let token = s.read_token;
+        let (s, _) = update(
+            s,
+            Msg::ValueGone {
+                token,
+                index: None,
+                name: "k".into(),
+                at_ms: 7_000,
+            },
+        );
+        assert!(s.confirm.is_none());
+        let open = s.open.as_ref().unwrap();
+        assert_eq!(open.deleted_at_ms, Some(7_000));
+        assert_eq!(open.editor().unwrap().text(), b"beta");
+    }
+
+    #[test]
+    fn key_gone_under_a_staged_delete_list_element_dialog_simply_closes() {
+        let s = with_cursor(open_with_list(&["a"], 1), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        assert!(s.confirm.is_some());
+        let token = s.read_token;
+        let (s, _) = update(
+            s,
+            Msg::ValueGone {
+                token,
+                index: None,
+                name: "k".into(),
+                at_ms: 7_000,
+            },
+        );
+        assert!(s.confirm.is_none());
+        assert!(s.notice.is_some());
+        let open = s.open.as_ref().unwrap();
+        assert_eq!(open.deleted_at_ms, Some(7_000));
+        assert!(open.editor().is_none(), "delete never had a buffer");
+    }
+
+    // ── R3.8: a live update arriving while the editor is open is held ──────
+
+    #[test]
+    fn an_update_arriving_while_the_list_edit_is_open_is_held() {
+        let s = with_cursor(open_with_list(&["alpha", "beta"], 2), 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let s = type_text(s, "!");
+        assert!(s.open.as_ref().unwrap().is_editing());
+        let (s, _) = update(
+            s,
+            Msg::ValueLoaded {
+                token: crate::command::ReadToken::default(),
+                index: Some(0),
+                name: "k".into(),
+                value: crate::state::Value::List(IndexedValue {
+                    items: vec![b"alpha".to_vec(), b"changed-under-the-editor".to_vec()],
+                    total: 2,
+                }),
+                ttl_seconds: -1,
+                size_bytes: 10,
+                at_ms: 9_000,
+            },
+        );
+        let open = s.open.as_ref().unwrap();
+        assert!(open.pending.is_some(), "held, not applied");
+        assert_eq!(
+            open.editor().unwrap().text(),
+            b"!beta",
+            "the buffer is never touched (R3.8)"
+        );
+    }
+
+    #[test]
+    fn an_update_arriving_while_the_list_add_form_is_open_is_held() {
+        let s = open_with_list(&["alpha"], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "beta");
+        assert!(s.open.as_ref().unwrap().is_editing());
+        let (s, _) = update(
+            s,
+            Msg::ValueLoaded {
+                token: crate::command::ReadToken::default(),
+                index: Some(0),
+                name: "k".into(),
+                value: crate::state::Value::List(IndexedValue {
+                    items: vec![b"alpha".to_vec(), b"changed-under-the-editor".to_vec()],
                     total: 2,
                 }),
                 ttl_seconds: -1,

@@ -45,6 +45,21 @@ pub enum EditTarget {
     /// only bytes — so the add form is a single capture, not the Hash add
     /// form's two-part `FIELD`/`VALUE` shape.
     NewSetMember,
+    /// One element of the Open List, being overwritten (`LSET`, guarded —
+    /// PLAN M2 task 8, D2, ADR-0017). Always on its **raw** value, never
+    /// reformatted, mirroring [`EditTarget::HashField`]. `index` is the
+    /// element's position, not a byte offset — the compare-and-set guard
+    /// (ADR-0017 D2) is keyed on it, and a rescan between opening and
+    /// staging cannot renumber it, since nothing here re-derives it from a
+    /// row.
+    ListElement { index: usize },
+    /// A brand-new element of the Open List, not yet on the server
+    /// (`LPUSH`/`RPUSH`, guarded) — PLAN M2 task 8, D6, ADR-0017. Carries no
+    /// [`FieldPart`]: a single capture, the same shape [`EditTarget::NewSetMember`]'s
+    /// form is — a List element has no name to type first either. `end` is
+    /// which end `a` will push to; `Tab` toggles it while the form is open
+    /// (phase 3's wiring, not this type's job).
+    NewListElement { end: super::value::ListEnd },
 }
 
 /// Which half of the add form (`FIELD`/`VALUE`) is active, while adding a new
@@ -232,6 +247,57 @@ impl EditBuffer {
         }
     }
 
+    /// Build a buffer on one List element's raw value, to overwrite it (`e`
+    /// on a List row, PLAN M2 task 8, D2, D4, ADR-0017).
+    ///
+    /// The **raw** element value, never reformatted, mirroring
+    /// [`EditBuffer::for_hash_field`]. `index` is the element's position
+    /// within the list, not a byte offset — D2's compare-and-set guard is
+    /// keyed on it. A non-UTF-8 element is refused the same way a binary
+    /// Hash field is (D4): a text editor cannot round-trip arbitrary bytes.
+    pub fn list_element(index: usize, value: &[u8]) -> Result<EditBuffer, &'static str> {
+        let Ok(value) = std::str::from_utf8(value) else {
+            return Err("binary elements aren't editable here yet");
+        };
+        if value.len() > MAX_EDIT_BYTES {
+            return Err(
+                "too large to edit inline (over 200KB) — an external-editor escape hatch is planned",
+            );
+        }
+        let was_json = super::value::looks_like_json(value);
+        let lines: Vec<String> = value.split('\n').map(str::to_string).collect();
+        let mut area = TextArea::new(lines);
+        area.set_wrap_mode(WrapMode::WordOrGlyph);
+        area.set_cursor_line_style(ratatui::style::Style::default());
+        Ok(EditBuffer {
+            area,
+            original: value.as_bytes().to_vec(),
+            was_json,
+            target: EditTarget::ListElement { index },
+        })
+    }
+
+    /// An empty buffer for a new List element that does not exist on the
+    /// server yet (`a` on a List, PLAN M2 task 8, D6, ADR-0017). A single
+    /// capture, the same shape [`EditBuffer::new_set_member`] is — a List
+    /// element has no name to type first either. Opens on
+    /// [`super::value::ListEnd`]'s default, [`super::value::ListEnd::Tail`]
+    /// (D6): appending is the common case, and the one that does not
+    /// renumber the rows the reader is looking at.
+    pub fn new_list_element() -> EditBuffer {
+        let mut area = TextArea::new(vec![String::new()]);
+        area.set_wrap_mode(WrapMode::WordOrGlyph);
+        area.set_cursor_line_style(ratatui::style::Style::default());
+        EditBuffer {
+            area,
+            original: Vec::new(),
+            was_json: false,
+            target: EditTarget::NewListElement {
+                end: super::value::ListEnd::default(),
+            },
+        }
+    }
+
     /// What this buffer writes back when staged.
     pub fn target(&self) -> &EditTarget {
         &self.target
@@ -244,17 +310,31 @@ impl EditBuffer {
     pub fn field_name(&self) -> Option<&str> {
         match &self.target {
             EditTarget::HashField { field } | EditTarget::NewHashField { field, .. } => Some(field),
-            EditTarget::Value | EditTarget::NewSetMember => None,
+            EditTarget::Value
+            | EditTarget::NewSetMember
+            | EditTarget::ListElement { .. }
+            | EditTarget::NewListElement { .. } => None,
         }
     }
 
     /// Which part of the add form is active. `None` outside
     /// [`EditTarget::NewHashField`] — editing an existing field, and a plain
     /// String, both have nothing but the value to be on.
+    ///
+    /// Exhaustive, not a wildcard fallback (PLAN M2 task 8, D8): a List's
+    /// two targets have no [`FieldPart`] to be on either — `NewListElement`'s
+    /// `Head`/`Tail` toggle is a different kind of "part" than
+    /// `FIELD`/`VALUE`, wired by its own mechanism in phase 3, not this one
+    /// — but that has to be a decision made here, once, the same reasoning
+    /// [`crate::state::PendingMutation::guard_text`] is exhaustive for.
     pub fn active_part(&self) -> Option<FieldPart> {
         match &self.target {
             EditTarget::NewHashField { part, .. } => Some(*part),
-            _ => None,
+            EditTarget::Value
+            | EditTarget::HashField { .. }
+            | EditTarget::NewSetMember
+            | EditTarget::ListElement { .. }
+            | EditTarget::NewListElement { .. } => None,
         }
     }
 
@@ -309,6 +389,20 @@ impl EditBuffer {
     pub fn return_to_name(&mut self) {
         if let EditTarget::NewHashField { part, .. } = &mut self.target {
             *part = FieldPart::Name;
+        }
+    }
+
+    /// Flip which end `a` will push to (D6, ADR-0017) — `Tab` while the List
+    /// add form is open. A no-op outside [`EditTarget::NewListElement`]:
+    /// nothing else has an end to toggle, and a stray `Tab` elsewhere already
+    /// has its own meaning (`insert_tab`), which the caller is responsible
+    /// for choosing between — this only ever changes the target it owns.
+    pub fn toggle_list_end(&mut self) {
+        if let EditTarget::NewListElement { end } = &mut self.target {
+            *end = match end {
+                super::value::ListEnd::Head => super::value::ListEnd::Tail,
+                super::value::ListEnd::Tail => super::value::ListEnd::Head,
+            };
         }
     }
 
@@ -550,6 +644,72 @@ mod tests {
         assert_eq!(buf.active_part(), None, "no FIELD/VALUE split for a member");
         assert_eq!(buf.text(), b"");
         assert!(!buf.was_json());
+    }
+
+    #[test]
+    fn list_element_opens_on_the_raw_value_with_the_index() {
+        let buf = EditBuffer::list_element(3, b"beta").unwrap();
+        assert_eq!(buf.target(), &EditTarget::ListElement { index: 3 });
+        assert_eq!(buf.text(), b"beta");
+        assert_eq!(buf.field_name(), None, "a list element has no field name");
+        assert_eq!(
+            buf.active_part(),
+            None,
+            "no FIELD/VALUE split for an element"
+        );
+        assert!(!buf.was_json());
+    }
+
+    #[test]
+    fn a_non_utf8_list_element_refuses_with_a_notice() {
+        let err = EditBuffer::list_element(0, b"\xff\x80").unwrap_err();
+        assert_eq!(err, "binary elements aren't editable here yet");
+    }
+
+    #[test]
+    fn new_list_element_opens_a_single_part_form_defaulting_to_tail() {
+        let buf = EditBuffer::new_list_element();
+        assert_eq!(
+            buf.target(),
+            &EditTarget::NewListElement {
+                end: crate::state::value::ListEnd::Tail
+            }
+        );
+        assert_eq!(buf.field_name(), None, "a list element has no field name");
+        assert_eq!(buf.active_part(), None, "no FIELD/VALUE split for an add");
+        assert_eq!(buf.text(), b"");
+        assert!(!buf.was_json());
+    }
+
+    #[test]
+    fn toggle_list_end_flips_head_and_tail_and_is_a_no_op_elsewhere() {
+        let mut buf = EditBuffer::new_list_element();
+        assert_eq!(
+            buf.target(),
+            &EditTarget::NewListElement {
+                end: crate::state::value::ListEnd::Tail
+            }
+        );
+        buf.toggle_list_end();
+        assert_eq!(
+            buf.target(),
+            &EditTarget::NewListElement {
+                end: crate::state::value::ListEnd::Head
+            }
+        );
+        buf.toggle_list_end();
+        assert_eq!(
+            buf.target(),
+            &EditTarget::NewListElement {
+                end: crate::state::value::ListEnd::Tail
+            }
+        );
+
+        // No end to toggle on any other target — a no-op, not a panic.
+        let mut existing = EditBuffer::list_element(0, b"beta").unwrap();
+        let before = existing.target().clone();
+        existing.toggle_list_end();
+        assert_eq!(existing.target(), &before);
     }
 
     #[test]

@@ -20,7 +20,7 @@ pub use loaded::{KeyKind, LoadedSet};
 pub use open::{Attachment, EditPhase, OpenKey, PendingRead, ReadOutcome};
 pub use scan::ScanState;
 pub use tree::Tree;
-pub use value::{Value, Viewer, looks_like_json};
+pub use value::{ListEnd, Value, Viewer, looks_like_json};
 pub use view::{FilterMode, KeyView, SortBy};
 
 /// Where a Connection's target came from (ADR-0001).
@@ -276,6 +276,36 @@ pub enum PendingMutation {
         member: Vec<u8>,
         last_member: bool,
     },
+    /// Overwrite one List element's value, refusing unless the element at
+    /// `index` still holds the bytes read (guarded `LSET`, PLAN M2 task 8,
+    /// D2, ADR-0017). `old`/`was_json` carry the same meaning
+    /// `SetHashField`'s give them, one element wide.
+    SetListElement {
+        name: crate::key::KeyName,
+        index: usize,
+        old: Vec<u8>,
+        new: Vec<u8>,
+        was_json: bool,
+    },
+    /// Add a new List element at either end, never recreating a gone key
+    /// (guarded `LPUSH`/`RPUSH`, PLAN M2 task 8, D2, D6, ADR-0017).
+    AddListElement {
+        name: crate::key::KeyName,
+        end: ListEnd,
+        value: Vec<u8>,
+    },
+    /// Remove one List element by index, duplicate-safely (PLAN M2 task 8,
+    /// D2, D5, ADR-0017). `element` is the bytes it must still hold to be
+    /// removed — carried through to the confirm dialog's diff, the same way
+    /// `DeleteSetMember::member` is. `last_element` mirrors
+    /// `DeleteHashField::last_field`/`DeleteSetMember::last_member`: whether
+    /// this was the list's only element at the moment it was staged.
+    DeleteListElement {
+        name: crate::key::KeyName,
+        index: usize,
+        element: Vec<u8>,
+        last_element: bool,
+    },
 }
 
 impl PendingMutation {
@@ -310,6 +340,21 @@ impl PendingMutation {
             // dialog's diff instead (`crate::render`'s confirm overlay).
             PendingMutation::AddSetMember { name, .. } => format!("SADD {name}"),
             PendingMutation::DeleteSetMember { name, .. } => format!("SREM {name}"),
+            // The index, not the element itself: an index is a position,
+            // safe to show on a command line, the same reasoning that keeps
+            // a member off `SADD`/`SREM`'s line above (ADR-0017). The
+            // element appears in the `+`/`-` side of the dialog's diff
+            // instead.
+            PendingMutation::SetListElement { name, index, .. } => {
+                format!("LSET {name} {index}")
+            }
+            PendingMutation::AddListElement { name, end, .. } => match end {
+                ListEnd::Head => format!("LPUSH {name}"),
+                ListEnd::Tail => format!("RPUSH {name}"),
+            },
+            PendingMutation::DeleteListElement { name, index, .. } => {
+                format!("LREM {name} {index}")
+            }
         }
     }
 
@@ -318,13 +363,24 @@ impl PendingMutation {
     /// everything else — `DeleteKey` and `SetString` need no such line, and
     /// `DeleteHashField` is plain `HDEL`, guarded by nothing but its own
     /// last-field warning (see [`crate::render`]'s confirm dialog).
-    pub fn guard_text(&self) -> Option<&'static str> {
+    ///
+    /// Returns an owned `String` rather than `&'static str`: a List guard's
+    /// wording carries the staged index (D2, ADR-0017), which no `'static`
+    /// literal can hold. `Option<String>` costs one allocation per confirm
+    /// dialog render, at the scale of a single overlay redraw — not a hot
+    /// path (ADR-0011).
+    ///
+    /// Exhaustive over every `PendingMutation` variant, not a wildcard
+    /// fallback (PLAN M2 task 8, D8): a new write's guard line has to be a
+    /// decision made here, once, rather than silently inheriting `None` from
+    /// a catch-all arm the way it would if this still ended in `_ => None`.
+    pub fn guard_text(&self) -> Option<String> {
         match self {
             PendingMutation::SetHashField { .. } => {
-                Some("only if the field still exists · keeps its TTL")
+                Some("only if the field still exists · keeps its TTL".to_string())
             }
             PendingMutation::AddHashField { .. } => {
-                Some("only if the key still exists · never overwrites a field")
+                Some("only if the key still exists · never overwrites a field".to_string())
             }
             // Exact wording D2/PLAN M2 task 7 specify — "never duplicates a
             // member", not "never overwrites a member": `SADD` has no
@@ -333,9 +389,25 @@ impl PendingMutation {
             // half — `SADD`'s own no-op-on-duplicate return — actually
             // prevents.
             PendingMutation::AddSetMember { .. } => {
-                Some("only if the key still exists · never duplicates a member")
+                Some("only if the key still exists · never duplicates a member".to_string())
             }
-            _ => None,
+            PendingMutation::DeleteKey { .. }
+            | PendingMutation::SetString { .. }
+            | PendingMutation::DeleteHashField { .. }
+            | PendingMutation::DeleteSetMember { .. } => None,
+            // ADR-0017 D2: the guard is a compare-and-set on the element at
+            // `index`, not `EXISTS` alone — the wording says so and names
+            // the index, since a stale index is the expected, routine
+            // refusal on a busy list (D3).
+            PendingMutation::SetListElement { index, .. }
+            | PendingMutation::DeleteListElement { index, .. } => Some(format!(
+                "only if that element is still there · index {index}"
+            )),
+            // Add has no compare-and-set half — it addresses no existing
+            // element — only the ordinary gone-key guard (ADR-0017 D2).
+            PendingMutation::AddListElement { .. } => {
+                Some("only if the key still exists".to_string())
+            }
         }
     }
 
@@ -352,6 +424,11 @@ impl PendingMutation {
                 ..
             }
             | PendingMutation::SetHashField {
+                was_json: true,
+                new,
+                ..
+            }
+            | PendingMutation::SetListElement {
                 was_json: true,
                 new,
                 ..
@@ -405,6 +482,42 @@ impl PendingMutation {
             PendingMutation::DeleteSetMember { name, member, .. } => {
                 (Mutation::DeleteSetMember { key: name, member }, None)
             }
+            PendingMutation::SetListElement {
+                name,
+                index,
+                old,
+                new,
+                ..
+            } => (
+                Mutation::SetListElement {
+                    key: name,
+                    index,
+                    expected: old,
+                    value: new,
+                },
+                None,
+            ),
+            PendingMutation::AddListElement { name, end, value } => (
+                Mutation::AddListElement {
+                    key: name,
+                    end,
+                    value,
+                },
+                None,
+            ),
+            PendingMutation::DeleteListElement {
+                name,
+                index,
+                element,
+                ..
+            } => (
+                Mutation::DeleteListElement {
+                    key: name,
+                    index,
+                    expected: element,
+                },
+                None,
+            ),
         };
         crate::Command::Execute { mutation, index }
     }
@@ -890,7 +1003,7 @@ mod tests {
         };
         assert_eq!(pending.command_text(), "SADD myset");
         assert_eq!(
-            pending.guard_text(),
+            pending.guard_text().as_deref(),
             Some("only if the key still exists · never duplicates a member")
         );
     }
@@ -965,6 +1078,148 @@ mod tests {
                 mutation: Mutation::DeleteSetMember {
                     key: "myset".into(),
                     member: b"alpha".to_vec(),
+                },
+                index: None,
+            }
+        );
+    }
+
+    #[test]
+    fn set_list_element_previews_lset_with_the_indexed_guard_line() {
+        let pending = PendingMutation::SetListElement {
+            name: "mylist".into(),
+            index: 3,
+            old: b"old".to_vec(),
+            new: b"new".to_vec(),
+            was_json: false,
+        };
+        assert_eq!(pending.command_text(), "LSET mylist 3");
+        assert_eq!(
+            pending.guard_text().as_deref(),
+            Some("only if that element is still there · index 3")
+        );
+    }
+
+    #[test]
+    fn add_list_element_previews_the_command_for_the_chosen_end() {
+        let head = PendingMutation::AddListElement {
+            name: "mylist".into(),
+            end: ListEnd::Head,
+            value: b"new".to_vec(),
+        };
+        assert_eq!(head.command_text(), "LPUSH mylist");
+        let tail = PendingMutation::AddListElement {
+            name: "mylist".into(),
+            end: ListEnd::Tail,
+            value: b"new".to_vec(),
+        };
+        assert_eq!(tail.command_text(), "RPUSH mylist");
+        assert_eq!(
+            tail.guard_text().as_deref(),
+            Some("only if the key still exists")
+        );
+    }
+
+    #[test]
+    fn delete_list_element_previews_lrem_with_the_indexed_guard_line() {
+        let pending = PendingMutation::DeleteListElement {
+            name: "mylist".into(),
+            index: 2,
+            element: b"gone".to_vec(),
+            last_element: false,
+        };
+        assert_eq!(pending.command_text(), "LREM mylist 2");
+        assert_eq!(
+            pending.guard_text().as_deref(),
+            Some("only if that element is still there · index 2")
+        );
+    }
+
+    #[test]
+    fn the_last_element_warning_only_shows_up_when_it_is_set() {
+        let last = PendingMutation::DeleteListElement {
+            name: "mylist".into(),
+            index: 0,
+            element: b"only".to_vec(),
+            last_element: true,
+        };
+        let not_last = PendingMutation::DeleteListElement {
+            name: "mylist".into(),
+            index: 0,
+            element: b"one-of-many".to_vec(),
+            last_element: false,
+        };
+        assert!(matches!(
+            last,
+            PendingMutation::DeleteListElement {
+                last_element: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            not_last,
+            PendingMutation::DeleteListElement {
+                last_element: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn into_command_carries_the_list_element_mutations_through() {
+        use crate::command::Command;
+        use crate::mutation::Mutation;
+
+        let set = PendingMutation::SetListElement {
+            name: "mylist".into(),
+            index: 1,
+            old: b"old".to_vec(),
+            new: b"new".to_vec(),
+            was_json: false,
+        };
+        assert_eq!(
+            set.into_command(),
+            Command::Execute {
+                mutation: Mutation::SetListElement {
+                    key: "mylist".into(),
+                    index: 1,
+                    expected: b"old".to_vec(),
+                    value: b"new".to_vec(),
+                },
+                index: None,
+            }
+        );
+
+        let add = PendingMutation::AddListElement {
+            name: "mylist".into(),
+            end: ListEnd::Head,
+            value: b"new".to_vec(),
+        };
+        assert_eq!(
+            add.into_command(),
+            Command::Execute {
+                mutation: Mutation::AddListElement {
+                    key: "mylist".into(),
+                    end: ListEnd::Head,
+                    value: b"new".to_vec(),
+                },
+                index: None,
+            }
+        );
+
+        let delete = PendingMutation::DeleteListElement {
+            name: "mylist".into(),
+            index: 2,
+            element: b"gone".to_vec(),
+            last_element: true,
+        };
+        assert_eq!(
+            delete.into_command(),
+            Command::Execute {
+                mutation: Mutation::DeleteListElement {
+                    key: "mylist".into(),
+                    index: 2,
+                    expected: b"gone".to_vec(),
                 },
                 index: None,
             }

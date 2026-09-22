@@ -234,10 +234,17 @@ under a staged edit and proves the write still lands on the intended member.
 
 ## Consequences
 
+**Built as drafted, with a few decisions the implementation forced that this ADR did not
+originally anticipate — recorded here so this section describes the code as it is, not as it was
+planned (phase 5).**
+
 - `crates/core/src/mutation.rs` gains `Mutation::{SetZSetScore, AddZSetMember,
   DeleteZSetMember}`, with `command_label` → `ZADD key <member>` / `ZADD key NX` / `ZREM key`, and
   `NotWritten::MemberGone` — a new variant (D3), not a reuse of `FieldGone`, because a ZSet member
-  and a Hash field are different things in this codebase's glossary (CONTEXT.md).
+  and a Hash field are different things in this codebase's glossary (CONTEXT.md). Both `Mutation`
+  and `PendingMutation` now implement `Eq` by hand (`f64` has no derivable `Eq`) — safe because
+  D4 rejects `nan` before a score can ever be staged, so every `f64` either enum holds compares
+  reflexively.
 - `crates/core/src/state/mod.rs` gains `PendingMutation::{SetZSetScore, AddZSetMember,
   DeleteZSetMember { last_member } }`, each with `command_text()` and `guard_text()`:
   - score edit — "only if that member still exists" (one clause; see above for why it has no
@@ -248,26 +255,68 @@ under a staged edit and proves the write still lands on the intended member.
   The delete variant carries the same `last_member`-shaped warning ADR-0016 gave Set's last-member
   delete.
 - `crates/core/src/state/editor.rs` gains `EditTarget::{ZSetScore { member }, NewZSetMember {
-  member, part }}`, `EditBuffer::{zset_score, new_zset_member}`, and a numeric-validity helper for
-  D4 (parses as f64, then explicitly rejects `is_nan()`). `EditBuffer::active_part` must return a
-  real `Some(..)` for the add target — the M3 inventory predicted exactly this case as the one that
+  member, part }}`, `EditBuffer::{zset_score, new_zset_member}`, and `is_valid_zset_score` for D4
+  (parses as f64, then explicitly rejects `is_nan()`). `EditBuffer::active_part` returns a real
+  `Some(..)` for the add target — the M3 inventory predicted exactly this case as the one that
   would "also be correct, silently" under the old `_ => None` fallback (task 8's D8 removed that
-  fallback), so the compiler now forces the answer.
+  fallback), so the compiler forced the answer. Phase 3 went one layer further than the table
+  above anticipated: `EditBuffer`'s own typing mechanics (`name_push`, `name_push_str`,
+  `name_pop`, `advance_to_value`, `return_to_name`) were `if let EditTarget::NewHashField` before
+  this task and are now exhaustive `match`es over every `EditTarget` variant, with
+  `NewZSetMember`'s `Enter`-advance sharing the Hash add form's arm. A third name-typed target
+  (Set member rename or List index rename, task 14) now fails to compile here instead of silently
+  doing nothing for it — the same discipline task 8's D8 established one layer up, extended down
+  to the buffer itself.
+- `crates/core/src/state/open.rs` gains `OpenKey::zset_member_shown_duplicate`, mirroring
+  `hash_field_shown_duplicate` rather than `set_member_shown_duplicate` — the ZSet add form's
+  member is a *name* being typed (`EditBuffer::field_name()` returns it), where a Set add's
+  member is the whole buffer with no name/value split (ADR-0016 D3). This is one naming decision
+  the plan's type table did not call out in advance.
 - `crates/app/src/redis/mutate.rs` gains `ZSET_SCORE_EDIT_SCRIPT`, `ZSET_MEMBER_ADD_SCRIPT`,
   `set_zset_score`, `add_zset_member`, `delete_zset_member`, and three arms in `execute` — the same
   `Command::Execute`/`Msg::MutationSettled` shape review H1 already generalized Hash's, Set's and
-  List's writes onto; no new `Command`/`Msg` variants are needed for this type.
+  List's writes onto; no new `Command`/`Msg` variants are needed for this type. Every phase-4
+  Docker-backed test passed against this code unmodified from phase 2 — nothing in D1–D8 or the
+  scripts was found wrong once a real server exercised them.
+- `crates/core/src/update/editor.rs`'s `stage_editor` parses the staged score text *before*
+  constructing `PendingMutation::SetZSetScore`/`AddZSetMember`, and refuses to stage rather than
+  inventing a value if that parse ever fails — the `⌃S`/`Enter` guard (`value_part_stage_blocked`)
+  is what actually prevents this in practice, but the fallback itself is `f64::NAN`, not `0.0`, so
+  that if it is ever reached despite the guard, the write is refused visibly by the server (`ERR
+  value is not a valid float`) rather than silently staging a fabricated `0.0` nobody typed.
 - `e`/`a`/`d` stay focus-gated to the value pane with a value fetched, per ADR-0015 D4. Unlike
   Hash/Set/List, `e` on a ZSet row does not refuse a binary member (D5) — it is the first
-  row-level edit a binary value does not block.
-- The preview must show a score diff distinctly from a membership diff (PLAN row 9's "Proves"): a
+  row-level edit a binary value does not block. This holds by construction, not by a new check:
+  `EditBuffer::zset_score` takes `member: &[u8]` and is infallible, unlike the `Result`-returning
+  Hash/List constructors beside it that do refuse non-UTF-8 bytes — there is no
+  `std::str::from_utf8` call on this path to accidentally add.
+- The preview shows a score diff distinctly from a membership diff (PLAN row 9's "Proves"): a
   score edit shows `member` unchanged with `old → new` on the score; an add shows the whole
   `member + score` pair on the `+` side; a remove shows it on the `−` side. The score-edit dialog
-  must visibly differ from the add/remove dialogs — a golden-frame requirement, not just a preview
-  requirement (phase 5).
+  visibly differs from the add/remove dialogs, pinned as three separate golden frames plus a
+  direct frame-inequality test (phase 5).
 - The hint bar (`crates/core/src/render/mod.rs`) gains a ZSet-shaped arm alongside Hash, Set and
   List's: `e score · a add · d remove` (D1) — `score`, not `edit`, so the hint does not promise
-  `e` opens the member.
+  `e` opens the member. D4's live invalid-score indicator is this hint bar, not a body-level
+  colour change: it covers both the existing-member score editor and the add form's score part
+  from one check, swapping the hint to `invalid score · …` while the text does not parse.
+- **A rendering bug, found and fixed while writing phase 5's golden frames.** The two-part
+  add-form body (shared with Hash's `FIELD`/`VALUE` form) hard-coded the labels `"FIELD"` and
+  `"VALUE"` regardless of which `EditTarget` was open, so a ZSet add form was drawing `FIELD`
+  and `VALUE` on screen — contradicting D6, the hint bar directly above it (which correctly said
+  `member`/`score`), and every doc comment describing this form. The same code path's
+  shown-duplicate check was also hard-coded to `hash_field_shown_duplicate`, so a duplicate ZSet
+  member typed into the add form never showed the `⚠ exists` warning at all. Both are fixed in
+  `crates/core/src/render/mod.rs`'s value-pane drawing: the labels and the duplicate check now
+  branch on whether `editor.target()` is `EditTarget::NewZSetMember`, and the labels read
+  `MEMBER`/`SCORE` there. Pinned by `zset_form_add_member`, `zset_form_add_duplicate` and
+  `zset_form_add_score`'s golden fixtures.
+- One deliberately unfixed defect, carried forward from phase 3 unchanged by this phase: a seeded
+  score editor's cursor starts at position 0 (`EditBuffer::zset_score`, like `for_hash_field` and
+  `list_element` before it), so typing right after `e` prepends rather than replaces. Every golden
+  frame and test that retypes a score does so via the same `End` + repeated `Backspace` sequence
+  the phase-3 unit tests use, not by fixing the underlying seeding — see phase 3's "Found while
+  building" for why no contained fix exists at this layer.
 
 ## Sources
 

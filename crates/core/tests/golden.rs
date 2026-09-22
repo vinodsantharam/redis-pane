@@ -2216,6 +2216,268 @@ fn golden_hint_bar_names_all_three_list_element_actions_with_a_cursor_active() {
     assert_eq!(hint_bar(&state), "e edit · a add · d remove");
 }
 
+// ── PLAN M2 task 9: editing a ZSet's score, add/remove members (D1–D8, ADR-0018) ──
+
+fn zset_value() -> Value {
+    Value::ZSet(ScoredValue {
+        entries: vec![
+            ("alpha".into(), 1.0),
+            ("beta".into(), 2.0),
+            ("gamma".into(), 3.5),
+        ],
+        total: 3,
+    })
+}
+
+/// Replace the score buffer's whole text, mirroring
+/// `crates/core/src/update/editor.rs`'s own `retype_score` test helper:
+/// [`EditBuffer::zset_score`] seeds the cursor at the *start* of the score
+/// text, not the end, so a bare `Backspace` right after `e` deletes nothing
+/// (phase 3's "Found while building" — a real, deliberately-unfixed defect,
+/// not a mistake in this fixture). Moving to the end and clearing first is
+/// what any reader actually retyping a score would have to do too.
+fn retype_score(mut s: State, new: &str) -> State {
+    (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::End)));
+    for _ in 0..32 {
+        (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Backspace)));
+    }
+    for c in new.chars() {
+        (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char(c))));
+    }
+    s
+}
+
+#[test]
+fn golden_zset_form_edit_score_shows_the_raw_score_by_member() {
+    let mut state = opened("user:8812:cart", zset_value(), 720);
+    let open = state.open.as_mut().unwrap();
+    open.cursor_active = true;
+    open.cursor = 1; // "beta"
+    open.begin_edit(EditBuffer::zset_score(b"beta", 2.0));
+    assert_golden("zset_form_edit_score", &draw(&state, 130, 22));
+}
+
+#[test]
+fn golden_zset_add_form_member_part_shows_the_placeholder_on_score() {
+    let mut state = opened("user:8812:cart", zset_value(), 720);
+    let open = state.open.as_mut().unwrap();
+    open.begin_edit(EditBuffer::new_zset_member());
+    let editor = open.typing_mut().unwrap();
+    for c in "delta".chars() {
+        editor.name_push(c);
+    }
+    assert_golden("zset_form_add_member", &draw(&state, 130, 22));
+}
+
+#[test]
+fn golden_zset_add_form_shown_duplicate_blocks_staging() {
+    let mut state = opened("user:8812:cart", zset_value(), 720);
+    let open = state.open.as_mut().unwrap();
+    open.begin_edit(EditBuffer::new_zset_member());
+    let editor = open.typing_mut().unwrap();
+    // "alpha" is one of `zset_value()`'s members — a shown duplicate.
+    for c in "alpha".chars() {
+        editor.name_push(c);
+    }
+    assert_golden("zset_form_add_duplicate", &draw(&state, 130, 22));
+}
+
+#[test]
+fn golden_zset_add_form_score_part_shows_member_above_the_active_editor() {
+    let mut state = opened("user:8812:cart", zset_value(), 720);
+    state.focus = Pane::Value;
+    let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+    let state = "delta".chars().fold(state, |s, c| {
+        update(s, Msg::Key(KeyPress::plain(KeyCode::Char(c)))).0
+    });
+    let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+    let mut state = state;
+    let editor = state.open.as_mut().unwrap().typing_mut().unwrap();
+    editor.insert_str("12.5");
+    assert_golden("zset_form_add_score", &draw(&state, 130, 22));
+}
+
+/// D4's live invalid-score indicator: `Ctrl-S`/`Enter` are blocked while the
+/// score part does not parse, and the hint bar says so — the same frame
+/// comparison the List add form's head/tail toggle test uses to prove its
+/// wording actually changed on screen.
+#[test]
+fn golden_zset_add_form_invalid_score_shows_the_live_indicator() {
+    let mut state = opened("user:8812:cart", zset_value(), 720);
+    state.focus = Pane::Value;
+    let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+    let state = "delta".chars().fold(state, |s, c| {
+        update(s, Msg::Key(KeyPress::plain(KeyCode::Char(c)))).0
+    });
+    let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+    let mut state = state;
+    let editor = state.open.as_mut().unwrap().typing_mut().unwrap();
+    editor.insert_str("not-a-number");
+    // The hint bar carries the live indicator (phase 3's D4 note), and the
+    // hint bar only draws at 24 rows or taller (`layout::layout`'s
+    // `area.height >= 24`) — asserted directly here, the same way the
+    // sibling Hash/List/Set hint-bar tests assert `hint_bar(&state)` rather
+    // than searching a shorter frame that would never show it.
+    assert!(
+        hint_bar(&state).contains("invalid score"),
+        "the live indicator must be on offer: {}",
+        hint_bar(&state)
+    );
+    assert_golden("zset_form_add_invalid_score", &draw(&state, 130, 22));
+}
+
+#[test]
+fn golden_confirm_set_zset_score_shows_the_effective_command_and_its_guard() {
+    let mut state = opened("user:8812:cart", zset_value(), 720);
+    // `e` is focus-gated (ADR-0015 D4, mirrored for ZSets); `opened()` leaves
+    // focus on the keys pane.
+    state.focus = Pane::Value;
+    let open = state.open.as_mut().unwrap();
+    open.cursor_active = true;
+    open.cursor = 1; // "beta", score 2.0
+    let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+    let state = retype_score(state, "10");
+    let (state, _) = update(state, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+    assert!(matches!(
+        state.confirm,
+        Some(PendingMutation::SetZSetScore { .. })
+    ));
+    assert_golden("confirm_set_zset_score", &draw(&state, 130, 22));
+}
+
+#[test]
+fn golden_confirm_add_zset_member_shows_the_guard_and_only_a_plus_side() {
+    let mut state = opened("user:8812:cart", zset_value(), 720);
+    state.focus = Pane::Value;
+    let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+    let state = "delta".chars().fold(state, |s, c| {
+        update(s, Msg::Key(KeyPress::plain(KeyCode::Char(c)))).0
+    });
+    let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+    let state = "12.5".chars().fold(state, |s, c| {
+        update(s, Msg::Key(KeyPress::plain(KeyCode::Char(c)))).0
+    });
+    let (state, _) = update(state, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+    assert!(matches!(
+        state.confirm,
+        Some(PendingMutation::AddZSetMember { .. })
+    ));
+    assert_golden("confirm_add_zset_member", &draw(&state, 130, 22));
+}
+
+#[test]
+fn golden_confirm_delete_zset_member_shows_the_effective_command() {
+    let mut state = opened("user:8812:cart", zset_value(), 720);
+    // `d` is focus-dependent (D8): without this, `opened()`'s default focus
+    // (the keys pane) makes `d` stage `DeleteKey`, not `DeleteZSetMember`.
+    state.focus = Pane::Value;
+    state.open.as_mut().unwrap().cursor_active = true;
+    let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+    assert!(matches!(
+        state.confirm,
+        Some(PendingMutation::DeleteZSetMember {
+            last_member: false,
+            ..
+        })
+    ));
+    assert_golden("confirm_delete_zset_member", &draw(&state, 130, 22));
+}
+
+#[test]
+fn golden_confirm_delete_zset_member_warns_when_it_is_the_last_member() {
+    let mut state = opened(
+        "user:8812:cart",
+        Value::ZSet(ScoredValue {
+            entries: vec![("only".into(), 1.0)],
+            total: 1,
+        }),
+        600,
+    );
+    state.focus = Pane::Value;
+    state.open.as_mut().unwrap().cursor_active = true;
+    let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+    assert!(matches!(
+        state.confirm,
+        Some(PendingMutation::DeleteZSetMember {
+            last_member: true,
+            ..
+        })
+    ));
+    assert_golden(
+        "confirm_delete_zset_member_last_member",
+        &draw(&state, 130, 22),
+    );
+}
+
+#[test]
+fn golden_hint_bar_names_all_three_zset_actions_with_a_cursor_active() {
+    let mut state = opened("user:8812:cart", zset_value(), 720);
+    state.focus = Pane::Value;
+    state.open.as_mut().unwrap().cursor_active = true;
+    assert_eq!(hint_bar(&state), "e score · a add · d remove");
+}
+
+/// PLAN M2 row 9's "Proves" clause, pinned directly: a score edit's dialog
+/// must visibly differ from add's and remove's, because it diffs a
+/// different thing. A score edit shows the member unchanged with
+/// `old → new` on the score alone; add and remove both diff *membership* —
+/// the whole `member + score` pair appears on a `+`/`-` side. Three
+/// different frames, not three renderings of the same shape.
+#[test]
+fn a_zset_score_edit_dialog_shows_a_score_diff_distinct_from_a_membership_diff() {
+    let mut score_state = opened("user:8812:cart", zset_value(), 720);
+    score_state.focus = Pane::Value;
+    let open = score_state.open.as_mut().unwrap();
+    open.cursor_active = true;
+    open.cursor = 1; // "beta", score 2.0
+    let (s, _) = update(score_state, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+    let s = retype_score(s, "10");
+    let (score_state, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+    let score_frame = draw(&score_state, 130, 22);
+    assert!(score_frame.contains("member beta"), "{score_frame}");
+    assert!(score_frame.contains("score 2 → 10"), "{score_frame}");
+    assert!(
+        !score_frame.contains("+ delta") && !score_frame.contains("- alpha"),
+        "a score edit must not draw a membership +/- diff: {score_frame}"
+    );
+
+    let mut add_state = opened("user:8812:cart", zset_value(), 720);
+    add_state.focus = Pane::Value;
+    let (s, _) = update(add_state, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+    let s = "delta".chars().fold(s, |s, c| {
+        update(s, Msg::Key(KeyPress::plain(KeyCode::Char(c)))).0
+    });
+    let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+    let s = "12.5".chars().fold(s, |s, c| {
+        update(s, Msg::Key(KeyPress::plain(KeyCode::Char(c)))).0
+    });
+    let (add_state, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+    let add_frame = draw(&add_state, 130, 22);
+    assert!(add_frame.contains("+ delta 12.5"), "{add_frame}");
+    assert!(
+        !add_frame.contains("→"),
+        "an add is a membership diff, not a score diff: {add_frame}"
+    );
+
+    let mut delete_state = opened("user:8812:cart", zset_value(), 720);
+    delete_state.focus = Pane::Value;
+    delete_state.open.as_mut().unwrap().cursor_active = true;
+    let (delete_state, _) = update(delete_state, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+    let delete_frame = draw(&delete_state, 130, 22);
+    assert!(delete_frame.contains("- alpha"), "{delete_frame}");
+    assert!(
+        !delete_frame.contains("→"),
+        "a remove is a membership diff, not a score diff: {delete_frame}"
+    );
+
+    assert_ne!(score_frame, add_frame, "score edit and add must differ");
+    assert_ne!(
+        score_frame, delete_frame,
+        "score edit and remove must differ"
+    );
+    assert_ne!(add_frame, delete_frame, "add and remove must differ");
+}
+
 // ── UI task: type colour dots and the selection bar (style-verified) ────────
 
 use redis_pane_core::theme::Token;

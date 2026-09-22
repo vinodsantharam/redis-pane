@@ -429,12 +429,22 @@ fn value_pane(
             let show_marker = mode(state) == Mode::Editing;
             let name_active = show_marker && name_part;
             let value_active = show_marker && value_part;
-            // "FIELD"/"VALUE" are both five characters, so one constant
-            // covers the gap to where the content column starts: the marker,
-            // the label, and two spaces of daylight — the same pairing the
-            // body's own FIELD/VALUE columns use elsewhere in this pane.
-            const LABEL_W: u16 = 5;
-            let content_x = x0 + 1 + LABEL_W + 2;
+            // The ZSet add form's two parts are a MEMBER and a SCORE, not a
+            // FIELD and a VALUE (D6, ADR-0018) — the labels have to say so,
+            // or the on-screen form contradicts the hint bar directly above
+            // it (which already says "member"/"score") and every doc
+            // comment describing this form. `MEMBER` (6 chars) is the widest
+            // label either form uses, so the column gap is sized off
+            // whichever pair is actually on screen rather than a fixed
+            // constant that was only ever true for FIELD/VALUE.
+            let is_zset_add = matches!(editor.target(), EditTarget::NewZSetMember { .. });
+            let (name_label, value_label) = if is_zset_add {
+                ("MEMBER", "SCORE")
+            } else {
+                ("FIELD", "VALUE")
+            };
+            let label_w = name_label.len().max(value_label.len()) as u16;
+            let content_x = x0 + 1 + label_w + 2;
             let mark = |active: bool| if active { "▌" } else { " " };
             let mark_token = |active: bool| {
                 if active {
@@ -451,7 +461,7 @@ fn value_pane(
                 mark(name_active),
                 sty(mark_token(name_active)),
             );
-            put(buf, x0 + 1, body_top, "FIELD", sty(Token::Muted));
+            put(buf, x0 + 1, body_top, name_label, sty(Token::Muted));
             let name_end = put(buf, content_x, body_top, name, sty(Token::Text));
             if name_active {
                 // The same cursor cell the capture line used to draw.
@@ -460,7 +470,12 @@ fn value_pane(
                     cell.set_symbol(" ");
                     cell.set_style(sty(Token::Selected));
                 }
-                if open.hash_field_shown_duplicate() {
+                let duplicate = if is_zset_add {
+                    open.zset_member_shown_duplicate()
+                } else {
+                    open.hash_field_shown_duplicate()
+                };
+                if duplicate {
                     put(buf, name_end + 2, body_top, "⚠ exists", sty(Token::Warn));
                 }
             }
@@ -476,7 +491,7 @@ fn value_pane(
                 mark(value_active),
                 sty(mark_token(value_active)),
             );
-            put(buf, x0 + 1, value_row, "VALUE", sty(Token::Muted));
+            put(buf, x0 + 1, value_row, value_label, sty(Token::Muted));
 
             if value_part {
                 let editor_area = Rect::new(

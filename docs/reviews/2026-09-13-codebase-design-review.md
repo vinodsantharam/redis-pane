@@ -761,6 +761,103 @@ Two patterns recur enough to be worth naming for whoever picks up M3:
   sibling trait for the mutable half) instead of in `update/`'s free functions — this inventory is
   the concrete list of call sites such a trait would need to replace.
 
+**Update — PLAN M2 task 9 (ZSet, ADR-0018), 2026-09-23. Four cases now exist. Does ZSet confirm
+task 8's answer, or change it?** Confirms it, but sharpens *where* the divergence actually lives —
+and turns up one piece of evidence three cases could not: a real bug caused by convergence, not
+divergence.
+
+**Where ZSet lined up with an existing type, exactly.** D1's own words: "the score is ordinary
+mutable data hanging off that identity, like a Hash field's value hanging off its name." Task 8's
+update had flagged this in advance as a possible "genuinely new combination... a ZSet member's
+identity might be its bytes (Set-like) while its mutable payload is the score (Hash-value-like)."
+Building it settled the question: it is not a new combination. It is Hash's shape, verbatim.
+`EditTarget::NewZSetMember { member, part }` slotted into the exact `FieldPart`/`active_part`
+machinery `NewHashField` already used, with zero new types — `EditBuffer::field_name()`,
+`active_part()`, `name_push`/`name_pop`/`advance_to_value`/`return_to_name` all gained a ZSet arm
+each, not a new mechanism. The add form is two-part, `Enter` advances name→value, the value part
+has a live block predicate, the chokepoint (`Mutation`, `PendingMutation`,
+`Command::Execute`/`Msg::MutationSettled`, one `redis::mutate::execute`, one confirm-dialog
+renderer) took three more variants exactly as task 8 predicted it would. None of that needed
+inventing.
+
+**Where it needed something none of the three others had.** Three real additions, not variations
+on existing ones:
+
+- **D4 — a second, independent kind of live guard.** Hash's and Set's add forms block staging on
+  one predicate: does this name/value already exist. ZSet's add form blocks on *two*, composed
+  with `||` (`value_part_stage_blocked`): the existing shown-duplicate check on the member part,
+  and a new content-validity check (`is_valid_zset_score`) on the score part — the first case
+  where a field can be *wrong*, not just *unwanted*, before it is even staged. Hash's value and
+  List's element accept any bytes; only a ZSet's score has a grammar narrower than "whatever was
+  typed."
+- **D5 — the binary-refusal rule turned out to be about the edit target, not the row.** Hash, Set
+  and List all refuse `e` on any row holding non-UTF-8 bytes, because for all three the thing
+  being edited *is* the bytes. ZSet is the first case where a row can hold binary data (the
+  member) while the thing `e` actually edits (the score) is untouched by that — so the refusal
+  rule had to be re-derived, not reused, and the answer flipped from "refuse" to "allow" for a
+  binary row for the first time. `EditBuffer::zset_score` is infallible and takes `member: &[u8]`
+  directly, unlike the `Result`-returning Hash/List constructors beside it — the difference is
+  structural, not just a flag.
+- **D7 — a near-miss with List's hazard, resolved by different reasoning.** A ZSet score edit
+  surfaces the same *symptom* List's compare-and-set exists for — a concurrent write elsewhere
+  visibly reorders the rows the reader is looking at. But the write addresses the member by its
+  bytes, not by a position a concurrent write can repoint, so no CAS is needed — the same
+  conclusion Hash and Set reached, but only reachable by understanding what "identity" means for
+  *this* type. A trait method that returned "needs CAS: yes/no" off some structural property of
+  the type would not have derived this correctly without the same reasoning ADR-0018 D7 spells
+  out in prose; it is not a fact a shared interface could compute.
+
+**A fourth, unplanned finding: convergence itself produced a bug, which divergence cannot.**
+Writing phase 5's golden frames surfaced a real defect: the add-form body in
+`crates/core/src/render/mod.rs` — the *one shared function* that already draws both Hash's and
+ZSet's two-part forms — hard-coded the labels `"FIELD"`/`"VALUE"` and the duplicate check
+`hash_field_shown_duplicate()`, so a ZSet add form was drawing the wrong labels and never showing
+`⚠ exists` for a duplicate member, silently, until this phase's golden frame caught it by
+rendering the actual pixels. This is a different failure mode than anything task 7 or task 8
+found. Every prior gap the M3 inventory named was a `_ => None`/sequential-`if let` site that
+*diverged* per type and would have caught a missing arm as a silent fallback — annoying, but the
+gap was visible in the code as an explicit `_`. This bug lived inside code that had *already*
+converged into one function serving two types, where nothing marked the two hard-coded strings as
+things that needed a per-type answer at all. Convergence without exhaustiveness is not safer than
+divergence without it; it is differently dangerous, because there is no `_` arm to grep for.
+
+**Does this suggest a concrete trait shape now?** Narrower than "yes, obviously" — and narrower
+than most of what a `Viewer`-sibling trait would cover. The write semantics (what hazard a guard
+checks, whether it needs a script at all, what its guard line says) still do not converge: ZSet's
+score-edit script exists for a third, distinct reason (distinguishing a gone member from an
+unchanged score) that is neither List's compare-and-set nor Hash's TTL-preservation. The identity
+model still does not converge structurally — it converged for ZSet *with Hash specifically*, by
+what turned out to be a real coincidence in the domain, not a property every type shares (Set and
+List each answered "what does `e` mean" differently again). Task 9 does not overturn task 8's
+central claim: the *plumbing* converges, the *per-type meaning* does not, and no trait collapses
+that meaning without becoming a thin re-statement of the `match` it replaced.
+
+What *would* be concrete, bounded, and justified by real duplication (not the anticipation of it):
+the two-part add form's **label pair** and **shown-duplicate predicate** — currently two
+hard-coded string literals and one hard-coded function call inside `render/mod.rs`'s shared
+drawing function, now fixed with an `is_zset_add` `bool` and an `if`/`else` — are exactly the
+seam this bug lived in. A pair of small, exhaustive lookups keyed on `EditTarget` (or a value
+type) — `fn add_form_labels(target: &EditTarget) -> (&'static str, &'static str)` and something
+`fn add_form_duplicate(open: &OpenKey, target: &EditTarget) -> bool` — would turn "a third
+two-part form's labels are still the old ones" from a silent wrong frame into a compile error the
+same way `EditBuffer::active_part`'s exhaustive match already does one layer up. That is a real,
+scoped fix for a real, scoped bug — not the `Viewer`-sibling trait M3 was deferred to design, and
+implementing it is explicitly out of scope here (per this task's brief).
+
+**What this means for task 14 (Hash field rename / Set member rename / ZSet member rename).**
+Task 14 is the next row that touches all three at once, and the honest carry-forward is two-
+sided. First, expect three real guarded scripts again, not one: a Hash field rename must preserve
+the field's TTL across the rename the same way its edit does; a Set member rename is `SREM old` +
+`SADD new` with no payload to carry, because a Set member has none; a ZSet member rename must
+carry the score across, and needs its own reasoning about whether `ZSCORE`/`ZADD`/`ZREM` in one
+script can do this atomically without ADR-0018's `EXISTS`/`ZSCORE` guard shape simply being copied
+by rote. None of that should be expected to fall out of a shared trait — task 8's and task 9's
+per-type write reasoning both argue against it directly. Second, if a rename form ends up
+two-part (`OLD`/`NEW`, structurally identical in shape to `FIELD`/`VALUE` and `MEMBER`/`SCORE`),
+task 14 is exactly the third data point this seam needs — and it should use the label/duplicate
+lookup above (or build it, if task 9 did not) rather than adding a third hard-coded string pair to
+the same shared drawing function that just produced one real, shipped bug from doing that twice.
+
 ---
 
 ## Sources

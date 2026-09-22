@@ -392,6 +392,20 @@ impl EditBuffer {
         }
     }
 
+    /// Flip which end `a` will push to (D6, ADR-0017) — `Tab` while the List
+    /// add form is open. A no-op outside [`EditTarget::NewListElement`]:
+    /// nothing else has an end to toggle, and a stray `Tab` elsewhere already
+    /// has its own meaning (`insert_tab`), which the caller is responsible
+    /// for choosing between — this only ever changes the target it owns.
+    pub fn toggle_list_end(&mut self) {
+        if let EditTarget::NewListElement { end } = &mut self.target {
+            *end = match end {
+                super::value::ListEnd::Head => super::value::ListEnd::Tail,
+                super::value::ListEnd::Tail => super::value::ListEnd::Head,
+            };
+        }
+    }
+
     /// The value part's cursor, `(line, column)` — used to tell whether `↑`
     /// actually moved anything (`crate::update::editor_key`).
     pub fn cursor(&self) -> (usize, usize) {
@@ -665,6 +679,37 @@ mod tests {
         assert_eq!(buf.active_part(), None, "no FIELD/VALUE split for an add");
         assert_eq!(buf.text(), b"");
         assert!(!buf.was_json());
+    }
+
+    #[test]
+    fn toggle_list_end_flips_head_and_tail_and_is_a_no_op_elsewhere() {
+        let mut buf = EditBuffer::new_list_element();
+        assert_eq!(
+            buf.target(),
+            &EditTarget::NewListElement {
+                end: crate::state::value::ListEnd::Tail
+            }
+        );
+        buf.toggle_list_end();
+        assert_eq!(
+            buf.target(),
+            &EditTarget::NewListElement {
+                end: crate::state::value::ListEnd::Head
+            }
+        );
+        buf.toggle_list_end();
+        assert_eq!(
+            buf.target(),
+            &EditTarget::NewListElement {
+                end: crate::state::value::ListEnd::Tail
+            }
+        );
+
+        // No end to toggle on any other target — a no-op, not a panic.
+        let mut existing = EditBuffer::list_element(0, b"beta").unwrap();
+        let before = existing.target().clone();
+        existing.toggle_list_end();
+        assert_eq!(existing.target(), &before);
     }
 
     #[test]

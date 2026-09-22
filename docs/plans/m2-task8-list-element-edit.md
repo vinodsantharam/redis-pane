@@ -430,3 +430,87 @@ table rows, the `ElementMoved` wording test, `list_element`/`new_list_element` c
 the `PendingMutation` `command_text`/`guard_text`/`last_element`/`into_command` tests), golden 129
 (baseline 129, unchanged — no wiring, no new frames), app 38 (baseline 38, unchanged). The boundary
 check (`cargo tree -p redis-pane-core -e normal | grep -iE 'crossterm|tokio|fred'`) printed nothing.
+
+**Phase 3.** `e`/`a`/`d` wired for a List in `crates/core/src/update/editor.rs`, `viewer.rs` and
+`confirm.rs`, and all five remaining D8 sites finished:
+
+- `open_editor` (`editor.rs`) gained a `Value::List` branch, ahead of the generic
+  `EditBuffer::from_value` fallback: with the value cursor active, `e` calls
+  `EditBuffer::list_element(open.cursor, element)`, refusing a non-UTF-8 element with D4's exact
+  wording, "binary elements aren't editable here yet". `open.cursor` is used directly as the index —
+  D7 means the fetched window always starts at 0, so a row's position *is* its Redis index.
+- `begin_add_field` **renamed to `begin_add_entry`** (D8 asked for this — it now opens the add form
+  for three collection types, not one) and given an exhaustive match over `Value` in place of the
+  `_ => refuse` fallback: `Value::List(_) => EditBuffer::new_list_element()` joins the Hash/Set arms,
+  and the refusal wording grew a third clause, "elements to a list".
+- `delete_hash_field` (`viewer.rs`) **renamed to `delete_value_row`** for the same reason — D5 gives
+  it a `Value::List` arm that stages `PendingMutation::DeleteListElement`, with `last_element` taken
+  as a `total == 1` snapshot at staging time, the same discipline `last_field`/`last_member` already
+  use. The match over `open.value` is now exhaustive (`Some(Value::Str(_) | Value::ZSet(_) | ... ) |
+  None` all fall to the shared refusal), rather than a trailing `_`.
+- `nothing_to_remove` (`confirm.rs`) is now an exhaustive match over `Mutation`: `DeleteHashField` →
+  `"field"`, `DeleteSetMember` → `"member"`, every other variant (including all three List
+  mutations) → `"entry"`. Behaviour is unchanged — no List write ever settles as
+  `MutationOutcome::NothingToRemove` (ADR-0017's guard always resolves to `KeyGone`/`ElementMoved`/
+  `Done` instead) — but the match is exhaustive so a future write that *does* start using
+  `NothingToRemove` (a ZSet member removed twice, task 9) has to choose its own noun instead of
+  silently inheriting `"field"`.
+- `hint_bar` (`render/mod.rs`) gained two things: a `Value::List` cursor-active arm mirroring the
+  Hash one (`e edit · a add · d remove`, ADR-0017's Consequences), and a dedicated branch inside the
+  editor-open hint for `EditTarget::NewListElement` naming `Tab` explicitly — `Tab` means "insert a
+  tab character" everywhere else in the editor, so the hint has to say when it means something else.
+- **D6's Head/Tail toggle**: `EditBuffer` gained `toggle_list_end()`, a no-op outside
+  `EditTarget::NewListElement`. `editor_key`'s `KeyCode::Tab` arm calls it when the target is
+  `NewListElement`, falling through to the existing `insert_tab()` otherwise — the only target where
+  `Tab` means something other than "insert a tab". The toggle's state lives where D6 put it,
+  `EditTarget::NewListElement { end }` inside the `EditBuffer` (built in phase 2) — nothing new was
+  added to `State` for it. The form's label requirement ("must show which end is active") is met by
+  `OpenKey::edit_verb` (`state/open.rs`), which changed its return type from `&'static str` to
+  `String` so it can format `"✎ adding element (head)"`/`"✎ adding element (tail)"` — the same reason
+  `guard_text` went from `&'static str` to `String` in phase 2.
+- **The `matches!`/or-pattern gap** flagged in phase 2 (`staged_edit_found_key_gone`,
+  `update/editor.rs`) is fixed by replacing the `matches!` call with a real `match` expression that
+  computes the same `bool`, still using or-patterns internally but with **no wildcard arm** —
+  `matches!` always expands to a `match` with a trailing `_ => false`, which is what made it
+  immune to exhaustiveness checking regardless of the or-pattern; a bare `match` with every
+  `PendingMutation` variant named (the nine "has a name" variants in one arm, `DeleteKey`/`None` in
+  the other) has no such fallback, so a tenth variant is a compile error here until this function
+  decides what it means. This is a genuinely compiler-enforced fix, not a partial one — no tradeoff
+  beyond the arm now looking mildly unusual: a `bool`-producing `match` doing the job a boolean
+  expression normally would. It was the only version found that gets equivalent exhaustiveness
+  checking; a version that kept `matches!` and added `Some(_) if false =>` guard tricks was
+  considered and rejected as strictly harder to read for identical safety.
+
+Tests added: `list_element_edit_tests` (31 tests, `update/editor.rs`) covering the binary refusal
+(D4), the raw-value open keyed on index, focus gating in both panes for `e`/`a`/`d`, the Head/Tail
+toggle (including that `Tab` still inserts on an in-place edit, not the add form), all three confirm
+dialogs' `command_text`/`guard_text`, the last-element warning, the duplicate-element case (`d`
+removes the row actually under the cursor, not the first matching value — the ADR-0017 D2 hazard
+this task exists to close), read-only refusal at confirm and not at the keypress, `NotWritten::
+ElementMoved`/`KeyGone` handling, the `dialog_up` fix (a staged `SetListElement`'s gone-key dialog
+now actually closes, which is the regression this test would have caught), R3.8 held-while-editing
+for both the in-place edit and the add form, and D7's long-list case (`total: 12_000` with a 500-item
+window does not change what `e`/`d` do to a row inside it). `toggle_list_end_flips_head_and_tail_and_
+is_a_no_op_elsewhere` (`state/editor.rs`) and five `hint_bar_tests` (`render/mod.rs`) round out the
+Tab-toggle and hint coverage.
+
+Counts at checkpoint 3: `cargo fmt --all -- --check` clean, `cargo clippy --workspace --all-targets --
+-D warnings` clean, `cargo test --workspace` — core 485 (448 + 37: 31 in `list_element_edit_tests`, 5
+in `hint_bar_tests`, 1 `toggle_list_end` test), golden 129 (unchanged — phase 3 wires behaviour, phase
+5 adds frames), app 38 (unchanged), integration 61 ignored (unchanged — phase 4's job). The boundary
+check printed nothing.
+
+Noticed but deliberately not fixed (out of this phase's scope):
+
+- `crates/core/src/update/editor.rs`, `EditBuffer::from_value`'s `Value::List` arm still returns
+  "only string values are editable so far" — now dead code from `open_editor`'s call site, since the
+  new List branch is checked first and never falls through to it. Left in place rather than removed:
+  `from_value` is a public associated function with its own direct unit tests
+  (`state/editor.rs::tests`) that exercise this exact arm, and removing it would either break those
+  tests or require them to construct a List value through some other path that does not exist. A
+  future cleanup could special-case `Value::List` out of `from_value` entirely now that no live
+  caller reaches it that way, but that is a refactor with no behavioural motivation right now.
+- `crates/core/src/render/mod.rs`, `confirm_overlay`'s List arms (written in phase 2) show the
+  compare-and-set guard line and the last-element warning but were never exercised by a real staged
+  dialog until this phase — phase 3's tests confirm the *values* (`command_text`/`guard_text`) but do
+  not render a frame through `confirm_overlay` itself; that is phase 5's golden-frame job.

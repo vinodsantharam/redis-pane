@@ -152,9 +152,27 @@ pub(super) fn nothing_to_remove(
     {
         return (state, Vec::new());
     }
+    // Exhaustive over `Mutation`, not a wildcard fallback (PLAN M2 task 8,
+    // D8): only `HDEL`/`SREM` ever settle with `NothingToRemove` today — the
+    // shell's `execute` (`crates/app/src/redis/mutate.rs`) maps every List
+    // write's "not written" case onto `NotWritten::ElementMoved`/`KeyGone`
+    // instead, since ADR-0017 D2's compare-and-set makes "already gone"
+    // indistinguishable from "moved" for an index-addressed element. Naming
+    // every variant here, rather than `_ => "field"`, means a future write
+    // that starts reporting `NothingToRemove` (a ZSet member removed twice,
+    // task 9) has to pick its own noun instead of silently inheriting
+    // "field".
     let what = match mutation {
+        Mutation::DeleteHashField { .. } => "field",
         Mutation::DeleteSetMember { .. } => "member",
-        _ => "field",
+        Mutation::DeleteKey { .. }
+        | Mutation::SetString { .. }
+        | Mutation::SetHashField { .. }
+        | Mutation::AddHashField { .. }
+        | Mutation::AddSetMember { .. }
+        | Mutation::SetListElement { .. }
+        | Mutation::AddListElement { .. }
+        | Mutation::DeleteListElement { .. } => "entry",
     };
     state.notice = Some((
         format!("{}: {what} already gone", mutation.command_label()),

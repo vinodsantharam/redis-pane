@@ -1232,6 +1232,15 @@ pub fn hint_bar(state: &State) -> String {
                 let undo = state.keymap.hint(Action::EditorUndo).unwrap_or_default();
                 return format!("Enter stage · ↑ field · {undo} undo · {cancel} cancel");
             }
+            // The List add form (D6, ADR-0017): `Tab` flips Head/Tail rather
+            // than inserting a tab character (`editor_key`), so the hint
+            // names it explicitly — nothing else on this bar mentions `Tab`
+            // at all, and a reader would otherwise have no way to discover
+            // it short of trying it.
+            None if matches!(editor.target(), EditTarget::NewListElement { .. }) => {
+                let undo = state.keymap.hint(Action::EditorUndo).unwrap_or_default();
+                return format!("Enter stage   Tab head/tail   {undo} undo   {cancel} cancel");
+            }
             None => {
                 let stage = state.keymap.hint(Action::EditorStage).unwrap_or_default();
                 let undo = state.keymap.hint(Action::EditorUndo).unwrap_or_default();
@@ -1274,6 +1283,21 @@ pub fn hint_bar(state: &State) -> String {
         let add = state.keymap.hint(Action::Add).unwrap_or_default();
         let remove = state.keymap.hint(Action::Delete).unwrap_or_default();
         return format!("{add} add · {remove} remove");
+    }
+    // A List with the value cursor on a row, and the value pane focused: all
+    // three mean something here, like a Hash (D1, ADR-0017) — an element has
+    // an identity, its index, that survives its bytes changing, so `e` is a
+    // real in-place edit rather than the refusal it is on a Set.
+    if !state.keys_pane_focused()
+        && state
+            .open
+            .as_ref()
+            .is_some_and(|o| o.cursor_active && matches!(o.value, Some(Value::List(_))))
+    {
+        let edit = state.keymap.hint(Action::Edit).unwrap_or_default();
+        let add = state.keymap.hint(Action::Add).unwrap_or_default();
+        let remove = state.keymap.hint(Action::Delete).unwrap_or_default();
+        return format!("{edit} edit · {add} add · {remove} remove");
     }
     [
         Action::Cancel,
@@ -1509,5 +1533,106 @@ mod safety {
         for (w, h) in [(0u16, 0u16), (1, 1), (80, 24), (200, 60)] {
             let _ = frame(&State::default(), &theme, &clock, Rect::new(0, 0, w, h));
         }
+    }
+}
+
+#[cfg(test)]
+mod hint_bar_tests {
+    //! The hint bar's List-shaped arms (PLAN M2 task 8, D8; ADR-0017): the
+    //! value cursor's `e edit · a add · d remove`, and the add form's `Tab`
+    //! wording, which is the only place on the whole bar `Tab` means
+    //! anything at all.
+
+    use super::*;
+    use crate::render::layout::Pane;
+    use crate::state::open::OpenKey;
+    use crate::state::value::IndexedValue;
+    use crate::state::{EditBuffer, State};
+
+    fn open_with_list(items: &[&str], total: usize) -> State {
+        let value = Value::List(IndexedValue {
+            items: items.iter().map(|i| i.as_bytes().to_vec()).collect(),
+            total,
+        });
+        let mut state = State {
+            cols: 130,
+            rows: 40,
+            focus: Pane::Value,
+            open: Some(OpenKey::new(Some(0), "k".into(), value, -1, 10, 0)),
+            ..State::default()
+        };
+        state.keys.push(b"k");
+        state.rebuild_list();
+        state
+    }
+
+    #[test]
+    fn a_list_with_the_cursor_active_and_the_value_pane_focused_hints_all_three() {
+        let mut s = open_with_list(&["alpha"], 1);
+        s.open.as_mut().unwrap().cursor_active = true;
+        let hint = hint_bar(&s);
+        assert!(hint.contains("edit"), "{hint}");
+        assert!(hint.contains("add"), "{hint}");
+        assert!(hint.contains("remove"), "{hint}");
+    }
+
+    #[test]
+    fn a_list_with_the_cursor_active_but_the_keys_pane_focused_does_not_use_the_list_hint() {
+        // The same discipline the Hash/Set branches already have: focus, not
+        // merely `cursor_active`, decides which hint shows — `d` there is
+        // `DeleteKey`, not `LREM`, and the hint must not claim otherwise.
+        let mut s = open_with_list(&["alpha"], 1);
+        s.open.as_mut().unwrap().cursor_active = true;
+        s.focus = Pane::Keys;
+        let hint = hint_bar(&s);
+        assert!(!hint.contains("edit · "), "{hint}");
+    }
+
+    #[test]
+    fn the_list_add_forms_hint_names_tab_and_nothing_else_does() {
+        let mut s = open_with_list(&["alpha"], 1);
+        s.open
+            .as_mut()
+            .unwrap()
+            .begin_edit(EditBuffer::new_list_element());
+        let hint = hint_bar(&s);
+        assert!(hint.contains("Tab"), "{hint}");
+        assert!(hint.contains("head/tail"), "{hint}");
+
+        // Nothing else on the bar mentions `Tab` — the Hash add form's name
+        // part, its value part, and a plain field edit all take this same
+        // function's other branches.
+        let mut hash = open_with_list(&["alpha"], 1);
+        hash.open.as_mut().unwrap().value = Some(Value::Hash(crate::state::value::PairValue {
+            pairs: vec![("f".into(), "v".into())],
+            total: 1,
+        }));
+        hash.open
+            .as_mut()
+            .unwrap()
+            .begin_edit(EditBuffer::new_hash_field());
+        assert!(!hint_bar(&hash).contains("Tab"), "{}", hint_bar(&hash));
+    }
+
+    #[test]
+    fn the_list_edit_forms_hint_never_mentions_tab() {
+        // `EditTarget::ListElement` (an in-place edit, not the add form) has
+        // no end to toggle — only `NewListElement` does (D6).
+        let mut s = open_with_list(&["alpha"], 1);
+        s.open
+            .as_mut()
+            .unwrap()
+            .begin_edit(EditBuffer::list_element(0, b"alpha").unwrap());
+        assert!(!hint_bar(&s).contains("Tab"), "{}", hint_bar(&s));
+    }
+
+    #[test]
+    fn a_list_add_form_toggled_to_head_still_names_tab_in_the_hint() {
+        let mut s = open_with_list(&["alpha"], 1);
+        let mut buffer = EditBuffer::new_list_element();
+        buffer.toggle_list_end();
+        s.open.as_mut().unwrap().begin_edit(buffer);
+        let hint = hint_bar(&s);
+        assert!(hint.contains("Tab"), "{hint}");
     }
 }

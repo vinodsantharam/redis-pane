@@ -342,10 +342,11 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
         }
         // `d` is focus-dependent (D4, PLAN M2 task 6), like `c`: the keys
         // pane's Selected-key delete below is unchanged; the Viewer's
-        // Hash-field/Set-member delete (D5, PLAN M2 task 7, ADR-0016) is
-        // `delete_hash_field`'s job, which tells the two apart itself.
+        // Hash-field/Set-member/List-element delete (D5, PLAN M2 task 7,
+        // ADR-0016; PLAN M2 task 8, ADR-0017) is `delete_value_row`'s job,
+        // which tells the three apart itself.
         Action::Delete if state.keys_pane_focused() => delete_selected_key(state),
-        Action::Delete => delete_hash_field(state),
+        Action::Delete => delete_value_row(state),
         // Nothing is staged — `key_press` intercepts every keypress before
         // this match while `state.confirm` is `Some`, so `y` only ever
         // reaches here with nothing to confirm.
@@ -392,7 +393,7 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
         }
         Action::CopyCommand => build_copy(state, CopyWhat::Command),
         Action::Edit => open_editor(state),
-        Action::Add => begin_add_field(state),
+        Action::Add => begin_add_entry(state),
         // Nothing is open to edit: `key_press` intercepts every keypress
         // before this match while an editor buffer or a field-name capture
         // exists, so these only ever reach here with neither to act on.

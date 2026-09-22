@@ -334,17 +334,22 @@ pub(super) fn enter_value_cursor(mut state: State) -> (State, Vec<Command>) {
     (state, vec![command])
 }
 
-/// `d` with the value pane focused: delete the field or member the cursor is
-/// on, in an open Hash (D4, PLAN M2 task 6) or Set (D5, PLAN M2 task 7,
-/// ADR-0016) — the name stays `delete_hash_field` (the Hash was first), but
-/// the function now stages either mutation depending on what is open, the
-/// same way `begin_add_field` above serves both types under its own
-/// unchanged name.
-pub(super) fn delete_hash_field(mut state: State) -> (State, Vec<Command>) {
+/// `d` with the value pane focused: delete the field, member or element the
+/// cursor is on, in an open Hash (D4, PLAN M2 task 6), Set (D5, PLAN M2 task
+/// 7, ADR-0016) or List (D5, PLAN M2 task 8, ADR-0017) — one function stages
+/// whichever mutation matches what is open, the same way `begin_add_entry`
+/// serves all three under one name.
+///
+/// Renamed from `delete_hash_field` (PLAN M2 task 8, D8): accurate for one
+/// collection type, misleading for three.
+pub(super) fn delete_value_row(mut state: State) -> (State, Vec<Command>) {
     let notify = |text: &str| vec![Command::Notify { text: text.into() }];
     let Some(open) = state.open.as_ref() else {
         return (state, notify("nothing to remove here"));
     };
+    // Exhaustive over `Value`, not a wildcard fallback (PLAN M2 task 8, D8):
+    // a fourth removable type (ZSet, task 9) has to make this same decision
+    // here, once, rather than silently falling through to this refusal.
     match &open.value {
         Some(Value::Hash(pairs)) => {
             if !open.cursor_active {
@@ -382,7 +387,35 @@ pub(super) fn delete_hash_field(mut state: State) -> (State, Vec<Command>) {
             });
             (state, Vec::new())
         }
-        _ => (state, notify("nothing to remove here")),
+        Some(Value::List(items)) => {
+            if !open.cursor_active {
+                return (state, notify("Enter to pick an element"));
+            }
+            let Some(element) = items.items.get(open.cursor).cloned() else {
+                return (state, notify("Enter to pick an element"));
+            };
+            // D5, ADR-0017: same `total == 1` snapshot-at-staging-time
+            // discipline as `last_field`/`last_member` above. `index` is the
+            // cursor's row, which is also the element's absolute Redis index
+            // — D7, the fetched window always starts at 0 — so this needs no
+            // arithmetic, and a row past the window is never selectable in
+            // the first place, so this cannot stage an index the window
+            // cannot support.
+            let last_element = items.total == 1;
+            let index = open.cursor;
+            let name = open.name.clone();
+            state.confirm = Some(PendingMutation::DeleteListElement {
+                name,
+                index,
+                element,
+                last_element,
+            });
+            (state, Vec::new())
+        }
+        Some(
+            Value::Str(_) | Value::ZSet(_) | Value::Stream(_) | Value::Json(_) | Value::Binary(_),
+        )
+        | None => (state, notify("nothing to remove here")),
     }
 }
 

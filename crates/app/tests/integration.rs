@@ -2360,9 +2360,9 @@ async fn editing_a_list_element_refuses_without_writing_when_the_list_shifted_un
         "a shifted index must refuse, not silently overwrite whatever moved into slot 1"
     );
 
-    // The list must be provably unchanged by the refused write: still five
-    // elements — sorry, four — in the shifted order, nothing replaced by
-    // "CORRUPTED" anywhere.
+    // The list must be provably unchanged by the refused write: still the
+    // four elements the push left, in the shifted order, with nothing
+    // replaced by "CORRUPTED" anywhere.
     let all: Vec<String> = writer.lrange("l:2", 0, -1).await.unwrap();
     assert_eq!(
         all,

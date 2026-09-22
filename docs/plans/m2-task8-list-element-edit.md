@@ -514,3 +514,69 @@ Noticed but deliberately not fixed (out of this phase's scope):
   compare-and-set guard line and the last-element warning but were never exercised by a real staged
   dialog until this phase — phase 3's tests confirm the *values* (`command_text`/`guard_text`) but do
   not render a frame through `confirm_overlay` itself; that is phase 5's golden-frame job.
+
+**Phase 4.** Nine `#[ignore]`d integration tests added to `crates/app/tests/integration.rs`
+(`redis:7-alpine`, following the Hash/Set sections' structure and naming exactly), proving the
+phase 2 implementation against a real server — no implementation changes were needed; every test
+passed on first run:
+
+- `editing_a_list_element_overwrites_it_and_keeps_the_keys_ttl` — `LSET` via
+  `set_list_element` lands, the key's own TTL survives (ADR-0017's verified fact, now pinned).
+- `editing_a_list_element_refuses_without_writing_when_the_list_shifted_under_it` — **the test
+  the whole task exists for.** See below for how it is made to exercise the real race rather than
+  simulate it.
+- `editing_a_list_element_on_a_gone_key_does_not_recreate_it` — `KeyGone`, key stays absent.
+- `adding_a_list_element_to_a_gone_key_does_not_recreate_it` — `KeyGone`, key stays absent.
+- `adding_a_list_element_lands_at_the_correct_end_for_head_and_tail` — one test covering both
+  `ListEnd::Head` (lands at index 0) and `ListEnd::Tail` (lands at the end) against the same list,
+  plus a TTL-survives assertion.
+- `deleting_a_list_element_removes_the_right_duplicate` — `[x, y, x, z]`, delete index 2, result
+  `[x, y, z]` — the exact ADR-0017 D2 hazard this task exists to close, plus a TTL-survives
+  assertion.
+- `deleting_the_last_list_element_deletes_the_key`.
+- `a_binary_list_element_round_trips_through_edit_and_read` — `m\xff\x80` read as the expected
+  bytes, edited to `e\xff\x802`, read back exactly.
+- `editing_a_list_element_against_a_wrong_type_key_surfaces_an_error_not_a_panic` — `LINDEX`
+  against a String key surfaces `WRONGTYPE` as an `Err`, not a panic; the key is untouched.
+
+TTL-survives assertions were added wherever natural (edit, add, delete-not-last) rather than as a
+separate test, following the Hash tests' own pattern of folding the TTL check into the write test
+it belongs to.
+
+**(d) Whether test #2 exercises the real race or only simulates it, and how it is made
+deterministic.** It exercises the real race, not a timing-based simulation of it: a second `fred`
+client (`second_client`, a genuinely separate TCP connection, standing in for a second session)
+issues a real `LPUSH` against the real server, and that call is `.await`ed to completion *before*
+the guarded `set_list_element` call runs against the original index (1) and the original expected
+bytes (`"beta"`, read from the server before the push). There is no sleep and no timing window to
+get lucky or unlucky on — determinism comes from ordering two real commands on two real
+connections in program order (the push happens-before the guarded write, enforced by `await`, not
+by wall-clock margin), which is exactly the sequence a real "push arrives while the dialog sits
+open" race produces, just without needing a human to actually pause. The assertion checks both
+that the outcome is `ElementMoved` and that the list is byte-for-byte unchanged from what the
+`LPUSH` alone produced (`["head", "alpha", "beta", "gamma"]`) with no `"CORRUPTED"` anywhere and
+the TTL intact — so a regression to a plain unguarded `LSET` (the rejected alternative ADR-0017
+records) would fail this test on the "must not have touched any element" assertion even if it
+happened to also return the right enum variant.
+
+**(c) Any place the phase 2 implementation turned out to be wrong.** None. All nine tests passed
+on the first run with no changes to `crates/app/src/redis/mutate.rs`. Phase 1's live verification
+and ADR-0017's own worked examples anticipated every case this phase automated.
+
+Counts at checkpoint 4: `cargo fmt --all -- --check` clean, `cargo clippy --workspace --all-targets
+-- -D warnings` clean, `cargo test --workspace` — core 485 (unchanged), golden 129 (unchanged), app
+38 (unchanged); `cargo test -p redis-pane -- --ignored --test-threads=1` — 70 passed (baseline 61 +
+9 new), 0 failed, needs Docker. The boundary check was not re-run this phase (no core/dependency
+changes) but remains satisfied by construction — phase 4 touches only `crates/app/tests/`.
+
+Noticed but deliberately not fixed (out of this phase's scope):
+
+- `crates/app/tests/integration.rs`, the new List section reuses `redis:7-alpine` throughout,
+  matching the Hash/Set sections' default image rather than pinning `8.4-alpine` (the version
+  ADR-0017's Lua scripts were verified against) or `6.2-alpine` (the version the Hash edit script's
+  `HPEXPIRETIME`-`pcall` compatibility test specifically targets). List's scripts use no
+  version-gated command — `EXISTS`/`LINDEX`/`LSET`/`LPUSH`/`RPUSH`/`LREM` are all pre-6.0 — so
+  there is no `the_edit_script_still_works_on_redis_6_2_...`-shaped test needed for List the way
+  there is for Hash's field-TTL `pcall`. Not fixed because there is nothing version-specific to
+  pin; noted so a future reader does not go looking for a List/6.2 test that has no reason to
+  exist.

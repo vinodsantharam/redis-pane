@@ -234,11 +234,29 @@ instead of implying a race on the exact element the reader was looking at.
 
   The delete variant carries the same `last_field`/`last_member`-shaped warning ADR-0015 D4 and
   ADR-0016 gave their last-element deletes, renamed to what it actually is for a List.
+  `guard_text()` changed its return type from `Option<&'static str>` to `Option<String>` as part
+  of this task, not merely for List's benefit: the List guard's wording carries the staged index
+  ("· index 3"), which no `'static` literal can hold, and every existing call site (Hash, Set,
+  String) now formats through the owned form too. `PendingMutation::json_warning` also gained a
+  `SetListElement` arm — the List element editor computes `was_json` exactly as the Hash-field one
+  does (below), and without this arm the confirm dialog's "⚠ no longer valid JSON" line would
+  silently never fire for a List edit that broke JSON. Found while writing this ADR's own phase-5
+  golden frame, the first thing ever to render a staged `SetListElement` through `confirm_overlay`
+  — fixed here rather than left for a future task, since it was a one-line correctness bug, not a
+  design question.
 - `crates/core/src/state/value.rs` gains `ListEnd { Head, Tail }` (D1's add-at-either-end choice),
   defaulting to `Tail`.
 - `crates/core/src/state/editor.rs` gains `EditTarget::{ListElement { index }, NewListElement {
   end } }` and `EditBuffer::list_element()`/`new_list_element()`. A List element opens its **raw**
-  value, never reformatted, mirroring the Hash-field path (ADR-0015).
+  value, never reformatted, mirroring the Hash-field path (ADR-0015). `EditBuffer` also gains
+  `toggle_list_end()` (D6), a no-op outside `EditTarget::NewListElement`, wired to `Tab` while the
+  add form is open — the only target where `Tab` means something other than "insert a tab
+  character". `OpenKey::edit_verb` (`state/open.rs`), which supplies the header's "what am I doing"
+  line, changed its return type from `&'static str` to `String` for the same reason `guard_text`
+  did: it now formats `"✎ adding element (head)"` / `"✎ adding element (tail)"` so the toggle's
+  state is visible rather than remembered, which D6 requires and which the phase-5 golden frames
+  (`list_form_add_head`/`list_form_add_tail`) pin as visibly different renders, not merely
+  different internal state.
 - `crates/app/src/redis/mutate.rs` gains `LIST_ELEMENT_EDIT_SCRIPT`, `LIST_ELEMENT_DELETE_SCRIPT`,
   `LIST_ELEMENT_ADD_SCRIPT`, `set_list_element`, `add_list_element`, `delete_list_element`, and
   three arms in `execute` — the same `Command::Execute`/`Msg::MutationSettled` shape review H1
@@ -249,10 +267,20 @@ instead of implying a race on the exact element the reader was looking at.
   Binary elements are refused with a notice, exactly as binary Hash fields and Set members are:
   "binary elements aren't editable here yet" (D4 of the plan).
 - The hint bar (`crates/core/src/render/mod.rs`) gains a List-shaped arm alongside the Hash and Set
-  ones: `e edit · a add · d remove`.
+  ones: `e edit · a add · d remove`, pinned by a golden frame
+  (`golden_hint_bar_names_all_three_list_element_actions_with_a_cursor_active`).
 - Only the fetched window (first 500 items, `IndexedValue.total` may exceed it) is editable — a row
   past the window is not rendered, so `e`/`a`/`d` have nothing to reach past it with; no new
   refusal is needed for this.
+- List being the third editable collection forced seven previously-fallback sites in
+  `crates/core` into exhaustive matches (PLAN M2 task 8, D8; the seven-site inventory is
+  `docs/reviews/2026-09-13-codebase-design-review.md` §9), and two of those sites changed name to
+  describe what they now do across three types rather than one:
+  `update/editor.rs::begin_add_field` → `begin_add_entry`, and
+  `update/viewer.rs::delete_hash_field` → `delete_value_row`. `state/mod.rs::PendingMutation::
+  guard_text` and `state/editor.rs::EditBuffer::active_part` were given their exhaustive form
+  without a rename; `update/confirm.rs::nothing_to_remove` and `render/mod.rs::hint_bar` likewise
+  gained List arms without changing shape. §9 is updated to mark all seven resolved.
 
 ## Sources
 

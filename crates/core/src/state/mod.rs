@@ -427,6 +427,11 @@ impl PendingMutation {
                 was_json: true,
                 new,
                 ..
+            }
+            | PendingMutation::SetListElement {
+                was_json: true,
+                new,
+                ..
             } => Some(serde_json::from_slice::<serde_json::Value>(new).is_err()),
             _ => None,
         }

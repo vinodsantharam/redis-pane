@@ -666,6 +666,85 @@ block, for the two that aren't `match`es — the day List (task 8) or ZSet (task
 | `crates/core/src/render/mod.rs:1161` (`hint_bar`) | Two sequential `if !state.keys_pane_focused() && … matches!(o.value, Some(Value::Hash(_)))` / `Some(Value::Set(_)))` blocks (added this phase), not a `match` | A third `if` block; a missing one silently falls through to the generic Cancel/Refetch/… hint, exactly the gap this phase's Set hint fixed for Set itself |
 | `crates/core/src/update/confirm.rs:143` (`nothing_to_remove`) | `match mutation { Mutation::DeleteSetMember { .. } => "member", _ => "field" }` | **Left unfixed, deliberately, per this phase's brief.** The `_ => "field"` fallback means a future `Mutation::DeleteZSetMember` (task 9) would silently report a member deleted in a field's words — the same class of defect `NotWritten::reason` (`mutation.rs:118`) was written to prevent by forcing an explicit arm per variant. Fixing it now would mean inventing a `DeleteZSetMember`-shaped noun with no real caller yet; M3 (or task 9 itself) is where that arm belongs. |
 
+**Update — PLAN M2 task 8 (List, ADR-0017), 2026-09-22.** List element edit/add/remove is the
+third editable collection type the inventory above anticipated. All seven fallback sites are now
+resolved, on this branch (`worktree-list-element-edit`):
+
+| Site | Resolved | Commit |
+|---|---|---|
+| `state/mod.rs:321` `PendingMutation::guard_text` | Exhaustive `match`, no fallback; also moved `Option<&'static str>` → `Option<String>` since the List guard's wording carries the staged index | `3d5a389` |
+| `state/editor.rs:254` `EditBuffer::active_part` | Exhaustive `match`; a List target answers `None` explicitly | `3d5a389` |
+| `update/confirm.rs:143` `nothing_to_remove` | Exhaustive `match` over `Mutation`; every List variant falls to `"entry"`, no longer through a `_` shared with Hash's `"field"` | `1a391d7` |
+| `update/editor.rs:20` `open_editor` | Gained a `Value::List` branch ahead of the generic `EditBuffer::from_value` fallback | `1a391d7` |
+| `update/editor.rs:116` `begin_add_field` | **Renamed to `begin_add_entry`** (it now opens the add form for three collection types) and made exhaustive over `Value` | `1a391d7` |
+| `update/viewer.rs:343` `delete_hash_field` | **Renamed to `delete_value_row`** (same reasoning) and made exhaustive over `Value` | `1a391d7` |
+| `render/mod.rs:1161` `hint_bar` | Gained a List cursor-active arm, plus a dedicated branch inside the editor-open hint naming `Tab` for `NewListElement`, where it means something other than "insert a tab" | `1a391d7` |
+
+One further gap was found and fixed along the way, not in the original seven because it isn't a
+`match` at all: `update/editor.rs`'s `staged_edit_found_key_gone` matched on `PendingMutation`
+through a `matches!` macro with an or-pattern, which expands to a `match` with a trailing
+`_ => false` regardless of the or-pattern — so it compiled, and silently misbehaved, the moment a
+List `PendingMutation` could be staged. Replaced with a bare `match` producing the same `bool`
+with no wildcard arm, so a tenth `PendingMutation` variant is a compile error there too (`1a391d7`).
+
+**Re-stated M3 inventory, now that three types exist.** Every exhaustive-match site named above
+did exactly what the first update (task 7) predicted: List's arrival was a compile error until
+handled, at every site with no wildcard, with zero silent drift. The seven fallback/sequential
+sites are now zero — this task closed the last of them, per its own D8, rather than adding an
+eighth. What's left for task 9 (ZSet) is not a punch list of known gaps; it is the general fact
+that *any* new `Mutation`/`PendingMutation`/`EditTarget`/`NotWritten` variant still means touching
+every exhaustive match across two crates by hand, one arm at a time, copy-adjusted from the
+sibling type nearest in shape. That is real but bounded work — the type system makes it impossible
+to forget a site, only tedious to write one. M3's actual question (below) is whether that
+per-site, per-type repetition is worth collapsing behind a trait, not whether anything is
+currently broken.
+
+**Did three cases make the shape of a `Viewer`-sibling trait obvious, or not?** Not obvious — and
+the honest answer is that the three types diverged in ways that would make a single trait's
+methods either overly generic or leaky, not that a trait almost fell out and was merely left
+undone. Concretely, from what building List actually showed:
+
+- **The write shapes are not parallel.** Hash's guard is `EXISTS` alone (a field write cannot
+  corrupt another field). Set's add guard is also `EXISTS` alone, with a *client-side* shown-
+  duplicate check that has no server-side enforcement. List's guard is compare-and-set on the
+  *value at a position* — a strictly different hazard (ADR-0017's whole point: "the hazard List
+  has is not the one Hash and Set have"). A trait method like `fn guard(&self) -> Guard` would
+  need a variant-rich `Guard` enum anyway to carry `EXISTS`-only vs. compare-and-set-on-bytes vs.
+  compare-and-set-on-index, at which point the trait is a thin wrapper that still needs a `match`
+  on what kind of guard it produced — it has not removed the per-type reasoning, only renamed it.
+- **The identity model differs per type, not just the write.** A Hash field's identity is its
+  name (stable across edits). A Set member's identity *is* its bytes (D1 of ADR-0016: editing one
+  is a rename, not an edit, precisely because there is no identity independent of the value). A
+  List element's identity is its position (ADR-0017: "a list element has an identity — its index —
+  that survives its bytes changing"). These three answers to "what does `e` even mean for this
+  row" are not three implementations of one interface; they are three different answers to what
+  the row *is*, which is upstream of any method signature a shared trait could offer.
+- **The add form's shape differs per type**, not just its guard: Hash's is two-part (name, then
+  value, with a live shown-duplicate check on the name); Set's is one-part with a
+  client-checked shown-duplicate on the value; List's is one-part with no duplicate check at all
+  (D6: "a list is allowed duplicates, which is precisely what distinguishes it from a Set") plus a
+  Head/Tail toggle neither sibling has anywhere to put. A trait method covering all three would
+  need an associated "form shape" description expressive enough to encode a toggle that exists for
+  exactly one implementer — again, a generic escape hatch standing in for the type-specific
+  reasoning, not a replacement for it.
+- **What *did* converge, cleanly, is the chokepoint below the per-type decision**: one `Mutation`
+  enum, one `PendingMutation` enum, one `Command::Execute`/`Msg::MutationSettled` pair, one
+  `redis::mutate::execute`, one confirm-dialog renderer keyed on the pending mutation, one
+  `EditBuffer`/`EditTarget` pair. That convergence was already in place after Hash (task 6) and
+  held unchanged through Set and List — it is real, and it is exactly what review H1's fix
+  produced. It is a different, narrower claim than "the three types share a dispatch interface":
+  the *plumbing* converged; the *per-type meaning* of edit/add/delete did not.
+
+So the honest carry-forward for task 9: expect ZSet's write shape, identity model, and add-form
+shape to each need their own answer again — a `ZScore`-vs-`ZMember` guard question ADR-0017's
+compare-and-set technique does not obviously answer, since a ZSet member's identity might be its
+bytes (Set-like) while its mutable payload is the score (Hash-value-like), which is a genuinely
+new combination none of the three existing types has. If a shared trait is worth designing, task
+9 is the point to attempt it with real requirements in hand rather than three retrofits — but
+three cases argue *against* assuming one is waiting to be found, not for it. A wrong confident
+"yes, obviously" here would have sent task 9 chasing a trait shaped by Hash-and-Set's accidental
+similarity (both guard on `EXISTS` alone) rather than by what a ZSet actually needs.
+
 Two patterns recur enough to be worth naming for whoever picks up M3:
 
 - **Exhaustive `match`es on `Mutation`, `PendingMutation` or `EditTarget` are self-defending** — a

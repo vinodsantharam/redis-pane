@@ -580,3 +580,58 @@ Noticed but deliberately not fixed (out of this phase's scope):
   there is for Hash's field-TTL `pcall`. Not fixed because there is nothing version-specific to
   pin; noted so a future reader does not go looking for a List/6.2 test that has no reason to
   exist.
+
+**Phase 5.** Eight golden frames added to `crates/core/tests/golden.rs`, following the Hash/Set
+sections' naming and `opened()`/`update()`-flow pattern exactly: `list_form_edit_element` (the
+element editor open on a row, raw value, keyed on index), `list_form_add_tail`/`list_form_add_head`
+(D6's toggle — confirmed **visibly** different, not just internally different: the header line
+reads "✎ adding element (tail)" vs "(head)"), `confirm_set_list_element`, `confirm_add_list_element`,
+`confirm_delete_list_element` (not last), `confirm_delete_list_element_last_element`, plus a plain
+`assert_eq!` pin of the List hint bar (`e edit · a add · d remove`) matching the Hash/Set hint-bar
+tests' shape.
+
+**A real rendering bug was found and fixed, not just noticed.** `PendingMutation::json_warning`
+(`state/mod.rs`) matched only `SetString`/`SetHashField` with `was_json: true`, falling through
+`_ => None` for every other variant — including `SetListElement`, which phase 2 gave a `was_json`
+field for exactly this purpose (`EditBuffer::list_element` classifies it with the same
+`looks_like_json` Hash uses). The confirm dialog's `if pending.json_warning() == Some(true)` check
+in `render/mod.rs`'s `SetListElement` arm (written in phase 2, per its own note, "never rendered
+until phase 5") therefore could never fire for a List: staging an edit that broke a JSON-shaped
+element would silently drop the "⚠ no longer valid JSON" line a Hash field edit shows for the
+identical case. This is exactly the class of defect the D8 table exists to prevent, just one level
+down — not a missing `match` arm that fails to compile, but a `match` that compiles fine because
+its wildcard silently absorbs a variant that should have had a real answer. Fixed by adding
+`PendingMutation::SetListElement { was_json: true, new, .. }` to the same or-pattern arm
+`SetHashField` uses; a regression test,
+`list_element_edit_tests::a_json_element_edited_into_something_invalid_warns`, pins it directly
+(`crates/core/src/update/editor.rs`), mirroring the existing Hash test of the same shape.
+
+The seven D8 sites, `nothing_to_remove`'s exhaustiveness, and the `PLAN.md`/ADR-0017/review-§9 docs
+were all confirmed to already read correctly for what phases 2–4 actually built, except ADR-0017's
+Consequences section, which still described `guard_text`/`edit_verb` as returning `&'static str`
+and referred to `begin_add_field`/`delete_hash_field` by their pre-rename names — corrected to match
+the code, including the `json_warning` fix above. `docs/reviews/2026-09-13-codebase-design-review.md`
+§9 gained a dated update marking all seven fallback sites resolved (with commit SHAs) and a
+re-stated M3 inventory answering task 9's inherited question directly: three cases did **not** make
+a shared `Viewer`-sibling trait's shape obvious — the write guard, the identity model, and the add
+form each diverge per type (compare-and-set-on-index vs. `EXISTS`-only; index-identity vs.
+bytes-identity vs. name-identity; two-part vs. one-part-with-duplicate-check vs.
+one-part-with-end-toggle), while what genuinely converged (the `Mutation`/`PendingMutation`/
+`Command::Execute` chokepoint) already existed after Hash and did not need a third case to find.
+
+Counts at checkpoint 5: `cargo fmt --all -- --check` clean, `cargo clippy --workspace --all-targets
+-- -D warnings` clean, `cargo test --workspace` — core 486 (485 + 1: the `json_warning` regression
+test), golden 137 (129 + 8: seven `#[test]`s each pinning one of the fixtures listed above, plus
+one non-golden hint-bar `assert_eq!` test, matching the Hash/Set sections' own mix), app 38 (unchanged); `cargo test -p redis-pane -- --ignored --test-threads=1` — 70 passed (unchanged
+— phase 5 is render/docs only, no new integration tests), 0 failed, needs Docker. The boundary
+check (`cargo tree -p redis-pane-core -e normal | grep -iE 'crossterm|tokio|fred'`) printed nothing.
+
+Noticed but deliberately not fixed (out of this phase's scope):
+
+- `CLAUDE.md`'s CONTEXT.md glossary was checked for new load-bearing terms this task introduces
+  ("List element", "index", "sentinel", "ListEnd", "Head"/"Tail") and none were added — task 7
+  (Set) added no glossary entries either despite Set member add/remove being an equally new
+  mutation surface, so no new term here is genuinely load-bearing beyond what "Command preview"
+  already generalizes over ("a Hash field edit or add, ADR-0015" — left as its existing Hash
+  example rather than expanded to list all three types, matching task 7's own choice not to touch
+  it for Set).

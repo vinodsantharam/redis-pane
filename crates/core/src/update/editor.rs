@@ -3005,6 +3005,24 @@ mod list_element_edit_tests {
         );
     }
 
+    /// Regression: `PendingMutation::json_warning` originally matched only
+    /// `SetString`/`SetHashField`, so a List element edit that broke JSON
+    /// carried `was_json: true` all the way to the confirm dialog and the
+    /// dialog's `if pending.json_warning() == Some(true)` check (`render/
+    /// mod.rs`) silently never fired — found while writing phase 5's golden
+    /// frame for this exact dialog, since nothing before this phase ever
+    /// rendered a staged `SetListElement` through `confirm_overlay`.
+    #[test]
+    fn a_json_element_edited_into_something_invalid_warns() {
+        let s = with_cursor(open_with_list(&["{\"a\":1}"], 1), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        assert!(s.open.as_ref().unwrap().editor().unwrap().was_json());
+        let s = type_text(s, "x"); // breaks the JSON
+        let (s, cmds) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(cmds.is_empty());
+        assert_eq!(s.confirm.as_ref().unwrap().json_warning(), Some(true));
+    }
+
     // ── D5: `d` in the value pane stages `DeleteListElement` ───────────────
 
     #[test]

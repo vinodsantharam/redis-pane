@@ -2621,3 +2621,446 @@ async fn editing_a_list_element_against_a_wrong_type_key_surfaces_an_error_not_a
     let _ = client.quit().await;
     let _ = writer.quit().await;
 }
+
+// ── PLAN M2 task 9 — ZSet score edit, add, delete (ADR-0018) ───────────────
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn editing_a_zset_score_overwrites_it_and_keeps_the_keys_ttl() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: i64 = writer
+        .zadd(
+            "zs:1",
+            None,
+            None,
+            false,
+            false,
+            vec![(1.0, "alpha"), (2.0, "beta"), (3.5, "gamma")],
+        )
+        .await
+        .unwrap();
+    let _: bool = writer.expire("zs:1", 600, None).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::mutate::set_zset_score(&client, b"zs:1", b"beta", 10.0)
+        .await
+        .unwrap();
+    assert_eq!(outcome, redis_pane::redis::mutate::ZSetScoreWrite::Written);
+
+    let now: Option<f64> = writer.zscore("zs:1", "beta").await.unwrap();
+    assert_eq!(now, Some(10.0));
+    let ttl: i64 = writer.ttl("zs:1").await.unwrap();
+    assert!((1..=600).contains(&ttl), "key TTL must survive, got {ttl}");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn editing_a_zset_score_on_a_gone_key_does_not_recreate_it() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::mutate::set_zset_score(&client, b"zs:gone", b"anything", 1.0)
+        .await
+        .unwrap();
+    assert_eq!(outcome, redis_pane::redis::mutate::ZSetScoreWrite::KeyGone);
+
+    let exists: i64 = writer.exists("zs:gone").await.unwrap();
+    assert_eq!(exists, 0, "the key must not be recreated");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+/// The gone-*member* half of D2's guard, distinct from the gone-*key* half
+/// above: the key is still there, but the member the dialog staged against
+/// was `ZREM`'d out from under it. `ZADD XX CH` cannot tell this apart from
+/// "present with an unchanged score" (ADR-0018 D2, the reason the script
+/// exists at all) — `ZSCORE`'s nil check is what makes the distinction, and
+/// this test is what pins it against a real server.
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn editing_a_zset_score_refuses_without_writing_when_the_member_is_gone_under_it() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: i64 = writer
+        .zadd(
+            "zs:2",
+            None,
+            None,
+            false,
+            false,
+            vec![(1.0, "alpha"), (2.0, "beta")],
+        )
+        .await
+        .unwrap();
+    let _: bool = writer.expire("zs:2", 600, None).await.unwrap();
+
+    // The dialog stages a score edit of "beta" from 2.0 to 20.0. Before it is
+    // confirmed, a second connection removes "beta" from the set entirely.
+    let second_client = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    second_client.init().await.unwrap();
+    let removed: i64 = second_client.zrem("zs:2", "beta").await.unwrap();
+    assert_eq!(removed, 1, "setup: beta must actually have been removed");
+    let _ = second_client.quit().await;
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::mutate::set_zset_score(&client, b"zs:2", b"beta", 20.0)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        redis_pane::redis::mutate::ZSetScoreWrite::MemberGone,
+        "a member removed under the dialog must refuse, not silently re-add it"
+    );
+
+    let beta_score: Option<f64> = writer.zscore("zs:2", "beta").await.unwrap();
+    assert_eq!(
+        beta_score, None,
+        "the refused write must not have resurrected beta"
+    );
+    let alpha_score: Option<f64> = writer.zscore("zs:2", "alpha").await.unwrap();
+    assert_eq!(alpha_score, Some(1.0), "the untouched member is unchanged");
+    let ttl: i64 = writer.ttl("zs:2").await.unwrap();
+    assert!((1..=600).contains(&ttl), "key TTL must survive, got {ttl}");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+/// D7's test — the one proving rank is not identity, the way task 8's shift
+/// test proved an index is not (ADR-0018 D7). A staged ZSet write names the
+/// member's bytes, captured when the row was picked, so a concurrent write
+/// that reorders every rank around it must not misdirect the write.
+///
+/// This exercises the real race, not a simulation of it: the second client's
+/// three `ZADD`s genuinely run, on the real server, and are `await`ed to
+/// completion — strictly between the moment "the dialog" would have picked
+/// `beta` and the moment the staged edit actually executes. Determinism comes
+/// from sequencing real commands on two real connections in program order,
+/// the same technique task 8's list-shift test uses, so there is no timing
+/// window to add margin for. The assertion checks the whole set's final
+/// state, not just the return value, so a write that landed on the wrong
+/// member (by rank rather than by name) would be caught even if it happened
+/// to return `Written`.
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn editing_a_zset_score_lands_on_the_right_member_after_a_reorder_under_it() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: i64 = writer
+        .zadd(
+            "zs:3",
+            None,
+            None,
+            false,
+            false,
+            vec![
+                (1.0, "alpha"),
+                (2.0, "beta"),
+                (3.0, "gamma"),
+                (4.0, "delta"),
+            ],
+        )
+        .await
+        .unwrap();
+    let _: bool = writer.expire("zs:3", 600, None).await.unwrap();
+
+    // The dialog picks "beta" (rank 1, score 2.0) and stages an edit to
+    // 100.0. Before it is confirmed, a second connection rewrites every
+    // *other* member's score, shuffling the ranks: alpha and gamma jump above
+    // beta's old rank, delta drops to the very bottom.
+    let original_rank: Option<i64> = writer.zrank("zs:3", "beta", false).await.unwrap();
+    assert_eq!(original_rank, Some(1), "setup: beta must start at rank 1");
+
+    let second_client = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    second_client.init().await.unwrap();
+    let _: i64 = second_client
+        .zadd(
+            "zs:3",
+            None,
+            None,
+            false,
+            false,
+            vec![(500.0, "alpha"), (1.0, "gamma"), (0.5, "delta")],
+        )
+        .await
+        .unwrap();
+    let _ = second_client.quit().await;
+
+    // Ranks are now, ascending by score: delta(0.5) gamma(1.0) beta(2.0
+    // still) alpha(500.0) — beta moved from rank 1 to rank 2 without anyone
+    // touching it.
+    let reordered_rank: Option<i64> = writer.zrank("zs:3", "beta", false).await.unwrap();
+    assert_eq!(
+        reordered_rank,
+        Some(2),
+        "setup: the reorder must actually have moved beta's rank"
+    );
+
+    // The staged write executes against the member name captured when it was
+    // picked, oblivious to the rank shuffle.
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::mutate::set_zset_score(&client, b"zs:3", b"beta", 100.0)
+        .await
+        .unwrap();
+    assert_eq!(outcome, redis_pane::redis::mutate::ZSetScoreWrite::Written);
+
+    // Assert the whole set's final state, not just the return value.
+    let alpha: Option<f64> = writer.zscore("zs:3", "alpha").await.unwrap();
+    let beta: Option<f64> = writer.zscore("zs:3", "beta").await.unwrap();
+    let gamma: Option<f64> = writer.zscore("zs:3", "gamma").await.unwrap();
+    let delta: Option<f64> = writer.zscore("zs:3", "delta").await.unwrap();
+    assert_eq!(alpha, Some(500.0), "alpha must hold the reorder's score");
+    assert_eq!(beta, Some(100.0), "beta must hold the staged edit's score");
+    assert_eq!(gamma, Some(1.0), "gamma must hold the reorder's score");
+    assert_eq!(delta, Some(0.5), "delta must hold the reorder's score");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn adding_a_zset_member_to_a_gone_key_does_not_recreate_it() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::mutate::add_zset_member(&client, b"zs:gone2", b"member", 1.0)
+        .await
+        .unwrap();
+    assert_eq!(outcome, redis_pane::redis::mutate::ZSetMemberAdd::KeyGone);
+
+    let exists: i64 = writer.exists("zs:gone2").await.unwrap();
+    assert_eq!(exists, 0, "the key must not be recreated");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn adding_a_duplicate_zset_member_refuses_without_changing_its_score() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: i64 = writer
+        .zadd("zs:4", None, None, false, false, (1.0, "alpha"))
+        .await
+        .unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::mutate::add_zset_member(&client, b"zs:4", b"alpha", 99.0)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        redis_pane::redis::mutate::ZSetMemberAdd::MemberExists
+    );
+
+    let score: Option<f64> = writer.zscore("zs:4", "alpha").await.unwrap();
+    assert_eq!(score, Some(1.0), "the existing score must be untouched");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn removing_the_last_zset_member_deletes_the_key() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: i64 = writer
+        .zadd("zs:5", None, None, false, false, (1.0, "only"))
+        .await
+        .unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let removed = redis_pane::redis::mutate::delete_zset_member(&client, b"zs:5", b"only")
+        .await
+        .unwrap();
+    assert!(removed);
+
+    let exists: i64 = writer.exists("zs:5").await.unwrap();
+    assert_eq!(exists, 0, "the key must go with its last member");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn a_binary_zset_members_score_round_trips_through_edit_and_read() {
+    // Review C2 / ADR-0018 D5: `ScoredValue.entries` is `Vec<(Vec<u8>, f64)>`,
+    // never `String`. A score edit never touches the member's bytes — they
+    // travel exactly as read — so a binary member's *score* must round-trip
+    // even though the member itself is not text.
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let member: &[u8] = b"m\xff\x80";
+    let _: i64 = writer
+        .zadd("zs:bin", None, None, false, false, (1.0, member.to_vec()))
+        .await
+        .unwrap();
+    let _: i64 = writer
+        .zadd("zs:bin", None, None, false, false, (9.0, "plain"))
+        .await
+        .unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::mutate::set_zset_score(&client, b"zs:bin", member, 2.5)
+        .await
+        .unwrap();
+    assert_eq!(outcome, redis_pane::redis::mutate::ZSetScoreWrite::Written);
+
+    let now: Option<f64> = writer.zscore("zs:bin", member).await.unwrap();
+    assert_eq!(
+        now,
+        Some(2.5),
+        "the binary member's score must round-trip through the edit"
+    );
+    let plain_untouched: Option<f64> = writer.zscore("zs:bin", "plain").await.unwrap();
+    assert_eq!(plain_untouched, Some(9.0), "the other member is untouched");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn inf_and_negative_inf_round_trip_through_a_score_edit() {
+    // ADR-0018's verified facts: `inf`/`-inf` are valid f64 scores and round-
+    // trip as `inf`/`-inf`, unlike `nan`, which the server refuses outright
+    // (rejected before it can be staged, per D4 — not exercised here).
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: i64 = writer
+        .zadd("zs:6", None, None, false, false, (1.0, "alpha"))
+        .await
+        .unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+
+    let to_inf =
+        redis_pane::redis::mutate::set_zset_score(&client, b"zs:6", b"alpha", f64::INFINITY)
+            .await
+            .unwrap();
+    assert_eq!(to_inf, redis_pane::redis::mutate::ZSetScoreWrite::Written);
+    let now: Option<f64> = writer.zscore("zs:6", "alpha").await.unwrap();
+    assert_eq!(now, Some(f64::INFINITY));
+
+    let to_neg_inf =
+        redis_pane::redis::mutate::set_zset_score(&client, b"zs:6", b"alpha", f64::NEG_INFINITY)
+            .await
+            .unwrap();
+    assert_eq!(
+        to_neg_inf,
+        redis_pane::redis::mutate::ZSetScoreWrite::Written
+    );
+    let now: Option<f64> = writer.zscore("zs:6", "alpha").await.unwrap();
+    assert_eq!(now, Some(f64::NEG_INFINITY));
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn a_high_precision_score_round_trips_byte_identically() {
+    // ADR-0018's verified fact: `1.0000000000000002` reads back byte
+    // identical via `ZSCORE`. Asserted here via `to_bits()`, not just `==`,
+    // so a lossy round-trip that happened to still compare equal (as `0.0`
+    // and `-0.0` do) would not slip past this test.
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: i64 = writer
+        .zadd("zs:7", None, None, false, false, (1.0, "alpha"))
+        .await
+        .unwrap();
+    let precise: f64 = 1.0000000000000002;
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::mutate::set_zset_score(&client, b"zs:7", b"alpha", precise)
+        .await
+        .unwrap();
+    assert_eq!(outcome, redis_pane::redis::mutate::ZSetScoreWrite::Written);
+
+    let now: Option<f64> = writer.zscore("zs:7", "alpha").await.unwrap();
+    let now = now.expect("the member must still be there");
+    assert_eq!(
+        now.to_bits(),
+        precise.to_bits(),
+        "the score must round-trip byte-identically, not just compare equal"
+    );
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn editing_a_zset_score_against_a_wrong_type_key_surfaces_an_error_not_a_panic() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer
+        .set("str:3", "hello", None, None, false)
+        .await
+        .unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let err = redis_pane::redis::mutate::set_zset_score(&client, b"str:3", b"hello", 1.0)
+        .await
+        .expect_err("ZADD/ZSCORE against a String key is WRONGTYPE");
+    assert!(err.details().contains("WRONGTYPE"), "{err}");
+
+    let value: Option<String> = writer.get("str:3").await.unwrap();
+    assert_eq!(
+        value.as_deref(),
+        Some("hello"),
+        "untouched by the failed write"
+    );
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}

@@ -485,3 +485,49 @@ have. And changing only ZSet's seeding would make it inconsistent with the two t
 while changing all three is a cross-type behaviour change well outside a ZSet row's scope. Raised
 for a decision rather than settled unilaterally — it belongs with task 5's `$EDITOR` work or its own
 row, not here.
+
+**Phase 4.** 11 `#[ignore]`d integration tests added to `crates/app/tests/integration.rs`, under a
+new `// ── PLAN M2 task 9 — ZSet score edit, add, delete (ADR-0018) ──` section following the List
+tests exactly in structure and naming: `editing_a_zset_score_overwrites_it_and_keeps_the_keys_ttl`,
+`editing_a_zset_score_on_a_gone_key_does_not_recreate_it`,
+`editing_a_zset_score_refuses_without_writing_when_the_member_is_gone_under_it`,
+`editing_a_zset_score_lands_on_the_right_member_after_a_reorder_under_it` (D7's test),
+`adding_a_zset_member_to_a_gone_key_does_not_recreate_it`,
+`adding_a_duplicate_zset_member_refuses_without_changing_its_score`,
+`removing_the_last_zset_member_deletes_the_key`,
+`a_binary_zset_members_score_round_trips_through_edit_and_read`,
+`inf_and_negative_inf_round_trip_through_a_score_edit`,
+`a_high_precision_score_round_trips_byte_identically` (asserted via `to_bits()`, not `==`, so a
+lossy round-trip that happened to still compare equal would not slip past it — see the `format_score`
+`-0.0` caveat phase 2 already flagged), and
+`editing_a_zset_score_against_a_wrong_type_key_surfaces_an_error_not_a_panic`. All 81 integration
+tests pass (70 baseline + 11 new) against `redis:7-alpine`, `#[test-threads=1]`, Docker.
+
+**The phase 2 implementation needed no changes.** `set_zset_score`/`add_zset_member`/
+`delete_zset_member` and both scripts in `crates/app/src/redis/mutate.rs` worked exactly as built —
+every test passed on the first Docker run once the suite itself compiled. Nothing in D1–D8 or the
+scripts was found wrong.
+
+**D7's reorder test (#4) exercises the real race, not a simulation of it**, the same way task 8's
+list-shift test does and for the same reason: the second client's three `ZADD`s (moving `alpha` to
+`500`, `gamma` to `1`, `delta` to `0.5`, leaving `beta` untouched) genuinely run against the real
+server on a second real connection, `await`ed to completion before the staged `set_zset_score` call
+executes. Determinism comes from sequencing two real commands in program order — no sleep, no
+timing margin. The test first asserts via `ZRANK` that `beta` actually moved from rank 1 to rank 2
+(proving the reorder really happened, not just that scores changed), then asserts the *whole* set's
+final state via four separate `ZSCORE` reads (`alpha`, `beta`, `gamma`, `delta`) rather than just the
+`Written` return value — a write that landed on whatever now sits at the *old* rank 1 (`alpha`, post-
+reorder) instead of on `beta` by name would still return `Written`, but would fail the `alpha`/`beta`
+assertions.
+
+**One naming fix needed against fred's actual signature, not the plan's**: `fred` 10.1's `zrank`
+takes three arguments (`key`, `member`, `withscore: bool`), not two — `writer.zrank("zs:3", "beta")`
+was written from the sibling tests' two-argument shape before checking fred's actual signature and
+corrected to `writer.zrank("zs:3", "beta", false)`. A `cargo test --no-run` catch, not a Redis-facts
+discrepancy.
+
+**Not fixed, and not this phase's concern:** the same seeded-cursor-at-position-0 typing defect
+phase 3 already recorded (`crates/core/src/state/editor.rs`, `EditBuffer::zset_score`/
+`for_hash_field`/`list_element`) has no integration-suite angle — it is a UI/`EditBuffer` behaviour,
+not something a headless `mutate::execute` call against a real server can observe. Left as phase 3
+left it.

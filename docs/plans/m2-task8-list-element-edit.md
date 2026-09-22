@@ -350,3 +350,16 @@ cargo run -p redis-pane -- --url redis://127.0.0.1:6379
 ## Found while building
 
 _(Executor: append anything noticed but deliberately not fixed, with `file:line`.)_
+
+**Phase 1.** All nine bullets under "Redis facts that shape the write" were re-verified against a
+live `redis:8.4-alpine` and confirmed exactly as drafted — no differences, see ADR-0017 for the
+observed output of each. All three D2 scripts were verified end to end, including the happy path,
+the stale-index refusal (`-2`), and the gone-key refusal (`-1`) for both edit and delete, and the
+duplicate-safe delete on `[x, y, x, z]`.
+
+D3's exact wording was settled as **"that element moved — the list changed underneath it, look
+again"**, not the shorter "that element changed" the plan's draft used as a placeholder. Reasoning
+recorded in ADR-0017 D3: `ElementMoved` is expected to be the *routine* refusal on a busy list
+(any concurrent write anywhere in the list can shift an index, not just a write to the same
+element), so it needs to read as "look again," and naming the mechanism ("the list changed
+underneath it") avoids implying the element's own value raced, which is the less common case.

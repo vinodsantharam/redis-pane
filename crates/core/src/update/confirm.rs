@@ -165,14 +165,19 @@ pub(super) fn nothing_to_remove(
     let what = match mutation {
         Mutation::DeleteHashField { .. } => "field",
         Mutation::DeleteSetMember { .. } => "member",
+        // Unreachable today — ADR-0017 D2's compare-and-set reports a missing
+        // element as `ElementMoved`, never `NothingToRemove` — but it gets the
+        // noun a List actually uses rather than sharing the catch-all below.
+        // Costing nothing now is the point: if a later write does start
+        // settling this way, it already says "element".
+        Mutation::DeleteListElement { .. } => "element",
         Mutation::DeleteKey { .. }
         | Mutation::SetString { .. }
         | Mutation::SetHashField { .. }
         | Mutation::AddHashField { .. }
         | Mutation::AddSetMember { .. }
         | Mutation::SetListElement { .. }
-        | Mutation::AddListElement { .. }
-        | Mutation::DeleteListElement { .. } => "entry",
+        | Mutation::AddListElement { .. } => "entry",
     };
     state.notice = Some((
         format!("{}: {what} already gone", mutation.command_label()),

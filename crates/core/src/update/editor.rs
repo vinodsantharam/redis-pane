@@ -350,6 +350,31 @@ pub(super) fn editor_key(mut state: State, key: KeyPress) -> (State, Vec<Command
             _ => {}
         }
     }
+    // `Enter` stages for every target except a plain String/JSON value
+    // (2026-09-22 amendment to ADR-0014, below the Decision heading): a
+    // Hash field's value, the Set add form, and the value part of the Hash
+    // add form (the name part never reaches here — it is routed to
+    // `name_part_key`, above, which keeps `Enter`'s existing "advance to the
+    // value part" meaning) all stage on `Enter` exactly as `⌃S` does. This is
+    // checked ahead of the mutable borrow below so it can hand `state`
+    // straight to `stage_editor` — the same call, and the same
+    // `set_member_blocked` guard, `Action::EditorStage` uses just above. One
+    // call site for "stage from here," so `Enter` cannot refuse something
+    // `⌃S` would let through, or the other way around. A String stays on
+    // `Enter` inserting a newline: it is the one value shape a reader
+    // genuinely needs to type more than one line into.
+    if key.code == KeyCode::Enter
+        && state
+            .open
+            .as_ref()
+            .and_then(OpenKey::typing)
+            .is_some_and(|editor| !matches!(editor.target(), EditTarget::Value))
+    {
+        if set_member_blocked(&state) {
+            return (state, Vec::new());
+        }
+        return stage_editor(state);
+    }
     let Some(editor) = state.open.as_mut().and_then(OpenKey::typing_mut) else {
         return (state, Vec::new());
     };
@@ -514,6 +539,40 @@ mod tests {
         assert_eq!(s.open.as_ref().unwrap().editor().unwrap().text(), b"old");
         let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('y'))));
         assert_eq!(s.open.as_ref().unwrap().editor().unwrap().text(), b"!old");
+    }
+
+    /// The user's explicit exception (2026-09-22 amendment to ADR-0014):
+    /// every other `EditTarget` stages on `Enter` now, but a String is
+    /// genuinely multi-line, so `Enter` still inserts a newline here and
+    /// leaves nothing staged.
+    #[test]
+    fn enter_still_inserts_a_newline_for_a_plain_string_value() {
+        let s = open_with_string("old");
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+        assert!(cmds.is_empty());
+        let text = s.open.as_ref().unwrap().editor().unwrap().text();
+        assert_eq!(text.len(), 4, "one newline byte inserted into \"old\"");
+        assert_eq!(text.iter().filter(|&&b| b == b'\n').count(), 1);
+        assert!(s.confirm.is_none(), "Enter never stages a String edit");
+    }
+
+    /// Same exception for a JSON-classified String — `EditTarget::Value`
+    /// covers both (2026-09-22 amendment to ADR-0014).
+    #[test]
+    fn enter_still_inserts_a_newline_for_a_json_value() {
+        let s = open_with_json("{\"a\":1}");
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let before = s.open.as_ref().unwrap().editor().unwrap().text();
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+        assert!(cmds.is_empty());
+        assert!(s.confirm.is_none());
+        let after = s.open.as_ref().unwrap().editor().unwrap().text();
+        assert_eq!(after.len(), before.len() + 1, "one newline byte inserted");
+        assert_eq!(
+            after.iter().filter(|&&b| b == b'\n').count(),
+            before.iter().filter(|&&b| b == b'\n').count() + 1
+        );
     }
 
     #[test]
@@ -1325,6 +1384,45 @@ mod hash_field_edit_tests {
         );
     }
 
+    // ── 2026-09-22 amendment to ADR-0014: `Enter` stages a Hash field ──────
+
+    #[test]
+    fn enter_stages_an_existing_hash_field_exactly_like_ctrl_s() {
+        let s = with_cursor(open_with_hash(&[("f", "old")], 1), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let s = type_text(s, "!");
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+        assert!(cmds.is_empty(), "Enter only opens the confirm dialog");
+        match &s.confirm {
+            Some(PendingMutation::SetHashField {
+                name, field, new, ..
+            }) => {
+                assert_eq!(name, b"k");
+                assert_eq!(field, b"f");
+                assert_eq!(new, b"!old");
+            }
+            other => panic!("expected a staged SetHashField, got {other:?}"),
+        }
+        // Staging is not executing: nothing runs until `y` confirms it.
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Command::Execute { .. })),
+            "Enter must never itself execute a write"
+        );
+        let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        assert_eq!(
+            cmds,
+            vec![Command::Execute {
+                mutation: Mutation::SetHashField {
+                    key: "k".into(),
+                    field: b"f".to_vec(),
+                    value: b"!old".to_vec()
+                },
+                index: None,
+            }],
+            "the write Enter staged is identical to the one Ctrl-S would have"
+        );
+    }
+
     #[test]
     fn ctrl_s_with_no_change_to_a_hash_field_closes_silently() {
         let s = with_cursor(open_with_hash(&[("f", "v")], 1), 0);
@@ -1417,6 +1515,29 @@ mod hash_field_edit_tests {
     }
 
     #[test]
+    fn enter_on_the_value_part_stages_add_hash_field_instead_of_a_newline() {
+        // The name part's own `Enter` meaning ("advance to the value part")
+        // is unchanged — this is `Enter` pressed a second time, once already
+        // on the value part, which now stages rather than inserting a
+        // newline (2026-09-22 amendment to ADR-0014).
+        let s = open_with_hash(&[("f", "v")], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "new");
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+        let s = type_text(s, "value");
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+        assert!(cmds.is_empty(), "Enter only opens the confirm dialog");
+        match &s.confirm {
+            Some(PendingMutation::AddHashField { name, field, value }) => {
+                assert_eq!(name, b"k");
+                assert_eq!(field, b"new");
+                assert_eq!(value, b"value");
+            }
+            other => panic!("expected a staged AddHashField, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn down_also_moves_to_the_value_part() {
         let s = open_with_hash(&[("f", "v")], 1);
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
@@ -1444,13 +1565,16 @@ mod hash_field_edit_tests {
 
     #[test]
     fn up_inside_a_multiline_value_moves_up_a_line_and_stays_in_the_value_part() {
+        // `Enter` now stages the Hash add form's value part (2026-09-22
+        // amendment to ADR-0014), so it can no longer be used to build a
+        // multi-line value the way it once could — a paste is the one
+        // remaining way to get a newline into this form's value part
+        // (`update::paste`, `insert_str` keeps `\n` outside the name part).
         let s = open_with_hash(&[("f", "v")], 1);
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
         let s = type_text(s, "new");
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
-        let s = type_text(s, "line1");
-        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
-        let s = type_text(s, "line2");
+        let (s, _) = update(s, Msg::Paste("line1\nline2".to_string()));
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Up)));
         let editor = s.open.as_ref().unwrap().editor().unwrap();
         assert_eq!(
@@ -2087,6 +2211,57 @@ mod set_member_edit_tests {
                 },
                 index: None,
             }]
+        );
+    }
+
+    // ── 2026-09-22 amendment to ADR-0014: `Enter` stages a Set member ──────
+
+    #[test]
+    fn enter_stages_add_set_member_exactly_like_ctrl_s() {
+        // ADR-0016 D3 originally kept `Enter` as an ordinary newline on this
+        // form, since a Set member has no name part to have advanced through
+        // first. The 2026-09-22 ADR-0014 amendment supersedes that: every
+        // target except a plain String now stages on `Enter`, member
+        // included.
+        let s = open_with_set(&["alpha"], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "beta");
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+        assert!(cmds.is_empty(), "Enter only opens the confirm dialog");
+        match &s.confirm {
+            Some(PendingMutation::AddSetMember { name, member }) => {
+                assert_eq!(name, b"k");
+                assert_eq!(member, b"beta");
+            }
+            other => panic!("expected a staged AddSetMember, got {other:?}"),
+        }
+        let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        assert_eq!(
+            cmds,
+            vec![Command::Execute {
+                mutation: Mutation::AddSetMember {
+                    key: "k".into(),
+                    member: b"beta".to_vec(),
+                },
+                index: None,
+            }],
+            "the write Enter staged is identical to the one Ctrl-S would have"
+        );
+    }
+
+    #[test]
+    fn a_shown_duplicate_member_blocks_enter_exactly_as_it_blocks_ctrl_s() {
+        // Both keys route through `set_member_blocked` at the same call
+        // site, so a refusal cannot drift between them.
+        let s = open_with_set(&["dup"], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "dup");
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+        assert!(cmds.is_empty());
+        assert!(s.confirm.is_none(), "Enter blocked");
+        assert!(
+            s.open.as_ref().unwrap().is_editing(),
+            "the buffer stays open, not discarded"
         );
     }
 

@@ -17,7 +17,8 @@ use crate::clock::Clock;
 use crate::keymap::{Action, key_label};
 use crate::state::value::Value;
 use crate::state::{
-    Attachment, EditBuffer, FieldPart, Link, Liveness, PendingMutation, PendingRead, State,
+    Attachment, EditBuffer, EditTarget, FieldPart, Link, Liveness, PendingMutation, PendingRead,
+    State,
 };
 use crate::theme::{Theme, Token, env_token};
 use crate::update::{Mode, mode};
@@ -1170,6 +1171,15 @@ pub fn hint_bar(state: &State) -> String {
     // vocabulary, since `⌃S`/`↑` mean nothing there yet.
     if let Some(editor) = state.open.as_ref().and_then(crate::state::OpenKey::typing) {
         let cancel = state.keymap.hint(Action::Cancel).unwrap_or_default();
+        // `Enter` stages every target except a plain String/JSON value
+        // (2026-09-22 amendment to ADR-0014) — the hint names whichever key
+        // actually does it, per target, rather than always naming the
+        // keymap's `EditorStage` binding. `Enter` itself is not a rebindable
+        // action (ADR-0014: `⌃S` was chosen over it precisely because no
+        // terminal reliably tells "commit" from "insert a newline"), so it is
+        // spelled out here the same way the name part's own "Enter value"
+        // wording already is, a few lines below.
+        let is_value = matches!(editor.target(), EditTarget::Value);
         match editor.active_part() {
             Some(FieldPart::Name) => {
                 let duplicate = state
@@ -1184,14 +1194,20 @@ pub fn hint_bar(state: &State) -> String {
                 };
             }
             Some(FieldPart::Value) => {
-                let stage = state.keymap.hint(Action::EditorStage).unwrap_or_default();
+                // Only reachable for the Hash add form's value part — the
+                // name part returns above — so `is_value` is always false
+                // here and `Enter` always stages.
                 let undo = state.keymap.hint(Action::EditorUndo).unwrap_or_default();
-                return format!("{stage} stage · ↑ field · {undo} undo · {cancel} cancel");
+                return format!("Enter stage · ↑ field · {undo} undo · {cancel} cancel");
             }
             None => {
                 let stage = state.keymap.hint(Action::EditorStage).unwrap_or_default();
                 let undo = state.keymap.hint(Action::EditorUndo).unwrap_or_default();
-                return format!("{stage} stage   {undo} undo   {cancel} cancel");
+                return if is_value {
+                    format!("{stage} stage   {undo} undo   {cancel} cancel")
+                } else {
+                    format!("Enter stage   {undo} undo   {cancel} cancel")
+                };
             }
         }
     }

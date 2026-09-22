@@ -171,6 +171,49 @@ read before the write rather than kept at it. `KEEPTTL` is available at this pro
 - `tokio`'s `process` feature is dropped from `crates/app/Cargo.toml` — nothing left in this crate
   spawns a child process.
 
+## Amendment, 2026-09-22 — `Enter` stages everything except a String
+
+**Decision revised: `Enter` now stages the buffer for [`EditTarget::HashField`], [`EditTarget::
+NewSetMember`], and the value part of [`EditTarget::NewHashField`] — exactly what `⌃S`
+(`Action::EditorStage`) already does, routed through the same `stage_editor` call so the two keys
+cannot drift on what either refuses. `Enter` keeps its original meaning, inserting a newline, for
+[`EditTarget::Value`]** (a String, or a JSON-classified String) **only.** The Hash add form's name
+part is untouched either way — `Enter` there still advances to the value part, so it reads as
+"move forward through the form, and submit at the end" rather than picking up a second, competing
+meaning partway through.
+
+This does not reopen the tension the Decision above closed. That tension was specifically
+*commit vs. insert-a-newline on the same keystroke*, and the reason a modifier could not resolve
+it was that no terminal reliably reports one reliably — Ctrl+Enter and Shift+Enter were both
+surveyed and rejected for exactly that reason, which is why `⌃S` was chosen in the first place.
+This amendment does not ask `Enter` to mean two things at once on one value; it changes which
+*targets* is multi-line at all. A Hash field's value, a Set member, and a Hash add form's value
+part are none of them read as a paragraph — they are short, structured pieces of a collection, the
+same way a Palette entry or a filter line is a single line the reader expects `Enter` to submit.
+A String is the one shape in this app a reader routinely wants to keep typing past a line break —
+a cached API response, a session blob, an arbitrary blob of prose — which is the same reasoning
+the "Single-line prompts only" alternative was rejected for, below. So the rule is not "guess which
+keystroke was meant"; it is "read whether *this value* is the kind of thing a newline belongs in,"
+decided once, from `EditTarget`, before the first keystroke ever arrives.
+
+**The cost, stated plainly: a Hash field value or a Set member that itself needs to contain a
+newline can no longer be typed by pressing `Enter` inline.** Nothing stops such a value existing —
+Redis puts no such constraint on a field or a member — only this app's inline editor's ability to
+type one in directly. The `$EDITOR` escape hatch this ADR already named as a later, separate,
+hardened change (PLAN M2 task 5) is the intended way out for that case: an external editor commits
+on its own terms, not on a keystroke this app has to guess the meaning of. A reader who hits this
+in the meantime still has `Ctrl-S` for every target — `Enter` is a second way to stage, not a
+replacement for the first — but no route left to insert a bare newline mid-value on a Hash field or
+a Set member specifically.
+
+**This also supersedes ADR-0016 D3's phase-3 correction**, which kept `Enter` as an ordinary
+newline on the Set add form precisely because that form has no name part for `Enter` to have
+"advanced through" first. That reasoning does not survive this amendment: the add form's value
+part is treated the same as a Hash field's value now, on the strength of the same String/non-String
+line above, not on whether a name part sits ahead of it. ADR-0016 itself is left as it reads —
+its account of *why* the phase-3 correction was made at the time is still accurate history — but
+readers of it should treat this section as the current behaviour of `Enter` on a Set add form.
+
 ## Sources
 
 - ratatui recipe, spawn vim: <https://ratatui.rs/recipes/apps/spawn-vim/>

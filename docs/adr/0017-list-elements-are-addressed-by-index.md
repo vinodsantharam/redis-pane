@@ -125,11 +125,26 @@ return 1
 in its sentinel state, so this cannot be seen as a spurious flicker by a concurrent reader. The
 sentinel must still not collide with a *real* element earlier in the list, or `LREM 1` would remove
 that one instead of the freshly-set sentinel — so it is generated per call as
-`__redis-pane-rp:<random hex>` rather than being a constant. A constant sentinel would be wrong the
-moment two elements of a list ever happened to equal it, however unlikely, and there is no reason
-to accept that risk when a fresh random suffix removes it entirely. Phase 2 sources those bytes
-from the injected randomness the core already has (ADR-0011), not from the shell — matching how the
-clock and terminal size are already injected rather than read live. Verified: deleting index 2 of
+`__redis-pane-rp:<unique suffix>` rather than being a constant. A constant sentinel would be wrong
+the moment two elements of a list ever happened to equal it, however unlikely, and there is no
+reason to accept that risk when a fresh suffix removes it entirely.
+
+**The sentinel is minted in the shell, not the core.** It is a detail of *how* `mutate.rs`
+implements a delete-by-index that Redis has no primitive for — the core's `Mutation` says only
+"remove the element at index `i`, whose bytes were `X`", and carries no sentinel at all. Keeping it
+out of `Mutation` keeps the core's write vocabulary about what the reader asked for rather than
+about the script that achieves it, and it avoids giving `crates/core` a randomness source it does
+not have: there is no `rand` dependency anywhere in the workspace, and `update()`'s own contract is
+"no I/O, no clock, no randomness" (`crates/core/src/update/mod.rs:132`). CLAUDE.md lists randomness
+among the things that *would* be injected if the core needed any; it does not, and this is not the
+feature that should change that.
+
+The suffix needs to be unlikely to equal real user data in one list, not cryptographically random,
+so the shell composes it from the wall clock's nanoseconds and a process-lifetime `AtomicU64`
+counter. No new dependency. The `__redis-pane-rp:` prefix already makes a collision with real data
+far-fetched; the suffix removes the shared-constant case entirely.
+
+Verified: deleting index 2 of
 `[x, y, x, z]` (the *second* `x`) leaves `[x, y, z]`, not `[y, x, z]` — the LREM-by-value hazard
 above, closed. Deleting the only element of a one-element list drops the key, and the
 already-verified stale-index and gone-key refusals apply identically to delete as to edit, since

@@ -116,9 +116,20 @@ return 1
 `ARGV[3]` is a sentinel. Because a Lua script is atomic, no other client can ever observe the list
 in its sentinel state. The sentinel must still not collide with a *real* element earlier in the
 list, or `LREM 1` would remove that one instead — so it is generated per call as
-`__redis-pane-rp:<random hex>` rather than being a constant. Phase 2 sources those bytes from the
-injected randomness the core already has (ADR-0011), not from the shell. Verified: deleting index 2
-of `[x, y, x, z]` leaves `[x, y, z]`, and deleting the only element drops the key.
+`__redis-pane-rp:<unique suffix>` rather than being a constant.
+
+**The sentinel is minted in the shell** (`crates/app/src/redis/mutate.rs`), not the core, and does
+not appear in `Mutation` at all: the core says "remove the element at index `i`, whose bytes were
+`X`" and the shell decides how. The corrected plan text: an earlier draft of this decision said the
+core would source the bytes from "the injected randomness the core already has (ADR-0011)". **It has
+none** — there is no `rand` dependency anywhere in the workspace, and `update()`'s contract is
+literally "no I/O, no clock, no randomness" (`crates/core/src/update/mod.rs:132`). Do not add one
+for this. The shell composes the suffix from wall-clock nanoseconds plus a process-lifetime
+`AtomicU64` counter, which needs no new dependency and is more than unique enough for something
+whose only job is to not equal a real element of one list.
+
+Verified: deleting index 2 of `[x, y, x, z]` leaves `[x, y, z]`, and deleting the only element
+drops the key.
 
 ```lua
 -- add: LPUSH/RPUSH, never recreating the key

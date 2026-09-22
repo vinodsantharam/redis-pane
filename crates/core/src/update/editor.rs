@@ -114,6 +114,28 @@ pub(super) fn open_editor(mut state: State) -> (State, Vec<Command>) {
             Err(text) => (state, notify(text)),
         };
     }
+    // `e` on a ZSet edits the score, never the member (D1, ADR-0018) — a
+    // member is identity, exactly as a Set member is (D1, one type over),
+    // and a member rename joins Hash field rename and Set member rename at
+    // PLAN M2 task 14. Unlike every other row-level edit above, a non-UTF-8
+    // member does **not** refuse here (D5): the score edit never touches the
+    // member's bytes — they travel to the server exactly as read — and the
+    // score itself is always ASCII, so [`EditBuffer::zset_score`] is
+    // infallible, unlike [`EditBuffer::for_hash_field`]/
+    // [`EditBuffer::list_element`] above it.
+    if let Value::ZSet(scored) = value {
+        if !open.cursor_active {
+            return (state, notify("Enter to pick a member"));
+        }
+        let Some((member, score)) = scored.entries.get(open.cursor) else {
+            return (state, notify("Enter to pick a member"));
+        };
+        let buffer = EditBuffer::zset_score(member, *score);
+        if let Some(open) = state.open.as_mut() {
+            open.begin_edit(buffer);
+        }
+        return (state, Vec::new());
+    }
     match EditBuffer::from_value(value, open.cursor) {
         Ok(buffer) => {
             if let Some(open) = state.open.as_mut() {
@@ -163,18 +185,21 @@ pub(super) fn begin_add_entry(mut state: State) -> (State, Vec<Command>) {
     // Exhaustive over `Value`, not a wildcard fallback (PLAN M2 task 8, D8):
     // a fourth addable type (ZSet, task 9) has to make this same decision
     // here, once, rather than silently falling through to this refusal the
-    // way a `_` arm would let it.
+    // way a `_` arm would let it. ZSet's add form is two-part — `MEMBER`
+    // then `SCORE` (D6, ADR-0018) — mirroring the Hash add form's
+    // `FIELD`/`VALUE` shape, unlike Set's/List's single-capture forms.
     let buffer = match &open.value {
         None => return (state, notify("nothing open to edit")),
         Some(Value::Hash(_)) => EditBuffer::new_hash_field(),
         Some(Value::Set(_)) => EditBuffer::new_set_member(),
         Some(Value::List(_)) => EditBuffer::new_list_element(),
-        Some(
-            Value::Str(_) | Value::ZSet(_) | Value::Stream(_) | Value::Json(_) | Value::Binary(_),
-        ) => {
+        Some(Value::ZSet(_)) => EditBuffer::new_zset_member(),
+        Some(Value::Str(_) | Value::Stream(_) | Value::Json(_) | Value::Binary(_)) => {
             return (
                 state,
-                notify("fields can only be added to a hash, members to a set, elements to a list"),
+                notify(
+                    "fields can only be added to a hash, members to a set or zset, elements to a list",
+                ),
             );
         }
     };
@@ -184,18 +209,35 @@ pub(super) fn begin_add_entry(mut state: State) -> (State, Vec<Command>) {
     (state, Vec::new())
 }
 
-/// Whether `Enter`, `↓` and `⌃S` are blocked on the add form's name part
-/// (PLAN M2 task 6 follow-up, D): an empty name, or one already in the
-/// fetched window. `true` with nothing to check at all, so a caller need not
-/// re-verify `open`/`editor` exist first.
-pub(super) fn hash_add_blocked(state: &State) -> bool {
+/// Whether `Enter`, `↓` and `⌃S` are blocked on the add form's name part —
+/// the Hash `FIELD` (PLAN M2 task 6 follow-up, D) or the ZSet `MEMBER` (PLAN
+/// M2 task 9, D6, ADR-0018). `true` with nothing to check at all, so a
+/// caller need not re-verify `open`/`editor` exist first.
+///
+/// The two targets' rules differ by one clause: Hash blocks an empty field
+/// name outright, where a ZSet member does not — Redis allows an empty ZSet
+/// member the same way it allows an empty Set member
+/// ([`OpenKey::set_member_shown_duplicate`]'s doc comment), and D6 names
+/// only the shown-duplicate guard as carrying over from Hash, not
+/// emptiness. `true` for any other target: this function is only ever asked
+/// about a name part, and every other target has none.
+pub(super) fn add_form_name_blocked(state: &State) -> bool {
     let Some(open) = &state.open else {
         return true;
     };
-    let Some(name) = open.editor().and_then(EditBuffer::field_name) else {
+    let Some(editor) = open.editor() else {
         return true;
     };
-    name.is_empty() || open.hash_field_shown_duplicate()
+    match editor.target() {
+        EditTarget::NewHashField { .. } => {
+            let Some(name) = editor.field_name() else {
+                return true;
+            };
+            name.is_empty() || open.hash_field_shown_duplicate()
+        }
+        EditTarget::NewZSetMember { .. } => open.zset_member_shown_duplicate(),
+        _ => true,
+    }
 }
 
 /// Whether `⌃S` is blocked on the Set add form (PLAN M2 task 7, D3,
@@ -213,17 +255,53 @@ pub(super) fn set_member_blocked(state: &State) -> bool {
         .is_some_and(OpenKey::set_member_shown_duplicate)
 }
 
+/// Whether the buffer's current text is a score `⌃S`/`Enter` may stage (D4,
+/// ADR-0018) — checked against the raw buffer text regardless of which part
+/// of the ZSet add form is active, since that text is exactly what
+/// `stage_editor` parses whichever part the reader happens to be looking at.
+/// `true` (nothing to block) for every target but [`EditTarget::ZSetScore`]
+/// and [`EditTarget::NewZSetMember`], so folding this into a guard changes
+/// nothing for the String/Hash/Set/List paths.
+fn zset_score_valid(state: &State) -> bool {
+    let Some(editor) = state.open.as_ref().and_then(OpenKey::typing) else {
+        return true;
+    };
+    match editor.target() {
+        EditTarget::ZSetScore { .. } | EditTarget::NewZSetMember { .. } => {
+            is_valid_zset_score(&String::from_utf8_lossy(&editor.text()))
+        }
+        _ => true,
+    }
+}
+
+/// Whether `⌃S`/`Enter` are blocked from the editor's main capture path —
+/// not the add form's *name* part, gated separately by
+/// [`add_form_name_blocked`] — on a shown Set duplicate (D3, ADR-0016) or an
+/// invalid ZSet score (D4, ADR-0018): either an existing member's score
+/// being edited, or the score half of the ZSet add form. `false` for every
+/// other target, so this adds nothing to the String/Hash-field/Hash-add/List
+/// paths.
+pub(super) fn value_part_stage_blocked(state: &State) -> bool {
+    set_member_blocked(state) || !zset_score_valid(state)
+}
+
 /// Keys read while the add form's name part is active (PLAN M2 task 6
 /// follow-up, F/N) — shaped like the old field-name capture it replaces:
 /// plain characters append, Backspace removes one, Paste appends with
 /// newlines stripped (handled in `update`'s `Msg::Paste` arm, not here).
 /// `Enter`/`↓` advance to the value part and `⌃S` stages directly from here,
-/// all three gated by [`hash_add_blocked`]; `Esc` discards the whole add.
+/// all three gated by [`add_form_name_blocked`]; `Esc` discards the whole add.
 pub(super) fn name_part_key(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
     if let Some(action) = state.keymap.action_for(&key) {
         match action {
             Action::EditorStage => {
-                if hash_add_blocked(&state) {
+                // Staging directly from the name part (never having advanced
+                // to the value/score part) uses whatever that part's buffer
+                // already holds — empty for a fresh Hash add, and D4's
+                // numeric guard must hold here too, or `⌃S` on the ZSet add
+                // form's bare member part would stage an empty, unparseable
+                // score.
+                if add_form_name_blocked(&state) || !zset_score_valid(&state) {
                     return (state, Vec::new());
                 }
                 return stage_editor(state);
@@ -241,7 +319,7 @@ pub(super) fn name_part_key(mut state: State, key: KeyPress) -> (State, Vec<Comm
     }
     match key.code {
         KeyCode::Enter | KeyCode::Down => {
-            if !hash_add_blocked(&state)
+            if !add_form_name_blocked(&state)
                 && let Some(editor) = state.open.as_mut().and_then(OpenKey::typing_mut)
             {
                 editor.advance_to_value();
@@ -423,17 +501,18 @@ pub(super) fn editor_key(mut state: State, key: KeyPress) -> (State, Vec<Command
     }
     if let Some(action) = state.keymap.action_for(&key) {
         match action {
-            // The Set add form's shown-duplicate guard (D3, ADR-0016) is
-            // checked here, not in `stage_editor` itself — `stage_editor` is
-            // also how a confirmed `y` at the dialog is *not* reached (that
-            // goes through `confirm_key`), so the one call site that can
-            // actually short-circuit staging on a duplicate is this key
-            // handler, the same way `hash_add_blocked` gates `⌃S` from the
-            // Hash name part in `name_part_key` above. Every other
-            // `EditTarget` leaves `set_member_blocked` `false`, so this adds
-            // nothing to the String/Hash-field/Hash-add paths.
+            // The Set add form's shown-duplicate guard (D3, ADR-0016) and the
+            // ZSet score's numeric guard (D4, ADR-0018) are checked here, not
+            // in `stage_editor` itself — `stage_editor` is also how a
+            // confirmed `y` at the dialog is *not* reached (that goes through
+            // `confirm_key`), so the one call site that can actually
+            // short-circuit staging on either is this key handler, the same
+            // way `add_form_name_blocked` gates `⌃S` from the name part in
+            // `name_part_key` above. Every other `EditTarget` leaves
+            // `value_part_stage_blocked` `false`, so this adds nothing to the
+            // String/Hash-field/Hash-add/List paths.
             Action::EditorStage => {
-                if set_member_blocked(&state) {
+                if value_part_stage_blocked(&state) {
                     return (state, Vec::new());
                 }
                 return stage_editor(state);
@@ -469,11 +548,11 @@ pub(super) fn editor_key(mut state: State, key: KeyPress) -> (State, Vec<Command
     // value part" meaning) all stage on `Enter` exactly as `⌃S` does. This is
     // checked ahead of the mutable borrow below so it can hand `state`
     // straight to `stage_editor` — the same call, and the same
-    // `set_member_blocked` guard, `Action::EditorStage` uses just above. One
-    // call site for "stage from here," so `Enter` cannot refuse something
-    // `⌃S` would let through, or the other way around. A String stays on
-    // `Enter` inserting a newline: it is the one value shape a reader
-    // genuinely needs to type more than one line into.
+    // `value_part_stage_blocked` guard, `Action::EditorStage` uses just
+    // above. One call site for "stage from here," so `Enter` cannot refuse
+    // something `⌃S` would let through, or the other way around. A String
+    // stays on `Enter` inserting a newline: it is the one value shape a
+    // reader genuinely needs to type more than one line into.
     if key.code == KeyCode::Enter
         && state
             .open
@@ -481,7 +560,7 @@ pub(super) fn editor_key(mut state: State, key: KeyPress) -> (State, Vec<Command
             .and_then(OpenKey::typing)
             .is_some_and(|editor| !matches!(editor.target(), EditTarget::Value))
     {
-        if set_member_blocked(&state) {
+        if value_part_stage_blocked(&state) {
             return (state, Vec::new());
         }
         return stage_editor(state);
@@ -3544,5 +3623,786 @@ mod zset_score_staging_tests {
             ),
             "{staged:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod zset_score_edit_tests {
+    //! `e`/`a`/`d` on a ZSet row (PLAN M2 task 9 phase 3, ADR-0018): `e`
+    //! opens the score editor (D1, D5), `a` opens the two-part `MEMBER`/
+    //! `SCORE` add form (D6), and `d` stages `ZREM` (D8) — sharing the same
+    //! chokepoint and R3.8 guard the Hash/Set/List wiring above does.
+
+    use super::*;
+    use crate::msg::KeyCode;
+    use crate::state::value::ScoredValue;
+
+    fn open_with_zset(entries: &[(&[u8], f64)], total: usize) -> State {
+        let value = crate::state::Value::ZSet(ScoredValue {
+            entries: entries.iter().map(|(m, s)| (m.to_vec(), *s)).collect(),
+            total,
+        });
+        let mut state = State {
+            cols: 130,
+            rows: 40,
+            focus: Pane::Value,
+            open: Some(OpenKey::new(Some(0), "k".into(), value, -1, 10, 0)),
+            ..State::default()
+        };
+        state.keys.push(b"k");
+        state.rebuild_list();
+        state
+    }
+
+    fn with_cursor(mut s: State, row: usize) -> State {
+        let open = s.open.as_mut().unwrap();
+        open.cursor_active = true;
+        open.cursor = row;
+        s
+    }
+
+    fn type_text(mut s: State, text: &str) -> State {
+        for c in text.chars() {
+            (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char(c))));
+        }
+        s
+    }
+
+    /// Replace the score buffer's whole text — [`EditBuffer::zset_score`]
+    /// opens with the cursor at the *start* of the seeded text, not the end
+    /// (there is no viewer row to map back from the way a String's is), so a
+    /// bare Backspace deletes nothing there. This moves to the end first and
+    /// clears every character before typing the replacement.
+    fn retype_score(mut s: State, new: &str) -> State {
+        (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::End)));
+        for _ in 0..32 {
+            (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Backspace)));
+        }
+        type_text(s, new)
+    }
+
+    // ── D1: `e` opens the score, never the member ───────────────────────────
+
+    #[test]
+    fn e_without_a_cursor_on_a_zset_gives_the_pick_a_member_notice() {
+        let s = open_with_zset(&[(b"alpha", 1.0)], 1);
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        assert!(!s.open.unwrap().is_editing());
+        assert!(
+            matches!(cmds.as_slice(), [Command::Notify { text }] if text == "Enter to pick a member"),
+            "{cmds:?}"
+        );
+    }
+
+    #[test]
+    fn e_on_a_zset_row_opens_the_score_seeded_from_format_score_with_the_member_fixed() {
+        let s = with_cursor(open_with_zset(&[(b"alpha", 3.5)], 1), 0);
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        assert!(
+            s.open.as_ref().unwrap().is_editing(),
+            "R3.8's guard must be up immediately"
+        );
+        let editor = s.open.as_ref().unwrap().editor().unwrap();
+        assert_eq!(
+            editor.target(),
+            &EditTarget::ZSetScore {
+                member: b"alpha".to_vec()
+            }
+        );
+        assert_eq!(
+            editor.text(),
+            b"3.5",
+            "seeded from format_score, not the member"
+        );
+        assert!(cmds.is_empty(), "opening the editor emits no command");
+    }
+
+    /// D5: unlike Hash/Set/List, a binary member does not refuse `e` — the
+    /// score edit never touches the member's bytes.
+    #[test]
+    fn e_on_a_binary_zset_member_edits_the_score_anyway() {
+        let s = with_cursor(open_with_zset(&[(&[0xff, 0x80], 1.0)], 1), 0);
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let open = s.open.unwrap();
+        assert!(open.is_editing(), "D5: a binary member does not refuse e");
+        let editor = open.editor().unwrap();
+        assert_eq!(
+            editor.target(),
+            &EditTarget::ZSetScore {
+                member: vec![0xff, 0x80]
+            }
+        );
+        assert_eq!(editor.text(), b"1");
+        assert!(cmds.is_empty());
+    }
+
+    // ── Focus gating (ADR-0015 D4, mirrored for ZSets) ──────────────────────
+
+    #[test]
+    fn e_in_the_keys_pane_with_a_zset_open_gives_the_tab_notice() {
+        let mut s = open_with_zset(&[(b"alpha", 1.0)], 1);
+        s.focus = Pane::Keys;
+        let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        assert!(
+            matches!(cmds.as_slice(), [Command::Notify { text }] if text == "Tab to the value pane to edit")
+        );
+    }
+
+    #[test]
+    fn a_in_the_keys_pane_with_a_zset_open_gives_the_tab_notice() {
+        let mut s = open_with_zset(&[(b"alpha", 1.0)], 1);
+        s.focus = Pane::Keys;
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        assert!(s.open.as_ref().unwrap().editor().is_none());
+        assert!(
+            matches!(cmds.as_slice(), [Command::Notify { text }] if text == "Tab to the value pane to edit")
+        );
+    }
+
+    #[test]
+    fn d_without_a_cursor_on_a_zset_gives_the_pick_a_member_notice() {
+        let s = open_with_zset(&[(b"alpha", 1.0)], 1);
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        assert!(s.confirm.is_none());
+        assert!(
+            matches!(cmds.as_slice(), [Command::Notify { text }] if text == "Enter to pick a member")
+        );
+    }
+
+    #[test]
+    fn d_in_the_keys_pane_still_stages_delete_key_with_a_zset_open() {
+        let mut s = open_with_zset(&[(b"alpha", 1.0)], 1);
+        s.focus = Pane::Keys;
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        assert!(matches!(s.confirm, Some(PendingMutation::DeleteKey { .. })));
+    }
+
+    // ── D4: the numeric guard blocks ⌃S/Enter while the score is invalid ───
+
+    #[test]
+    fn an_invalid_score_blocks_ctrl_s_on_an_existing_score_edit() {
+        let s = with_cursor(open_with_zset(&[(b"alpha", 1.0)], 1), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        // Replace the seeded "1" with garbage.
+        let s = retype_score(s, "abc");
+        let (s, cmds) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(cmds.is_empty());
+        assert!(s.confirm.is_none(), "⌃S blocked on an invalid score");
+        assert!(
+            s.open.as_ref().unwrap().is_editing(),
+            "the buffer stays open, not discarded"
+        );
+    }
+
+    #[test]
+    fn nan_blocks_ctrl_s_even_though_it_parses_as_an_f64() {
+        let s = with_cursor(open_with_zset(&[(b"alpha", 1.0)], 1), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let s = retype_score(s, "nan");
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(s.confirm.is_none(), "nan must not reach the dialog");
+    }
+
+    #[test]
+    fn enter_is_blocked_the_same_way_ctrl_s_is_on_an_invalid_score() {
+        let s = with_cursor(open_with_zset(&[(b"alpha", 1.0)], 1), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let s = retype_score(s, "abc");
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+        assert!(cmds.is_empty());
+        assert!(s.confirm.is_none(), "Enter blocked exactly as ⌃S is");
+    }
+
+    #[test]
+    fn a_valid_score_unblocks_ctrl_s_and_stages_set_zset_score() {
+        let s = with_cursor(open_with_zset(&[(b"alpha", 1.0)], 1), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let s = retype_score(s, "9.5");
+        let (s, cmds) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(cmds.is_empty());
+        match &s.confirm {
+            Some(PendingMutation::SetZSetScore {
+                name,
+                member,
+                old_score,
+                new_score,
+            }) => {
+                assert_eq!(name, b"k");
+                assert_eq!(member, b"alpha");
+                assert_eq!(*old_score, 1.0);
+                assert_eq!(*new_score, 9.5);
+            }
+            other => panic!("expected a staged SetZSetScore, got {other:?}"),
+        }
+        assert_eq!(s.confirm.as_ref().unwrap().command_text(), "ZADD k alpha");
+        assert_eq!(
+            s.confirm.as_ref().unwrap().guard_text().as_deref(),
+            Some("only if that member still exists")
+        );
+        let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        assert_eq!(
+            cmds,
+            vec![Command::Execute {
+                mutation: Mutation::SetZSetScore {
+                    key: "k".into(),
+                    member: b"alpha".to_vec(),
+                    score: 9.5,
+                },
+                index: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn inf_is_accepted_and_unblocks_ctrl_s() {
+        let s = with_cursor(open_with_zset(&[(b"alpha", 1.0)], 1), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let s = retype_score(s, "inf");
+        let (s, cmds) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(cmds.is_empty());
+        assert!(matches!(
+            s.confirm,
+            Some(PendingMutation::SetZSetScore { new_score, .. }) if new_score.is_infinite()
+        ));
+    }
+
+    // ── D6: the add form is two-part, MEMBER then SCORE ─────────────────────
+
+    #[test]
+    fn a_opens_a_two_part_buffer_on_the_member_part() {
+        let s = open_with_zset(&[(b"alpha", 1.0)], 1);
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        assert!(cmds.is_empty());
+        let open = s.open.as_ref().unwrap();
+        assert!(open.is_editing(), "R3.8's guard is up immediately");
+        let editor = open.editor().unwrap();
+        assert_eq!(
+            editor.target(),
+            &EditTarget::NewZSetMember {
+                member: String::new(),
+                part: FieldPart::Name,
+            }
+        );
+        assert_eq!(editor.active_part(), Some(FieldPart::Name));
+        assert_eq!(editor.field_name(), Some(""));
+    }
+
+    #[test]
+    fn enter_advances_from_the_member_part_to_the_score_part() {
+        let s = open_with_zset(&[(b"alpha", 1.0)], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "beta");
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+        assert!(cmds.is_empty(), "Enter only advances, it does not stage");
+        assert!(s.confirm.is_none());
+        let editor = s.open.as_ref().unwrap().editor().unwrap();
+        assert_eq!(editor.active_part(), Some(FieldPart::Value));
+        assert_eq!(editor.field_name(), Some("beta"), "the member is kept");
+    }
+
+    #[test]
+    fn a_shown_duplicate_member_blocks_advancing_past_the_member_part() {
+        let s = open_with_zset(&[(b"dup", 1.0)], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "dup");
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+        assert!(cmds.is_empty());
+        let editor = s.open.as_ref().unwrap().editor().unwrap();
+        assert_eq!(
+            editor.active_part(),
+            Some(FieldPart::Name),
+            "still on the member part — a shown duplicate blocks the advance"
+        );
+    }
+
+    #[test]
+    fn removing_a_character_unblocks_a_duplicate_member_advance() {
+        let s = open_with_zset(&[(b"dup", 1.0)], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "dup");
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Backspace)));
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+        let editor = s.open.as_ref().unwrap().editor().unwrap();
+        assert_eq!(
+            editor.active_part(),
+            Some(FieldPart::Value),
+            "no longer blocked"
+        );
+    }
+
+    #[test]
+    fn typing_a_member_then_a_score_and_ctrl_s_stages_add_zset_member() {
+        let s = open_with_zset(&[(b"alpha", 1.0)], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "beta");
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+        let s = type_text(s, "3.5");
+        let (s, cmds) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(cmds.is_empty());
+        match &s.confirm {
+            Some(PendingMutation::AddZSetMember {
+                name,
+                member,
+                score,
+            }) => {
+                assert_eq!(name, b"k");
+                assert_eq!(member, b"beta");
+                assert_eq!(*score, 3.5);
+            }
+            other => panic!("expected a staged AddZSetMember, got {other:?}"),
+        }
+        assert_eq!(s.confirm.as_ref().unwrap().command_text(), "ZADD k NX");
+        assert_eq!(
+            s.confirm.as_ref().unwrap().guard_text().as_deref(),
+            Some("only if the key still exists · never overwrites a member's score")
+        );
+        let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        assert_eq!(
+            cmds,
+            vec![Command::Execute {
+                mutation: Mutation::AddZSetMember {
+                    key: "k".into(),
+                    member: b"beta".to_vec(),
+                    score: 3.5,
+                },
+                index: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn an_invalid_score_on_the_add_forms_score_part_blocks_ctrl_s() {
+        let s = open_with_zset(&[(b"alpha", 1.0)], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "beta");
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+        let s = type_text(s, "not-a-number");
+        let (s, cmds) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(cmds.is_empty());
+        assert!(s.confirm.is_none(), "⌃S blocked on an invalid score");
+        assert!(s.open.as_ref().unwrap().is_editing());
+    }
+
+    #[test]
+    fn ctrl_s_directly_from_the_member_part_is_blocked_by_the_empty_unparseable_score() {
+        // The score part's buffer starts empty, and an empty string is not a
+        // valid score — so ⌃S pressed before ever advancing must not stage
+        // an AddZSetMember with an invented score.
+        let s = open_with_zset(&[(b"alpha", 1.0)], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "beta");
+        let (s, cmds) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(cmds.is_empty());
+        assert!(s.confirm.is_none());
+        assert!(s.open.as_ref().unwrap().is_editing());
+    }
+
+    // ── D8: `d` in the value pane stages `DeleteZSetMember` ────────────────
+
+    #[test]
+    fn d_in_the_value_pane_stages_delete_zset_member_and_marks_the_last_member() {
+        let s = with_cursor(open_with_zset(&[(b"only", 1.0)], 1), 0);
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        assert!(cmds.is_empty());
+        match &s.confirm {
+            Some(PendingMutation::DeleteZSetMember {
+                name,
+                member,
+                last_member,
+            }) => {
+                assert_eq!(name, b"k");
+                assert_eq!(member, b"only");
+                assert!(*last_member);
+            }
+            other => panic!("expected a staged DeleteZSetMember, got {other:?}"),
+        }
+        assert_eq!(s.confirm.as_ref().unwrap().command_text(), "ZREM k");
+        assert_eq!(s.confirm.as_ref().unwrap().guard_text(), None);
+    }
+
+    #[test]
+    fn d_with_more_than_one_member_left_is_not_marked_as_the_last() {
+        let s = with_cursor(open_with_zset(&[(b"a", 1.0), (b"b", 2.0)], 2), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        match &s.confirm {
+            Some(PendingMutation::DeleteZSetMember { last_member, .. }) => assert!(!last_member),
+            other => panic!("expected a staged DeleteZSetMember, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn confirming_a_delete_zset_member_issues_zrem() {
+        let s = with_cursor(open_with_zset(&[(b"only", 1.0)], 1), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        assert_eq!(
+            cmds,
+            vec![Command::Execute {
+                mutation: Mutation::DeleteZSetMember {
+                    key: "k".into(),
+                    member: b"only".to_vec(),
+                },
+                index: None,
+            }]
+        );
+    }
+
+    // ── Read-only Mode refuses at confirm, never at the keypress ───────────
+
+    #[test]
+    fn read_only_refuses_all_three_zset_mutations_at_confirm_not_at_the_keypress() {
+        let mutations = [
+            PendingMutation::SetZSetScore {
+                name: b"k".to_vec().into(),
+                member: b"m".to_vec(),
+                old_score: 1.0,
+                new_score: 2.0,
+            },
+            PendingMutation::AddZSetMember {
+                name: b"k".to_vec().into(),
+                member: b"m".to_vec(),
+                score: 1.0,
+            },
+            PendingMutation::DeleteZSetMember {
+                name: b"k".to_vec().into(),
+                member: b"m".to_vec(),
+                last_member: false,
+            },
+        ];
+        for mutation in mutations {
+            let s = State {
+                read_only: Some(ReadOnlyReason::User),
+                confirm: Some(mutation.clone()),
+                ..State::default()
+            };
+            let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+            assert!(s.confirm.is_none(), "{mutation:?}");
+            assert!(
+                matches!(cmds.as_slice(), [Command::Notify { text }] if text.contains("read-only")),
+                "{mutation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_mode_does_not_refuse_e_on_a_zset_only_at_y() {
+        let s = State {
+            read_only: Some(ReadOnlyReason::Environment),
+            ..with_cursor(open_with_zset(&[(b"alpha", 1.0)], 1), 0)
+        };
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        assert!(
+            s.open.as_ref().unwrap().editor().is_some(),
+            "opening is never refused"
+        );
+        assert!(cmds.is_empty());
+        let s = retype_score(s, "9");
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(s.confirm.is_some(), "the preview is composed anyway");
+        let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        assert!(
+            !cmds.iter().any(|c| matches!(
+                c,
+                Command::Execute {
+                    mutation: Mutation::SetZSetScore { .. },
+                    ..
+                }
+            )),
+            "but nothing was actually sent to the server"
+        );
+    }
+
+    // ── `NotWritten::MemberGone`/`MemberExists` hand the buffer back ───────
+
+    #[test]
+    fn not_written_member_gone_names_zadd_and_hands_the_score_edit_back() {
+        let s = with_cursor(open_with_zset(&[(b"alpha", 1.0)], 1), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let s = retype_score(s, "9");
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        let (s, cmds) = update(
+            s,
+            Msg::MutationSettled {
+                mutation: Mutation::SetZSetScore {
+                    key: "k".into(),
+                    member: b"alpha".to_vec(),
+                    score: 9.0,
+                },
+                index: None,
+                result: Ok(MutationOutcome::NotWritten(NotWritten::MemberGone)),
+                at_ms: 5_000,
+            },
+        );
+        assert!(matches!(cmds.as_slice(), [Command::ReadKey { .. }]));
+        let (text, _) = s.error.as_ref().unwrap();
+        assert!(text.contains("ZADD k alpha"), "{text}");
+        assert!(text.contains("member no longer exists"), "{text}");
+        let open = s.open.as_ref().unwrap();
+        assert!(
+            open.is_editing(),
+            "held under R3.8 — the buffer is open again"
+        );
+        assert_eq!(open.editor().unwrap().text(), b"9");
+    }
+
+    #[test]
+    fn not_written_member_exists_names_zadd_nx_and_hands_the_add_form_back() {
+        let s = open_with_zset(&[(b"alpha", 1.0)], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "beta");
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+        let s = type_text(s, "5");
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        let (s, cmds) = update(
+            s,
+            Msg::MutationSettled {
+                mutation: Mutation::AddZSetMember {
+                    key: "k".into(),
+                    member: b"beta".to_vec(),
+                    score: 5.0,
+                },
+                index: None,
+                result: Ok(MutationOutcome::NotWritten(NotWritten::MemberExists)),
+                at_ms: 5_000,
+            },
+        );
+        assert!(matches!(cmds.as_slice(), [Command::ReadKey { .. }]));
+        let (text, _) = s.error.as_ref().unwrap();
+        assert!(text.contains("ZADD k NX"), "{text}");
+        assert!(text.contains("member already exists"), "{text}");
+        assert!(s.open.as_ref().unwrap().is_editing());
+    }
+
+    #[test]
+    fn not_written_key_gone_tombstones_and_hands_the_score_edit_back() {
+        let s = with_cursor(open_with_zset(&[(b"alpha", 1.0)], 1), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let s = retype_score(s, "9");
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        let (s, cmds) = update(
+            s,
+            Msg::MutationSettled {
+                mutation: Mutation::SetZSetScore {
+                    key: "k".into(),
+                    member: b"alpha".to_vec(),
+                    score: 9.0,
+                },
+                index: None,
+                result: Ok(MutationOutcome::NotWritten(NotWritten::KeyGone)),
+                at_ms: 6_000,
+            },
+        );
+        assert!(cmds.is_empty(), "never retried, never recreated");
+        let open = s.open.as_ref().unwrap();
+        assert_eq!(open.deleted_at_ms, Some(6_000));
+        assert!(open.is_editing(), "the buffer is open again");
+        assert_eq!(open.editor().unwrap().text(), b"9");
+    }
+
+    #[test]
+    fn key_gone_under_a_staged_set_zset_score_dialog_closes_and_hands_the_buffer_back() {
+        let s = with_cursor(open_with_zset(&[(b"alpha", 1.0)], 1), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let s = retype_score(s, "9");
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(s.confirm.is_some());
+        let token = s.read_token;
+        let (s, _) = update(
+            s,
+            Msg::ValueGone {
+                token,
+                index: None,
+                name: "k".into(),
+                at_ms: 7_000,
+            },
+        );
+        assert!(
+            s.confirm.is_none(),
+            "the compiler-enforced `dialog_up` match in \
+             `staged_edit_found_key_gone` must recognize SetZSetScore"
+        );
+        let open = s.open.as_ref().unwrap();
+        assert_eq!(open.deleted_at_ms, Some(7_000));
+        assert_eq!(open.editor().unwrap().text(), b"9");
+    }
+
+    #[test]
+    fn key_gone_under_a_staged_add_zset_member_dialog_closes_and_hands_the_buffer_back() {
+        let s = open_with_zset(&[(b"alpha", 1.0)], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "beta");
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+        let s = type_text(s, "5");
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(s.confirm.is_some());
+        let token = s.read_token;
+        let (s, _) = update(
+            s,
+            Msg::ValueGone {
+                token,
+                index: None,
+                name: "k".into(),
+                at_ms: 7_000,
+            },
+        );
+        assert!(s.confirm.is_none());
+        let open = s.open.as_ref().unwrap();
+        assert_eq!(open.deleted_at_ms, Some(7_000));
+        assert_eq!(open.editor().unwrap().field_name(), Some("beta"));
+    }
+
+    #[test]
+    fn key_gone_under_a_staged_delete_zset_member_dialog_simply_closes() {
+        let s = with_cursor(open_with_zset(&[(b"a", 1.0)], 1), 0);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        assert!(s.confirm.is_some());
+        let token = s.read_token;
+        let (s, _) = update(
+            s,
+            Msg::ValueGone {
+                token,
+                index: None,
+                name: "k".into(),
+                at_ms: 7_000,
+            },
+        );
+        assert!(s.confirm.is_none());
+        assert!(s.notice.is_some());
+        let open = s.open.as_ref().unwrap();
+        assert_eq!(open.deleted_at_ms, Some(7_000));
+        assert!(open.editor().is_none(), "delete never had a buffer");
+    }
+
+    #[test]
+    fn a_delete_zset_member_zrem_returning_zero_says_member_not_field() {
+        let s = open_with_zset(&[(b"a", 1.0)], 1);
+        let (s, cmds) = update(
+            s,
+            Msg::MutationSettled {
+                mutation: Mutation::DeleteZSetMember {
+                    key: "k".into(),
+                    member: b"a".to_vec(),
+                },
+                index: None,
+                result: Ok(MutationOutcome::NothingToRemove),
+                at_ms: 5_000,
+            },
+        );
+        assert!(matches!(cmds.as_slice(), [Command::ReadKey { .. }]));
+        assert!(s.error.is_none(), "not an error");
+        let (text, _) = s.notice.as_ref().unwrap();
+        assert!(text.contains("ZREM k"), "{text}");
+        assert!(text.contains("member already gone"), "{text}");
+        assert!(!text.contains("field"), "{text}");
+    }
+
+    // ── R3.8: a live update arriving while the editor is open is held ──────
+
+    #[test]
+    fn an_update_arriving_while_the_zset_score_edit_is_open_is_held() {
+        let s = with_cursor(open_with_zset(&[(b"alpha", 1.0), (b"beta", 2.0)], 2), 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let s = retype_score(s, "9");
+        assert!(s.open.as_ref().unwrap().is_editing());
+        let (s, _) = update(
+            s,
+            Msg::ValueLoaded {
+                token: crate::command::ReadToken::default(),
+                index: Some(0),
+                name: "k".into(),
+                value: crate::state::Value::ZSet(ScoredValue {
+                    entries: vec![(b"alpha".to_vec(), 1.0), (b"changed".to_vec(), 3.0)],
+                    total: 2,
+                }),
+                ttl_seconds: -1,
+                size_bytes: 10,
+                at_ms: 9_000,
+            },
+        );
+        let open = s.open.as_ref().unwrap();
+        assert!(open.pending.is_some(), "held, not applied");
+        assert_eq!(
+            open.editor().unwrap().text(),
+            b"9",
+            "the buffer is never touched (R3.8)"
+        );
+    }
+
+    #[test]
+    fn an_update_arriving_while_the_zset_add_form_is_open_is_held() {
+        let s = open_with_zset(&[(b"alpha", 1.0)], 1);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('a'))));
+        let s = type_text(s, "beta");
+        assert!(s.open.as_ref().unwrap().is_editing());
+        let (s, _) = update(
+            s,
+            Msg::ValueLoaded {
+                token: crate::command::ReadToken::default(),
+                index: Some(0),
+                name: "k".into(),
+                value: crate::state::Value::ZSet(ScoredValue {
+                    entries: vec![(b"alpha".to_vec(), 1.0), (b"changed".to_vec(), 3.0)],
+                    total: 2,
+                }),
+                ttl_seconds: -1,
+                size_bytes: 10,
+                at_ms: 9_000,
+            },
+        );
+        let open = s.open.as_ref().unwrap();
+        assert!(open.pending.is_some(), "held, not applied");
+        assert_eq!(
+            open.editor().unwrap().field_name(),
+            Some("beta"),
+            "the buffer is never touched (R3.8)"
+        );
+    }
+
+    // ── D7 (phase-1 note): a row inside the window behaves identically past
+    //    the 500-member fetch window ──────────────────────────────────────
+
+    #[test]
+    fn a_long_zsets_total_past_the_window_does_not_change_what_e_does_to_a_row_inside_it() {
+        let entries: Vec<(Vec<u8>, f64)> = (0..500)
+            .map(|i| (format!("member-{i}").into_bytes(), i as f64))
+            .collect();
+        let refs: Vec<(&[u8], f64)> = entries.iter().map(|(m, s)| (m.as_slice(), *s)).collect();
+        let s = with_cursor(open_with_zset(&refs, 12_000), 499);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('e'))));
+        let editor = s.open.as_ref().unwrap().editor().unwrap();
+        assert_eq!(
+            editor.target(),
+            &EditTarget::ZSetScore {
+                member: b"member-499".to_vec()
+            }
+        );
+        assert_eq!(editor.text(), b"499");
+    }
+
+    #[test]
+    fn a_long_zsets_total_past_the_window_does_not_change_what_d_does_to_a_row_inside_it() {
+        let entries: Vec<(Vec<u8>, f64)> = (0..500)
+            .map(|i| (format!("member-{i}").into_bytes(), i as f64))
+            .collect();
+        let refs: Vec<(&[u8], f64)> = entries.iter().map(|(m, s)| (m.as_slice(), *s)).collect();
+        let s = with_cursor(open_with_zset(&refs, 12_000), 250);
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
+        match &s.confirm {
+            Some(PendingMutation::DeleteZSetMember {
+                member,
+                last_member,
+                ..
+            }) => {
+                assert_eq!(member, b"member-250");
+                assert!(
+                    !last_member,
+                    "12,000 members total — nowhere near the set's last member"
+                );
+            }
+            other => panic!("expected a staged DeleteZSetMember, got {other:?}"),
+        }
     }
 }

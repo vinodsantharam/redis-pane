@@ -18,7 +18,7 @@ use crate::keymap::{Action, key_label};
 use crate::state::value::{Value, format_score};
 use crate::state::{
     Attachment, EditBuffer, EditTarget, FieldPart, Link, Liveness, PendingMutation, PendingRead,
-    State,
+    State, is_valid_zset_score,
 };
 use crate::theme::{Theme, Token, env_token};
 use crate::update::{Mode, mode};
@@ -1278,12 +1278,29 @@ pub fn hint_bar(state: &State) -> String {
         // spelled out here the same way the name part's own "Enter value"
         // wording already is, a few lines below.
         let is_value = matches!(editor.target(), EditTarget::Value);
+        // D6, ADR-0018: the ZSet add form's name part is a member, not a
+        // Hash field — its own noun and its own duplicate check
+        // ([`crate::state::OpenKey::zset_member_shown_duplicate`]), but the
+        // same two-part shape, so it shares this match arm rather than
+        // duplicating it.
+        let is_zset_add = matches!(editor.target(), EditTarget::NewZSetMember { .. });
         match editor.active_part() {
             Some(FieldPart::Name) => {
-                let duplicate = state
-                    .open
-                    .as_ref()
-                    .is_some_and(|o| o.hash_field_shown_duplicate());
+                let duplicate = state.open.as_ref().is_some_and(|o| {
+                    if is_zset_add {
+                        o.zset_member_shown_duplicate()
+                    } else {
+                        o.hash_field_shown_duplicate()
+                    }
+                });
+                if is_zset_add {
+                    return if duplicate {
+                        let edit = state.keymap.hint(Action::Edit).unwrap_or_default();
+                        format!("member exists — {cancel}, then {edit} its score")
+                    } else {
+                        format!("Enter score · {cancel} cancel")
+                    };
+                }
                 return if duplicate {
                     let edit = state.keymap.hint(Action::Edit).unwrap_or_default();
                     format!("field exists — {cancel}, then {edit} to edit")
@@ -1292,11 +1309,19 @@ pub fn hint_bar(state: &State) -> String {
                 };
             }
             Some(FieldPart::Value) => {
-                // Only reachable for the Hash add form's value part — the
-                // name part returns above — so `is_value` is always false
-                // here and `Enter` always stages.
+                // Reachable for the Hash add form's value part and the ZSet
+                // add form's score part — the name part returns above — so
+                // `is_value` is always false here and `Enter` always stages,
+                // once D4's numeric guard (ZSet only) allows it.
                 let undo = state.keymap.hint(Action::EditorUndo).unwrap_or_default();
-                return format!("Enter stage · ↑ field · {undo} undo · {cancel} cancel");
+                let back = if is_zset_add { "member" } else { "field" };
+                if is_zset_add && !is_valid_zset_score(&String::from_utf8_lossy(&editor.text())) {
+                    // D4's live indicator: `⌃S`/`Enter` are blocked
+                    // (`value_part_stage_blocked`) while this holds, so the
+                    // hint says so rather than silently doing nothing.
+                    return format!("invalid score · ↑ {back} · {undo} undo · {cancel} cancel");
+                }
+                return format!("Enter stage · ↑ {back} · {undo} undo · {cancel} cancel");
             }
             // The List add form (D6, ADR-0017): `Tab` flips Head/Tail rather
             // than inserting a tab character (`editor_key`), so the hint
@@ -1306,6 +1331,19 @@ pub fn hint_bar(state: &State) -> String {
             None if matches!(editor.target(), EditTarget::NewListElement { .. }) => {
                 let undo = state.keymap.hint(Action::EditorUndo).unwrap_or_default();
                 return format!("Enter stage   Tab head/tail   {undo} undo   {cancel} cancel");
+            }
+            // A ZSet score edit — existing member (D1, D4, ADR-0018): no
+            // `MEMBER`/`SCORE` split (`active_part` is `None` the same way a
+            // Hash field edit's is), but the score's own numeric guard
+            // still applies, with the same live indicator the add form's
+            // score part shows above.
+            None if matches!(editor.target(), EditTarget::ZSetScore { .. }) => {
+                let stage = state.keymap.hint(Action::EditorStage).unwrap_or_default();
+                let undo = state.keymap.hint(Action::EditorUndo).unwrap_or_default();
+                if !is_valid_zset_score(&String::from_utf8_lossy(&editor.text())) {
+                    return format!("invalid score · {undo} undo · {cancel} cancel");
+                }
+                return format!("{stage} stage   {undo} undo   {cancel} cancel");
             }
             None => {
                 let stage = state.keymap.hint(Action::EditorStage).unwrap_or_default();
@@ -1364,6 +1402,22 @@ pub fn hint_bar(state: &State) -> String {
         let add = state.keymap.hint(Action::Add).unwrap_or_default();
         let remove = state.keymap.hint(Action::Delete).unwrap_or_default();
         return format!("{edit} edit · {add} add · {remove} remove");
+    }
+    // A ZSet with the value cursor on a row, and the value pane focused: all
+    // three mean something, like a Hash/List (D1, ADR-0018) — but `e` edits
+    // the *score*, never the member (D1), so the hint says `score`, not
+    // `edit`, matching `OpenKey::edit_verb`'s "editing score" wording — the
+    // one word D1 calls out so this is not a surprise.
+    if !state.keys_pane_focused()
+        && state
+            .open
+            .as_ref()
+            .is_some_and(|o| o.cursor_active && matches!(o.value, Some(Value::ZSet(_))))
+    {
+        let edit = state.keymap.hint(Action::Edit).unwrap_or_default();
+        let add = state.keymap.hint(Action::Add).unwrap_or_default();
+        let remove = state.keymap.hint(Action::Delete).unwrap_or_default();
+        return format!("{edit} score · {add} add · {remove} remove");
     }
     [
         Action::Cancel,
@@ -1700,5 +1754,131 @@ mod hint_bar_tests {
         s.open.as_mut().unwrap().begin_edit(buffer);
         let hint = hint_bar(&s);
         assert!(hint.contains("Tab"), "{hint}");
+    }
+}
+
+#[cfg(test)]
+mod zset_hint_bar_tests {
+    //! The hint bar's ZSet-shaped arms (PLAN M2 task 9, D1, D4, D6,
+    //! ADR-0018): the value cursor's `e score · a add · d remove` — `score`,
+    //! not `edit`, per D1 — and D4's live invalid-score indicator on both the
+    //! existing-member editor and the add form's score part.
+
+    use super::*;
+    use crate::render::layout::Pane;
+    use crate::state::open::OpenKey;
+    use crate::state::value::ScoredValue;
+    use crate::state::{EditBuffer, State};
+
+    fn open_with_zset(entries: &[(&[u8], f64)], total: usize) -> State {
+        let value = Value::ZSet(ScoredValue {
+            entries: entries.iter().map(|(m, s)| (m.to_vec(), *s)).collect(),
+            total,
+        });
+        let mut state = State {
+            cols: 130,
+            rows: 40,
+            focus: Pane::Value,
+            open: Some(OpenKey::new(Some(0), "k".into(), value, -1, 10, 0)),
+            ..State::default()
+        };
+        state.keys.push(b"k");
+        state.rebuild_list();
+        state
+    }
+
+    #[test]
+    fn a_zset_with_the_cursor_active_hints_score_not_edit() {
+        let mut s = open_with_zset(&[(b"alpha", 1.0)], 1);
+        s.open.as_mut().unwrap().cursor_active = true;
+        let hint = hint_bar(&s);
+        assert!(hint.contains("score"), "{hint}");
+        assert!(
+            !hint.contains("edit"),
+            "D1: e edits the score, not e edit — {hint}"
+        );
+        assert!(hint.contains("add"), "{hint}");
+        assert!(hint.contains("remove"), "{hint}");
+    }
+
+    #[test]
+    fn a_zset_with_the_cursor_active_but_the_keys_pane_focused_does_not_use_the_zset_hint() {
+        let mut s = open_with_zset(&[(b"alpha", 1.0)], 1);
+        s.open.as_mut().unwrap().cursor_active = true;
+        s.focus = Pane::Keys;
+        let hint = hint_bar(&s);
+        assert!(!hint.contains("score · "), "{hint}");
+    }
+
+    #[test]
+    fn an_existing_score_edit_with_a_valid_score_hints_stage_not_invalid() {
+        let mut s = open_with_zset(&[(b"alpha", 1.0)], 1);
+        s.open
+            .as_mut()
+            .unwrap()
+            .begin_edit(EditBuffer::zset_score(b"alpha", 1.0));
+        let hint = hint_bar(&s);
+        assert!(!hint.contains("invalid"), "{hint}");
+    }
+
+    #[test]
+    fn an_existing_score_edit_with_an_invalid_score_shows_the_live_indicator() {
+        // D4: the buffer's text can be typed into invalidity even though it
+        // was seeded valid — the hint must say so live, since `⌃S` is
+        // silently blocked (`value_part_stage_blocked`) while this holds.
+        let mut s = open_with_zset(&[(b"alpha", 1.0)], 1);
+        let mut buffer = EditBuffer::zset_score(b"alpha", 1.0);
+        buffer.insert_char('x');
+        s.open.as_mut().unwrap().begin_edit(buffer);
+        let hint = hint_bar(&s);
+        assert!(hint.contains("invalid"), "{hint}");
+    }
+
+    #[test]
+    fn the_add_forms_member_part_hints_enter_score() {
+        let mut s = open_with_zset(&[(b"alpha", 1.0)], 1);
+        s.open
+            .as_mut()
+            .unwrap()
+            .begin_edit(EditBuffer::new_zset_member());
+        let hint = hint_bar(&s);
+        assert!(hint.contains("score"), "{hint}");
+    }
+
+    #[test]
+    fn the_add_forms_member_part_names_the_shown_duplicate() {
+        let mut s = open_with_zset(&[(b"dup", 1.0)], 1);
+        let mut buffer = EditBuffer::new_zset_member();
+        buffer.name_push('d');
+        buffer.name_push('u');
+        buffer.name_push('p');
+        s.open.as_mut().unwrap().begin_edit(buffer);
+        let hint = hint_bar(&s);
+        assert!(hint.contains("member exists"), "{hint}");
+    }
+
+    #[test]
+    fn the_add_forms_score_part_with_a_valid_score_hints_stage() {
+        let mut s = open_with_zset(&[(b"alpha", 1.0)], 1);
+        let mut buffer = EditBuffer::new_zset_member();
+        buffer.name_push('b');
+        buffer.advance_to_value();
+        buffer.insert_char('5');
+        s.open.as_mut().unwrap().begin_edit(buffer);
+        let hint = hint_bar(&s);
+        assert!(hint.contains("stage"), "{hint}");
+        assert!(!hint.contains("invalid"), "{hint}");
+    }
+
+    #[test]
+    fn the_add_forms_score_part_with_an_invalid_score_shows_the_live_indicator() {
+        let mut s = open_with_zset(&[(b"alpha", 1.0)], 1);
+        let mut buffer = EditBuffer::new_zset_member();
+        buffer.name_push('b');
+        buffer.advance_to_value();
+        buffer.insert_str("nope");
+        s.open.as_mut().unwrap().begin_edit(buffer);
+        let hint = hint_bar(&s);
+        assert!(hint.contains("invalid"), "{hint}");
     }
 }

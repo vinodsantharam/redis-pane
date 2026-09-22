@@ -603,6 +603,29 @@ impl OpenKey {
         let text = editor.text();
         matches!(&self.value, Some(Value::Set(members)) if members.members.contains(&text))
     }
+
+    /// Whether the reader's typed member, while adding one to a ZSet, matches
+    /// a member already in the fetched window (PLAN M2 task 9, D6,
+    /// ADR-0018) — exact byte equality, mirroring
+    /// [`OpenKey::hash_field_shown_duplicate`] one type over: the member part
+    /// is a name, the same shape a Hash field's name is, unlike
+    /// [`OpenKey::set_member_shown_duplicate`]'s whole-buffer comparison.
+    /// `false` with nothing to check: no editor, an empty member, or a
+    /// target other than [`super::EditTarget::NewZSetMember`]. A hidden
+    /// duplicate outside the window is not this function's job; the `ZADD
+    /// ... NX` guard at write time is what catches those.
+    pub fn zset_member_shown_duplicate(&self) -> bool {
+        let Some(member) = self.editor().and_then(super::EditBuffer::field_name) else {
+            return false;
+        };
+        if member.is_empty() {
+            return false;
+        }
+        matches!(
+            &self.value,
+            Some(Value::ZSet(scored)) if scored.entries.iter().any(|(m, _)| m == member.as_bytes())
+        )
+    }
 }
 
 fn ago(now_ms: u64, then_ms: u64) -> String {

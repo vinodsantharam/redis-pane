@@ -426,36 +426,82 @@ impl EditBuffer {
 
     /// Append to the name being typed. A no-op unless the name part is
     /// active, so a stray call from the wrong mode can never corrupt it.
+    ///
+    /// Exhaustive over [`EditTarget`], not an `if let` (PLAN M2 task 9,
+    /// phase 3 "Found while building"): with two targets now carrying a
+    /// [`FieldPart::Name`] half — [`EditTarget::NewHashField`]'s field and
+    /// [`EditTarget::NewZSetMember`]'s member — an `if let` naming only one
+    /// of them would silently do nothing for the other, exactly the shape
+    /// PLAN M2 task 8's D8 spent a phase eliminating elsewhere. A future
+    /// third add-form-with-a-name target now has to answer this here too.
     pub fn name_push(&mut self, c: char) {
-        if let EditTarget::NewHashField {
-            field,
-            part: FieldPart::Name,
-        } = &mut self.target
-        {
-            field.push(c);
+        match &mut self.target {
+            EditTarget::NewHashField {
+                field,
+                part: FieldPart::Name,
+            } => field.push(c),
+            EditTarget::NewZSetMember {
+                member,
+                part: FieldPart::Name,
+            } => member.push(c),
+            EditTarget::NewHashField { .. }
+            | EditTarget::NewZSetMember { .. }
+            | EditTarget::Value
+            | EditTarget::HashField { .. }
+            | EditTarget::NewSetMember
+            | EditTarget::ListElement { .. }
+            | EditTarget::NewListElement { .. }
+            | EditTarget::ZSetScore { .. } => {}
         }
     }
 
     /// One paste into the name, already stripped of newlines by the caller
     /// (`Msg::Paste`'s job, the same as it is for the filter and the old
-    /// field-name capture).
+    /// field-name capture). Exhaustive for the same reason [`EditBuffer::name_push`] is.
     pub fn name_push_str(&mut self, s: &str) {
-        if let EditTarget::NewHashField {
-            field,
-            part: FieldPart::Name,
-        } = &mut self.target
-        {
-            field.push_str(s);
+        match &mut self.target {
+            EditTarget::NewHashField {
+                field,
+                part: FieldPart::Name,
+            } => field.push_str(s),
+            EditTarget::NewZSetMember {
+                member,
+                part: FieldPart::Name,
+            } => member.push_str(s),
+            EditTarget::NewHashField { .. }
+            | EditTarget::NewZSetMember { .. }
+            | EditTarget::Value
+            | EditTarget::HashField { .. }
+            | EditTarget::NewSetMember
+            | EditTarget::ListElement { .. }
+            | EditTarget::NewListElement { .. }
+            | EditTarget::ZSetScore { .. } => {}
         }
     }
 
+    /// Exhaustive for the same reason [`EditBuffer::name_push`] is.
     pub fn name_pop(&mut self) {
-        if let EditTarget::NewHashField {
-            field,
-            part: FieldPart::Name,
-        } = &mut self.target
-        {
-            field.pop();
+        match &mut self.target {
+            EditTarget::NewHashField {
+                field,
+                part: FieldPart::Name,
+            } => {
+                field.pop();
+            }
+            EditTarget::NewZSetMember {
+                member,
+                part: FieldPart::Name,
+            } => {
+                member.pop();
+            }
+            EditTarget::NewHashField { .. }
+            | EditTarget::NewZSetMember { .. }
+            | EditTarget::Value
+            | EditTarget::HashField { .. }
+            | EditTarget::NewSetMember
+            | EditTarget::ListElement { .. }
+            | EditTarget::NewListElement { .. }
+            | EditTarget::ZSetScore { .. } => {}
         }
     }
 
@@ -463,18 +509,38 @@ impl EditBuffer {
     /// checks the name is non-empty and not a shown duplicate first (PLAN M2
     /// task 6 follow-up, D) — this only ever moves a genuinely blank capture
     /// forward if asked to, so the guard lives once, at the call site.
+    /// Exhaustive for the same reason [`EditBuffer::name_push`] is — D6's
+    /// member→score advance is this same "move from name to value" motion,
+    /// not a new mechanism.
     pub fn advance_to_value(&mut self) {
-        if let EditTarget::NewHashField { part, .. } = &mut self.target {
-            *part = FieldPart::Value;
+        match &mut self.target {
+            EditTarget::NewHashField { part, .. } | EditTarget::NewZSetMember { part, .. } => {
+                *part = FieldPart::Value;
+            }
+            EditTarget::Value
+            | EditTarget::HashField { .. }
+            | EditTarget::NewSetMember
+            | EditTarget::ListElement { .. }
+            | EditTarget::NewListElement { .. }
+            | EditTarget::ZSetScore { .. } => {}
         }
     }
 
     /// Move from the value part back to the name part (`↑` at the top row).
-    /// A no-op outside [`EditTarget::NewHashField`] — there is no name part
-    /// to return to.
+    /// A no-op outside [`EditTarget::NewHashField`]/[`EditTarget::NewZSetMember`] —
+    /// every other target has no name part to return to. Exhaustive for the
+    /// same reason [`EditBuffer::name_push`] is.
     pub fn return_to_name(&mut self) {
-        if let EditTarget::NewHashField { part, .. } = &mut self.target {
-            *part = FieldPart::Name;
+        match &mut self.target {
+            EditTarget::NewHashField { part, .. } | EditTarget::NewZSetMember { part, .. } => {
+                *part = FieldPart::Name;
+            }
+            EditTarget::Value
+            | EditTarget::HashField { .. }
+            | EditTarget::NewSetMember
+            | EditTarget::ListElement { .. }
+            | EditTarget::NewListElement { .. }
+            | EditTarget::ZSetScore { .. } => {}
         }
     }
 

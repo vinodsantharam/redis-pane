@@ -414,3 +414,53 @@ around the `s.fract() == 0.0` branch).
 without a ZSet arm and are correctly phase 3's job (D6's `Enter` advance from `MEMBER` to `SCORE`),
 not this phase's — flagging here only so phase 3 does not have to rediscover which mechanics still
 need wiring, the same courtesy task 8's phase 2 note extended to `staged_edit_found_key_gone`.
+
+**Phase 3.** `e`/`a`/`d` wired in `crates/core/src/update/editor.rs` (`open_editor`,
+`begin_add_entry`, `stage_editor`'s guards) and `crates/core/src/update/viewer.rs`
+(`delete_value_row`); the hint bar in `crates/core/src/render/mod.rs`; a `zset_member_shown_duplicate`
+added to `crates/core/src/state/open.rs`, mirroring `hash_field_shown_duplicate`.
+`crates/core/src/update/confirm.rs` needed **no changes at all** — `confirm_key`,
+`mutation_settled`, `not_written` and `nothing_to_remove` were already exhaustive over
+`PendingMutation`/`Mutation`/`NotWritten` from phase 2 and simply started being exercised the
+moment phase 3 could stage the three new variants; every test that exercises read-only refusal,
+`NotWritten::MemberGone`/`MemberExists`, and the "member already gone" `ZREM` notice passed against
+unmodified phase-2 code.
+
+**The five `EditTarget::NewHashField`-only typing mechanics were made exhaustive**, per this
+phase's brief: `name_push`, `name_push_str`, `name_pop`, `advance_to_value`, `return_to_name` in
+`crates/core/src/state/editor.rs` now match every `EditTarget` variant by name, with
+`NewZSetMember`'s `Enter`-advance sharing the same arm as `NewHashField`'s (both are "move from a
+name part to a value part") and every other variant landing in an explicit empty arm. This is the
+same shape task 8's D8 established for `Mutation`/`PendingMutation`/`NotWritten`/`EditTarget`
+matches at the update/render layer, extended one layer down to `EditBuffer`'s own mutators — a
+third target with a name-typed half (Set member rename or List index rename at task 14, say) will
+now fail to compile here instead of silently doing nothing for it.
+
+**D4's live indicator is the hint bar**, not a widget-level color change: `hint_bar` in
+`crates/core/src/render/mod.rs` checks `is_valid_zset_score` against the buffer's raw text on
+every render and swaps the hint to `invalid score · …` — covering both the existing-member score
+editor (`EditTarget::ZSetScore`, active_part `None`) and the add form's score part
+(`EditTarget::NewZSetMember { part: FieldPart::Value, .. }`) from one helper. The actual block is
+`value_part_stage_blocked` (`update/editor.rs`), which `Ctrl-S` and the generic `Enter`-stages-
+everything-but-`Value` path both route through — one guard, so `Enter` cannot let through what
+`Ctrl-S` refuses, matching the discipline the Set duplicate guard already established.
+
+**D5 stayed working by construction, not by a new check**: `open_editor`'s new ZSet arm calls
+`EditBuffer::zset_score(member, score)` directly — that constructor takes `member: &[u8]` and is
+infallible (phase 2 built it that way specifically so no `Result`/refusal branch could be added by
+mistake), unlike the `Result`-returning `for_hash_field`/`list_element` next to it that do refuse
+non-UTF-8 bytes. There is no `std::str::from_utf8` check to accidentally add on this path; the test
+`e_on_a_binary_zset_member_edits_the_score_anyway` (`crates/core/src/update/editor.rs`) pins that
+opening `e` on a `[0xff, 0x80]` member succeeds and seeds the score text normally.
+
+**One naming decision not in the plan's table**: the ZSet add form's *member*-part duplicate check
+needed its own function (`OpenKey::zset_member_shown_duplicate`, `state/open.rs`) rather than
+reusing `set_member_shown_duplicate` — a ZSet add's member is a *name* being typed
+(`EditBuffer::field_name()` returns it, the same shape a Hash field name is), where a Set add's
+member is the *whole buffer text* with no name/value split at all (ADR-0016 D3). Mirrors
+`hash_field_shown_duplicate` one type over, not `set_member_shown_duplicate`, per D6's own framing
+("mirrors the Hash add form's `FIELD`/`VALUE` shape").
+
+**Nothing noticed but left unfixed this phase** — the four D8-flagged `Value`-matching sites
+(`open_editor`, `begin_add_entry`, `delete_value_row`, `hint_bar`) all got real ZSet arms as this
+phase's actual job, not stubs, and every arm is now exercised by a passing test.

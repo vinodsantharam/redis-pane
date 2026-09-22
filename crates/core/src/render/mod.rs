@@ -20,6 +20,7 @@ use crate::state::{
     Attachment, EditBuffer, FieldPart, Link, Liveness, PendingMutation, PendingRead, State,
 };
 use crate::theme::{Theme, Token, env_token};
+use crate::update::{Mode, mode};
 
 /// Render the whole frame into a fresh buffer of the given size.
 pub fn frame(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect) -> Buffer {
@@ -50,6 +51,10 @@ pub fn frame(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect) -> Buf
     if state.help_open {
         help_overlay(state, theme, area, &mut buf);
     }
+    // Not `mode()`: drawing the dialog is not a precedence question. The
+    // overlay is drawn last, so it is on top whenever one is staged, and
+    // asking the mode here would only buy an `expect` on the way to the
+    // `PendingMutation` this needs anyway.
     if let Some(pending) = &state.confirm {
         confirm_overlay(state, pending, theme, area, &mut buf);
     }
@@ -420,7 +425,7 @@ fn value_pane(
             // read as "the one taking keys right now".
             let name_part = editor.active_part() == Some(FieldPart::Name);
             let value_part = !name_part;
-            let show_marker = open.typing().is_some();
+            let show_marker = mode(state) == Mode::Editing;
             let name_active = show_marker && name_part;
             let value_active = show_marker && value_part;
             // "FIELD"/"VALUE" are both five characters, so one constant
@@ -1136,7 +1141,7 @@ pub fn status_readout(state: &State, clock: &dyn Clock) -> Vec<(String, Token)> 
 /// so there is no binding to look up here either — the hint has to be
 /// hard-coded too, or the fact that Esc clears and exits stays invisible.
 pub fn hint_bar(state: &State) -> String {
-    if state.filtering {
+    if mode(state) == Mode::Filtering {
         return "Esc clear & exit   Enter apply".to_string();
     }
     // The inline editor is a mode of its own (ADR-0014), the same way filter

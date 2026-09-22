@@ -601,7 +601,7 @@ Ordered by blast radius and by what each fix unblocks, not strictly by severity:
 | M8 | Fixed: `connect_or_exit`, `readout` | `ff49f67` |
 | L4 | Fixed: `RowCtx`/`RowAt`; no `too_many_arguments` allows remain | `3333ec1` |
 | M4 | Fixed: the core wraps to the pane and re-wraps on resize and divider moves | `effa1d1` |
-| M2 | **Deferred.** Splitting `update.rs` is a pure move of ~6,600 lines; landed in the same change, it would bury every behaviour change above it. It is cheapest as its own change now that the seams have settled. | — |
+| M2 | Fixed: `update.rs` split into `update/` (`mod.rs`, `link.rs`, `scan.rs`, `keys.rs`, `viewer.rs`, `editor.rs`, `confirm.rs`, `mouse.rs`); `Mode` derived by `mode(&State)` replaces the implicit early-return precedence | `2e71c40`, `3e1326a`, `ca46488`, `eb874f1`, `9346f4e`, `0ed4e02` |
 | M3 | **Deferred, as recommended:** until a second collection type becomes editable. | — |
 | L3 | No change; still worth watching on a `ratatui-textarea` bump. | — |
 
@@ -617,6 +617,18 @@ Ordered by blast radius and by what each fix unblocks, not strictly by severity:
 - **H2's `pub(crate)` fields were not done.** The golden-frame suite in `crates/core/tests` builds
   `State` and `OpenKey` directly. The invariants that mattered — who mints a `ReadToken`, how a session
   starts, what an edit's states are — are now carried by types instead.
+- **M2's own review claimed mode precedence was also re-derived in `keymap::pane_is_on_screen`.**
+  It was not — that function answers pane *visibility* below 70 columns, a different question.
+  Only `render` duplicated the mode question, at two sites (the active-part marker and the hint
+  bar). A third site, the confirm overlay in `frame()`, turned out not to be a precedence question
+  at all: the overlay is drawn last and belongs on top whenever one is staged, so it still reads
+  `state.confirm` directly rather than buying an `expect` on the way to the `PendingMutation` it
+  needs.
+- **The M2 fix deviates from its own plan's sketched layout in two places.** `update/mouse.rs` is
+  new — mouse handling spans both panes (it focuses, scrolls and drags the divider), so it fits
+  neither `keys.rs` nor `viewer.rs`. And the shared read helpers (`issue_read`, `refetch`,
+  `read_key`) stayed in `update/mod.rs` rather than getting a file of their own, since four of the
+  seven submodules call them.
 
 **Defects found while fixing, and fixed:**
 

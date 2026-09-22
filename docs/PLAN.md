@@ -42,7 +42,15 @@ redis-pane/
 │   │   ├── state/             App state, Loaded set arena, Viewer state, Connection state
 │   │   ├── msg.rs             Msg — everything that can happen
 │   │   ├── command.rs         Command — everything the shells must do
-│   │   ├── update.rs          update(State, Msg) -> (State, Vec<Command>)
+│   │   ├── update/            update(State, Msg) -> (State, Vec<Command>)
+│   │   │   ├── mod.rs          update(), key_press(), Mode + mode(), read helpers
+│   │   │   ├── link.rs         connection, tracking and server-condition messages
+│   │   │   ├── scan.rs         scan and metadata batches; the Loaded set cap
+│   │   │   ├── keys.rs         selection, filter capture, tree fold, sort
+│   │   │   ├── viewer.rs       value replies, cursor movement and scroll, copy
+│   │   │   ├── editor.rs       inline edits: open, type, stage
+│   │   │   ├── confirm.rs      the dialog, and what a settled mutation does
+│   │   │   └── mouse.rs        clicks, scroll, divider drags
 │   │   ├── render/            panes, Viewers, title bar, hint bar
 │   │   ├── theme/             semantic tokens, palettes, capability degradation
 │   │   ├── keymap/            bindings as data

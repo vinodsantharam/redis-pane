@@ -349,7 +349,15 @@ impl Viewer for ScoredValue {
 }
 
 /// Scores are f64 but are usually integers; printing `1` beats printing `1.0`.
-fn format_score(s: f64) -> String {
+///
+/// `pub(crate)`, not private: `crate::state::editor::EditBuffer::zset_score`
+/// seeds the score editor with exactly this text (PLAN M2 task 9, D4,
+/// ADR-0018), so what the reader edits is what they saw in the SCORE column.
+/// Display → parse → write is lossless in both branches — see
+/// `format_score_round_trips_losslessly` below — which is what makes that
+/// seeding safe: nothing is lost between what the Viewer showed and what the
+/// editor writes back.
+pub(crate) fn format_score(s: f64) -> String {
     if s.fract() == 0.0 && s.abs() < 1e15 {
         format!("{}", s as i64)
     } else {
@@ -688,6 +696,37 @@ mod tests {
     fn scores_print_as_integers_when_they_are_integers() {
         assert_eq!(format_score(3.0), "3");
         assert_eq!(format_score(1.5), "1.5");
+    }
+
+    /// PLAN M2 task 9, D4/ADR-0018: the score editor seeds its buffer from
+    /// this exact text (`EditBuffer::zset_score`), so display → parse → f64
+    /// must be exact in both branches — the integral `as i64` branch and the
+    /// `{s}` branch, including the infinities, which take the `{s}` branch
+    /// since `f64::INFINITY.fract()` is `NaN`, not `0.0`.
+    #[test]
+    fn format_score_round_trips_losslessly() {
+        let cases = [
+            0.0,
+            3.0,
+            -3.0,
+            100.0,
+            999_999_999_999.0, // integral, well under the 1e15 cutoff
+            1.5,
+            0.1,
+            1.0000000000000002,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ];
+        for s in cases {
+            let text = format_score(s);
+            let parsed: f64 = text
+                .parse()
+                .unwrap_or_else(|e| panic!("{text:?} did not parse back: {e}"));
+            assert_eq!(
+                parsed, s,
+                "{s} printed as {text:?}, parsed back to {parsed}"
+            );
+        }
     }
 
     #[test]

@@ -171,13 +171,26 @@ pub(super) fn nothing_to_remove(
         // Costing nothing now is the point: if a later write does start
         // settling this way, it already says "element".
         Mutation::DeleteListElement { .. } => "element",
+        // Reachable, unlike the List arm above: ADR-0018 D2's remove is a
+        // plain `ZREM`, with `0` removed reported as `NothingToRemove`
+        // exactly as `HDEL`'s and `SREM`'s are — a member, not a field
+        // (CLAUDE.md's glossary), the same reason `NotWritten::MemberGone`
+        // gets its own wording instead of borrowing `FieldGone`'s.
+        Mutation::DeleteZSetMember { .. } => "member",
         Mutation::DeleteKey { .. }
         | Mutation::SetString { .. }
         | Mutation::SetHashField { .. }
         | Mutation::AddHashField { .. }
         | Mutation::AddSetMember { .. }
         | Mutation::SetListElement { .. }
-        | Mutation::AddListElement { .. } => "entry",
+        | Mutation::AddListElement { .. }
+        // Never settles this way — a score edit refuses via
+        // `NotWritten::MemberGone`/`KeyGone`, and an add via
+        // `NotWritten::MemberExists`/`KeyGone` (ADR-0018 D2) — but the
+        // match stays exhaustive over `Mutation`, not a wildcard (PLAN M2
+        // task 8, D8).
+        | Mutation::SetZSetScore { .. }
+        | Mutation::AddZSetMember { .. } => "entry",
     };
     state.notice = Some((
         format!("{}: {what} already gone", mutation.command_label()),
@@ -235,7 +248,8 @@ pub(super) fn not_written(
         NotWritten::FieldGone
         | NotWritten::FieldExists
         | NotWritten::MemberExists
-        | NotWritten::ElementMoved => {
+        | NotWritten::ElementMoved
+        | NotWritten::MemberGone => {
             if let Some(open) = state.open.as_mut() {
                 open.unstage_buffer();
             }
@@ -244,8 +258,9 @@ pub(super) fn not_written(
             // re-reads. `MemberExists` cannot arrive here until `a` on a Set
             // is wired (PLAN M2 task 7 phase 3); `ElementMoved` cannot arrive
             // until `e`/`a`/`d` on a List are wired (PLAN M2 task 8 phase 3,
-            // ADR-0017) — both arms are here because `NotWritten` is matched
-            // exhaustively.
+            // ADR-0017); `MemberGone` cannot arrive until `e` on a ZSet is
+            // wired (PLAN M2 task 9 phase 3, ADR-0018) — every arm is here
+            // because `NotWritten` is matched exhaustively.
             state.error = Some((
                 format!("{command}: {} — nothing written, edit kept", why.reason()),
                 at_ms,

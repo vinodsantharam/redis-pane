@@ -9,7 +9,7 @@
 
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 
-use super::value::{StringValue, Value};
+use super::value::{StringValue, Value, format_score};
 
 /// Values whose raw byte length exceeds this are refused inline (ADR-0014).
 ///
@@ -60,6 +60,28 @@ pub enum EditTarget {
     /// which end `a` will push to; `Tab` toggles it while the form is open
     /// (phase 3's wiring, not this type's job).
     NewListElement { end: super::value::ListEnd },
+    /// The score of one member of the Open ZSet, being overwritten (`ZADD
+    /// ... XX`, guarded — PLAN M2 task 9, D1, D2, D5, ADR-0018). Unlike
+    /// every other row-level [`EditTarget`], the member's bytes are not
+    /// refused for being non-UTF-8 (D5): a score edit never touches them —
+    /// they travel to the server exactly as read — and the score itself is
+    /// always ASCII, so `member` is `Vec<u8>`, not `String`, the same
+    /// binary-safety [`super::value::ScoredValue::entries`] already carries.
+    /// A member is never edited in place (D1, mirroring
+    /// [`EditTarget::NewSetMember`]'s reasoning one type over) — a changed
+    /// member is a rename, deferred to PLAN M2 task 14.
+    ZSetScore { member: Vec<u8> },
+    /// A brand-new member+score of the Open ZSet, not yet on the server
+    /// (`ZADD ... NX`, guarded — PLAN M2 task 9, D2, D3, D6, ADR-0018) — the
+    /// two-part `MEMBER`/`SCORE` add form, mirroring
+    /// [`EditTarget::NewHashField`]'s `FIELD`/`VALUE` shape. `member` is
+    /// itself being typed while `part` is [`FieldPart::Name`]; the score is
+    /// captured while `part` is [`FieldPart::Value`]. Unlike
+    /// [`EditTarget::ZSetScore`], the member here is `String`, not
+    /// `Vec<u8>`: the add form's member capture is text-only and still
+    /// refuses a non-UTF-8 typed member, the same as every other add form
+    /// (D5 only exempts an existing score edit, not a new member's bytes).
+    NewZSetMember { member: String, part: FieldPart },
 }
 
 /// Which half of the add form (`FIELD`/`VALUE`) is active, while adding a new
@@ -298,6 +320,53 @@ impl EditBuffer {
         }
     }
 
+    /// Build a buffer on one ZSet member's score, to overwrite it (`e` on a
+    /// ZSet row, PLAN M2 task 9, D1, D4, D5, ADR-0018).
+    ///
+    /// Seeded from [`format_score`] — the same text the Viewer's SCORE
+    /// column shows — so what the reader edits is exactly what they saw.
+    /// Display → parse → f64 is lossless in both of `format_score`'s
+    /// branches (`state::value`'s own `format_score_round_trips_losslessly`
+    /// pins this), which is what makes seeding the buffer from it safe.
+    /// Unlike [`EditBuffer::for_hash_field`]/[`EditBuffer::list_element`], a
+    /// non-UTF-8 `member` does **not** refuse here (D5): the member's bytes
+    /// never travel back changed — only the score, always ASCII — so there
+    /// is nothing here a text editor could fail to round-trip.
+    pub fn zset_score(member: &[u8], score: f64) -> EditBuffer {
+        let text = format_score(score);
+        let mut area = TextArea::new(vec![text.clone()]);
+        area.set_wrap_mode(WrapMode::WordOrGlyph);
+        area.set_cursor_line_style(ratatui::style::Style::default());
+        EditBuffer {
+            area,
+            original: text.into_bytes(),
+            was_json: false,
+            target: EditTarget::ZSetScore {
+                member: member.to_vec(),
+            },
+        }
+    }
+
+    /// An empty buffer for a member+score that does not exist on the server
+    /// yet (`a` on a ZSet, PLAN M2 task 9, D6, ADR-0018). Two-part, like
+    /// [`EditBuffer::new_hash_field`] — a member is typed first, then
+    /// `Enter` advances to the score — opening on the member part with both
+    /// halves empty.
+    pub fn new_zset_member() -> EditBuffer {
+        let mut area = TextArea::new(vec![String::new()]);
+        area.set_wrap_mode(WrapMode::WordOrGlyph);
+        area.set_cursor_line_style(ratatui::style::Style::default());
+        EditBuffer {
+            area,
+            original: Vec::new(),
+            was_json: false,
+            target: EditTarget::NewZSetMember {
+                member: String::new(),
+                part: FieldPart::Name,
+            },
+        }
+    }
+
     /// What this buffer writes back when staged.
     pub fn target(&self) -> &EditTarget {
         &self.target
@@ -310,10 +379,19 @@ impl EditBuffer {
     pub fn field_name(&self) -> Option<&str> {
         match &self.target {
             EditTarget::HashField { field } | EditTarget::NewHashField { field, .. } => Some(field),
+            // The member being typed, the same shape a Hash field's name is
+            // (PLAN M2 task 9, D6, ADR-0018) — the add form's member capture
+            // is text, unlike `ZSetScore`'s.
+            EditTarget::NewZSetMember { member, .. } => Some(member),
             EditTarget::Value
             | EditTarget::NewSetMember
             | EditTarget::ListElement { .. }
-            | EditTarget::NewListElement { .. } => None,
+            | EditTarget::NewListElement { .. }
+            // Not a name being typed or fixed — a score edit's member is
+            // fixed identity carried as bytes (D5), not necessarily UTF-8,
+            // so there is no `&str` to hand back here even if there were a
+            // reason to.
+            | EditTarget::ZSetScore { .. } => None,
         }
     }
 
@@ -330,46 +408,100 @@ impl EditBuffer {
     pub fn active_part(&self) -> Option<FieldPart> {
         match &self.target {
             EditTarget::NewHashField { part, .. } => Some(*part),
+            // PLAN M2 task 9, D6, ADR-0018: the case the M3 inventory
+            // predicted would need a real `Some(..)` here — a ZSet add's
+            // `MEMBER`/`SCORE` split is exactly `FieldPart`-shaped, the same
+            // way the Hash add form's `FIELD`/`VALUE` split is.
+            EditTarget::NewZSetMember { part, .. } => Some(*part),
             EditTarget::Value
             | EditTarget::HashField { .. }
             | EditTarget::NewSetMember
             | EditTarget::ListElement { .. }
-            | EditTarget::NewListElement { .. } => None,
+            | EditTarget::NewListElement { .. }
+            // A score edit has no FIELD/VALUE-shaped split — one field, the
+            // score, always active (D1).
+            | EditTarget::ZSetScore { .. } => None,
         }
     }
 
     /// Append to the name being typed. A no-op unless the name part is
     /// active, so a stray call from the wrong mode can never corrupt it.
+    ///
+    /// Exhaustive over [`EditTarget`], not an `if let` (PLAN M2 task 9,
+    /// phase 3 "Found while building"): with two targets now carrying a
+    /// [`FieldPart::Name`] half — [`EditTarget::NewHashField`]'s field and
+    /// [`EditTarget::NewZSetMember`]'s member — an `if let` naming only one
+    /// of them would silently do nothing for the other, exactly the shape
+    /// PLAN M2 task 8's D8 spent a phase eliminating elsewhere. A future
+    /// third add-form-with-a-name target now has to answer this here too.
     pub fn name_push(&mut self, c: char) {
-        if let EditTarget::NewHashField {
-            field,
-            part: FieldPart::Name,
-        } = &mut self.target
-        {
-            field.push(c);
+        match &mut self.target {
+            EditTarget::NewHashField {
+                field,
+                part: FieldPart::Name,
+            } => field.push(c),
+            EditTarget::NewZSetMember {
+                member,
+                part: FieldPart::Name,
+            } => member.push(c),
+            EditTarget::NewHashField { .. }
+            | EditTarget::NewZSetMember { .. }
+            | EditTarget::Value
+            | EditTarget::HashField { .. }
+            | EditTarget::NewSetMember
+            | EditTarget::ListElement { .. }
+            | EditTarget::NewListElement { .. }
+            | EditTarget::ZSetScore { .. } => {}
         }
     }
 
     /// One paste into the name, already stripped of newlines by the caller
     /// (`Msg::Paste`'s job, the same as it is for the filter and the old
-    /// field-name capture).
+    /// field-name capture). Exhaustive for the same reason [`EditBuffer::name_push`] is.
     pub fn name_push_str(&mut self, s: &str) {
-        if let EditTarget::NewHashField {
-            field,
-            part: FieldPart::Name,
-        } = &mut self.target
-        {
-            field.push_str(s);
+        match &mut self.target {
+            EditTarget::NewHashField {
+                field,
+                part: FieldPart::Name,
+            } => field.push_str(s),
+            EditTarget::NewZSetMember {
+                member,
+                part: FieldPart::Name,
+            } => member.push_str(s),
+            EditTarget::NewHashField { .. }
+            | EditTarget::NewZSetMember { .. }
+            | EditTarget::Value
+            | EditTarget::HashField { .. }
+            | EditTarget::NewSetMember
+            | EditTarget::ListElement { .. }
+            | EditTarget::NewListElement { .. }
+            | EditTarget::ZSetScore { .. } => {}
         }
     }
 
+    /// Exhaustive for the same reason [`EditBuffer::name_push`] is.
     pub fn name_pop(&mut self) {
-        if let EditTarget::NewHashField {
-            field,
-            part: FieldPart::Name,
-        } = &mut self.target
-        {
-            field.pop();
+        match &mut self.target {
+            EditTarget::NewHashField {
+                field,
+                part: FieldPart::Name,
+            } => {
+                field.pop();
+            }
+            EditTarget::NewZSetMember {
+                member,
+                part: FieldPart::Name,
+            } => {
+                member.pop();
+            }
+            EditTarget::NewHashField { .. }
+            | EditTarget::NewZSetMember { .. }
+            | EditTarget::Value
+            | EditTarget::HashField { .. }
+            | EditTarget::NewSetMember
+            | EditTarget::ListElement { .. }
+            | EditTarget::NewListElement { .. }
+            | EditTarget::ZSetScore { .. } => {}
         }
     }
 
@@ -377,18 +509,38 @@ impl EditBuffer {
     /// checks the name is non-empty and not a shown duplicate first (PLAN M2
     /// task 6 follow-up, D) — this only ever moves a genuinely blank capture
     /// forward if asked to, so the guard lives once, at the call site.
+    /// Exhaustive for the same reason [`EditBuffer::name_push`] is — D6's
+    /// member→score advance is this same "move from name to value" motion,
+    /// not a new mechanism.
     pub fn advance_to_value(&mut self) {
-        if let EditTarget::NewHashField { part, .. } = &mut self.target {
-            *part = FieldPart::Value;
+        match &mut self.target {
+            EditTarget::NewHashField { part, .. } | EditTarget::NewZSetMember { part, .. } => {
+                *part = FieldPart::Value;
+            }
+            EditTarget::Value
+            | EditTarget::HashField { .. }
+            | EditTarget::NewSetMember
+            | EditTarget::ListElement { .. }
+            | EditTarget::NewListElement { .. }
+            | EditTarget::ZSetScore { .. } => {}
         }
     }
 
     /// Move from the value part back to the name part (`↑` at the top row).
-    /// A no-op outside [`EditTarget::NewHashField`] — there is no name part
-    /// to return to.
+    /// A no-op outside [`EditTarget::NewHashField`]/[`EditTarget::NewZSetMember`] —
+    /// every other target has no name part to return to. Exhaustive for the
+    /// same reason [`EditBuffer::name_push`] is.
     pub fn return_to_name(&mut self) {
-        if let EditTarget::NewHashField { part, .. } = &mut self.target {
-            *part = FieldPart::Name;
+        match &mut self.target {
+            EditTarget::NewHashField { part, .. } | EditTarget::NewZSetMember { part, .. } => {
+                *part = FieldPart::Name;
+            }
+            EditTarget::Value
+            | EditTarget::HashField { .. }
+            | EditTarget::NewSetMember
+            | EditTarget::ListElement { .. }
+            | EditTarget::NewListElement { .. }
+            | EditTarget::ZSetScore { .. } => {}
         }
     }
 
@@ -482,6 +634,23 @@ impl EditBuffer {
 
     pub fn redo(&mut self) {
         self.area.redo();
+    }
+}
+
+/// Whether `text` is a score `⌃S` may stage (PLAN M2 task 9, D4, ADR-0018).
+///
+/// Accepts what Redis's `ZADD` accepts: decimal and exponent floats, and
+/// `inf`/`+inf`/`-inf` case-insensitively (`str::parse::<f64>()` already
+/// covers all of that). **`nan` must be rejected explicitly, after
+/// parsing** — `str::parse::<f64>()` accepts `"nan"`/`"NaN"`/`"NAN"`
+/// case-insensitively, so a successful parse is not by itself proof Redis
+/// will accept the value: it refuses `nan` with `ERR value is not a valid
+/// float`, and finding that out after the confirm dialog is strictly worse
+/// than being told while typing (R4.4).
+pub fn is_valid_zset_score(text: &str) -> bool {
+    match text.parse::<f64>() {
+        Ok(value) => !value.is_nan(),
+        Err(_) => false,
     }
 }
 
@@ -722,5 +891,92 @@ mod tests {
         assert!(buf.is_dirty());
         buf.undo();
         assert!(!buf.is_dirty());
+    }
+
+    #[test]
+    fn zset_score_opens_seeded_from_format_score_with_the_member_fixed() {
+        let buf = EditBuffer::zset_score(b"alpha", 3.5);
+        assert_eq!(
+            buf.target(),
+            &EditTarget::ZSetScore {
+                member: b"alpha".to_vec()
+            }
+        );
+        assert_eq!(buf.text(), b"3.5");
+        assert_eq!(buf.field_name(), None, "a score edit has no field name");
+        assert_eq!(buf.active_part(), None, "no MEMBER/SCORE split for an edit");
+        assert!(!buf.was_json());
+    }
+
+    #[test]
+    fn zset_score_seeds_integral_scores_without_a_decimal_point() {
+        let buf = EditBuffer::zset_score(b"alpha", 3.0);
+        assert_eq!(buf.text(), b"3");
+    }
+
+    #[test]
+    fn a_binary_member_does_not_block_a_zset_score_edit() {
+        // D5: unlike every other row-level edit, a non-UTF-8 member is not
+        // refused — the score edit never touches the member's bytes.
+        let buf = EditBuffer::zset_score(b"m\xff\x80", 1.0);
+        assert_eq!(
+            buf.target(),
+            &EditTarget::ZSetScore {
+                member: b"m\xff\x80".to_vec()
+            }
+        );
+    }
+
+    #[test]
+    fn new_zset_member_opens_a_two_part_form_on_the_member_part() {
+        let buf = EditBuffer::new_zset_member();
+        assert_eq!(
+            buf.target(),
+            &EditTarget::NewZSetMember {
+                member: String::new(),
+                part: FieldPart::Name,
+            }
+        );
+        assert_eq!(buf.field_name(), Some(""));
+        assert_eq!(
+            buf.active_part(),
+            Some(FieldPart::Name),
+            "D6: the M3 inventory's predicted case — a real Some(..), not the old wildcard's None"
+        );
+        assert_eq!(buf.text(), b"");
+        assert!(!buf.was_json());
+    }
+
+    #[test]
+    fn is_valid_zset_score_accepts_what_redis_accepts() {
+        for text in [
+            "1",
+            "-1",
+            "0",
+            "0.1",
+            "-3.5",
+            "1e10",
+            "-1e10",
+            "1.0000000000000002",
+            "inf",
+            "+inf",
+            "-inf",
+            "INF",
+            "Infinity",
+            "+Infinity",
+            "-infinity",
+        ] {
+            assert!(is_valid_zset_score(text), "{text:?} should be accepted");
+        }
+    }
+
+    #[test]
+    fn is_valid_zset_score_rejects_nan_and_garbage() {
+        for text in [
+            "nan", "NaN", "NAN", "+nan", "-nan", "", " ", "  ", "abc", "1.2.3", "1,5", "1_000",
+            "0x10", "--1", "1e", "inf inf",
+        ] {
+            assert!(!is_valid_zset_score(text), "{text:?} should be rejected");
+        }
     }
 }

@@ -412,10 +412,30 @@ pub(super) fn delete_value_row(mut state: State) -> (State, Vec<Command>) {
             });
             (state, Vec::new())
         }
-        Some(
-            Value::Str(_) | Value::ZSet(_) | Value::Stream(_) | Value::Json(_) | Value::Binary(_),
-        )
-        | None => (state, notify("nothing to remove here")),
+        // `d` on a ZSet stages `ZREM` (D8, ADR-0018): same `total == 1`
+        // snapshot-at-staging-time discipline as `last_field`/`last_member`/
+        // `last_element` above — the cursor's row is the member the reader
+        // was looking at, captured before the dialog can be raced by a
+        // concurrent write.
+        Some(Value::ZSet(scored)) => {
+            if !open.cursor_active {
+                return (state, notify("Enter to pick a member"));
+            }
+            let Some((member, _)) = scored.entries.get(open.cursor).cloned() else {
+                return (state, notify("Enter to pick a member"));
+            };
+            let last_member = scored.total == 1;
+            let name = open.name.clone();
+            state.confirm = Some(PendingMutation::DeleteZSetMember {
+                name,
+                member,
+                last_member,
+            });
+            (state, Vec::new())
+        }
+        Some(Value::Str(_) | Value::Stream(_) | Value::Json(_) | Value::Binary(_)) | None => {
+            (state, notify("nothing to remove here"))
+        }
     }
 }
 

@@ -143,7 +143,45 @@ pub async fn connect_with(
     // one code path per Viewer.
     config.version = RespVersion::RESP3;
 
-    let client = Builder::from_config(config)
+    let mut builder = Builder::from_config(config);
+    // Bound how long a silently dead socket can hide, on both the connection
+    // and the command. Neither timing default fred ships is enough on its
+    // own for a laptop-sleep/idle-NAT drop: a black-holed socket returns no
+    // RST and no FIN, so `poll_next` just stays `Pending` forever, and
+    // nothing here relies on the OS ever noticing.
+    //
+    // - `unresponsive.max_timeout` (`ConnectionConfig`) is fred's own dead-
+    //   connection detector: a periodic check (`unresponsive.interval`, kept
+    //   at fred's 2s default) that force-closes a connection which has had a
+    //   write outstanding longer than this without a reply, then reconnects
+    //   it. It surfaces as `ErrorKind::IO` on `error_rx`
+    //   (`fred-10.1.0/src/router/types.rs:58`) — see `Shell::watch_link`.
+    // - `default_command_timeout` (`PerformanceConfig`) is a per-command
+    //   backstop that fires client-side, independent of whether fred's own
+    //   connection machinery ever notices the socket is dead. This is what
+    //   actually guarantees `read.await` inside `ReadPermit::run`
+    //   (`crates/app/src/redis/read.rs`) resolves — the held mutex is only
+    //   ever released once that `.await` returns, Ok or Err — and it
+    //   produces `ErrorKind::Timeout`
+    //   (`fred-10.1.0/src/utils.rs:286-299`, `fred-10.1.0/src/types/config.rs`
+    //   `Command::inherit_options`). Set comfortably above the connection
+    //   timeout so the connection-level detector gets first chance to
+    //   classify the failure correctly; this is the backstop, not the
+    //   primary signal.
+    //
+    // Both values are generous rather than snappy on purpose: this product
+    // is explicitly meant to run over SSH to a bastion host (CLAUDE.md), and
+    // a fast timeout would misclassify ordinary WAN latency as a dead
+    // connection.
+    builder
+        .with_connection_config(|connection| {
+            connection.unresponsive.max_timeout = Some(Duration::from_secs(6));
+        })
+        .with_performance_config(|performance| {
+            performance.default_command_timeout = Duration::from_secs(10);
+        });
+
+    let client = builder
         .build()
         .map_err(|e| ConnectError::Unreachable(e.to_string()))?;
     client.init().await.map_err(|e| {

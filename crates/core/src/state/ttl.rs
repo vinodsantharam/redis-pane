@@ -218,6 +218,20 @@ fn parse_unit_chain(rest: &str) -> Result<u64, TtlEditRefusal> {
         }
         last_rank = rank;
         i += 1; // consume the unit character
+        // Whitespace is allowed *between* segments, so `1h 12m` parses — but
+        // not *within* one, so `5 m` is still refused (D4). The distinction
+        // is the whole reason this skip lives here rather than in a blanket
+        // strip at the top: a space after a completed segment is how people
+        // write durations, while a space between a number and its unit is a
+        // typo, and one of the two has to remain a refusal.
+        //
+        // This is also what makes `format_duration`'s own output re-parseable.
+        // The TTL field is seeded with it, so a grammar that rejected `1h 12m`
+        // would be a field that refuses the text it just put in front of the
+        // reader.
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
         let value = saturating_parse_u64(digits);
         let contribution = value.saturating_mul(unit_seconds);
         total = total.saturating_add(contribution);
@@ -476,5 +490,84 @@ mod tests {
     #[test]
     fn format_duration_clamps_a_negative_input_rather_than_panicking() {
         assert_eq!(format_duration(-1), "0s");
+    }
+
+    /// Whitespace separates segments; it never separates a number from its
+    /// unit.
+    ///
+    /// `1h 12m` is how people write durations, and — more importantly — it is
+    /// what `format_duration` emits, which is what the TTL field is seeded
+    /// with. A grammar that rejected it would be a field refusing the text it
+    /// had just put in front of the reader. `5 m` stays refused because a
+    /// space between a number and its unit is a typo, not a style.
+    #[test]
+    fn whitespace_separates_segments_but_not_a_number_from_its_unit() {
+        assert_eq!(parse_ttl_edit("1h 12m"), Ok(TtlEdit::Set(4_320)));
+        assert_eq!(parse_ttl_edit("1d 2h"), Ok(TtlEdit::Set(93_600)));
+        assert_eq!(parse_ttl_edit("1d 2h 30m 10s"), Ok(TtlEdit::Set(95_410)));
+        assert_eq!(parse_ttl_edit("+1h 30m"), Ok(TtlEdit::Shift(5_400)));
+
+        for typo in ["5 m", "1 h 12m", "2h 3 0m"] {
+            assert_eq!(
+                parse_ttl_edit(typo),
+                Err(TtlEditRefusal::Unreadable),
+                "{typo:?} puts a space inside a segment and must stay refused"
+            );
+        }
+        // Spacing does not buy an ascending or repeated chain a pass.
+        assert_eq!(parse_ttl_edit("30m 2h"), Err(TtlEditRefusal::Unreadable));
+        assert_eq!(parse_ttl_edit("1h 1h"), Err(TtlEditRefusal::Unreadable));
+    }
+
+    /// Every seed the TTL field can show must parse back.
+    ///
+    /// The field is seeded with `format_duration(current)`, so this is the
+    /// invariant that keeps `⌃S` from refusing the app's own text. It is a
+    /// round trip in *shape*, not in value: `format_duration` truncates to two
+    /// units, so the parsed figure is the seed's own worth, not necessarily
+    /// the TTL it was made from — which is exactly why an untouched TTL buffer
+    /// must not stage at all (`EditBuffer::is_dirty`).
+    #[test]
+    fn every_format_duration_output_parses_back_as_a_set() {
+        let interesting = [
+            1,
+            45,
+            59,
+            60,
+            61,
+            90,
+            119,
+            120,
+            3_599,
+            3_600,
+            3_601,
+            4_320,
+            7_200,
+            86_399,
+            86_400,
+            86_401,
+            90_000,
+            95_410,
+            183_600,
+            604_800,
+            2_592_000,
+            i32::MAX,
+        ];
+        for seconds in interesting {
+            let seed = format_duration(seconds);
+            let parsed = parse_ttl_edit(&seed);
+            assert!(
+                matches!(parsed, Ok(TtlEdit::Set(_))),
+                "the field seeds {seconds}s as {seed:?}, which must parse back — got {parsed:?}"
+            );
+            let Ok(TtlEdit::Set(round_tripped)) = parsed else {
+                unreachable!()
+            };
+            assert!(
+                round_tripped <= seconds,
+                "a two-unit seed may lose precision but must never gain time: \
+                 {seconds}s seeded {seed:?} which parsed as {round_tripped}s"
+            );
+        }
     }
 }

@@ -703,8 +703,25 @@ impl EditBuffer {
     }
 
     /// Whether the text has changed from what the buffer was opened with.
+    ///
+    /// A TTL buffer is asked about its own `text`, not the `TextArea`: its
+    /// capture is the hand-painted single-line one (ADR-0019 D11), so the
+    /// `TextArea` stays empty and comparing it would report every TTL buffer
+    /// as dirty the moment it was seeded with anything.
+    ///
+    /// That distinction is load-bearing rather than tidy. `format_duration`
+    /// seeds the field at two units' precision, so a key at `1d 2h 30m 10s`
+    /// seeds `1d 2h` — and staging *that* unchanged would write `1d 2h`,
+    /// silently shortening the key by forty minutes nobody asked to lose.
+    /// Answering honestly here means an untouched TTL field stages nothing
+    /// at all, exactly like every other editor, and the lossy seed can only
+    /// ever reach the server after a reader has edited it into something
+    /// they meant.
     pub fn is_dirty(&self) -> bool {
-        self.text() != self.original
+        match &self.target {
+            EditTarget::Ttl { text } => text.as_bytes() != self.original,
+            _ => self.text() != self.original,
+        }
     }
 
     /// The lines to render, for the value pane's `&TextArea` widget.
@@ -1115,6 +1132,50 @@ mod tests {
     fn ttl_seeds_the_two_unit_form_for_a_multi_unit_duration() {
         let buf = EditBuffer::ttl(4_320); // 1h 12m
         assert_eq!(buf.ttl_text(), Some("1h 12m"));
+    }
+
+    /// An untouched TTL field is not dirty, so `⌃S` closes it without writing.
+    ///
+    /// This is what stops the two-unit seed from silently shortening a key.
+    /// `format_duration` shows `1d 2h 30m 10s` as `1d 2h`, so staging an
+    /// untouched buffer would write forty minutes less than the key has. The
+    /// answer has to come from the target's own text: a TTL buffer's
+    /// `TextArea` is always empty, so the ordinary `text() != original` check
+    /// would call every seeded TTL field dirty.
+    #[test]
+    fn an_untouched_ttl_buffer_is_not_dirty_however_lossy_its_seed() {
+        for seconds in [2_520, 4_320, 95_410, 1, i32::MAX] {
+            let buf = EditBuffer::ttl(seconds);
+            assert!(
+                !buf.is_dirty(),
+                "{seconds}s seeded {:?} and must not read as dirty",
+                buf.ttl_text()
+            );
+        }
+        // A key with no expiry seeds empty, and is equally untouched.
+        assert!(!EditBuffer::ttl(crate::state::loaded::TTL_NONE).is_dirty());
+    }
+
+    #[test]
+    fn a_ttl_buffer_becomes_dirty_the_moment_it_is_typed_into() {
+        let mut buf = EditBuffer::ttl(95_410); // seeds "1d 2h"
+        assert!(!buf.is_dirty());
+        buf.name_push('5');
+        assert!(buf.is_dirty(), "a typed character must register");
+
+        // And back again: retyping the seed exactly is not a change.
+        buf.name_pop();
+        assert!(!buf.is_dirty(), "undoing the edit returns it to clean");
+
+        // Clearing it entirely is a real edit — that is how persist is asked
+        // for on a key that currently has an expiry.
+        while buf.ttl_text().is_some_and(|t| !t.is_empty()) {
+            buf.name_pop();
+        }
+        assert!(
+            buf.is_dirty(),
+            "cleared-to-persist is a change, not a no-op"
+        );
     }
 
     #[test]

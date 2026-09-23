@@ -359,20 +359,23 @@ pub(super) fn stage_editor(mut state: State) -> (State, Vec<Command>) {
     // A brand-new field or member has no prior value to be unchanged from —
     // an empty value is a real value Redis allows, not "nothing to save"
     // (D1, and ADR-0016 D3 for the Set member one field narrower).
-    // `EditTarget::Ttl` joins this group not because it is "new" the way an
-    // add form is, but for the same structural reason the add forms' *name*
-    // half does (PLAN M2 task 10, D11, ADR-0019): its text lives in the
-    // target's own `text` field, never in the `TextArea` `is_dirty` actually
-    // reads, so that check can never see a TTL edit as dirty. Bypassing it
-    // here means `⌃S`/`Enter` always attempt to parse whatever was typed,
-    // rather than silently closing an edited-but-"clean" buffer.
+    //
+    // `EditTarget::Ttl` is deliberately **not** in this group. It has a prior
+    // value — the key's current TTL, which seeded the field — so an untouched
+    // TTL buffer means "I looked and changed nothing", and the honest answer
+    // to that is to close without writing, exactly as every value editor
+    // does. Letting it through would be actively harmful rather than merely
+    // redundant: `format_duration` seeds at two units' precision, so a key at
+    // `1d 2h 30m 10s` shows `1d 2h`, and staging that unchanged would shorten
+    // it by forty minutes the reader never asked to lose. `EditBuffer::
+    // is_dirty` answers this correctly for a TTL by reading the target's own
+    // `text` rather than the always-empty `TextArea` (ADR-0019 D11).
     let is_new_field = matches!(
         editor.target(),
         EditTarget::NewHashField { .. }
             | EditTarget::NewSetMember
             | EditTarget::NewListElement { .. }
             | EditTarget::NewZSetMember { .. }
-            | EditTarget::Ttl { .. }
     );
     if !is_new_field && !editor.is_dirty() {
         open.end_edit();

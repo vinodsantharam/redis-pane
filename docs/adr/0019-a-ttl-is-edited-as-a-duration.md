@@ -132,7 +132,7 @@ before it runs).
 | `0`, or a set resolving to `0` | `·· 0 deletes the key — use d` |
 | `+30m`/`-10m` on a key with `ttl == -1` | `·· no expiry to change — type 30m to set one` |
 | a shorten resolving to `≤ 0` | `·· that would expire it now — use d to delete` |
-| a set above the ceiling | `·· too long — the most is <ceiling>` |
+| a set above the ceiling | `·· too long — the most is about 68 years` |
 | `never`/empty on a key already at `∞` | `·· already never expires` |
 
 **`0` is the important one.** `EXPIRE key 0` deletes the key — verified above. A TTL field that
@@ -155,6 +155,17 @@ that binds in practice; Redis's own boundary is recorded here for completeness a
 and this task's own plan both asked that it be found on the record rather than assumed, not because
 a reader will ever reach it. Parsing must saturate rather than overflow, and the saturated value is
 then refused by the ceiling check — no wrapping, no release-mode surprise.
+
+**The rejection line names the ceiling in years, not through `format_duration`.** Settled at
+checkpoint 1. `format_duration`'s two-most-significant-units rule (D10) renders `i32::MAX` seconds as
+`24855d 3h`, which is arithmetically right and useless: a reader who has just typed something absurd
+needs to know the shape of the limit, not its day count. The line is therefore fixed text:
+
+> `·· too long — the most is about 68 years`
+
+"about" is doing real work — the bound is an implementation artifact of `i32`, not a product
+decision anyone made, and stating it to the second would dress it up as one. This is the only
+refusal line in D4 that does not interpolate a live figure, for that reason.
 
 **The `Ctrl-S` block reads `open.ttl_seconds` — the raw read TTL — not the counted-down one,
 deliberately.** `editor_key` and `stage_editor` have no clock (ADR-0011). The two checks needing a
@@ -315,9 +326,21 @@ built, the way ADR-0018's Consequences section does.
   `EditBuffer::{ttl, ttl_text, is_single_line_capture}`; `field_name()` gains a `Ttl => None` arm so
   the TTL text never feeds the shown-duplicate checks it was never meant for.
 - `crates/core/src/keymap/mod.rs` and `update/mod.rs` gain the `Action::ToggleTree` focus split —
-  keys pane still toggles the tree, value pane opens the TTL editor. The name `ToggleTree` is kept
-  for now with a doc comment naming both halves; this was flagged to the main agent as the one
-  decision here a reviewer might reasonably want the other way (checkpoint 1).
+  keys pane still toggles the tree, value pane opens the TTL editor. **The name `ToggleTree` is
+  kept, settled at checkpoint 1**, with a doc comment naming both halves and pointing at `label_in`.
+
+  The deciding argument is that this is not a new pattern: `Action::Refetch` already means *refetch*
+  in the value pane and *rescan* in the keys pane — two different verbs under one variant named
+  after only one of them, disambiguated for the reader by `label_in`. `ToggleTree` doing the same is
+  consistent with a shape the keymap already has, rather than a novel compromise. The alternatives
+  were each worse: a second `Action::EditTtl` bound to `t` is **unreachable**, since `action_for` is
+  first-match, so it would compile, appear in help, and never fire; and a rename needs a name
+  covering both halves, which `t`'s two unrelated verbs do not admit without something like
+  `TreeOrTtl` that describes the keybinding rather than the behaviour.
+
+  What the reader sees is unaffected either way: `label_in` says `tree` or `ttl` per pane, and
+  `label()` says `tree / edit ttl` in the help overlay. The awkwardness is confined to one variant
+  name inside the core, which is the cheapest place for it to live.
 - `crates/app/src/redis/mutate.rs` gains the two Lua scripts above, `set_ttl`/`persist_ttl`/
   `shift_ttl`, and three arms in `execute` — no new `Command`/`Msg` variants, the same shape
   ADR-0018's ZSet arm reused.

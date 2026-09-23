@@ -161,7 +161,7 @@ confirm dialog.** R4.4 is about knowing before it runs.
 | `0`, or a set resolving to `0` | `·· 0 deletes the key — use d` |
 | `+30m`/`-10m` on a key with `ttl == -1` | `·· no expiry to change — type 30m to set one` |
 | a shorten resolving to `≤ 0` | `·· that would expire it now — use d to delete` |
-| a set above the ceiling | `·· too long — the most is <ceiling>` |
+| a set above the ceiling | `·· too long — the most is about 68 years` |
 | `never`/empty on a key already at `∞` | `·· already never expires` |
 
 Four deserve their reasoning on the record:

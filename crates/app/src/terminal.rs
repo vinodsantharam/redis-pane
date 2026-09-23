@@ -604,7 +604,24 @@ impl Shell {
                 while let Ok((error, _server)) = errors.recv().await {
                     // A connection-level error means the link is gone; anything
                     // else is a command failure and belongs in a notification.
-                    let msg = if matches!(error.kind(), fred::error::ErrorKind::IO) {
+                    //
+                    // Both kinds matched here are what `connect_with`'s bounded-
+                    // responsiveness config (`crates/app/src/redis/mod.rs`) can
+                    // actually produce for a silently dead socket: `IO` from
+                    // fred's own unresponsive-connection detector
+                    // (`fred-10.1.0/src/router/types.rs:58`), and `Timeout` from
+                    // the per-command `default_command_timeout` backstop
+                    // (`fred-10.1.0/src/utils.rs:286-299`). The latter is
+                    // ordinarily returned straight to the awaiting caller rather
+                    // than broadcast here, but treating it the same on the rare
+                    // path where it does arrive on this stream costs nothing —
+                    // a command that just timed out on a wire this deliberately
+                    // slow to declare unresponsive is not a connection worth
+                    // still calling live.
+                    let msg = if matches!(
+                        error.kind(),
+                        fred::error::ErrorKind::IO | fred::error::ErrorKind::Timeout
+                    ) {
                         Msg::ConnectionLost
                     } else {
                         Msg::Failed {

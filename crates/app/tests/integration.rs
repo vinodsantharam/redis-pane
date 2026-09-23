@@ -3428,3 +3428,139 @@ async fn setting_a_ttl_works_identically_on_a_string_a_hash_and_a_zset() {
     let _ = client.quit().await;
     let _ = writer.quit().await;
 }
+
+// ── The value pane must not wedge after a silent disconnect ─────────────────
+//
+// docs/plans/value-pane-frozen-after-silent-disconnect.md. A laptop sleeping,
+// an SSH session going idle, or a NAT/LB dropping an idle connection all
+// black-hole a socket the same way: no RST, no FIN, just silence. `docker
+// pause` reproduces exactly that — it freezes the container's process
+// without touching the TCP connection, so a read against it blocks the way a
+// truly dead-but-silent connection does, not the way a cleanly closed one
+// does.
+//
+// Before `connect_with`'s bounded responsiveness config
+// (`crates/app/src/redis/mod.rs`), `read.await` inside `ReadPermit::run`
+// (`crates/app/src/redis/read.rs`) never resolved against a black-holed
+// socket, so the `_guard` was never dropped and every read after it —
+// including the reconnect's own refetch — queued behind it forever. This
+// proves the read resolves as an error within the configured bound instead
+// of hanging, that the resulting error is classified as connection loss the
+// same way `Shell::watch_link` does (crates/app/src/terminal.rs), and that a
+// second read through the same `ReadGate` — standing in for the reconnect's
+// refetch — is not left wedged behind the first.
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn a_silently_dead_connection_frees_the_read_gate_within_the_configured_timeout() {
+    let (container, url) = start("redis", "7-alpine").await;
+    let (client, est) = redis_pane::redis::connect(&url).await.unwrap();
+    assert!(est.tracking_supported);
+
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer.set("k", "v1", None, None, false).await.unwrap();
+
+    // The same `ReadGate` a real `Shell` holds for the life of the
+    // connection: every read (an Open, a manual Refetch, an
+    // invalidation-triggered re-arm) takes a turn through it, and whether a
+    // stuck read ever gives its turn back is exactly the deadlock this test
+    // is for.
+    let mut gate = redis_pane::redis::read::ReadGate::default();
+    // Subscribed before the pause, the same way `Shell::watch_link` is
+    // subscribed for the life of the connection — this is what proves the
+    // widened classification in `terminal.rs`'s `error_rx` match, not just
+    // the timeout value in `mod.rs`.
+    let mut errors = client.error_rx();
+
+    // Freezes the server's process; the socket itself is untouched, so
+    // `poll_next` on it just stays `Pending` — the black hole, not a clean
+    // disconnect.
+    container.pause().await.unwrap();
+
+    let permit = gate.begin();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(20),
+        permit.run(redis_pane::redis::read::read_value(
+            &client,
+            b"k",
+            redis_pane::redis::read::Arming::Enabled,
+        )),
+    )
+    .await
+    .expect(
+        "read.await must resolve within the configured responsiveness bound \
+         instead of hanging forever on a black-holed socket",
+    );
+    assert!(
+        matches!(outcome, Some(Err(_))),
+        "a read against a dead connection must surface as an error, not a value"
+    );
+
+    // Whichever of the two configured timeouts released the read above
+    // (fred's unresponsive-connection detector, or the per-command
+    // `default_command_timeout` backstop — see the comment in
+    // `connect_with`), it must also be one `Shell::watch_link` classifies as
+    // connection loss.
+    let (err, _server) = tokio::time::timeout(Duration::from_secs(10), errors.recv())
+        .await
+        .expect("a dead connection must eventually report itself on error_rx")
+        .expect("error_rx must not close while the connection is merely dead");
+    assert!(
+        matches!(
+            err.kind(),
+            fred::error::ErrorKind::IO | fred::error::ErrorKind::Timeout
+        ),
+        "unexpected ErrorKind for a dead connection: {:?} ({err})",
+        err.kind()
+    );
+
+    // The deadlock this bug report describes: without the fix, the guard
+    // from the first read is never dropped, so this second read — standing
+    // in for the reconnect's own refetch — queues behind it and never runs.
+    let permit = gate.begin();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        permit.run(redis_pane::redis::read::read_value(
+            &client,
+            b"k",
+            redis_pane::redis::read::Arming::Enabled,
+        )),
+    )
+    .await
+    .expect("the read-gate mutex must not still be held by the first, stuck read");
+
+    container.unpause().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // What the app's own `Command::Reconnect` does: build a fresh
+    // connection (`connect_with` again) and read the open key through it.
+    // This is the re-arm half of the invariant, proven the same way
+    // `a_reconnect_loses_tracking_which_is_why_it_must_be_re_armed` proves
+    // it — a fresh connection tracks nothing until a read arms it again.
+    let (fresh, fresh_est) = redis_pane::redis::connect(&url).await.unwrap();
+    assert!(fresh_est.tracking_supported);
+    let mut fresh_gate = redis_pane::redis::read::ReadGate::default();
+    let permit = fresh_gate.begin();
+    let refetched = permit
+        .run(redis_pane::redis::read::read_value(
+            &fresh,
+            b"k",
+            redis_pane::redis::read::Arming::Enabled,
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("the key must still be readable once the connection is back");
+    match refetched.value {
+        redis_pane_core::state::value::Value::Str(s) => {
+            assert_eq!(s.raw, "v1", "the refetch must see the key's real value")
+        }
+        other => panic!("expected a String value, got {other:?}"),
+    }
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+    let _ = fresh.quit().await;
+}

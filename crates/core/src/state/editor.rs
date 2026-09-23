@@ -82,6 +82,14 @@ pub enum EditTarget {
     /// refuses a non-UTF-8 typed member, the same as every other add form
     /// (D5 only exempts an existing score edit, not a new member's bytes).
     NewZSetMember { member: String, part: FieldPart },
+    /// The Open key's TTL, being typed as a duration expression (`t` in the
+    /// value pane — PLAN M2 task 10, D1, D3, D11, ADR-0019). A guarded
+    /// `EXPIRE`/`PERSIST`, resolved from `text` by
+    /// [`crate::state::ttl::parse_ttl_edit`]. Unlike every other row-level
+    /// target, this addresses the key's metadata, not part of a `Value` —
+    /// there is no type branch and no cursor prerequisite (D1): every Redis
+    /// type has exactly one TTL, edited identically.
+    Ttl { text: String },
 }
 
 /// Which half of the add form (`FIELD`/`VALUE`) is active, while adding a new
@@ -367,6 +375,56 @@ impl EditBuffer {
         }
     }
 
+    /// Build a buffer on the Open key's TTL, seeded from its current value
+    /// (`t` in the value pane, PLAN M2 task 10, D1, D3, D11, ADR-0019).
+    ///
+    /// `ttl_seconds` is the **raw** read TTL, not the counted-down figure —
+    /// `open_ttl_editor` runs in `update`, which has no clock (ADR-0011), so
+    /// the seed is at most a few seconds stale. A key with no expiry
+    /// ([`TTL_NONE`]) seeds empty rather than the word `never`, so an
+    /// untouched field and a deliberately-typed `never` are the same input
+    /// to the parser either way.
+    ///
+    /// The seed is [`super::ttl::format_duration`]'s two-unit form (`42m`,
+    /// `1h 12m`),
+    /// not raw seconds — D3's own example seeds `42m`. This is safe even
+    /// though `format_duration`'s spaced multi-unit output (`1h 12m`) is not
+    /// itself always parseable back: unlike every other row edit, this
+    /// buffer is a hand-painted single-line capture (D11) whose
+    /// [`EditBuffer::is_dirty`] check never applies to it — an unedited
+    /// field is never staged at all (`update`'s `is_new_field`-style bypass,
+    /// PLAN M2 task 10 phase 3), so what is parsed is always whatever the
+    /// reader actually typed, never the seed itself.
+    ///
+    /// Unlike [`EditBuffer::zset_score`]/[`EditBuffer::for_hash_field`]/
+    /// [`EditBuffer::list_element`], typing here goes through
+    /// [`EditBuffer::name_push`]/[`EditBuffer::name_pop`]/
+    /// [`EditBuffer::name_push_str`] into [`EditTarget::Ttl`]'s own `text`
+    /// field, not into the internal `TextArea` — the same mechanism the
+    /// Hash/ZSet add forms' name half uses (D11), and the reason this target
+    /// does not inherit the seeded-cursor-at-position-0 defect those add
+    /// forms' *value* halves have (task 9's phase 3 "found while building"):
+    /// there is no cursor to be in the wrong place, so `Backspace` removes
+    /// the last character exactly as a reader expects of a seeded scalar.
+    pub fn ttl(ttl_seconds: i32) -> EditBuffer {
+        let seed = if ttl_seconds == super::loaded::TTL_NONE {
+            String::new()
+        } else {
+            super::ttl::format_duration(ttl_seconds.max(0))
+        };
+        // Unused by this target's capture (the hand-painted `text` field is
+        // what typing mutates), but every `EditBuffer` needs one.
+        let mut area = TextArea::new(vec![String::new()]);
+        area.set_wrap_mode(WrapMode::WordOrGlyph);
+        area.set_cursor_line_style(ratatui::style::Style::default());
+        EditBuffer {
+            area,
+            original: seed.clone().into_bytes(),
+            was_json: false,
+            target: EditTarget::Ttl { text: seed },
+        }
+    }
+
     /// What this buffer writes back when staged.
     pub fn target(&self) -> &EditTarget {
         &self.target
@@ -391,8 +449,47 @@ impl EditBuffer {
             // fixed identity carried as bytes (D5), not necessarily UTF-8,
             // so there is no `&str` to hand back here even if there were a
             // reason to.
-            | EditTarget::ZSetScore { .. } => None,
+            | EditTarget::ZSetScore { .. }
+            // PLAN M2 task 10, D11, ADR-0019: **must not** return the TTL
+            // text — it feeds the shown-duplicate checks, which a duration
+            // expression has no business being compared against. See
+            // `ttl_text` for what the parser and preview actually read.
+            | EditTarget::Ttl { .. } => None,
         }
+    }
+
+    /// The TTL duration expression being typed ([`EditTarget::Ttl`]). `None`
+    /// for every other target. Deliberately separate from
+    /// [`EditBuffer::field_name`] (D11) — that one feeds the shown-duplicate
+    /// checks a TTL has nothing to do with; this is what the parser and the
+    /// resolution line actually read.
+    pub fn ttl_text(&self) -> Option<&str> {
+        match &self.target {
+            EditTarget::Ttl { text } => Some(text),
+            _ => None,
+        }
+    }
+
+    /// Whether the add form's name part, or [`EditTarget::Ttl`], is the
+    /// thing actually being typed into right now — the property
+    /// `editor_key`'s routing (PLAN M2 task 10 phase 3) needs in place of
+    /// `active_part() == Some(FieldPart::Name)`, since a TTL capture has no
+    /// [`FieldPart`] to be on at all (D11): it is a single field, always
+    /// active, the same shape [`EditTarget::NewSetMember`]/
+    /// [`EditTarget::ListElement`] already have, except that a TTL, like the
+    /// add forms' name half, types into this struct's own `text`/`field`/
+    /// `member` rather than the internal `TextArea`.
+    pub fn is_single_line_capture(&self) -> bool {
+        matches!(
+            self.target,
+            EditTarget::NewHashField {
+                part: FieldPart::Name,
+                ..
+            } | EditTarget::NewZSetMember {
+                part: FieldPart::Name,
+                ..
+            } | EditTarget::Ttl { .. }
+        )
     }
 
     /// Which part of the add form is active. `None` outside
@@ -420,7 +517,12 @@ impl EditBuffer {
             | EditTarget::NewListElement { .. }
             // A score edit has no FIELD/VALUE-shaped split — one field, the
             // score, always active (D1).
-            | EditTarget::ZSetScore { .. } => None,
+            | EditTarget::ZSetScore { .. }
+            // PLAN M2 task 10, D11, ADR-0019: honestly `None` — a TTL edit
+            // has no FIELD/VALUE-shaped split any more than a score edit
+            // does; [`EditBuffer::is_single_line_capture`] is the property
+            // that actually routes it.
+            | EditTarget::Ttl { .. } => None,
         }
     }
 
@@ -444,6 +546,10 @@ impl EditBuffer {
                 member,
                 part: FieldPart::Name,
             } => member.push(c),
+            // PLAN M2 task 10, D11, ADR-0019: the TTL capture's own `text`,
+            // the same "types into this struct, not the `TextArea`"
+            // mechanism the add forms' name half uses above.
+            EditTarget::Ttl { text } => text.push(c),
             EditTarget::NewHashField { .. }
             | EditTarget::NewZSetMember { .. }
             | EditTarget::Value
@@ -468,6 +574,7 @@ impl EditBuffer {
                 member,
                 part: FieldPart::Name,
             } => member.push_str(s),
+            EditTarget::Ttl { text } => text.push_str(s),
             EditTarget::NewHashField { .. }
             | EditTarget::NewZSetMember { .. }
             | EditTarget::Value
@@ -493,6 +600,9 @@ impl EditBuffer {
                 part: FieldPart::Name,
             } => {
                 member.pop();
+            }
+            EditTarget::Ttl { text } => {
+                text.pop();
             }
             EditTarget::NewHashField { .. }
             | EditTarget::NewZSetMember { .. }
@@ -522,7 +632,10 @@ impl EditBuffer {
             | EditTarget::NewSetMember
             | EditTarget::ListElement { .. }
             | EditTarget::NewListElement { .. }
-            | EditTarget::ZSetScore { .. } => {}
+            | EditTarget::ZSetScore { .. }
+            // No value part to advance to — a TTL is one field, always
+            // active (D11).
+            | EditTarget::Ttl { .. } => {}
         }
     }
 
@@ -540,7 +653,8 @@ impl EditBuffer {
             | EditTarget::NewSetMember
             | EditTarget::ListElement { .. }
             | EditTarget::NewListElement { .. }
-            | EditTarget::ZSetScore { .. } => {}
+            | EditTarget::ZSetScore { .. }
+            | EditTarget::Ttl { .. } => {}
         }
     }
 
@@ -589,8 +703,25 @@ impl EditBuffer {
     }
 
     /// Whether the text has changed from what the buffer was opened with.
+    ///
+    /// A TTL buffer is asked about its own `text`, not the `TextArea`: its
+    /// capture is the hand-painted single-line one (ADR-0019 D11), so the
+    /// `TextArea` stays empty and comparing it would report every TTL buffer
+    /// as dirty the moment it was seeded with anything.
+    ///
+    /// That distinction is load-bearing rather than tidy. `format_duration`
+    /// seeds the field at two units' precision, so a key at `1d 2h 30m 10s`
+    /// seeds `1d 2h` — and staging *that* unchanged would write `1d 2h`,
+    /// silently shortening the key by forty minutes nobody asked to lose.
+    /// Answering honestly here means an untouched TTL field stages nothing
+    /// at all, exactly like every other editor, and the lossy seed can only
+    /// ever reach the server after a reader has edited it into something
+    /// they meant.
     pub fn is_dirty(&self) -> bool {
-        self.text() != self.original
+        match &self.target {
+            EditTarget::Ttl { text } => text.as_bytes() != self.original,
+            _ => self.text() != self.original,
+        }
     }
 
     /// The lines to render, for the value pane's `&TextArea` widget.
@@ -968,6 +1099,125 @@ mod tests {
         ] {
             assert!(is_valid_zset_score(text), "{text:?} should be accepted");
         }
+    }
+
+    #[test]
+    fn ttl_seeds_from_format_duration_of_the_raw_ttl() {
+        let buf = EditBuffer::ttl(2_520); // 42m
+        assert_eq!(
+            buf.target(),
+            &EditTarget::Ttl {
+                text: "42m".to_string()
+            }
+        );
+        assert_eq!(buf.field_name(), None, "must not feed the duplicate checks");
+        assert_eq!(buf.active_part(), None, "no FIELD/VALUE split for a TTL");
+        assert!(buf.is_single_line_capture());
+        assert_eq!(buf.ttl_text(), Some("42m"));
+    }
+
+    #[test]
+    fn ttl_seeds_empty_for_a_key_with_no_expiry() {
+        let buf = EditBuffer::ttl(crate::state::loaded::TTL_NONE);
+        assert_eq!(
+            buf.target(),
+            &EditTarget::Ttl {
+                text: String::new()
+            }
+        );
+        assert_eq!(buf.ttl_text(), Some(""));
+    }
+
+    #[test]
+    fn ttl_seeds_the_two_unit_form_for_a_multi_unit_duration() {
+        let buf = EditBuffer::ttl(4_320); // 1h 12m
+        assert_eq!(buf.ttl_text(), Some("1h 12m"));
+    }
+
+    /// An untouched TTL field is not dirty, so `⌃S` closes it without writing.
+    ///
+    /// This is what stops the two-unit seed from silently shortening a key.
+    /// `format_duration` shows `1d 2h 30m 10s` as `1d 2h`, so staging an
+    /// untouched buffer would write forty minutes less than the key has. The
+    /// answer has to come from the target's own text: a TTL buffer's
+    /// `TextArea` is always empty, so the ordinary `text() != original` check
+    /// would call every seeded TTL field dirty.
+    #[test]
+    fn an_untouched_ttl_buffer_is_not_dirty_however_lossy_its_seed() {
+        for seconds in [2_520, 4_320, 95_410, 1, i32::MAX] {
+            let buf = EditBuffer::ttl(seconds);
+            assert!(
+                !buf.is_dirty(),
+                "{seconds}s seeded {:?} and must not read as dirty",
+                buf.ttl_text()
+            );
+        }
+        // A key with no expiry seeds empty, and is equally untouched.
+        assert!(!EditBuffer::ttl(crate::state::loaded::TTL_NONE).is_dirty());
+    }
+
+    #[test]
+    fn a_ttl_buffer_becomes_dirty_the_moment_it_is_typed_into() {
+        let mut buf = EditBuffer::ttl(95_410); // seeds "1d 2h"
+        assert!(!buf.is_dirty());
+        buf.name_push('5');
+        assert!(buf.is_dirty(), "a typed character must register");
+
+        // And back again: retyping the seed exactly is not a change.
+        buf.name_pop();
+        assert!(!buf.is_dirty(), "undoing the edit returns it to clean");
+
+        // Clearing it entirely is a real edit — that is how persist is asked
+        // for on a key that currently has an expiry.
+        while buf.ttl_text().is_some_and(|t| !t.is_empty()) {
+            buf.name_pop();
+        }
+        assert!(
+            buf.is_dirty(),
+            "cleared-to-persist is a change, not a no-op"
+        );
+    }
+
+    #[test]
+    fn ttl_typing_mutates_the_hand_painted_text_not_the_text_area() {
+        let mut buf = EditBuffer::ttl(2_520);
+        buf.name_pop();
+        buf.name_pop();
+        buf.name_pop();
+        buf.name_push_str("1h");
+        buf.name_push('5');
+        buf.name_push('m');
+        assert_eq!(buf.ttl_text(), Some("1h5m"));
+        // The `TextArea`-backed `text()`/`widget()` machinery is untouched —
+        // this target never routes typing through it (D11).
+        assert_eq!(buf.text(), b"");
+    }
+
+    #[test]
+    fn ttl_is_a_no_op_for_every_field_part_shaped_operation() {
+        let mut buf = EditBuffer::ttl(2_520);
+        let before = buf.target().clone();
+        buf.advance_to_value();
+        assert_eq!(buf.target(), &before, "no value part to advance to");
+        buf.return_to_name();
+        assert_eq!(buf.target(), &before);
+        buf.toggle_list_end();
+        assert_eq!(buf.target(), &before, "no end to toggle");
+    }
+
+    #[test]
+    fn only_ttl_and_the_add_forms_name_part_are_single_line_captures() {
+        assert!(EditBuffer::ttl(60).is_single_line_capture());
+        assert!(EditBuffer::new_hash_field().is_single_line_capture());
+        assert!(EditBuffer::new_zset_member().is_single_line_capture());
+        assert!(!EditBuffer::new_set_member().is_single_line_capture());
+        assert!(!EditBuffer::new_list_element().is_single_line_capture());
+        let value = Value::Str(StringValue::new("v", 40));
+        assert!(
+            !EditBuffer::from_value(&value, 0)
+                .unwrap()
+                .is_single_line_capture()
+        );
     }
 
     #[test]

@@ -1,0 +1,21 @@
+─ redis-pane ─ ● staging · cache-01:6379/0 · from profile staging ─────────────────────────────────────────────────────── ● live ─
+
+ KEY                               TYPE        SIZE   TTL │ session:9f3a
+ ● user:8812:cart                  zset       412 B   12m │ hash · 5 fields · 2.1 KB
+ ● user:8812:profile               json       880 B     ∞ │ ttl ∞                                                   ✎ editing ttl
+ ● user:8812:session               hash      2.1 KB   42m │
+ ● user:8813:session               hash      1.9 ┌─ confirm ────────────────────┐
+ ● cart:91af3c9d2e                 zset      1.1 │                              │
+ ● feed:global:hot                 list     63.0 │ EXPIRE session:9f3a 300      │
+ · session:9f3a                    ·             │ only if the key still exists │
+                                                 │ ttl never → 5m               │
+                                                 │ ⚠ this key had no expiry     │
+                                                 │                              │
+                                                 │ y confirm · Esc cancel       │
+                                                 └──────────────────────────────┘
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+                                                          │

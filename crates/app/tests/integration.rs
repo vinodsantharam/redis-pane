@@ -3064,3 +3064,367 @@ async fn editing_a_zset_score_against_a_wrong_type_key_surfaces_an_error_not_a_p
     let _ = client.quit().await;
     let _ = writer.quit().await;
 }
+
+// ── PLAN M2 task 10 — TTL set, persist, extend/shorten (ADR-0019) ──────────
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn setting_a_ttl_lands_and_ttl_reads_it_back() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer
+        .set("ttl:set1", "v", None, None, false)
+        .await
+        .unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::mutate::set_ttl(&client, b"ttl:set1", 300)
+        .await
+        .unwrap();
+    assert_eq!(outcome, redis_pane::redis::mutate::SetTtlWrite::Written);
+
+    let ttl: i64 = writer.ttl("ttl:set1").await.unwrap();
+    assert!((1..=300).contains(&ttl), "got {ttl}");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn setting_a_ttl_on_a_gone_key_does_not_recreate_it() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::mutate::set_ttl(&client, b"ttl:set_gone", 300)
+        .await
+        .unwrap();
+    assert_eq!(outcome, redis_pane::redis::mutate::SetTtlWrite::KeyGone);
+
+    let exists: i64 = writer.exists("ttl:set_gone").await.unwrap();
+    assert_eq!(exists, 0, "the key must not be recreated");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn persisting_a_ttl_clears_the_expiry() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer
+        .set("ttl:persist1", "v", None, None, false)
+        .await
+        .unwrap();
+    let _: bool = writer.expire("ttl:persist1", 600, None).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::mutate::persist_ttl(&client, b"ttl:persist1")
+        .await
+        .unwrap();
+    assert_eq!(outcome, redis_pane::redis::mutate::PersistTtlWrite::Written);
+
+    let ttl: i64 = writer.ttl("ttl:persist1").await.unwrap();
+    assert_eq!(ttl, -1, "TTL must read back as no-expiry");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn persisting_a_ttl_on_a_key_with_no_expiry_settles_without_error() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer
+        .set("ttl:persist2", "v", None, None, false)
+        .await
+        .unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::mutate::persist_ttl(&client, b"ttl:persist2")
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        redis_pane::redis::mutate::PersistTtlWrite::NoExpiry
+    );
+
+    let value: Option<String> = writer.get("ttl:persist2").await.unwrap();
+    assert_eq!(value.as_deref(), Some("v"), "untouched by the no-op");
+    let ttl: i64 = writer.ttl("ttl:persist2").await.unwrap();
+    assert_eq!(ttl, -1);
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn persisting_a_ttl_on_a_gone_key_does_not_recreate_it() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::mutate::persist_ttl(&client, b"ttl:persist_gone")
+        .await
+        .unwrap();
+    assert_eq!(outcome, redis_pane::redis::mutate::PersistTtlWrite::KeyGone);
+
+    let exists: i64 = writer.exists("ttl:persist_gone").await.unwrap();
+    assert_eq!(exists, 0, "the key must not be recreated");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+/// D7's test — the analogue of task 9's reorder test, and the test this row
+/// exists for. `shift_ttl` carries only a signed delta, never a "staged old
+/// TTL" — that is the whole point of D5/D7's script running the arithmetic
+/// atomically at the server against whatever `TTL` reads *there*, not against
+/// any value this session captured earlier. This exercises the real race,
+/// not a simulation of it: a second, real connection genuinely rewrites the
+/// key's TTL on the live server, awaited to completion, strictly between the
+/// moment "the dialog" would have captured the original TTL and the moment
+/// the staged extend actually executes. The two candidate results — computed
+/// from the stale, pre-change TTL versus the live, post-change one — are
+/// numerically far enough apart that landing on the wrong one is unambiguous,
+/// and the assertion checks the resulting TTL itself, not just the return
+/// value.
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn extending_a_ttl_adds_to_the_servers_ttl_not_the_staged_one() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer
+        .set("ttl:extend1", "v", None, None, false)
+        .await
+        .unwrap();
+    // "The dialog" opens against this TTL — 100s — and stages "+50m" (a
+    // +50-second delta, kept small here for a fast test).
+    let _: bool = writer.expire("ttl:extend1", 100, None).await.unwrap();
+
+    // Before the staged extend is confirmed, a second, independent
+    // connection changes the server's TTL to something far away from the
+    // staged value.
+    let second_client = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    second_client.init().await.unwrap();
+    let _: bool = second_client
+        .expire("ttl:extend1", 500, None)
+        .await
+        .unwrap();
+    let server_ttl_before_extend: i64 = second_client.ttl("ttl:extend1").await.unwrap();
+    assert!(
+        (490..=500).contains(&server_ttl_before_extend),
+        "setup: the second connection's EXPIRE must actually have landed, got {server_ttl_before_extend}"
+    );
+    let _ = second_client.quit().await;
+
+    // The staged extend executes now, carrying only the delta — no "old TTL"
+    // travels with it at all (D6/D7).
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::mutate::shift_ttl(&client, b"ttl:extend1", 50)
+        .await
+        .unwrap();
+    assert_eq!(outcome, redis_pane::redis::mutate::ShiftTtlWrite::Written);
+
+    let final_ttl: i64 = writer.ttl("ttl:extend1").await.unwrap();
+    // Computed from the *staged* TTL (100) + 50 would land at ~150.
+    // Computed from the *server's* TTL (~500) + 50 lands at ~550.
+    assert!(
+        final_ttl > 400,
+        "the extend must be computed from the server's live TTL (~500 + 50 = ~550), \
+         not the staged one (100 + 50 = 150) — got {final_ttl}"
+    );
+    assert!(
+        (530..=550).contains(&final_ttl),
+        "expected ~550 (server's live TTL + delta), got {final_ttl}"
+    );
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn shifting_a_ttl_on_a_key_with_no_expiry_refuses_and_writes_nothing() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer
+        .set("ttl:shift_noexp", "v", None, None, false)
+        .await
+        .unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::mutate::shift_ttl(&client, b"ttl:shift_noexp", 30)
+        .await
+        .unwrap();
+    assert_eq!(outcome, redis_pane::redis::mutate::ShiftTtlWrite::NoExpiry);
+
+    let ttl: i64 = writer.ttl("ttl:shift_noexp").await.unwrap();
+    assert_eq!(ttl, -1, "must still have no expiry");
+    let value: Option<String> = writer.get("ttl:shift_noexp").await.unwrap();
+    assert_eq!(value.as_deref(), Some("v"), "untouched by the refusal");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn shifting_a_ttl_past_zero_refuses_and_the_key_still_exists() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer
+        .set("ttl:shift_zero", "v", None, None, false)
+        .await
+        .unwrap();
+    let _: bool = writer.expire("ttl:shift_zero", 10, None).await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::mutate::shift_ttl(&client, b"ttl:shift_zero", -1000)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        redis_pane::redis::mutate::ShiftTtlWrite::WouldExpireNow
+    );
+
+    let exists: i64 = writer.exists("ttl:shift_zero").await.unwrap();
+    assert_eq!(exists, 1, "the key must still exist after the refusal");
+    let ttl: i64 = writer.ttl("ttl:shift_zero").await.unwrap();
+    assert!(
+        (1..=10).contains(&ttl),
+        "the TTL must be untouched, got {ttl}"
+    );
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn shifting_a_ttl_on_a_gone_key_does_not_recreate_it() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::mutate::shift_ttl(&client, b"ttl:shift_gone", 30)
+        .await
+        .unwrap();
+    assert_eq!(outcome, redis_pane::redis::mutate::ShiftTtlWrite::KeyGone);
+
+    let exists: i64 = writer.exists("ttl:shift_gone").await.unwrap();
+    assert_eq!(exists, 0, "the key must not be recreated");
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn setting_a_ttl_changes_neither_the_value_nor_the_type_nor_the_member_count() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: i64 = writer
+        .hset(
+            "ttl:hash_unchanged",
+            [("f1", "v1"), ("f2", "v2"), ("f3", "v3")],
+        )
+        .await
+        .unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    let outcome = redis_pane::redis::mutate::set_ttl(&client, b"ttl:hash_unchanged", 300)
+        .await
+        .unwrap();
+    assert_eq!(outcome, redis_pane::redis::mutate::SetTtlWrite::Written);
+
+    let count: i64 = writer.hlen("ttl:hash_unchanged").await.unwrap();
+    assert_eq!(count, 3, "the field count must be unchanged");
+    let f1: Option<String> = writer.hget("ttl:hash_unchanged", "f1").await.unwrap();
+    let f2: Option<String> = writer.hget("ttl:hash_unchanged", "f2").await.unwrap();
+    let f3: Option<String> = writer.hget("ttl:hash_unchanged", "f3").await.unwrap();
+    assert_eq!(f1.as_deref(), Some("v1"));
+    assert_eq!(f2.as_deref(), Some("v2"));
+    assert_eq!(f3.as_deref(), Some("v3"));
+    let ttl: i64 = writer.ttl("ttl:hash_unchanged").await.unwrap();
+    assert!((1..=300).contains(&ttl));
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}
+
+/// D1 made concrete: unlike every sibling task, there is no `WRONGTYPE` case
+/// to test here, because `EXPIRE` applies identically to every Redis type.
+/// This asserts that explicitly, on a String, a Hash and a ZSet, rather than
+/// reaching for a `WRONGTYPE` test that cannot happen for this mutation.
+#[tokio::test]
+#[ignore = "needs docker"]
+async fn setting_a_ttl_works_identically_on_a_string_a_hash_and_a_zset() {
+    let (_c, url) = start("redis", "7-alpine").await;
+    let writer = Builder::from_config(Config::from_url(&url).unwrap())
+        .build()
+        .unwrap();
+    writer.init().await.unwrap();
+    let _: () = writer
+        .set("ttl:type_str", "v", None, None, false)
+        .await
+        .unwrap();
+    let _: i64 = writer.hset("ttl:type_hash", [("f", "v")]).await.unwrap();
+    let _: i64 = writer
+        .zadd("ttl:type_zset", None, None, false, false, (1.0, "m"))
+        .await
+        .unwrap();
+
+    let (client, _) = redis_pane::redis::connect(&url).await.unwrap();
+    for key in ["ttl:type_str", "ttl:type_hash", "ttl:type_zset"] {
+        let outcome = redis_pane::redis::mutate::set_ttl(&client, key.as_bytes(), 300)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            redis_pane::redis::mutate::SetTtlWrite::Written,
+            "EXPIRE must succeed identically on {key}"
+        );
+        let ttl: i64 = writer.ttl(key).await.unwrap();
+        assert!((1..=300).contains(&ttl), "{key} got ttl {ttl}");
+    }
+
+    let _ = client.quit().await;
+    let _ = writer.quit().await;
+}

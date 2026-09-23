@@ -110,7 +110,13 @@ fn read_issued(mut state: State, token: ReadToken, at_ms: u64) -> (State, Vec<Co
 /// one message that can land in either.
 fn paste(mut state: State, text: String) -> (State, Vec<Command>) {
     if let Some(editor) = state.open.as_mut().and_then(OpenKey::typing_mut) {
-        if editor.active_part() == Some(FieldPart::Name) {
+        // `is_single_line_capture` in place of `active_part() ==
+        // Some(FieldPart::Name)` (PLAN M2 task 10, D11, ADR-0019): a TTL
+        // capture has no `FieldPart` to be on, so the old predicate would
+        // have sent a pasted duration into the buffer's unused `TextArea`
+        // instead of its own `text` — the same routing gap `editor_key`'s
+        // top check had, one call site over.
+        if editor.is_single_line_capture() {
             let stripped: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
             editor.name_push_str(&stripped);
         } else {
@@ -403,7 +409,11 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             (state, Vec::new())
         }
         Action::Sort => cycle_sort(state),
-        Action::ToggleTree => toggle_tree(state),
+        // `t` is focus-dependent, exactly like `d` above (PLAN M2 task 10,
+        // D2, ADR-0019): the keys pane's tree toggle is unchanged; the
+        // Viewer's TTL editor is `open_ttl_editor`'s job.
+        Action::ToggleTree if state.keys_pane_focused() => toggle_tree(state),
+        Action::ToggleTree => open_ttl_editor(state),
         Action::CollapseGroup => collapse_group(state),
         Action::ToggleReadOnly => {
             // A replica will refuse writes whatever we believe, so this is not
@@ -740,6 +750,48 @@ mod tests {
                 "at {cols} columns, an open-but-unfocused key must not own `r`"
             );
         }
+    }
+
+    /// PLAN M2 task 10, D2, ADR-0019: `t` splits on focus the same way `r`
+    /// does — keys pane still folds/unfolds the tree, value pane opens the
+    /// TTL editor. This is the shape the existing focus-dependent `d` test
+    /// has, one key over.
+    #[test]
+    fn t_follows_focus_tree_in_the_keys_pane_ttl_in_the_viewer() {
+        let mut before_tree = State {
+            focus: Pane::Keys,
+            ..viewing()
+        };
+        assert!(!before_tree.tree_mode);
+        let (after_tree, cmds) = update(
+            before_tree.clone(),
+            Msg::Key(KeyPress::plain(KeyCode::Char('t'))),
+        );
+        assert!(
+            after_tree.tree_mode,
+            "t in the keys pane still toggles the tree with a key open"
+        );
+        assert!(cmds.is_empty());
+        assert!(
+            after_tree.open.as_ref().unwrap().editor().is_none(),
+            "no TTL buffer was opened"
+        );
+        before_tree.tree_mode = true;
+
+        let (after_ttl, cmds) = update(viewing(), Msg::Key(KeyPress::plain(KeyCode::Char('t'))));
+        assert!(
+            !after_ttl.tree_mode,
+            "t in the value pane must not touch tree mode"
+        );
+        assert!(cmds.is_empty(), "opening the TTL editor emits no command");
+        assert!(
+            after_ttl.open.as_ref().unwrap().is_editing(),
+            "t in the value pane opens the TTL editor"
+        );
+        assert!(matches!(
+            after_ttl.open.as_ref().unwrap().editor().unwrap().target(),
+            crate::state::EditTarget::Ttl { .. }
+        ));
     }
 
     #[test]

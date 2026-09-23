@@ -177,6 +177,12 @@ pub(super) fn nothing_to_remove(
         // (CLAUDE.md's glossary), the same reason `NotWritten::MemberGone`
         // gets its own wording instead of borrowing `FieldGone`'s.
         Mutation::DeleteZSetMember { .. } => "member",
+        // PLAN M2 task 10, D6, ADR-0019: `PersistTtl` returning `0` (the key
+        // already had no expiry) is the one TTL write that settles as
+        // `NothingToRemove` — the script's own `EXISTS` is what tells that
+        // apart from a gone key, the same reason `SetZSetScore`'s guard
+        // exists one type over.
+        Mutation::PersistTtl { .. } => "expiry",
         Mutation::DeleteKey { .. }
         | Mutation::SetString { .. }
         | Mutation::SetHashField { .. }
@@ -190,7 +196,12 @@ pub(super) fn nothing_to_remove(
         // match stays exhaustive over `Mutation`, not a wildcard (PLAN M2
         // task 8, D8).
         | Mutation::SetZSetScore { .. }
-        | Mutation::AddZSetMember { .. } => "entry",
+        | Mutation::AddZSetMember { .. }
+        // Never settles this way either — `SetTtl`/`ShiftTtl` refuse via
+        // `NotWritten::KeyGone`/`NoExpiry`/`WouldExpireNow`, never
+        // `NothingToRemove` (PLAN M2 task 10, D5, D6, ADR-0019).
+        | Mutation::SetTtl { .. }
+        | Mutation::ShiftTtl { .. } => "entry",
     };
     state.notice = Some((
         format!("{}: {what} already gone", mutation.command_label()),
@@ -249,7 +260,9 @@ pub(super) fn not_written(
         | NotWritten::FieldExists
         | NotWritten::MemberExists
         | NotWritten::ElementMoved
-        | NotWritten::MemberGone => {
+        | NotWritten::MemberGone
+        | NotWritten::NoExpiry
+        | NotWritten::WouldExpireNow => {
             if let Some(open) = state.open.as_mut() {
                 open.unstage_buffer();
             }
@@ -259,8 +272,10 @@ pub(super) fn not_written(
             // is wired (PLAN M2 task 7 phase 3); `ElementMoved` cannot arrive
             // until `e`/`a`/`d` on a List are wired (PLAN M2 task 8 phase 3,
             // ADR-0017); `MemberGone` cannot arrive until `e` on a ZSet is
-            // wired (PLAN M2 task 9 phase 3, ADR-0018) — every arm is here
-            // because `NotWritten` is matched exhaustively.
+            // wired (PLAN M2 task 9 phase 3, ADR-0018); `NoExpiry`/
+            // `WouldExpireNow` cannot arrive until `t` is wired (PLAN M2
+            // task 10 phase 3, ADR-0019) — every arm is here because
+            // `NotWritten` is matched exhaustively.
             state.error = Some((
                 format!("{command}: {} — nothing written, edit kept", why.reason()),
                 at_ms,
@@ -391,5 +406,53 @@ mod tests {
         s.focus = Pane::Keys;
         let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('d'))));
         assert!(matches!(s.confirm, Some(PendingMutation::DeleteKey { .. })));
+    }
+
+    fn open_with_string_for_ttl() -> State {
+        let value = crate::state::Value::Str(crate::state::value::StringValue::new("v", 40));
+        let mut state = State {
+            open: Some(OpenKey::new(Some(0), "k".into(), value, 2_520, 1, 0)),
+            ..State::default()
+        };
+        state.keys.push(b"k");
+        state.rebuild_list();
+        state
+    }
+
+    #[test]
+    fn a_persist_ttl_already_gone_settles_nothing_to_remove_with_the_expiry_noun() {
+        let s = open_with_string_for_ttl();
+        let mutation = Mutation::PersistTtl { key: "k".into() };
+        let (s, _) = nothing_to_remove(s, &mutation, 1_000);
+        let (text, _) = s.notice.as_ref().unwrap();
+        assert!(
+            text.contains("expiry already gone"),
+            "PersistTtl's noun is 'expiry', not 'field' or 'entry': {text}"
+        );
+    }
+
+    #[test]
+    fn a_ttl_shift_not_written_reports_its_own_wording_and_keeps_the_key() {
+        let s = open_with_string_for_ttl();
+        let mutation = Mutation::ShiftTtl {
+            key: "k".into(),
+            delta_seconds: -1_800,
+        };
+        let (s, _) = not_written(s, &mutation, NotWritten::NoExpiry, 1_000);
+        let (text, _) = s.error.as_ref().unwrap();
+        assert!(text.contains("key has no expiry to change"), "{text}");
+        assert!(s.open.as_ref().unwrap().deleted_at_ms.is_none());
+
+        let s = open_with_string_for_ttl();
+        let (s, _) = not_written(s, &mutation, NotWritten::WouldExpireNow, 1_000);
+        let (text, _) = s.error.as_ref().unwrap();
+        assert!(
+            text.contains("the ttl moved underneath it, look again"),
+            "{text}"
+        );
+        assert!(
+            s.open.as_ref().unwrap().deleted_at_ms.is_none(),
+            "the key is never tombstoned by this refusal"
+        );
     }
 }

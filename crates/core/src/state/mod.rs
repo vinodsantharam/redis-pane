@@ -11,6 +11,7 @@ pub mod loaded;
 pub mod open;
 pub mod scan;
 pub mod tree;
+pub mod ttl;
 pub mod value;
 pub mod view;
 
@@ -20,6 +21,9 @@ pub use loaded::{KeyKind, LoadedSet};
 pub use open::{Attachment, EditPhase, OpenKey, PendingRead, ReadOutcome};
 pub use scan::ScanState;
 pub use tree::Tree;
+pub use ttl::{
+    TtlEdit, TtlEditRefusal, TtlOutcome, format_duration, parse_ttl_edit, resolve_ttl_edit,
+};
 pub use value::{ListEnd, Value, Viewer, looks_like_json};
 pub use view::{FilterMode, KeyView, SortBy};
 
@@ -342,6 +346,33 @@ pub enum PendingMutation {
         member: Vec<u8>,
         last_member: bool,
     },
+    /// Set the Open key's TTL outright (plain `EXPIRE`, PLAN M2 task 10, D1,
+    /// D6, ADR-0019). `old_ttl` is the raw TTL read when `t` opened — carried
+    /// through so the dialog's `ttl old → new` line need not re-derive it
+    /// from a `State` it is not given, the same reasoning
+    /// [`PendingMutation::SetZSetScore`]'s `old_score` carries.
+    SetTtl {
+        name: crate::key::KeyName,
+        old_ttl: i32,
+        new_ttl: i32,
+    },
+    /// Clear the Open key's TTL (guarded `PERSIST`, PLAN M2 task 10, D1, D6,
+    /// ADR-0019).
+    PersistTtl {
+        name: crate::key::KeyName,
+        old_ttl: i32,
+    },
+    /// Extend or shorten the Open key's TTL by a signed delta (guarded,
+    /// PLAN M2 task 10, D1, D6, D7, ADR-0019). `delta_seconds` is the
+    /// reader's own signed figure, parsed once and carried through — the
+    /// server applies it to the TTL as it sees it at write time, not to
+    /// `old_ttl` (D7), so this is never pre-resolved to an absolute seconds
+    /// figure the way [`PendingMutation::SetTtl`] is.
+    ShiftTtl {
+        name: crate::key::KeyName,
+        old_ttl: i32,
+        delta_seconds: i32,
+    },
 }
 
 impl Eq for PendingMutation {}
@@ -405,6 +436,26 @@ impl PendingMutation {
             // side of the dialog's diff instead.
             PendingMutation::AddZSetMember { name, .. } => format!("ZADD {name} NX"),
             PendingMutation::DeleteZSetMember { name, .. } => format!("ZREM {name}"),
+            // Literal seconds: this is exactly what is sent (D5, D9).
+            PendingMutation::SetTtl { name, new_ttl, .. } => format!("EXPIRE {name} {new_ttl}"),
+            PendingMutation::PersistTtl { name, .. } => format!("PERSIST {name}"),
+            // Not a literal command (D9's own note — `PendingMutation::command_text`'s
+            // doc comment above already allows a guarded write's "effective
+            // command" to diverge from the wire form): `EXPIRE` takes no
+            // signed delta, but showing one reads the reader's own intent
+            // back to them, which a raw seconds figure computed from a
+            // `delta_seconds` the reader never typed would not.
+            PendingMutation::ShiftTtl {
+                name,
+                delta_seconds,
+                ..
+            } => {
+                let sign = if *delta_seconds >= 0 { "+" } else { "-" };
+                format!(
+                    "EXPIRE {name} {sign}{}",
+                    crate::render::keys::format_duration(delta_seconds.unsigned_abs() as i32)
+                )
+            }
         }
     }
 
@@ -476,6 +527,23 @@ impl PendingMutation {
             // duplicate leaves untouched.
             PendingMutation::AddZSetMember { .. } => Some(
                 "only if the key still exists · never overwrites a member's score".to_string(),
+            ),
+            // D8: `EXPIRE` genuinely refuses on a missing key and reports it
+            // unambiguously — earned, the same as every other plain
+            // gone-key guard above.
+            PendingMutation::SetTtl { .. } => Some("only if the key still exists".to_string()),
+            // D8: earned by the script's own `EXISTS`, which exists
+            // precisely so a gone key can be reported apart from a key that
+            // already had no expiry.
+            PendingMutation::PersistTtl { .. } => {
+                Some("only if the key still exists".to_string())
+            }
+            // D8: both clauses are literally the script's `t == -1` and
+            // `n <= 0` branches — never a third clause naming "never deletes
+            // the key," which is Redis behaving normally, not something the
+            // script does (D8's explicit rejection).
+            PendingMutation::ShiftTtl { .. } => Some(
+                "only if the key still has an expiry · never expires it immediately".to_string(),
             ),
         }
     }
@@ -615,6 +683,25 @@ impl PendingMutation {
             PendingMutation::DeleteZSetMember { name, member, .. } => {
                 (Mutation::DeleteZSetMember { key: name, member }, None)
             }
+            PendingMutation::SetTtl { name, new_ttl, .. } => (
+                Mutation::SetTtl {
+                    key: name,
+                    seconds: new_ttl,
+                },
+                None,
+            ),
+            PendingMutation::PersistTtl { name, .. } => (Mutation::PersistTtl { key: name }, None),
+            PendingMutation::ShiftTtl {
+                name,
+                delta_seconds,
+                ..
+            } => (
+                Mutation::ShiftTtl {
+                    key: name,
+                    delta_seconds,
+                },
+                None,
+            ),
         };
         crate::Command::Execute { mutation, index }
     }
@@ -1443,6 +1530,106 @@ mod tests {
                 mutation: Mutation::DeleteZSetMember {
                     key: "myzset".into(),
                     member: b"gamma".to_vec(),
+                },
+                index: None,
+            }
+        );
+    }
+
+    #[test]
+    fn set_ttl_previews_expire_with_the_literal_seconds_and_a_gone_key_guard() {
+        let pending = PendingMutation::SetTtl {
+            name: "session:9f3a".into(),
+            old_ttl: 2_520,
+            new_ttl: 300,
+        };
+        assert_eq!(pending.command_text(), "EXPIRE session:9f3a 300");
+        assert_eq!(
+            pending.guard_text().as_deref(),
+            Some("only if the key still exists")
+        );
+        assert_eq!(pending.json_warning(), None);
+    }
+
+    #[test]
+    fn persist_ttl_previews_persist_with_a_gone_key_guard() {
+        let pending = PendingMutation::PersistTtl {
+            name: "session:9f3a".into(),
+            old_ttl: 2_520,
+        };
+        assert_eq!(pending.command_text(), "PERSIST session:9f3a");
+        assert_eq!(
+            pending.guard_text().as_deref(),
+            Some("only if the key still exists")
+        );
+    }
+
+    #[test]
+    fn shift_ttl_previews_a_signed_duration_not_a_literal_expire() {
+        let extend = PendingMutation::ShiftTtl {
+            name: "session:9f3a".into(),
+            old_ttl: 2_520,
+            delta_seconds: 1_800,
+        };
+        assert_eq!(extend.command_text(), "EXPIRE session:9f3a +30m");
+        assert_eq!(
+            extend.guard_text().as_deref(),
+            Some("only if the key still has an expiry · never expires it immediately"),
+            "one clause for each script branch, never a third naming what Redis does anyway"
+        );
+
+        let shorten = PendingMutation::ShiftTtl {
+            name: "session:9f3a".into(),
+            old_ttl: 2_520,
+            delta_seconds: -600,
+        };
+        assert_eq!(shorten.command_text(), "EXPIRE session:9f3a -10m");
+    }
+
+    #[test]
+    fn into_command_carries_the_ttl_mutations_through() {
+        use crate::command::Command;
+        use crate::mutation::Mutation;
+
+        let set = PendingMutation::SetTtl {
+            name: "k".into(),
+            old_ttl: 2_520,
+            new_ttl: 300,
+        };
+        assert_eq!(
+            set.into_command(),
+            Command::Execute {
+                mutation: Mutation::SetTtl {
+                    key: "k".into(),
+                    seconds: 300,
+                },
+                index: None,
+            }
+        );
+
+        let persist = PendingMutation::PersistTtl {
+            name: "k".into(),
+            old_ttl: 2_520,
+        };
+        assert_eq!(
+            persist.into_command(),
+            Command::Execute {
+                mutation: Mutation::PersistTtl { key: "k".into() },
+                index: None,
+            }
+        );
+
+        let shift = PendingMutation::ShiftTtl {
+            name: "k".into(),
+            old_ttl: 2_520,
+            delta_seconds: -600,
+        };
+        assert_eq!(
+            shift.into_command(),
+            Command::Execute {
+                mutation: Mutation::ShiftTtl {
+                    key: "k".into(),
+                    delta_seconds: -600,
                 },
                 index: None,
             }

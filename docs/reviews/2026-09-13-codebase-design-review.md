@@ -858,6 +858,55 @@ task 14 is exactly the third data point this seam needs — and it should use th
 lookup above (or build it, if task 9 did not) rather than adding a third hard-coded string pair to
 the same shared drawing function that just produced one real, shipped bug from doing that twice.
 
+### Revisited again after task 10 (TTL editing, ADR-0019): a fifth case, of a different kind
+
+The four cases before this were all the same *shape* of thing — a value type, edited through a
+`Value` branch. **TTL editing is the first edit that is not per-type at all.** It has no `Value`
+branch, no `cursor_active` prerequisite, and no binary refusal, because every Redis type has exactly
+one TTL and it is edited identically. Its refusal ladder is two clauses shorter than any sibling's.
+That makes it the first evidence about M3 that is not another sample from the same population.
+
+**Does a metadata-shaped mutation sit inside the shape the four value types suggested, or beside it?
+Beside it — and that is a useful answer, not a shrug.** The part of the machinery that converged for
+four types converged for this one too, unchanged and without argument: one `Mutation` variant per
+write, one `PendingMutation` previewing it, one `Command::Execute`, one `redis::mutate::execute`, one
+confirm renderer. TTL editing added three variants to each and needed no new seam anywhere. That is
+now five types' worth of evidence that **the chokepoint is the real abstraction in this codebase**,
+and it was complete after task 6.
+
+The part that never converged — per-type write semantics, identity reasoning, what `e` even *means*
+for a row — TTL editing does not participate in at all. It has no identity model because it has no
+row. So it neither strengthens nor weakens the case against a `Viewer`-sibling trait; it sits
+outside the question. **Any such trait must therefore not be the thing that owns "how a write is
+staged and previewed", because a whole category of writes has no viewer to hang off.** That is the
+one genuinely new constraint five cases give that four did not, and it rules out the most tempting
+over-general version of the trait — the one that would have absorbed the chokepoint along with the
+type dispatch.
+
+**On task 9's narrow proposal — it is strengthened, and its shape is now clearer.** Task 9 proposed
+exhaustive `add_form_labels`/`add_form_duplicate` lookups keyed on `EditTarget`, after a shared
+drawing function with two hard-coded strings produced a real bug. TTL editing adds a **third kind of
+single-line capture** (`EditTarget::Ttl`), and in wiring it two more instances of exactly that class
+of defect surfaced: `editor_key` and then `paste` both routed on `active_part() ==
+Some(FieldPart::Name)`, a predicate that is honestly `None` for a TTL, so a pasted duration silently
+vanished into an unused `TextArea`. Both were fixed by naming the property actually wanted —
+`EditBuffer::is_single_line_capture()`.
+
+That is the same lesson one level down, and it sharpens the proposal rather than merely repeating it:
+**the recurring defect is not "type knowledge leaked", it is "a predicate stood in for a property".**
+`active_part() == Some(Name)` stood in for "is this a single-line capture". A hard-coded `"FIELD"`
+stood in for "what does this form call its first part". Each worked until a target appeared for which
+the proxy and the property came apart, and each failed *silently*, because a proxy that returns the
+wrong answer is still a valid answer. So the fix task 9 named should be generalised one notch: not
+only label and duplicate lookups, but **an audit of every `EditTarget`/`FieldPart` predicate used to
+decide behaviour rather than to describe state**. There are now three known instances and all three
+were found by accident.
+
+A fourth, still unfixed and worth naming here: the seeded-cursor-at-position-0 behaviour in
+`for_hash_field`/`list_element`/`zset_score` (task 9's phase 3 note). The TTL capture does not have
+it — D11 explains why — which means the codebase now contains both the defect and its remedy side by
+side, and the remedy is the one that arrived last.
+
 ---
 
 ## Sources

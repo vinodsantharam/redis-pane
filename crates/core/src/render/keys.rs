@@ -522,10 +522,23 @@ pub fn format_size(bytes: u32) -> String {
     }
 }
 
+/// The two-most-significant-units duration formatter used by the TTL edit's
+/// resolution line and confirm dialog (PLAN M2 task 10, D10, D12,
+/// ADR-0019) — defined in [`crate::state::ttl`], the one pure, clock-free
+/// place both `update` and `render` read the TTL grammar from, and
+/// re-exported here so it sits beside [`format_ttl`], the coarser
+/// single-unit form it is not. See `format_ttl`'s own doc comment for the
+/// reverse pointer.
+pub use crate::state::ttl::format_duration;
+
 /// A TTL in seconds, at the coarsest useful precision.
 ///
 /// `∞` for a key with no expiry — a fact, and visually distinct from the
-/// placeholder that means "we have not asked yet".
+/// placeholder that means "we have not asked yet". For the one moment the
+/// exact figure matters — the TTL edit's resolution line and confirm dialog,
+/// while the reader is deciding what to type — see
+/// [`format_duration`] instead: two most-significant units, never one
+/// collapsed to `1m` for what is actually 90 seconds (D10).
 pub fn format_ttl(seconds: i32) -> String {
     match seconds {
         TTL_NONE => "∞".into(),

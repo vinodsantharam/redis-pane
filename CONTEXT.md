@@ -103,6 +103,26 @@ How long ago the value on screen was read. It is displayed whenever Liveness is 
 because a value with no stated age is a value the user has to guess about.
 _Avoid_: Staleness, last updated, timestamp
 
+**TTL**:
+The server's fact about when a key expires — what `TTL key` answers, in whole seconds, with `-1`
+meaning the key has no expiry at all. A TTL only ever changes because a read brought back a new
+one or a write set one; the app never infers it.
+_Avoid_: Expiry time, lifetime, timeout (each names a different thing to a Redis reader)
+
+**Countdown**:
+The local projection of a TTL, ticking down between reads so the most time-sensitive figure on
+screen costs no round trip. It is computed per frame from the TTL and the moment it was read —
+never polled, never refreshed, and never a second source of truth: a countdown that disagrees with
+the server is a countdown waiting for the next read, not a TTL.
+_Avoid_: Timer, ticker, live TTL, auto-refresh
+
+**Duration expression**:
+What the reader types into the TTL field — `5m`, `2h30m`, `+30m`, `-10m`, or `never`. It is not a
+TTL: it is a request that resolves to one of four operations against the key's current TTL, and
+the field says which one while it is being typed. **Set** replaces the expiry, **persist** removes
+it, and **extend** and **shorten** move it by a signed delta the server applies to its own TTL.
+_Avoid_: Timeout string, TTL input, expiry value
+
 **Viewer**:
 The type-specific rendering of a value — one per Redis type, all sharing a common frame so
 navigation transfers between them.

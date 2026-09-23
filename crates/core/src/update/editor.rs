@@ -147,6 +147,58 @@ pub(super) fn open_editor(mut state: State) -> (State, Vec<Command>) {
     }
 }
 
+/// Stages `t` in the value pane: opens the TTL editor on the Open key's
+/// metadata (D1, D2, D11, ADR-0019).
+///
+/// Every prior editor branches on `Value` and refuses types it cannot
+/// handle. A TTL does not: a String, a Hash, a Stream and a binary blob all
+/// have exactly one TTL, edited identically, so this refusal ladder is
+/// shorter than [`open_editor`]'s — no `cursor_active` prerequisite and no
+/// per-`Value` arm at all. A binary value does **not** refuse `t`, for the
+/// same reason ADR-0018 D5 let a binary member's score be edited: the bytes
+/// never travel.
+///
+/// The "a value has been read at all" clause stays even though a TTL edit
+/// needs no value: acting on a key whose read has not landed means acting
+/// on a key that may not exist.
+pub(super) fn open_ttl_editor(mut state: State) -> (State, Vec<Command>) {
+    let notify = |text: &str| vec![Command::Notify { text: text.into() }];
+    // Mirrors `open_editor`'s own check (PLAN M2 task 10, D2): `t`'s
+    // keys-pane/value-pane split happens in `update`'s dispatch, before this
+    // is even called, so this branch is unreachable from the real keymap —
+    // it stays for the same reason `open_editor`'s does, so this function is
+    // independently testable and does not silently start acting on whatever
+    // key the Viewer holds if a future rebind ever calls it from the wrong
+    // focus.
+    if state.keys_pane_focused() {
+        let text = if state.open.is_some() {
+            "Tab to the value pane to edit"
+        } else {
+            "open a key first"
+        };
+        return (state, notify(text));
+    }
+    let Some(open) = state.open.as_ref() else {
+        return (state, notify("nothing open to edit"));
+    };
+    if open.deleted_at_ms.is_some() {
+        return (state, notify("gone — no ttl to edit"));
+    }
+    // The previous edit's write has not been read back yet — the same guard
+    // `open_editor` applies, one type over.
+    if open.is_editing() {
+        return (state, notify("still saving the last edit"));
+    }
+    if open.value.is_none() {
+        return (state, notify("nothing open to edit"));
+    }
+    let buffer = EditBuffer::ttl(open.ttl_seconds);
+    if let Some(open) = state.open.as_mut() {
+        open.begin_edit(buffer);
+    }
+    (state, Vec::new())
+}
+
 /// Stages `a`: opens the add form on the Open Hash, Set or List — the
 /// two-part `FIELD`/`VALUE` form on the name part for a Hash (PLAN M2 task 6
 /// follow-up, F), or the single-part capture for a Set (PLAN M2 task 7, D3,
@@ -285,6 +337,45 @@ pub(super) fn value_part_stage_blocked(state: &State) -> bool {
     set_member_blocked(state) || !zset_score_valid(state)
 }
 
+/// Whether `⌃S`/`Enter` are blocked on the TTL capture (D4, D12, ADR-0019):
+/// the buffer's text must both parse as a [`crate::state::ttl::TtlEdit`] and
+/// resolve against the key's current TTL. Reads `open.ttl_seconds` — the raw
+/// read figure, not the counted-down one — because `editor_key` and
+/// `name_part_key` have no clock (ADR-0011); the live resolution line under
+/// the field, which does render with a clock, is what shows the exact
+/// current figure while the reader types. `true` (blocked) with nothing to
+/// check, so a caller need not re-verify `open`/`editor` exist or that the
+/// buffer is even a TTL capture first — the same shape [`set_member_blocked`]
+/// and [`zset_score_valid`] already have, one grammar wider.
+fn ttl_edit_blocked(state: &State) -> bool {
+    let Some(open) = state.open.as_ref() else {
+        return true;
+    };
+    let Some(editor) = open.typing() else {
+        return true;
+    };
+    let EditTarget::Ttl { text } = editor.target() else {
+        return true;
+    };
+    match crate::state::ttl::parse_ttl_edit(text) {
+        Ok(edit) => crate::state::ttl::resolve_ttl_edit(edit, open.ttl_seconds).is_err(),
+        Err(_) => true,
+    }
+}
+
+/// Whether the buffer currently being typed into is [`EditTarget::Ttl`] —
+/// the property [`name_part_key`] needs to pick between the add forms' name
+/// half (gated by [`add_form_name_blocked`]) and the TTL capture (gated by
+/// [`ttl_edit_blocked`]), which share this routing function but not this
+/// guard (D4, D11, ADR-0019).
+fn typing_is_ttl(state: &State) -> bool {
+    state
+        .open
+        .as_ref()
+        .and_then(OpenKey::typing)
+        .is_some_and(|e| matches!(e.target(), EditTarget::Ttl { .. }))
+}
+
 /// Keys read while the add form's name part is active (PLAN M2 task 6
 /// follow-up, F/N) — shaped like the old field-name capture it replaces:
 /// plain characters append, Backspace removes one, Paste appends with
@@ -292,6 +383,14 @@ pub(super) fn value_part_stage_blocked(state: &State) -> bool {
 /// `Enter`/`↓` advance to the value part and `⌃S` stages directly from here,
 /// all three gated by [`add_form_name_blocked`]; `Esc` discards the whole add.
 pub(super) fn name_part_key(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
+    // D11, ADR-0019: a TTL capture shares this routing function (it is one
+    // more [`EditBuffer::is_single_line_capture`] target) but not the add
+    // forms' name-part guard — `add_form_name_blocked` has no
+    // [`EditTarget::Ttl`] arm of its own and falls to its `true` default,
+    // which is the right answer for "is this a shown duplicate?" but the
+    // wrong question for a duration expression. `ttl_edit_blocked` is D4's
+    // grammar instead.
+    let is_ttl = typing_is_ttl(&state);
     if let Some(action) = state.keymap.action_for(&key) {
         match action {
             Action::EditorStage => {
@@ -301,7 +400,11 @@ pub(super) fn name_part_key(mut state: State, key: KeyPress) -> (State, Vec<Comm
                 // numeric guard must hold here too, or `⌃S` on the ZSet add
                 // form's bare member part would stage an empty, unparseable
                 // score.
-                if add_form_name_blocked(&state) || !zset_score_valid(&state) {
+                if is_ttl {
+                    if ttl_edit_blocked(&state) {
+                        return (state, Vec::new());
+                    }
+                } else if add_form_name_blocked(&state) || !zset_score_valid(&state) {
                     return (state, Vec::new());
                 }
                 return stage_editor(state);
@@ -318,6 +421,19 @@ pub(super) fn name_part_key(mut state: State, key: KeyPress) -> (State, Vec<Comm
         }
     }
     match key.code {
+        // D11, ADR-0019: a TTL capture has no value part to advance to, so
+        // `Enter` stages directly from here — the same "stage everything but
+        // a multi-line String" rule `editor_key`'s own Enter-staging block
+        // applies to every other non-`Value` target (2026-09-22 amendment to
+        // ADR-0014). `Down` is left with its ordinary (here, no-op)
+        // meaning — nothing in this app's keymap treats `Down` as a stage
+        // request, and D3's own text calls out `Enter` specifically.
+        KeyCode::Enter if is_ttl => {
+            if ttl_edit_blocked(&state) {
+                return (state, Vec::new());
+            }
+            stage_editor(state)
+        }
         KeyCode::Enter | KeyCode::Down => {
             if !add_form_name_blocked(&state)
                 && let Some(editor) = state.open.as_mut().and_then(OpenKey::typing_mut)
@@ -537,11 +653,18 @@ pub(super) fn stage_editor(mut state: State) -> (State, Vec<Command>) {
 /// own capture mode, since a text editor's movement and insertion keys are
 /// not meaningfully "actions" a user would rebind one at a time.
 pub(super) fn editor_key(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
+    // `is_single_line_capture` in place of `active_part() ==
+    // Some(FieldPart::Name)` (PLAN M2 task 10, D11, ADR-0019): a TTL capture
+    // has no `FieldPart` to be on at all — one field, always active — so the
+    // old predicate could never route it here. `is_single_line_capture` is
+    // the property both the add forms' name half and the TTL capture
+    // actually share: typing goes into this struct's own text, not the
+    // internal `TextArea`.
     if state
         .open
         .as_ref()
         .and_then(OpenKey::typing)
-        .is_some_and(|e| e.active_part() == Some(FieldPart::Name))
+        .is_some_and(EditBuffer::is_single_line_capture)
     {
         return name_part_key(state, key);
     }
@@ -4554,5 +4677,500 @@ mod zset_score_edit_tests {
             delta_seconds: 1_800,
         };
         assert_eq!(extend.command_text(), "EXPIRE k +30m");
+    }
+}
+
+#[cfg(test)]
+mod ttl_editor_wiring_tests {
+    //! PLAN M2 task 10 phase 3 (D1, D2, D4, D7, D11, ADR-0019): `t` in the
+    //! value pane, wired end to end — `open_ttl_editor`'s refusal ladder, the
+    //! `⌃S` duration-grammar block, the three confirm dialogs reached through
+    //! the real keypress path, read-only refusal at confirm, R3.8's
+    //! held-while-editing guard, and D7's refetch-only path. The TTL
+    //! *grammar* itself (`parse_ttl_edit`/`resolve_ttl_edit`) is proved once
+    //! in `crate::state::ttl`'s own tests; these only prove it is wired to
+    //! `⌃S` correctly, without restating it.
+
+    use super::*;
+    use crate::msg::KeyCode;
+    use crate::state::value::{BinaryValue, JsonValue, MemberValue, PairValue, ScoredValue};
+
+    fn open_string_key(ttl_seconds: i32) -> State {
+        let value = crate::state::Value::Str(crate::state::value::StringValue::new("v", 80));
+        let mut state = State {
+            cols: 130,
+            rows: 40,
+            focus: Pane::Value,
+            open: Some(OpenKey::new(Some(0), "k".into(), value, ttl_seconds, 1, 0)),
+            ..State::default()
+        };
+        state.keys.push(b"k");
+        state.rebuild_list();
+        state
+    }
+
+    /// `t`, through the real dispatch path (`Action::ToggleTree`'s focus
+    /// split in `update/mod.rs`, D2) — not a direct `open_ttl_editor` call —
+    /// so this also proves the keymap wiring, not just the function.
+    fn open_ttl(ttl_seconds: i32) -> State {
+        let (s, cmds) = update(
+            open_string_key(ttl_seconds),
+            Msg::Key(KeyPress::plain(KeyCode::Char('t'))),
+        );
+        assert!(cmds.is_empty(), "opening the TTL editor emits no command");
+        assert!(
+            s.open.as_ref().unwrap().is_editing(),
+            "t must have opened the buffer"
+        );
+        assert!(matches!(
+            s.open.as_ref().unwrap().editor().unwrap().target(),
+            EditTarget::Ttl { .. }
+        ));
+        s
+    }
+
+    fn type_text(mut s: State, text: &str) -> State {
+        for c in text.chars() {
+            (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char(c))));
+        }
+        s
+    }
+
+    /// Clear the seeded duration and type a replacement — the TTL capture
+    /// has no cursor to be in the wrong place (D11), so a plain run of
+    /// Backspace is enough, unlike the ZSet score buffer's `retype_score`.
+    fn retype_ttl(mut s: State, new: &str) -> State {
+        let len = s
+            .open
+            .as_ref()
+            .unwrap()
+            .editor()
+            .unwrap()
+            .ttl_text()
+            .unwrap()
+            .chars()
+            .count();
+        for _ in 0..len {
+            (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Backspace)));
+        }
+        type_text(s, new)
+    }
+
+    // ── D1: the refusal ladder ──────────────────────────────────────────────
+
+    #[test]
+    fn t_in_the_keys_pane_with_a_key_open_gives_the_tab_notice() {
+        let mut s = open_string_key(2_520);
+        s.focus = Pane::Keys;
+        let (s, cmds) = open_ttl_editor(s);
+        assert!(s.open.as_ref().unwrap().editor().is_none());
+        assert!(
+            matches!(cmds.as_slice(), [Command::Notify { text }] if text == "Tab to the value pane to edit")
+        );
+    }
+
+    #[test]
+    fn t_in_the_keys_pane_with_nothing_open_says_open_a_key_first() {
+        let s = State {
+            focus: Pane::Keys,
+            ..State::default()
+        };
+        let (_, cmds) = open_ttl_editor(s);
+        assert!(
+            matches!(cmds.as_slice(), [Command::Notify { text }] if text == "open a key first")
+        );
+    }
+
+    #[test]
+    fn t_with_nothing_open_at_all_says_nothing_open_to_edit() {
+        let s = State {
+            focus: Pane::Value,
+            ..State::default()
+        };
+        let (_, cmds) = open_ttl_editor(s);
+        assert!(
+            matches!(cmds.as_slice(), [Command::Notify { text }] if text == "nothing open to edit")
+        );
+    }
+
+    #[test]
+    fn t_on_a_gone_key_refuses_naming_the_ttl_not_the_value() {
+        let mut s = open_string_key(2_520);
+        s.open.as_mut().unwrap().deleted_at_ms = Some(1_000);
+        let (s, cmds) = open_ttl_editor(s);
+        assert!(s.open.as_ref().unwrap().editor().is_none());
+        assert!(
+            matches!(cmds.as_slice(), [Command::Notify { text }] if text == "gone — no ttl to edit"),
+            "{cmds:?}"
+        );
+    }
+
+    #[test]
+    fn t_while_the_last_ttl_edit_is_still_saving_is_refused() {
+        let s = retype_ttl(open_ttl(2_520), "5m");
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        assert!(
+            s.open.as_ref().unwrap().is_editing(),
+            "R3.8's guard still holds — the SET has not settled"
+        );
+        let (_, cmds) = open_ttl_editor(s);
+        assert!(
+            matches!(cmds.as_slice(), [Command::Notify { text }] if text == "still saving the last edit")
+        );
+    }
+
+    /// D1: no `cursor_active` prerequisite and no per-`Value` arm — every
+    /// Redis type has exactly one TTL, edited identically. Unlike `e`, `t`
+    /// never needs a row picked first.
+    #[test]
+    fn t_opens_on_every_value_type_with_no_cursor_active() {
+        let values = [
+            crate::state::Value::Str(crate::state::value::StringValue::new("v", 80)),
+            crate::state::Value::Hash(PairValue {
+                pairs: vec![("f".into(), "v".into())],
+                total: 1,
+            }),
+            crate::state::Value::Set(MemberValue {
+                members: vec![b"m".to_vec()],
+                total: 1,
+            }),
+            crate::state::Value::List(crate::state::value::IndexedValue {
+                items: vec![b"e".to_vec()],
+                total: 1,
+            }),
+            crate::state::Value::ZSet(ScoredValue {
+                entries: vec![(b"m".to_vec(), 1.0)],
+                total: 1,
+            }),
+            crate::state::Value::Stream(crate::state::value::StreamValue {
+                entries: vec![("1-0".into(), vec![(b"f".to_vec(), b"v".to_vec())])],
+                total: 1,
+            }),
+            crate::state::Value::Json(JsonValue::parse("{\"a\":1}")),
+        ];
+        for value in values {
+            let mut state = State {
+                cols: 130,
+                rows: 40,
+                focus: Pane::Value,
+                open: Some(OpenKey::new(
+                    Some(0),
+                    "k".into(),
+                    value.clone(),
+                    2_520,
+                    1,
+                    0,
+                )),
+                ..State::default()
+            };
+            state.keys.push(b"k");
+            state.rebuild_list();
+            let (state, cmds) = open_ttl_editor(state);
+            assert!(
+                state.open.as_ref().unwrap().is_editing(),
+                "t must not refuse {value:?}"
+            );
+            assert!(cmds.is_empty());
+        }
+    }
+
+    /// D1: a binary value does **not** refuse `t`, for the same reason
+    /// ADR-0018 D5 let a binary member's score be edited — the bytes never
+    /// travel.
+    #[test]
+    fn t_does_not_refuse_a_binary_value() {
+        let mut state = State {
+            cols: 130,
+            rows: 40,
+            focus: Pane::Value,
+            open: Some(OpenKey::new(
+                Some(0),
+                "k".into(),
+                crate::state::Value::Binary(BinaryValue {
+                    bytes: vec![0xff, 0x00, 0x80],
+                }),
+                2_520,
+                1,
+                0,
+            )),
+            ..State::default()
+        };
+        state.keys.push(b"k");
+        state.rebuild_list();
+        let (state, cmds) = open_ttl_editor(state);
+        assert!(
+            state.open.as_ref().unwrap().is_editing(),
+            "D1: a binary value does not refuse t"
+        );
+        assert!(cmds.is_empty());
+    }
+
+    // ── D4: the `⌃S` duration-grammar block, every refusal by name ──────────
+
+    #[test]
+    fn ctrl_s_is_blocked_on_unreadable_text() {
+        let s = retype_ttl(open_ttl(2_520), "abc");
+        let (s, cmds) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(cmds.is_empty());
+        assert!(s.confirm.is_none(), "unreadable text must not stage");
+        assert!(s.open.as_ref().unwrap().is_editing(), "buffer stays open");
+    }
+
+    #[test]
+    fn ctrl_s_is_blocked_when_the_typed_value_resolves_to_zero() {
+        let s = retype_ttl(open_ttl(2_520), "0");
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(
+            s.confirm.is_none(),
+            "0 deletes the key — must not stage as a TTL write"
+        );
+    }
+
+    #[test]
+    fn ctrl_s_is_blocked_shifting_a_key_with_no_expiry() {
+        let s = retype_ttl(open_ttl(crate::state::loaded::TTL_NONE), "+30m");
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(s.confirm.is_none(), "nothing to extend");
+    }
+
+    #[test]
+    fn ctrl_s_is_blocked_shortening_past_zero() {
+        let s = retype_ttl(open_ttl(60), "-3600");
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(s.confirm.is_none(), "would expire it now");
+    }
+
+    #[test]
+    fn ctrl_s_is_blocked_above_the_ceiling() {
+        let s = retype_ttl(open_ttl(2_520), &(i64::from(i32::MAX) + 1).to_string());
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(s.confirm.is_none(), "over the app's own i32 ceiling");
+    }
+
+    #[test]
+    fn ctrl_s_is_blocked_persisting_a_key_that_already_never_expires() {
+        let s = retype_ttl(open_ttl(crate::state::loaded::TTL_NONE), "never");
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(s.confirm.is_none(), "already never expires");
+    }
+
+    /// `Enter` is blocked exactly the same way `⌃S` is — one call site for
+    /// "stage from here" (D11).
+    #[test]
+    fn enter_is_blocked_the_same_way_ctrl_s_is() {
+        let s = retype_ttl(open_ttl(2_520), "abc");
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Enter)));
+        assert!(cmds.is_empty());
+        assert!(s.confirm.is_none());
+        assert!(s.open.as_ref().unwrap().is_editing());
+    }
+
+    // ── D9: the three confirm dialogs, reached through the real keypresses ──
+
+    #[test]
+    fn a_valid_set_unblocks_ctrl_s_and_stages_set_ttl_with_its_own_command_line() {
+        let s = retype_ttl(open_ttl(2_520), "5m");
+        let (s, cmds) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(cmds.is_empty());
+        match &s.confirm {
+            Some(PendingMutation::SetTtl {
+                name,
+                old_ttl,
+                new_ttl,
+            }) => {
+                assert_eq!(name, b"k");
+                assert_eq!(*old_ttl, 2_520);
+                assert_eq!(*new_ttl, 300);
+            }
+            other => panic!("expected a staged SetTtl, got {other:?}"),
+        }
+        assert_eq!(s.confirm.as_ref().unwrap().command_text(), "EXPIRE k 300");
+        assert_eq!(
+            s.confirm.as_ref().unwrap().guard_text().as_deref(),
+            Some("only if the key still exists")
+        );
+        let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        assert_eq!(
+            cmds,
+            vec![Command::Execute {
+                mutation: Mutation::SetTtl {
+                    key: "k".into(),
+                    seconds: 300,
+                },
+                index: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn clearing_the_field_unblocks_ctrl_s_and_stages_persist_ttl() {
+        let s = retype_ttl(open_ttl(2_520), "");
+        let (s, cmds) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(cmds.is_empty());
+        match &s.confirm {
+            Some(PendingMutation::PersistTtl { name, old_ttl }) => {
+                assert_eq!(name, b"k");
+                assert_eq!(*old_ttl, 2_520);
+            }
+            other => panic!("expected a staged PersistTtl, got {other:?}"),
+        }
+        assert_eq!(s.confirm.as_ref().unwrap().command_text(), "PERSIST k");
+        let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        assert_eq!(
+            cmds,
+            vec![Command::Execute {
+                mutation: Mutation::PersistTtl { key: "k".into() },
+                index: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_signed_duration_unblocks_ctrl_s_and_stages_shift_ttl() {
+        let s = retype_ttl(open_ttl(2_520), "+30m");
+        let (s, cmds) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(cmds.is_empty());
+        match &s.confirm {
+            Some(PendingMutation::ShiftTtl {
+                name,
+                old_ttl,
+                delta_seconds,
+            }) => {
+                assert_eq!(name, b"k");
+                assert_eq!(*old_ttl, 2_520);
+                assert_eq!(*delta_seconds, 1_800);
+            }
+            other => panic!("expected a staged ShiftTtl, got {other:?}"),
+        }
+        // Not literal EXPIRE syntax — the effective command as a signed
+        // duration (D6's "Found while building" note, phase 2).
+        assert_eq!(s.confirm.as_ref().unwrap().command_text(), "EXPIRE k +30m");
+        let (_, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        assert_eq!(
+            cmds,
+            vec![Command::Execute {
+                mutation: Mutation::ShiftTtl {
+                    key: "k".into(),
+                    delta_seconds: 1_800,
+                },
+                index: None,
+            }]
+        );
+    }
+
+    // ── Read-only refused at confirm ─────────────────────────────────────
+
+    #[test]
+    fn read_only_mode_refuses_a_staged_ttl_write_at_confirm_not_at_ctrl_s() {
+        let s = State {
+            read_only: Some(crate::state::ReadOnlyReason::Environment),
+            ..retype_ttl(open_ttl(2_520), "5m")
+        };
+        let (s, cmds) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(s.confirm.is_some(), "staging composes the preview anyway");
+        assert!(cmds.is_empty());
+
+        let (s, cmds) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        assert!(s.confirm.is_none(), "the dialog still closes");
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Command::Execute { .. })),
+            "nothing was actually sent to the server: {cmds:?}"
+        );
+    }
+
+    // ── R3.8: held while a TTL capture is open ───────────────────────────
+
+    #[test]
+    fn a_value_loaded_while_the_ttl_editor_is_open_is_held_not_applied() {
+        let s = open_ttl(2_520);
+        let token = s.read_token;
+        let (s, _) = update(
+            s,
+            Msg::ValueLoaded {
+                token,
+                index: Some(0),
+                name: "k".into(),
+                value: crate::state::Value::Str(crate::state::value::StringValue::new(
+                    "from the server",
+                    80,
+                )),
+                ttl_seconds: 60,
+                size_bytes: 10,
+                at_ms: 1_000,
+            },
+        );
+        let open = s.open.unwrap();
+        assert_eq!(
+            open.ttl_seconds, 2_520,
+            "the screen's TTL must not change under an open editor"
+        );
+        assert!(open.pending.is_some(), "held for later instead");
+        assert!(
+            open.editor().is_some(),
+            "and the buffer itself is untouched"
+        );
+    }
+
+    // ── D7: the refetch is the only path a new TTL reaches the Viewer by ────
+
+    #[test]
+    fn a_settled_ttl_set_issues_a_refetch_and_touches_no_local_ttl() {
+        let s = retype_ttl(open_ttl(2_520), "5m");
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        assert_eq!(
+            s.open.as_ref().unwrap().ttl_seconds,
+            2_520,
+            "still the raw read figure — nothing applies the write locally (D7)"
+        );
+
+        let (s, cmds) = update(
+            s,
+            Msg::MutationSettled {
+                mutation: Mutation::SetTtl {
+                    key: "k".into(),
+                    seconds: 300,
+                },
+                index: None,
+                result: Ok(MutationOutcome::Done),
+                at_ms: 5_000,
+            },
+        );
+        assert!(
+            matches!(cmds.as_slice(), [Command::ReadKey { .. }]),
+            "the reply is the only way a new TTL reaches the Viewer, never this message: {cmds:?}"
+        );
+        assert_eq!(
+            s.open.as_ref().unwrap().ttl_seconds,
+            2_520,
+            "still untouched — only `Msg::ValueLoaded` (the Refetch's reply) may change it"
+        );
+        assert!(!s.open.as_ref().unwrap().is_editing());
+    }
+
+    #[test]
+    fn a_settled_ttl_shift_also_only_ever_refetches() {
+        let s = retype_ttl(open_ttl(2_520), "+30m");
+        let (s, _) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        let (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char('y'))));
+        let (s, cmds) = update(
+            s,
+            Msg::MutationSettled {
+                mutation: Mutation::ShiftTtl {
+                    key: "k".into(),
+                    delta_seconds: 1_800,
+                },
+                index: None,
+                result: Ok(MutationOutcome::Done),
+                at_ms: 5_000,
+            },
+        );
+        assert!(matches!(cmds.as_slice(), [Command::ReadKey { .. }]));
+        assert_eq!(
+            s.open.as_ref().unwrap().ttl_seconds,
+            2_520,
+            "the script's arithmetic is never mirrored locally — the refetch brings the real figure"
+        );
     }
 }

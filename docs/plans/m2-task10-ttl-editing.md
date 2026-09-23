@@ -689,3 +689,45 @@ keys-pane/value-pane split in `keymap/mod.rs`/`update/mod.rs` — all phase 3. `
 tree in both panes; no keypress opens a TTL editor. Golden frames for the resolution line and the
 three confirm dialogs are phase 5, once phase 3 can actually stage one of these three variants
 through the real dispatch path.
+
+**Phase 3.** Built per the plan's own scope list. `keymap/mod.rs`: `ToggleTree` moved out of the
+key-list `pane_is_on_screen` group into the `Delete`/`Edit`/`Add` focus-dependent one; `label_in`
+gained a `ToggleTree` arm (`"tree"`/`"ttl"`); `label()` became `"tree / edit ttl"`; the `Action`
+variant itself gained a doc comment naming both halves, per checkpoint 1's settled decision.
+`update/mod.rs`: the two-arm focus split dispatching to `toggle_tree`/`open_ttl_editor`.
+`update/editor.rs`: `open_ttl_editor` (D1's ladder, mirroring `open_editor`'s structure exactly
+including the keys-pane-focused branch that is unreachable through the real keymap today but
+keeps the function independently testable — the same reasoning `open_editor`'s own copy of that
+branch has); `ttl_edit_blocked` (D4's `⌃S` gate, reusing `parse_ttl_edit`/`resolve_ttl_edit`
+against `open.ttl_seconds`, the raw read figure); `typing_is_ttl`; `name_part_key` gained an
+`is_ttl` branch so `Enter` stages directly (D11 — there is no value part to advance to) and
+`Action::EditorStage` from the name part uses `ttl_edit_blocked` instead of
+`add_form_name_blocked` for a TTL buffer; `editor_key`'s top routing predicate changed from
+`active_part() == Some(FieldPart::Name)` to `EditBuffer::is_single_line_capture`.
+
+**One site the plan's declared list did not name, found while wiring: `paste` in
+`update/mod.rs`.** It routes a bracketed paste the same way `editor_key`'s old top check did —
+`active_part() == Some(FieldPart::Name)` — which is `None` for a TTL capture (D11: one field,
+always active, no `FieldPart` to be on). Left unfixed, pasting a duration into the TTL field would
+have gone through `editor.insert_str(&text)` into the buffer's unused internal `TextArea` instead
+of `name_push_str` into `EditTarget::Ttl`'s own `text` — silently absorbing the paste into a field
+nothing reads. Fixed the same way `editor_key`'s predicate was: `is_single_line_capture()` in
+place of the `FieldPart` check. Not covered by a dedicated unit test this phase (paste routing for
+the Hash/ZSet name half has none either, and the TTL wiring tests exercise typed input via
+`Backspace`/`Char`, not `Msg::Paste`) — worth a golden or unit test in phase 5 if the resolution
+line's own tests do not already exercise it incidentally.
+
+**One existing golden frame needed updating, not creating:** `crates/core/tests/golden/help_overlay.txt`,
+whose `t` row read `tree` and now reads `tree / edit ttl` — a consequence of `label()`'s D2 change,
+not a new TTL-specific frame (those are phase 5's job per the plan). Regenerated with
+`UPDATE_GOLDEN=1`.
+
+Every test the plan asked for landed in a new `crates/core/src/update/editor.rs` module,
+`ttl_editor_wiring_tests` (21 tests), plus three in `keymap::tests`/`keymap::tests` and one in
+`update::tests` for the focus split itself. Notably: the D1 ladder is driven both through the real
+keymap dispatch (`open_ttl(..)`, which presses `t`) and via direct `open_ttl_editor(state)` calls
+for the branches `update/mod.rs`'s dispatch makes structurally unreachable from a real keypress
+(the keys-pane-focused checks) — the same shape `open_editor`'s own tests already use for the
+mirrored branch. D7 is pinned by asserting `open.ttl_seconds` is unchanged both immediately after
+`y` (before the reply) and after `Msg::MutationSettled` lands (still only `Command::ReadKey`
+emitted, never a local apply) — covered for both `SetTtl` and `ShiftTtl`.

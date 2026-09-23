@@ -15,7 +15,7 @@ Home    top
 End     bottom
 /       filter
 s       sort
-t       tree
+t       tree / edit ttl
 →       open / expand
 l       open / expand
 ←       collapse / parent

@@ -31,7 +31,13 @@ pub enum Action {
     Filter,
     /// Cycle the sort column.
     Sort,
-    /// Fold the list on the separator, or unfold it.
+    /// Fold the list on the separator, or unfold it (keys pane focused), or
+    /// edit the Open key's TTL (value pane focused) — the same
+    /// one-`Action`-two-verbs shape `Refetch` already has for
+    /// `refetch`/`rescan` (PLAN M2 task 10, D2, ADR-0019's Consequences).
+    /// The name is kept rather than split or renamed — see `label_in` for
+    /// which half is in force, and ADR-0019's Consequences for why a second
+    /// `Action` or a rename were both rejected.
     ToggleTree,
     /// Collapse the group under the cursor, matching the standard treeview
     /// Left-arrow behavior (VS Code, macOS/Windows outline views, the
@@ -128,29 +134,21 @@ impl Action {
                 }
             }
             // The rest of the key list: reshaping it, or opening from it.
-            Action::Filter
-            | Action::Sort
-            | Action::ToggleTree
-            | Action::CollapseGroup
-            | Action::Open => state.pane_visible(Pane::Keys),
+            Action::Filter | Action::Sort | Action::CollapseGroup | Action::Open => {
+                state.pane_visible(Pane::Keys)
+            }
             // `d` is focus-dependent, like `c` (D4, PLAN M2 task 6): the keys
             // pane's Selected-key delete and the Viewer's Hash-field delete
             // are different commands on different targets, and whichever
             // pane is not drawn has no target for its half to act on.
-            Action::Delete => {
-                if state.keys_pane_focused() {
-                    state.pane_visible(Pane::Keys)
-                } else {
-                    state.pane_visible(Pane::Value)
-                }
-            }
-            // `e`/`a` are focus-dependent too, like `d` above (PLAN M2 task 6
-            // follow-up, G): with the keys pane focused they act on nothing
-            // (`open_editor`/`begin_add_entry` refuse with a notice rather
-            // than acting on whatever key happens to be open), so route them
-            // the same way — following focus, not merely "is the value pane
-            // drawn at all".
-            Action::Edit | Action::Add => {
+            //
+            // `t` joins this group one row down (PLAN M2 task 10, D2,
+            // ADR-0019): the keys pane's tree toggle and the Viewer's TTL
+            // editor are two different commands on two different targets,
+            // exactly the same shape — not "is the value pane merely drawn",
+            // which `open_ttl_editor`'s own ladder checks again for the same
+            // reason `open_editor`'s does.
+            Action::Delete | Action::Edit | Action::Add | Action::ToggleTree => {
                 if state.keys_pane_focused() {
                     state.pane_visible(Pane::Keys)
                 } else {
@@ -189,7 +187,10 @@ impl Action {
             Action::Bottom => "bottom",
             Action::Filter => "filter",
             Action::Sort => "sort",
-            Action::ToggleTree => "tree",
+            // Both halves, the same reason `Refetch`'s does (PLAN M2 task 10,
+            // D2): the help overlay has to explain all of `t`, not just the
+            // half in force in whichever pane happens to be focused.
+            Action::ToggleTree => "tree / edit ttl",
             Action::CollapseGroup => "collapse / parent",
             Action::Open => "open / expand",
             Action::EnterValueCursor => "open / move in value",
@@ -222,6 +223,11 @@ impl Action {
             Action::Refetch if disconnected => "reconnect",
             Action::Refetch if keys_pane_focused => "rescan",
             Action::Refetch => "refetch",
+            // PLAN M2 task 10, D2, ADR-0019: the same split `Refetch` makes
+            // above, one row down — `disconnected` plays no part here, since
+            // both halves of `t` work offline.
+            Action::ToggleTree if keys_pane_focused => "tree",
+            Action::ToggleTree => "ttl",
             other => other.label(),
         }
     }
@@ -507,6 +513,60 @@ mod tests {
     fn refetch_still_splits_on_pane_focus_when_connected() {
         assert_eq!(Action::Refetch.label_in(true, false), "rescan");
         assert_eq!(Action::Refetch.label_in(false, false), "refetch");
+    }
+
+    /// PLAN M2 task 10, D2: `t` now follows `pane_is_on_screen`'s
+    /// focus-dependent group exactly the way `d` already does — both check
+    /// visibility of *whichever pane is currently focused*, so both are
+    /// always on screen regardless of terminal width: the action is always
+    /// aimed at the pane the reader is looking at, never the other one. This
+    /// is the fix over the old grouping, where `t` (then only ever "toggle
+    /// tree") checked the keys pane's visibility unconditionally, so below
+    /// 70 columns with the Viewer focused — exactly the state that now means
+    /// "edit ttl" — it was blocked outright.
+    #[test]
+    fn toggle_tree_follows_the_focused_pane_exactly_like_delete() {
+        use crate::render::layout::Pane;
+        let narrow = crate::State {
+            cols: 60,
+            rows: 24,
+            ..crate::State::default()
+        };
+        let keys_focused = crate::State {
+            focus: Pane::Keys,
+            ..narrow.clone()
+        };
+        let value_focused = crate::State {
+            focus: Pane::Value,
+            ..narrow
+        };
+        for action in [Action::ToggleTree, Action::Delete] {
+            assert!(
+                action.pane_is_on_screen(&keys_focused),
+                "{action:?} in the keys pane, narrow"
+            );
+            assert!(
+                action.pane_is_on_screen(&value_focused),
+                "{action:?} in the value pane, narrow — this is the case that used to be blocked for ToggleTree"
+            );
+        }
+    }
+
+    /// PLAN M2 task 10, D2: `t` splits the same way `r` does — `tree` in the
+    /// keys pane, `ttl` in the Viewer — regardless of connection state.
+    #[test]
+    fn toggle_tree_splits_on_pane_focus() {
+        assert_eq!(Action::ToggleTree.label_in(true, false), "tree");
+        assert_eq!(Action::ToggleTree.label_in(false, false), "ttl");
+        assert_eq!(Action::ToggleTree.label_in(true, true), "tree");
+        assert_eq!(Action::ToggleTree.label_in(false, true), "ttl");
+    }
+
+    /// The help overlay explains both halves at once, the same shape
+    /// `Refetch`'s `"refetch / rescan"` already has.
+    #[test]
+    fn toggle_tree_label_names_both_halves() {
+        assert_eq!(Action::ToggleTree.label(), "tree / edit ttl");
     }
 
     #[test]

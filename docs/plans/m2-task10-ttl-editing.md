@@ -690,6 +690,30 @@ tree in both panes; no keypress opens a TTL editor. Golden frames for the resolu
 three confirm dialogs are phase 5, once phase 3 can actually stage one of these three variants
 through the real dispatch path.
 
+**Phase 4.** All eleven proofs landed in `crates/app/tests/integration.rs` under
+`// ── PLAN M2 task 10 — TTL set, persist, extend/shorten (ADR-0019) ──`, every one `#[ignore]`d,
+following the ZSet section's structure and naming exactly. No implementation defect was found:
+`crates/app/src/redis/mutate.rs`'s phase-2 `set_ttl`/`persist_ttl`/`shift_ttl` and both scripts
+worked as documented on every path exercised — nothing there needed extending or rewriting.
+
+Test 6 (`extending_a_ttl_adds_to_the_servers_ttl_not_the_staged_one`) is the row this phase exists
+for. It genuinely exercises the race, not a simulation of it: a key is `EXPIRE`d to 100s (standing
+in for "the dialog" opening against that TTL and staging `+50s`), then a second, independent
+connection really runs `EXPIRE key 500` on the live server and is `await`ed to completion —
+strictly before the staged `shift_ttl(client, key, 50)` executes. `shift_ttl`'s own signature
+(`client, name, delta_seconds`) carries no "old TTL" parameter at all, so there is no way for the
+call site to smuggle in the stale value even by accident — the atomicity is structural, not just
+asserted. The two candidate outcomes are numerically unambiguous (≈150 if it had used the staged
+100, ≈550 if it used the server's live 500), and the test asserts the resulting TTL directly
+(`final_ttl > 400` and `(530..=550).contains(&final_ttl)`), not merely the `ShiftTtlWrite::Written`
+return value — the same shape task 9's reorder test asserts the whole set's final state rather than
+just the outcome.
+
+Nothing was noticed and left deliberately unfixed this phase — every proof the plan asked for
+passed on the first run against `mutate.rs` exactly as phase 2 built it, and the one pre-existing
+flake (`a_freshly_added_entry_reads_as_just_added`) passed cleanly in this run's
+`--test-threads=1` pass, so there was nothing to isolate or re-run.
+
 **Phase 3.** Built per the plan's own scope list. `keymap/mod.rs`: `ToggleTree` moved out of the
 key-list `pane_is_on_screen` group into the `Delete`/`Edit`/`Add` focus-dependent one; `label_in`
 gained a `ToggleTree` arm (`"tree"`/`"ttl"`); `label()` became `"tree / edit ttl"`; the `Action`

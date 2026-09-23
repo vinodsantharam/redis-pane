@@ -755,3 +755,37 @@ for the branches `update/mod.rs`'s dispatch makes structurally unreachable from 
 mirrored branch. D7 is pinned by asserting `open.ttl_seconds` is unchanged both immediately after
 `y` (before the reply) and after `Msg::MutationSettled` lands (still only `Command::ReadKey`
 emitted, never a local apply) — covered for both `SetTtl` and `ShiftTtl`.
+
+**Phase 5.** Completed by the main agent after the executing subagent hit a session rate limit
+partway through — the render work (the capture body, the `··` resolution line, the hint-bar arm) was
+already written and building cleanly when it stopped; the golden frames, `CONTEXT.md`, the doc
+updates and the §9 revisit were finished by hand from there.
+
+**A rendering bug, found by the first frame ever to draw these arms.** `PendingMutation::SetTtl`'s
+`old → new` line rendered a key with no expiry as **`ttl 0s → 5m`** — `TTL_NONE` is `-1` and
+`format_duration` clamps a negative to `0s` — sitting directly above `⚠ this key had no expiry`.
+Two adjacent lines in a confirm dialog contradicting each other, one of them claiming the key was
+about to expire when it never would, at exactly the moment the reader decides whether to proceed.
+Fixed with `render::ttl_before`, which answers `never` for `TTL_NONE` and defers to
+`format_duration` otherwise; applied to all three TTL dialog arms, not just the one that showed it.
+The `new` side needs no such treatment — a write's resulting TTL is either a real duration or the
+literal word `never`, spelled out by its own arm.
+
+This is the third consecutive task where the golden frames caught a defect that every unit test had
+passed over (task 8's `json_warning` wildcard, task 9's hard-coded `FIELD`/`VALUE` labels, this).
+The pattern is worth naming: all three were **wrong text rendered from correct state** — invisible
+to any test that asserts on state, and visible the instant a frame is drawn.
+
+**Fifteen golden frames**, covering the capture seeded and empty (with its `·· 5m · +30m · never`
+placeholder), the resolution line for all four operations, three of D4's refusals including
+`0 deletes the key`, all three confirm dialogs, and the `had no expiry` warning. Two of the tests
+assert rather than pin a fixture: that the three dialogs are pairwise different (PLAN row 10's own
+preview requirement, pinned as an inequality rather than left implied by three separate files), and
+that the hint bar is constant whatever is typed (D13 — the live indicator is the resolution line, so
+the bar must *not* move, which is the opposite of what ADR-0018 D4 asserts for a ZSet score).
+
+**`CONTEXT.md` gained three entries** where it previously had no TTL vocabulary at all: **TTL** (the
+server's fact), **Countdown** (the local projection that ticks between reads — "never a second
+source of truth"), and **Duration expression** (what the reader types, which is not a TTL but a
+request that resolves against one). The three exist to stop the countdown and the TTL being called
+the same thing, which is the confusion D7 turns on.

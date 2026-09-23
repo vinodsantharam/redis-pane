@@ -3275,3 +3275,206 @@ fn the_editor_cursor_is_drawn_with_the_viewers_cursor_colour() {
         "no reverse-video cursor left over"
     );
 }
+
+// ── PLAN M2 task 10 — TTL editing (ADR-0019) ────────────────────────────────
+
+/// Open the TTL field through the real keypress path — `t`'s focus split
+/// (D2) — so these frames also pin the dispatch, not just the drawing.
+fn open_ttl_field(mut state: State) -> State {
+    state.focus = Pane::Value;
+    let (state, _) = update(state, Msg::Key(KeyPress::plain(KeyCode::Char('t'))));
+    assert!(
+        state.open.as_ref().unwrap().is_editing(),
+        "t in the value pane must open the TTL field"
+    );
+    state
+}
+
+/// Clear the seeded duration and type a replacement.
+///
+/// Unlike `retype_score` above, no `End` is needed first: the TTL capture is
+/// the hand-painted single-line one (D11), which has no cursor to be in the
+/// wrong place, so `Backspace` removes the last character as a reader would
+/// expect. That difference is the point of D11 and is worth seeing here.
+fn retype_ttl(mut s: State, new: &str) -> State {
+    for _ in 0..24 {
+        (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Backspace)));
+    }
+    for c in new.chars() {
+        (s, _) = update(s, Msg::Key(KeyPress::plain(KeyCode::Char(c))));
+    }
+    s
+}
+
+#[test]
+fn golden_ttl_form_seeded_from_the_keys_current_ttl() {
+    let state = open_ttl_field(opened("session:9f3a", hash_value(), 2_520));
+    assert_golden("ttl_form_seeded", &draw(&state, 130, 22));
+}
+
+/// A key with no expiry seeds empty, and the line under the field teaches the
+/// grammar rather than refusing a field nobody has typed into yet (D11).
+#[test]
+fn golden_ttl_form_empty_shows_the_grammar_as_a_placeholder() {
+    let state = open_ttl_field(opened("session:9f3a", hash_value(), -1));
+    assert_golden("ttl_form_empty_placeholder", &draw(&state, 130, 22));
+}
+
+#[test]
+fn golden_ttl_form_resolves_a_set_while_typing() {
+    let state = retype_ttl(
+        open_ttl_field(opened("session:9f3a", hash_value(), 2_520)),
+        "5m",
+    );
+    assert_golden("ttl_form_set", &draw(&state, 130, 22));
+}
+
+#[test]
+fn golden_ttl_form_resolves_an_extend_while_typing() {
+    let state = retype_ttl(
+        open_ttl_field(opened("session:9f3a", hash_value(), 2_520)),
+        "+30m",
+    );
+    assert_golden("ttl_form_extend", &draw(&state, 130, 22));
+}
+
+#[test]
+fn golden_ttl_form_resolves_a_shorten_while_typing() {
+    let state = retype_ttl(
+        open_ttl_field(opened("session:9f3a", hash_value(), 2_520)),
+        "-10m",
+    );
+    assert_golden("ttl_form_shorten", &draw(&state, 130, 22));
+}
+
+/// Clearing the field entirely is how persist is asked for on a key that
+/// currently has an expiry.
+#[test]
+fn golden_ttl_form_resolves_a_persist_when_cleared() {
+    let state = retype_ttl(
+        open_ttl_field(opened("session:9f3a", hash_value(), 2_520)),
+        "",
+    );
+    assert_golden("ttl_form_persist", &draw(&state, 130, 22));
+}
+
+/// The refusal that matters most: `EXPIRE key 0` deletes the key, so the
+/// field names `d` rather than sending it (D4).
+#[test]
+fn golden_ttl_form_refuses_zero_and_names_the_delete_key() {
+    let state = retype_ttl(
+        open_ttl_field(opened("session:9f3a", hash_value(), 2_520)),
+        "0",
+    );
+    assert_golden("ttl_form_zero_deletes", &draw(&state, 130, 22));
+}
+
+#[test]
+fn golden_ttl_form_refuses_text_it_cannot_read() {
+    let state = retype_ttl(
+        open_ttl_field(opened("session:9f3a", hash_value(), 2_520)),
+        "1.5h",
+    );
+    assert_golden("ttl_form_unreadable", &draw(&state, 130, 22));
+}
+
+/// A shift needs an expiry to shift. Refused with wording that names the fix,
+/// rather than silently doing nothing (D4).
+#[test]
+fn golden_ttl_form_refuses_a_shift_on_a_key_with_no_expiry() {
+    let state = retype_ttl(
+        open_ttl_field(opened("session:9f3a", hash_value(), -1)),
+        "+30m",
+    );
+    assert_golden("ttl_form_no_expiry", &draw(&state, 130, 22));
+}
+
+fn stage_ttl(state: State, typed: &str) -> State {
+    let state = retype_ttl(open_ttl_field(state), typed);
+    let (state, _) = update(state, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+    state
+}
+
+#[test]
+fn golden_confirm_set_ttl_shows_the_command_its_guard_and_the_diff() {
+    let state = stage_ttl(opened("session:9f3a", hash_value(), 2_520), "5m");
+    assert!(matches!(
+        state.confirm,
+        Some(PendingMutation::SetTtl { .. })
+    ));
+    assert_golden("confirm_set_ttl", &draw(&state, 130, 22));
+}
+
+#[test]
+fn golden_confirm_persist_ttl_shows_the_expiry_being_cleared() {
+    let state = stage_ttl(opened("session:9f3a", hash_value(), 2_520), "");
+    assert!(matches!(
+        state.confirm,
+        Some(PendingMutation::PersistTtl { .. })
+    ));
+    assert_golden("confirm_persist_ttl", &draw(&state, 130, 22));
+}
+
+#[test]
+fn golden_confirm_shift_ttl_shows_both_guard_clauses() {
+    let state = stage_ttl(opened("session:9f3a", hash_value(), 2_520), "+30m");
+    assert!(matches!(
+        state.confirm,
+        Some(PendingMutation::ShiftTtl { .. })
+    ));
+    assert_golden("confirm_shift_ttl", &draw(&state, 130, 22));
+}
+
+/// Giving a permanent key an expiry is the risky direction — on `prod` it is
+/// how data goes missing at 3am — so it carries a warning, the TTL analogue
+/// of "last member — the key will be deleted" (D9).
+#[test]
+fn golden_confirm_set_ttl_warns_when_the_key_had_no_expiry() {
+    let state = stage_ttl(opened("session:9f3a", hash_value(), -1), "5m");
+    assert_golden("confirm_set_ttl_had_no_expiry", &draw(&state, 130, 22));
+}
+
+/// PLAN row 10 asks the preview to distinguish the three writes. Pinned as a
+/// frame inequality rather than left implied by three separate fixtures.
+#[test]
+fn golden_the_three_ttl_dialogs_are_visibly_different() {
+    let base = || opened("session:9f3a", hash_value(), 2_520);
+    let set = draw(&stage_ttl(base(), "5m"), 130, 22);
+    let shift = draw(&stage_ttl(base(), "+30m"), 130, 22);
+    let persist = draw(&stage_ttl(base(), ""), 130, 22);
+
+    assert_ne!(set, shift, "a set and an extend must not read alike");
+    assert_ne!(set, persist, "a set and a persist must not read alike");
+    assert_ne!(
+        shift, persist,
+        "an extend and a persist must not read alike"
+    );
+
+    assert!(set.contains("EXPIRE session:9f3a 300"), "{set}");
+    assert!(shift.contains("+30m"), "{shift}");
+    assert!(persist.contains("PERSIST session:9f3a"), "{persist}");
+    assert!(
+        shift.contains("never expires it immediately"),
+        "only the shift carries the second guard clause\n{shift}"
+    );
+}
+
+/// D13: the TTL field's live indicator is the resolution line under it, not
+/// the hint bar — so the bar stays constant, unlike the ZSet score edit's.
+#[test]
+fn golden_ttl_hint_bar_is_constant_whatever_is_typed() {
+    let state = open_ttl_field(opened("session:9f3a", hash_value(), 2_520));
+    let resting = render::hint_bar(&state);
+    assert_eq!(resting, "⌃S apply · never persists · Esc cancel");
+    for typed in ["5m", "+30m", "0", "1.5h", ""] {
+        let s = retype_ttl(
+            open_ttl_field(opened("session:9f3a", hash_value(), 2_520)),
+            typed,
+        );
+        assert_eq!(
+            render::hint_bar(&s),
+            resting,
+            "the bar must not change for {typed:?} — the resolution line carries that"
+        );
+    }
+}

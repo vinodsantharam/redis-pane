@@ -413,6 +413,84 @@ fn value_pane(
     // The text colour is painted underneath instead of set on the widget,
     // since setting a style needs `&mut` and render only borrows `State`.
     if let Some(editor) = open.editor() {
+        // The TTL capture (D3, D11, D13, ADR-0019): one hand-painted line,
+        // no FIELD/VALUE split — `field_name()` answers `None` for this
+        // target on purpose (it feeds the Hash/ZSet shown-duplicate checks,
+        // which a duration expression has no analogue of), so this has to
+        // be checked ahead of that branch rather than folded into it.
+        if let EditTarget::Ttl { text } = editor.target() {
+            put(buf, x0, body_top, "TTL", sty(Token::Muted));
+            let content_x = x0 + 1 + "TTL".len() as u16 + 1;
+            let text_end = put(buf, content_x, body_top, text, sty(Token::Text));
+            if text_end < area.x + area.width {
+                let cell = &mut buf[(text_end, body_top)];
+                cell.set_symbol(" ");
+                cell.set_style(sty(Token::Selected));
+            }
+            if body_height < 2 {
+                return;
+            }
+            // The resolution line (D3, D13): the live indicator for a TTL
+            // capture lives here, not in the hint bar — a TTL edit has a
+            // resolved *value* to show, not just a valid/invalid bit
+            // (ADR-0018 D4 made the hint bar carry that for a score; this
+            // diverges on purpose, per ADR-0019 D13). Runs the same
+            // clock-free grammar the `⌃S` block in `update` uses (D12), but
+            // against the counted-down TTL, which is what a reader looking
+            // at the screen while typing actually wants to see.
+            let line_row = body_top + 1;
+            let current = open.ttl_now(now);
+            // An untouched, empty capture on a key that already has no
+            // expiry is the field's resting state for such a key (D11), not
+            // a mistake — `resolve_ttl_edit` would correctly refuse it as
+            // `AlreadyNever` (empty parses as persist, D4's table), but
+            // showing that refusal on a field nobody has typed into yet
+            // reads as an accusation. So this one case shows the grammar
+            // itself instead, the same "teach by placeholder" idiom the
+            // Hash/ZSet add form's empty VALUE part already uses
+            // (`·· Enter to write the value` above). `⌃S` is unaffected —
+            // it still runs the real `resolve_ttl_edit` and still refuses.
+            let line = if text.is_empty() && current == crate::state::loaded::TTL_NONE {
+                "·· 5m · +30m · never".to_string()
+            } else {
+                match crate::state::ttl::parse_ttl_edit(text) {
+                    Ok(edit) => {
+                        // The verb is read off what was *typed* (the sign
+                        // on a shift), not off the resulting figure — a
+                        // resulting TTL equal to `current` would otherwise
+                        // be ambiguous between the two.
+                        let verb = match edit {
+                            crate::state::ttl::TtlEdit::Set(_) => "set",
+                            crate::state::ttl::TtlEdit::Persist => "persist",
+                            crate::state::ttl::TtlEdit::Shift(delta) if delta >= 0 => "extend",
+                            crate::state::ttl::TtlEdit::Shift(_) => "shorten",
+                        };
+                        match crate::state::ttl::resolve_ttl_edit(edit, current) {
+                            Ok(outcome) => {
+                                let new_text = match outcome {
+                                    crate::state::ttl::TtlOutcome::Set(s) => {
+                                        keys::format_duration(s)
+                                    }
+                                    crate::state::ttl::TtlOutcome::Persist => "never".to_string(),
+                                    crate::state::ttl::TtlOutcome::Shift(s) => {
+                                        keys::format_duration(s)
+                                    }
+                                };
+                                format!(
+                                    "·· {verb} · {} → {}",
+                                    keys::format_duration(current),
+                                    new_text
+                                )
+                            }
+                            Err(refusal) => format!("·· {}", refusal.reason()),
+                        }
+                    }
+                    Err(refusal) => format!("·· {}", refusal.reason()),
+                }
+            };
+            put(buf, content_x, line_row, &line, sty(Token::Muted));
+            return;
+        }
         if let Some(name) = editor.field_name() {
             // The two-part FIELD/VALUE form (PLAN M2 task 6 follow-up, F):
             // adding a field shows both, name first; editing an existing one
@@ -847,6 +925,23 @@ fn push_diff_side(lines: &mut Vec<(String, Token)>, mark: &str, bytes: &[u8], to
     }
 }
 
+/// The `old` side of a TTL dialog's `old → new` line (PLAN M2 task 10, D9).
+///
+/// Distinct from [`keys::format_duration`] in exactly one case, which is the
+/// case that matters: `TTL_NONE` is `-1`, and `format_duration` clamps a
+/// negative to `0s`. A key with no expiry therefore rendered as
+/// `ttl 0s → 5m` — telling the reader it was about to expire, directly above
+/// the `⚠ this key had no expiry` warning telling them it never would. The
+/// `new` side never needs this: a write's resulting TTL is either a real
+/// duration or the literal word `never`, spelled out by its own arm.
+fn ttl_before(seconds: i32) -> String {
+    if seconds == crate::state::loaded::TTL_NONE {
+        "never".to_string()
+    } else {
+        keys::format_duration(seconds)
+    }
+}
+
 /// The mutation-preview dialog (R4.4, DESIGN §6.5).
 ///
 /// Composes the real command first, and only then says whether Read-only
@@ -1034,6 +1129,15 @@ fn confirm_overlay(
         // matched exhaustively (PLAN M2 task 8, D8). A scalar `old → new`
         // line, the shape closest to this (ADR-0018's `SetZSetScore` arm
         // above): a TTL is metadata, not a byte diff.
+        //
+        // The `old` side goes through `ttl_before`, not `format_duration`.
+        // `TTL_NONE` is `-1`, and `format_duration` clamps a negative to
+        // `0s` — so a key that never expires rendered as `ttl 0s → 5m`,
+        // claiming it was about to expire, on the line directly above the
+        // `⚠ this key had no expiry` warning saying the opposite. Two
+        // adjacent lines contradicting each other, in the dialog where the
+        // reader decides. Caught by this task's first golden frame of this
+        // arm; see `ttl_before`.
         PendingMutation::SetTtl {
             old_ttl, new_ttl, ..
         } => {
@@ -1044,7 +1148,7 @@ fn confirm_overlay(
             lines.push((
                 format!(
                     "ttl {} → {}",
-                    keys::format_duration(*old_ttl),
+                    ttl_before(*old_ttl),
                     keys::format_duration(*new_ttl)
                 ),
                 Token::Text,
@@ -1062,10 +1166,7 @@ fn confirm_overlay(
             if let Some(guard) = pending.guard_text() {
                 lines.push((guard, Token::Muted));
             }
-            lines.push((
-                format!("ttl {} → never", keys::format_duration(*old_ttl)),
-                Token::Text,
-            ));
+            lines.push((format!("ttl {} → never", ttl_before(*old_ttl)), Token::Text));
         }
         PendingMutation::ShiftTtl {
             old_ttl,
@@ -1084,7 +1185,7 @@ fn confirm_overlay(
             lines.push((
                 format!(
                     "ttl {} → {}",
-                    keys::format_duration(*old_ttl),
+                    ttl_before(*old_ttl),
                     keys::format_duration(resulting)
                 ),
                 Token::Text,
@@ -1422,6 +1523,18 @@ pub fn hint_bar(state: &State) -> String {
                     return format!("invalid score · {undo} undo · {cancel} cancel");
                 }
                 return format!("{stage} stage   {undo} undo   {cancel} cancel");
+            }
+            // The TTL capture (D13, ADR-0019): the bar stays constant here,
+            // deliberately diverging from the ZSet score edit's live
+            // invalid/valid indicator just above — a TTL edit always
+            // resolves to a shown value (or a named refusal), and that
+            // belongs on the resolution line under the field, not in the
+            // bar (D13). `never persists` is spelled out because typing
+            // nothing is itself a valid write here, unlike every other
+            // capture on this bar.
+            None if matches!(editor.target(), EditTarget::Ttl { .. }) => {
+                let stage = state.keymap.hint(Action::EditorStage).unwrap_or_default();
+                return format!("{stage} apply · never persists · {cancel} cancel");
             }
             None => {
                 let stage = state.keymap.hint(Action::EditorStage).unwrap_or_default();

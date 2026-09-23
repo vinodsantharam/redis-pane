@@ -311,8 +311,40 @@ a clock — shows the true current figure immediately.
 
 ## Consequences
 
-Anticipated from the decisions above; phase 5 will revise this section to match what was actually
-built, the way ADR-0018's Consequences section does.
+Revised at phase 5 to describe what was actually built. Four things landed differently from, or in
+addition to, what the decisions above anticipated — three of them defects found during execution,
+each recorded here rather than only in the plan, because each is a trap the next person to touch
+this code could walk into again.
+
+**The grammar had to admit whitespace between segments, or the field refused its own seed.**
+`format_duration` emits `1h 12m`, and D4's grammar originally rejected every internal space — so
+opening `t` on a key at 4320s displayed `1h 12m` and then answered `can't read that` on `⌃S`. The
+parser now allows whitespace *between* segments while still refusing it *within* one, so `1h 12m`
+parses and `5 m` remains the typo it is. A round-trip test pins the invariant: every figure
+`format_duration` can emit must parse back, and must never parse back as more time than it was made
+from.
+
+**An untouched TTL field must not stage, because its seed is lossy.** `format_duration` shows two
+units, so a key at `1d 2h 30m 10s` seeds `1d 2h`. `EditTarget::Ttl` was briefly folded into
+`stage_editor`'s `is_new_field` group, which bypasses the dirty check — meaning `⌃S` on an untouched
+field would have written a TTL forty minutes shorter than the key had. It is deliberately **not** in
+that group, and `EditBuffer::is_dirty` answers for a TTL by reading the target's own `text` rather
+than the always-empty `TextArea` (D11). An untouched field closes without writing, exactly as every
+value editor does, and the lossy seed can only reach the server once a reader has edited it.
+
+**`paste` needed the same routing fix `editor_key` got.** Both routed on `active_part() ==
+Some(FieldPart::Name)`, which is honestly `None` for a TTL (D11) — so a pasted duration went into
+the buffer's unused `TextArea` and vanished, leaving the field looking untouched. Both now use
+`EditBuffer::is_single_line_capture()`, which is the property each actually wanted.
+
+**A key with no expiry rendered as `ttl 0s`, contradicting its own warning.** `TTL_NONE` is `-1` and
+`format_duration` clamps a negative to `0s`, so the `SetTtl` dialog read `ttl 0s → 5m` — claiming the
+key was about to expire — directly above `⚠ this key had no expiry` saying the opposite. Two adjacent
+lines disagreeing, in the dialog where the reader decides. The `old` side of every TTL dialog now goes
+through `render::ttl_before`, which says `never` for `TTL_NONE`. Found by the first golden frame ever
+to render these arms, which is what those frames are for.
+
+The rest landed as anticipated:
 
 - `crates/core/src/state/ttl.rs` (new) carries `TtlEdit`, `TtlEditRefusal`, `parse_ttl_edit`,
   `resolve_ttl_edit` and `format_duration` — pure, clock-free, shared by the `Ctrl-S` block in

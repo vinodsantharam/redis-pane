@@ -562,6 +562,10 @@ impl OpenKey {
             // the member.
             Some(super::EditTarget::ZSetScore { .. }) => "✎ editing score".to_string(),
             Some(super::EditTarget::NewZSetMember { .. }) => "✎ adding member".to_string(),
+            // PLAN M2 task 10, D1, ADR-0019: not reachable until `t` in the
+            // value pane is wired (phase 3) — the arm exists now because
+            // this match is exhaustive over `EditTarget`.
+            Some(super::EditTarget::Ttl { .. }) => "✎ editing ttl".to_string(),
             Some(super::EditTarget::Value) | None => "✎ editing".to_string(),
         }
     }

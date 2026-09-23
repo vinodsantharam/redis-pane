@@ -113,6 +113,25 @@ pub async fn execute(client: &Client, mutation: &Mutation) -> Result<MutationOut
                 MutationOutcome::NothingToRemove
             }
         }
+        Mutation::SetTtl { seconds, .. } => match set_ttl(client, key, *seconds).await? {
+            SetTtlWrite::Written => MutationOutcome::Done,
+            SetTtlWrite::KeyGone => MutationOutcome::NotWritten(NotWritten::KeyGone),
+        },
+        Mutation::PersistTtl { .. } => match persist_ttl(client, key).await? {
+            PersistTtlWrite::Written => MutationOutcome::Done,
+            PersistTtlWrite::NoExpiry => MutationOutcome::NothingToRemove,
+            PersistTtlWrite::KeyGone => MutationOutcome::NotWritten(NotWritten::KeyGone),
+        },
+        Mutation::ShiftTtl { delta_seconds, .. } => {
+            match shift_ttl(client, key, *delta_seconds).await? {
+                ShiftTtlWrite::Written => MutationOutcome::Done,
+                ShiftTtlWrite::NoExpiry => MutationOutcome::NotWritten(NotWritten::NoExpiry),
+                ShiftTtlWrite::WouldExpireNow => {
+                    MutationOutcome::NotWritten(NotWritten::WouldExpireNow)
+                }
+                ShiftTtlWrite::KeyGone => MutationOutcome::NotWritten(NotWritten::KeyGone),
+            }
+        }
     })
 }
 
@@ -768,4 +787,155 @@ pub async fn delete_zset_member(
     let member_key = fred::types::Key::from(member);
     let removed: i64 = client.zrem(key, member_key).await?;
     Ok(removed > 0)
+}
+
+/// What a set TTL did on the server ([`set_ttl`], PLAN M2 task 10, D5,
+/// ADR-0019).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetTtlWrite {
+    /// The TTL was set.
+    Written,
+    /// The key was already gone; nothing was written, nothing recreated.
+    KeyGone,
+}
+
+/// Set a key's TTL outright (`EXPIRE`, PLAN M2 task 10, D1, D5, ADR-0019).
+///
+/// `name` is built as a binary-safe `Key`, the same way [`delete_key`]'s doc
+/// comment explains. No script: `EXPIRE` already refuses on its own to
+/// create a key that is gone, and its `0` means exactly that and nothing
+/// else — unlike `PERSIST`'s `0` and unlike `ZADD XX CH`'s (ADR-0019 D5).
+///
+/// **`seconds` must never be `0` or negative here** — `EXPIRE key 0` (or a
+/// negative argument) deletes the key immediately, verified against a live
+/// server for ADR-0019. `crate::state::ttl::parse_ttl_edit`'s D4 grammar
+/// refuses `0` at the keyboard before a `Mutation::SetTtl` carrying one can
+/// even be built, so this function does not re-check it.
+pub async fn set_ttl(client: &Client, name: &[u8], seconds: i32) -> Result<SetTtlWrite, Error> {
+    let key = fred::types::Key::from(name);
+    let result: i64 = client.expire(key, i64::from(seconds), None).await?;
+    Ok(if result == 1 {
+        SetTtlWrite::Written
+    } else {
+        SetTtlWrite::KeyGone
+    })
+}
+
+/// Lua guard for clearing a key's TTL (PLAN M2 task 10, D5, ADR-0019).
+///
+/// `KEYS[1]` is the key. Returns `-1` if the key is already gone, `0` if the
+/// key already had no expiry, or `1` if the expiry was removed. Verified end
+/// to end for ADR-0019: a gone key, a key with no expiry, and a key with an
+/// expiry, all three return codes exercised. A bare `PERSIST` answers `0` to
+/// both of the first two cases — the same ambiguity `ZADD XX CH` had, and
+/// "the key you were looking at is gone" and "it already never expired" are
+/// different things to tell a reader who just asked to persist.
+const TTL_PERSIST_SCRIPT: &str = r#"
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  return -1
+end
+return redis.call('PERSIST', KEYS[1])
+"#;
+
+/// Lua guard for extending or shortening a key's TTL by a signed delta
+/// (PLAN M2 task 10, D5, D7, ADR-0019).
+///
+/// `KEYS[1]` is the key; `ARGV[1]` the signed delta in seconds, as a decimal
+/// string. Returns `-1` if the key is already gone, `-2` if the key has no
+/// expiry to shift, `-3` if the shift would land at or below zero — which
+/// `EXPIRE` would immediately delete the key for, verified against a live
+/// server for ADR-0019 — or `1` on success. Verified end to end for
+/// ADR-0019: a gone key, a no-expiry key, a would-expire-now shorten (which
+/// left the key's TTL untouched), and both an extend and a shorten that
+/// landed. The delta applies to the TTL as the server sees it at write
+/// time, not the TTL staged at open time (D7) — the whole reason this needs
+/// a script rather than a plain `EXPIRE`, along with `EXPIRE ... GT/LT`
+/// being 7.0+, below the 6.0 floor (ADR-0007).
+const TTL_SHIFT_SCRIPT: &str = r#"
+local t = redis.call('TTL', KEYS[1])
+if t == -2 then
+  return -1
+end
+if t == -1 then
+  return -2
+end
+local n = t + tonumber(ARGV[1])
+if n <= 0 then
+  return -3
+end
+redis.call('EXPIRE', KEYS[1], n)
+return 1
+"#;
+
+/// What a guarded persist did on the server ([`persist_ttl`], D5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistTtlWrite {
+    /// The expiry was removed.
+    Written,
+    /// The key already had no expiry; nothing was written. Not a
+    /// `NotWritten` (D6): nothing was refused, and the core settles this as
+    /// `MutationOutcome::NothingToRemove`, the same shape `HDEL`'s own
+    /// "nothing to remove" case has.
+    NoExpiry,
+    /// The key was already gone; nothing was written, nothing recreated.
+    KeyGone,
+}
+
+/// Clear a key's TTL, telling a gone key apart from one that already had no
+/// expiry (`EVAL`, PLAN M2 task 10, D1, D5, ADR-0019).
+///
+/// `name` travels the same binary-safe way [`set_hash_field`]'s `name` does
+/// — see its doc comment for the `Vec<u8>` conversion traps this avoids.
+pub async fn persist_ttl(client: &Client, name: &[u8]) -> Result<PersistTtlWrite, Error> {
+    let key = fred::types::Key::from(name);
+    let result: i64 = client
+        .eval(TTL_PERSIST_SCRIPT, vec![key], Vec::<Vec<u8>>::new())
+        .await?;
+    Ok(match result {
+        -1 => PersistTtlWrite::KeyGone,
+        0 => PersistTtlWrite::NoExpiry,
+        _ => PersistTtlWrite::Written,
+    })
+}
+
+/// What a guarded shift did on the server ([`shift_ttl`], D5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShiftTtlWrite {
+    /// The TTL was extended or shortened.
+    Written,
+    /// The key has no expiry to shift.
+    NoExpiry,
+    /// The shift would land at or below zero; the key's TTL is untouched.
+    WouldExpireNow,
+    /// The key was already gone; nothing was written, nothing recreated.
+    KeyGone,
+}
+
+/// Extend or shorten a key's TTL by a signed delta, atomically against the
+/// TTL the server sees at write time (`EVAL`, PLAN M2 task 10, D1, D5, D7,
+/// ADR-0019).
+///
+/// `name` travels the same binary-safe way [`set_hash_field`]'s `name` does.
+/// `delta_seconds` travels as a decimal-string `ARGV` entry — signed, unlike
+/// [`set_list_element`]'s unsigned index — Lua's `tonumber` parses a leading
+/// `-` directly.
+pub async fn shift_ttl(
+    client: &Client,
+    name: &[u8],
+    delta_seconds: i32,
+) -> Result<ShiftTtlWrite, Error> {
+    let key = fred::types::Key::from(name);
+    let result: i64 = client
+        .eval(
+            TTL_SHIFT_SCRIPT,
+            vec![key],
+            vec![delta_seconds.to_string().into_bytes()],
+        )
+        .await?;
+    Ok(match result {
+        -1 => ShiftTtlWrite::KeyGone,
+        -2 => ShiftTtlWrite::NoExpiry,
+        -3 => ShiftTtlWrite::WouldExpireNow,
+        _ => ShiftTtlWrite::Written,
+    })
 }

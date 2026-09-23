@@ -1027,6 +1027,69 @@ fn confirm_overlay(
                 ));
             }
         }
+        // TTL edit (D1, D6, D8, D9, ADR-0019): not reachable until PLAN M2
+        // task 10 phase 3 wires `t` in the value pane — no golden frame
+        // exercises this yet, since nothing stages a `SetTtl`/`PersistTtl`/
+        // `ShiftTtl` — the arms exist now because `PendingMutation` is
+        // matched exhaustively (PLAN M2 task 8, D8). A scalar `old → new`
+        // line, the shape closest to this (ADR-0018's `SetZSetScore` arm
+        // above): a TTL is metadata, not a byte diff.
+        PendingMutation::SetTtl {
+            old_ttl, new_ttl, ..
+        } => {
+            lines.push((pending.command_text(), Token::Text));
+            if let Some(guard) = pending.guard_text() {
+                lines.push((guard, Token::Muted));
+            }
+            lines.push((
+                format!(
+                    "ttl {} → {}",
+                    keys::format_duration(*old_ttl),
+                    keys::format_duration(*new_ttl)
+                ),
+                Token::Text,
+            ));
+            // D9: the risky direction — a permanent key becoming disposable,
+            // the TTL analogue of a last-member warning. Deliberately not a
+            // warning for a short resulting TTL, which is a normal thing to
+            // ask for (D9's explicit rejection).
+            if *old_ttl == crate::state::loaded::TTL_NONE {
+                lines.push(("⚠ this key had no expiry".to_string(), Token::Warn));
+            }
+        }
+        PendingMutation::PersistTtl { old_ttl, .. } => {
+            lines.push((pending.command_text(), Token::Text));
+            if let Some(guard) = pending.guard_text() {
+                lines.push((guard, Token::Muted));
+            }
+            lines.push((
+                format!("ttl {} → never", keys::format_duration(*old_ttl)),
+                Token::Text,
+            ));
+        }
+        PendingMutation::ShiftTtl {
+            old_ttl,
+            delta_seconds,
+            ..
+        } => {
+            lines.push((pending.command_text(), Token::Text));
+            if let Some(guard) = pending.guard_text() {
+                lines.push((guard, Token::Muted));
+            }
+            // A local courtesy figure for display only (D4, D7) — the
+            // server applies the delta to the TTL as it sees it at write
+            // time, which the post-write refetch is what actually shows.
+            let resulting = (i64::from(*old_ttl) + i64::from(*delta_seconds)).max(0);
+            let resulting = resulting.min(i64::from(i32::MAX)) as i32;
+            lines.push((
+                format!(
+                    "ttl {} → {}",
+                    keys::format_duration(*old_ttl),
+                    keys::format_duration(resulting)
+                ),
+                Token::Text,
+            ));
+        }
     }
     let hint_token = if refused.is_some() {
         Token::Danger

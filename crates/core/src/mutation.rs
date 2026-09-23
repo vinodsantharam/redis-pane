@@ -114,6 +114,22 @@ pub enum Mutation {
     /// `ZREM key member`. Removing the last member removes the key: Redis's
     /// own behaviour, not something this arranges (ADR-0018).
     DeleteZSetMember { key: KeyName, member: Vec<u8> },
+    /// Plain `EXPIRE key <seconds>` (PLAN M2 task 10, D1, D5, ADR-0019). No
+    /// guard script: `EXPIRE` already refuses on its own to create a key
+    /// that is gone, and its `0` means exactly that and nothing else —
+    /// unlike `PERSIST`'s `0` and unlike `ZADD XX CH`'s. `seconds` is never
+    /// `0` here — D4's grammar refuses that at the keyboard, since
+    /// `EXPIRE key 0` deletes the key immediately.
+    SetTtl { key: KeyName, seconds: i32 },
+    /// Guarded `PERSIST key`, telling a gone key apart from one that already
+    /// had no expiry — a bare `PERSIST` answers `0` to both (PLAN M2 task
+    /// 10, D1, D5, ADR-0019).
+    PersistTtl { key: KeyName },
+    /// Guarded extend/shorten by a signed delta, applied to the TTL as the
+    /// server sees it at write time (PLAN M2 task 10, D1, D5, D7,
+    /// ADR-0019). Needs a script rather than `EXPIRE ... GT/LT`: that syntax
+    /// is 7.0+, below this app's 6.0 floor (ADR-0007).
+    ShiftTtl { key: KeyName, delta_seconds: i32 },
 }
 
 impl Eq for Mutation {}
@@ -134,7 +150,10 @@ impl Mutation {
             | Mutation::DeleteListElement { key, .. }
             | Mutation::SetZSetScore { key, .. }
             | Mutation::AddZSetMember { key, .. }
-            | Mutation::DeleteZSetMember { key, .. } => key,
+            | Mutation::DeleteZSetMember { key, .. }
+            | Mutation::SetTtl { key, .. }
+            | Mutation::PersistTtl { key }
+            | Mutation::ShiftTtl { key, .. } => key,
         }
     }
 
@@ -174,6 +193,14 @@ impl Mutation {
             // member is only a value, and an error line is no place for one.
             Mutation::AddZSetMember { key, .. } => format!("ZADD {key} NX"),
             Mutation::DeleteZSetMember { key, .. } => format!("ZREM {key}"),
+            // `EXPIRE`, literally, for both set and shift: it is the true
+            // underlying command either way (D6, ADR-0019), and unlike
+            // `SetString`/`SetHashField` this label never uses the word
+            // "set" anywhere, so there is no risk of an extend/shorten
+            // error notification reading as if a plain set had failed.
+            Mutation::SetTtl { key, .. } => format!("EXPIRE {key}"),
+            Mutation::PersistTtl { key } => format!("PERSIST {key}"),
+            Mutation::ShiftTtl { key, .. } => format!("EXPIRE {key}"),
         }
     }
 }
@@ -210,6 +237,16 @@ pub enum NotWritten {
     /// member distinct, so this gets its own variant and its own wording
     /// rather than borrowing a Hash-shaped one.
     MemberGone,
+    /// A `ShiftTtl` found the key had no expiry to change (PLAN M2 task 10,
+    /// D6, ADR-0019). Not [`NotWritten::KeyGone`] — the key is fine — and
+    /// not [`NotWritten::FieldGone`]/[`NotWritten::MemberGone`] — a TTL is
+    /// neither.
+    NoExpiry,
+    /// A `ShiftTtl`'s arithmetic landed at or below zero at the server
+    /// (PLAN M2 task 10, D6, ADR-0019). Worded in ADR-0017's longer
+    /// `ElementMoved` register: like that one, this is a *race* refusal a
+    /// reader meets on a key under churn, not a broken write.
+    WouldExpireNow,
 }
 
 impl NotWritten {
@@ -237,6 +274,14 @@ impl NotWritten {
             // ADR-0018 D3: a member, not a field — the glossary's distinction
             // is load-bearing, so this does not borrow `FieldGone`'s words.
             NotWritten::MemberGone => "member no longer exists",
+            // PLAN M2 task 10, D6, ADR-0019: a TTL fact, so it gets its own
+            // noun rather than "field"/"member".
+            NotWritten::NoExpiry => "key has no expiry to change",
+            // ADR-0017's `ElementMoved` register, one type over: a race
+            // refusal, not a broken write.
+            NotWritten::WouldExpireNow => {
+                "that would expire it now — the ttl moved underneath it, look again"
+            }
         }
     }
 }
@@ -365,6 +410,21 @@ mod tests {
                 },
                 "ZREM user:1",
             ),
+            (
+                Mutation::SetTtl {
+                    key: key.clone(),
+                    seconds: 300,
+                },
+                "EXPIRE user:1",
+            ),
+            (Mutation::PersistTtl { key: key.clone() }, "PERSIST user:1"),
+            (
+                Mutation::ShiftTtl {
+                    key: key.clone(),
+                    delta_seconds: 1_800,
+                },
+                "EXPIRE user:1",
+            ),
         ];
         for (mutation, label) in cases {
             assert_eq!(mutation.command_label(), label);
@@ -387,6 +447,41 @@ mod tests {
         assert_ne!(
             NotWritten::MemberGone.reason(),
             NotWritten::FieldGone.reason()
+        );
+    }
+
+    #[test]
+    fn no_expiry_and_would_expire_now_each_own_their_wording() {
+        assert_eq!(NotWritten::NoExpiry.reason(), "key has no expiry to change");
+        assert_eq!(
+            NotWritten::WouldExpireNow.reason(),
+            "that would expire it now — the ttl moved underneath it, look again"
+        );
+        assert_ne!(
+            NotWritten::NoExpiry.reason(),
+            NotWritten::WouldExpireNow.reason()
+        );
+    }
+
+    #[test]
+    fn ttl_mutations_key_correctly() {
+        let key = KeyName::from("session:9f3a");
+        assert_eq!(
+            Mutation::SetTtl {
+                key: key.clone(),
+                seconds: 300
+            }
+            .key(),
+            &key
+        );
+        assert_eq!(Mutation::PersistTtl { key: key.clone() }.key(), &key);
+        assert_eq!(
+            Mutation::ShiftTtl {
+                key: key.clone(),
+                delta_seconds: -600
+            }
+            .key(),
+            &key
         );
     }
 }

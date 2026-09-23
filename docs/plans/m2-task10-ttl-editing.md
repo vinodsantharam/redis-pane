@@ -633,3 +633,59 @@ closed. Also not fixed, because out of scope for phase 1: `docs/PLAN.md` row 10 
 "TTL editing: set / persist / extend" with no mention of shorten in the Task column despite the
 plan's own D3 table listing shorten throughout — the amended wording (this phase) folds shorten in
 explicitly rather than leaving the asymmetry for a future reader to puzzle over.
+
+**Phase 2.** All types built per the table: `crates/core/src/state/ttl.rs` (new) — `TtlEdit`,
+`TtlOutcome`, `TtlEditRefusal`, `parse_ttl_edit`, `resolve_ttl_edit`, `format_duration`, pure and
+clock-free; `Mutation::{SetTtl, PersistTtl, ShiftTtl}` and `NotWritten::{NoExpiry,
+WouldExpireNow}` (`crates/core/src/mutation.rs`); `PendingMutation::{SetTtl, PersistTtl,
+ShiftTtl}` with `command_text()`/`guard_text()`/`into_command()` (`crates/core/src/state/mod.rs`);
+`EditTarget::Ttl { text }` and `EditBuffer::{ttl, ttl_text, is_single_line_capture}`
+(`crates/core/src/state/editor.rs`); the real `TTL_PERSIST_SCRIPT`/`TTL_SHIFT_SCRIPT` and
+`set_ttl`/`persist_ttl`/`shift_ttl`, plus three arms in `execute`
+(`crates/app/src/redis/mutate.rs`).
+
+**`PendingMutation::ShiftTtl::command_text` is not a literal command, on purpose.** D6's table
+says the label is "EXPIRE key" for both Set and Shift (matching what actually crosses the wire),
+but that reading conflicts with D6's own worry about an error notification misleadingly reading
+"set" for an extend — resolved by noting `Mutation::command_label` (the short form used only in
+error notifications, which never spells out an operation word at all — it never says "set")
+literally returns `EXPIRE {key}` for both, satisfying D6's concern by construction, while
+`PendingMutation::command_text` (the confirm dialog's fuller preview, per D9's own worked
+examples) shows a signed duration like `EXPIRE k +30m` instead — not literal Redis syntax, but
+`command_text`'s own doc comment already licenses a guarded write's "effective command" to diverge
+from the wire form, and this is the form that actually answers "what did I ask for," which a raw
+`delta_seconds` in the dialog would not.
+
+**Sites forced to compile beyond the plan's declared four files**, matching task 9 phase 2's
+precedent exactly: `crates/core/src/state/open.rs`'s `edit_verb` (one new arm, `✎ editing ttl`);
+`crates/core/src/update/editor.rs`'s `stage_editor` (one new arm resolving `EditTarget::Ttl`'s text
+via `parse_ttl_edit`, parsed *before* `open.stage_edit()` is called, mirroring the ZSet score
+block's own precedent for "no honest fallback exists, so refuse to stage" — the same shape task 9
+phase 2 records for its own `nan`-score fallback) and `staged_edit_found_key_gone`'s `dialog_up`
+match (three new or-pattern arms); `crates/core/src/update/confirm.rs`'s `nothing_to_remove` (one
+new arm, `PersistTtl => "expiry"`, plus `SetTtl`/`ShiftTtl` folded into the existing `"entry"`
+catch-all since neither ever settles that way) and `not_written` (two new arms joining the
+existing `FieldGone`/`FieldExists`/`MemberExists`/`ElementMoved`/`MemberGone` group, since
+`NoExpiry`/`WouldExpireNow` behave identically at this level: the key is fine, the buffer comes
+back, the Viewer re-reads); `crates/core/src/render/mod.rs`'s `confirm_overlay` (three new arms
+with real preview lines per D9, including the `⚠ this key had no expiry` warning gated on `old_ttl
+== TTL_NONE`). All given real arms, not stubs, and all unreachable today since nothing in
+`update/`'s dispatch constructs a TTL `EditTarget`/`PendingMutation` yet — `stage_editor`'s Ttl arm
+and the `is_new_field`-style dirty-check bypass just above it are exercised directly by phase 2's
+own unit tests (calling `stage_editor` on hand-built state), the same way task 9 phase 2 could not
+exercise its ZSet arms via `update()` dispatch either.
+
+**The seeded-cursor-at-position-0 defect genuinely does not recur here**, as D11 promised:
+`EditBuffer::ttl` seeds `EditTarget::Ttl { text }` directly rather than a `TextArea`, and typing
+routes through `name_push`/`name_pop`/`name_push_str` exactly as the Hash/ZSet add forms' name
+half already does — confirmed by a dedicated test
+(`ttl_typing_mutates_the_hand_painted_text_not_the_text_area`) that pops the seeded `"42m"` down to
+empty and retypes, and separately asserts the buffer's `TextArea`-backed `text()` stays `b""`
+throughout.
+
+**Not built, deliberately out of this phase's scope, and not a gap:** `open_ttl_editor`, the `⌃S`
+duration-grammar block, `editor_key`'s `is_single_line_capture()`-based routing, and `t`'s
+keys-pane/value-pane split in `keymap/mod.rs`/`update/mod.rs` — all phase 3. `t` still toggles the
+tree in both panes; no keypress opens a TTL editor. Golden frames for the resolution line and the
+three confirm dialogs are phase 5, once phase 3 can actually stage one of these three variants
+through the real dispatch path.

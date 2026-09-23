@@ -359,12 +359,20 @@ pub(super) fn stage_editor(mut state: State) -> (State, Vec<Command>) {
     // A brand-new field or member has no prior value to be unchanged from —
     // an empty value is a real value Redis allows, not "nothing to save"
     // (D1, and ADR-0016 D3 for the Set member one field narrower).
+    // `EditTarget::Ttl` joins this group not because it is "new" the way an
+    // add form is, but for the same structural reason the add forms' *name*
+    // half does (PLAN M2 task 10, D11, ADR-0019): its text lives in the
+    // target's own `text` field, never in the `TextArea` `is_dirty` actually
+    // reads, so that check can never see a TTL edit as dirty. Bypassing it
+    // here means `⌃S`/`Enter` always attempt to parse whatever was typed,
+    // rather than silently closing an edited-but-"clean" buffer.
     let is_new_field = matches!(
         editor.target(),
         EditTarget::NewHashField { .. }
             | EditTarget::NewSetMember
             | EditTarget::NewListElement { .. }
             | EditTarget::NewZSetMember { .. }
+            | EditTarget::Ttl { .. }
     );
     if !is_new_field && !editor.is_dirty() {
         open.end_edit();
@@ -399,6 +407,21 @@ pub(super) fn stage_editor(mut state: State) -> (State, Vec<Command>) {
         // Every other target's payload is bytes, which cannot fail to parse.
         _ => (0.0, 0.0),
     };
+    // PLAN M2 task 10, D4, D12, ADR-0019: the same "parse before staging,
+    // refuse to stage at all on a failure" shape the score block above uses,
+    // one type over — `crate::state::ttl::parse_ttl_edit` is the one
+    // grammar `⌃S`'s own block (phase 3) already blocks on, so reaching
+    // here with an unreadable duration is unreachable in practice, but
+    // there is no honest fallback to fabricate the way there is none for a
+    // `nan` score, so this refuses to stage rather than guessing.
+    let ttl_edit = match editor.target() {
+        EditTarget::Ttl { text } => match crate::state::ttl::parse_ttl_edit(text) {
+            Ok(edit) => Some(edit),
+            Err(_) => return (state, Vec::new()),
+        },
+        _ => None,
+    };
+    let old_ttl = open.ttl_seconds;
     let name = open.name.clone();
     // Staged, not closed: the pane keeps showing what is about to be
     // written under the dialog, instead of the value it replaces.
@@ -473,6 +496,26 @@ pub(super) fn stage_editor(mut state: State) -> (State, Vec<Command>) {
             name,
             member: member.into_bytes(),
             score: new_score,
+        },
+        // `t` in the value pane (PLAN M2 task 10 phase 3, D1, D3, D6,
+        // ADR-0019): not reachable until `open_ttl_editor` constructs this
+        // target — the arm exists now because `EditTarget` is matched
+        // exhaustively (PLAN M2 task 8, D8). `ttl_edit` was parsed above,
+        // before anything was staged — an unreadable one returned early
+        // rather than reaching here, so this is always the reader's own,
+        // already-valid edit.
+        EditTarget::Ttl { .. } => match ttl_edit.expect("parsed above for EditTarget::Ttl") {
+            crate::state::ttl::TtlEdit::Set(seconds) => PendingMutation::SetTtl {
+                name,
+                old_ttl,
+                new_ttl: seconds,
+            },
+            crate::state::ttl::TtlEdit::Persist => PendingMutation::PersistTtl { name, old_ttl },
+            crate::state::ttl::TtlEdit::Shift(delta_seconds) => PendingMutation::ShiftTtl {
+                name,
+                old_ttl,
+                delta_seconds,
+            },
         },
     };
     state.confirm = Some(mutation);
@@ -656,7 +699,10 @@ pub(super) fn staged_edit_found_key_gone(state: &mut State, name: &KeyName, at_m
             | PendingMutation::DeleteListElement { name: staged, .. }
             | PendingMutation::SetZSetScore { name: staged, .. }
             | PendingMutation::AddZSetMember { name: staged, .. }
-            | PendingMutation::DeleteZSetMember { name: staged, .. },
+            | PendingMutation::DeleteZSetMember { name: staged, .. }
+            | PendingMutation::SetTtl { name: staged, .. }
+            | PendingMutation::PersistTtl { name: staged, .. }
+            | PendingMutation::ShiftTtl { name: staged, .. },
         ) => staged == name,
         // `DeleteKey` never opens a buffer and is handled entirely by
         // `key_deleted` (`update/confirm.rs`), not this function — the key
@@ -4404,5 +4450,106 @@ mod zset_score_edit_tests {
             }
             other => panic!("expected a staged DeleteZSetMember, got {other:?}"),
         }
+    }
+
+    // ── PLAN M2 task 10 — TTL editing (ADR-0019) ──
+    //
+    // `open_ttl_editor` is not built until phase 3 (D1's ladder is not this
+    // phase's job), so these drive `stage_editor` directly against a buffer
+    // opened by hand with `open.begin_edit(EditBuffer::ttl(..))` — the same
+    // way ADR-0018's task 9 phase-2 tests exercised `stage_editor`'s ZSet
+    // arms before `e`/`a` were wired.
+
+    fn open_with_ttl_editor(ttl_seconds: i32, text: &str) -> State {
+        let value = crate::state::Value::Str(crate::state::value::StringValue::new("v", 80));
+        let mut open = OpenKey::new(Some(0), "k".into(), value, ttl_seconds, 1, 0);
+        let mut buffer = crate::state::EditBuffer::ttl(ttl_seconds);
+        for _ in 0..buffer.ttl_text().unwrap().chars().count() {
+            buffer.name_pop();
+        }
+        buffer.name_push_str(text);
+        open.begin_edit(buffer);
+        let mut state = State {
+            cols: 130,
+            rows: 40,
+            focus: Pane::Value,
+            open: Some(open),
+            ..State::default()
+        };
+        state.keys.push(b"k");
+        state.rebuild_list();
+        state
+    }
+
+    #[test]
+    fn staging_a_set_ttl_resolves_seconds_and_carries_old_ttl() {
+        let s = open_with_ttl_editor(2_520, "5m");
+        let (s, _) = stage_editor(s);
+        match &s.confirm {
+            Some(PendingMutation::SetTtl {
+                name,
+                old_ttl,
+                new_ttl,
+            }) => {
+                assert_eq!(name, b"k");
+                assert_eq!(*old_ttl, 2_520);
+                assert_eq!(*new_ttl, 300);
+            }
+            other => panic!("expected a staged SetTtl, got {other:?}"),
+        }
+        assert_eq!(s.confirm.as_ref().unwrap().command_text(), "EXPIRE k 300");
+    }
+
+    #[test]
+    fn staging_an_empty_field_resolves_persist() {
+        let s = open_with_ttl_editor(2_520, "");
+        let (s, _) = stage_editor(s);
+        match &s.confirm {
+            Some(PendingMutation::PersistTtl { name, old_ttl }) => {
+                assert_eq!(name, b"k");
+                assert_eq!(*old_ttl, 2_520);
+            }
+            other => panic!("expected a staged PersistTtl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn staging_a_signed_duration_resolves_shift() {
+        let s = open_with_ttl_editor(2_520, "+30m");
+        let (s, _) = stage_editor(s);
+        match &s.confirm {
+            Some(PendingMutation::ShiftTtl {
+                name,
+                old_ttl,
+                delta_seconds,
+            }) => {
+                assert_eq!(name, b"k");
+                assert_eq!(*old_ttl, 2_520);
+                assert_eq!(*delta_seconds, 1_800);
+            }
+            other => panic!("expected a staged ShiftTtl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn staging_unreadable_ttl_text_refuses_to_stage_rather_than_guessing() {
+        // Only reachable if `⌃S`'s own block (phase 3) somehow let this
+        // through — there is no honest fallback, so this must refuse to
+        // stage rather than write a duration nobody typed (mirrors task 9's
+        // `nan`-score precedent).
+        let s = open_with_ttl_editor(2_520, "abc");
+        let (s, cmds) = stage_editor(s);
+        assert!(s.confirm.is_none());
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn a_ttl_mutations_command_text_reads_as_a_signed_duration_for_a_shift() {
+        let extend = PendingMutation::ShiftTtl {
+            name: "k".into(),
+            old_ttl: 2_520,
+            delta_seconds: 1_800,
+        };
+        assert_eq!(extend.command_text(), "EXPIRE k +30m");
     }
 }

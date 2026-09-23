@@ -5173,4 +5173,60 @@ mod ttl_editor_wiring_tests {
             "the script's arithmetic is never mirrored locally — the refetch brings the real figure"
         );
     }
+
+    /// Opening the field and staging it untouched writes nothing.
+    ///
+    /// This is the end-to-end half of the guard `EditBuffer::is_dirty` gives
+    /// the seed. `format_duration` seeds at two units, so a key at
+    /// `1d 2h 30m 10s` shows `1d 2h` — and a `⌃S` that staged *that* would
+    /// shorten the key by forty minutes the reader never asked to lose. The
+    /// editor must simply close, the way it does for an untouched value.
+    #[test]
+    fn staging_an_untouched_ttl_field_closes_it_without_writing() {
+        for seconds in [2_520, 4_320, 95_410] {
+            let s = open_ttl(seconds);
+            let seeded = s.open.as_ref().unwrap().ttl_seconds;
+            let (s, cmds) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+            assert!(
+                s.confirm.is_none(),
+                "{seconds}s: an untouched seed must not stage a write"
+            );
+            assert!(cmds.is_empty(), "{seconds}s: {cmds:?}");
+            assert!(
+                !s.open.as_ref().unwrap().is_editing(),
+                "{seconds}s: the editor closes, as it does for an untouched value"
+            );
+            assert_eq!(
+                s.open.as_ref().unwrap().ttl_seconds,
+                seeded,
+                "{seconds}s: and the key's own TTL is untouched"
+            );
+        }
+    }
+
+    /// A pasted duration reaches the TTL capture, not the unused `TextArea`.
+    ///
+    /// `paste` routed on `active_part() == Some(FieldPart::Name)`, which is
+    /// honestly `None` for a TTL (D11 — there is no `FIELD`/`VALUE` split to
+    /// be on), so before phase 3's fix a paste landed in the buffer's unused
+    /// `TextArea` and vanished: the field looked unchanged and `⌃S` closed it
+    /// without writing. Pinned here because the fix has no other coverage —
+    /// every other test in this module types character by character.
+    #[test]
+    fn a_pasted_duration_lands_in_the_ttl_capture() {
+        let s = retype_ttl(open_ttl(2_520), "");
+        let (s, _) = update(s, Msg::Paste("90m".into()));
+        assert_eq!(
+            s.open.as_ref().unwrap().editor().unwrap().ttl_text(),
+            Some("90m"),
+            "the paste must reach the capture's own text"
+        );
+
+        let (s, cmds) = update(s, Msg::Key(KeyPress::ctrl(KeyCode::Char('s'))));
+        assert!(cmds.is_empty());
+        match &s.confirm {
+            Some(PendingMutation::SetTtl { new_ttl, .. }) => assert_eq!(*new_ttl, 5_400),
+            other => panic!("a pasted duration must stage like a typed one, got {other:?}"),
+        }
+    }
 }

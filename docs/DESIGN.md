@@ -124,7 +124,7 @@ terminal is small and the situation is urgent.
 | `e` | Open the inline value editor, or (Hash, cursor on a field) edit that field's value | value pane, focused |
 | `a` | Add a field to the open Hash — opens the two-part FIELD/VALUE add form | value pane, focused |
 | `Ctrl-S` | Stage the inline editor's buffer for confirmation | value pane, editing |
-| `t` | Edit TTL | value pane |
+| `t` | Edit TTL (set / persist / extend) | value pane, focused |
 | `c` / `C` | Copy key or value / copy `redis-cli` command | key list, value pane |
 | `d` | Stage delete of the Selected key (`DEL`), or (Hash, cursor on a field) of that field (`HDEL`) | key list, value pane |
 | `y` | Confirm a staged mutation (`Esc` dismisses) | global, only while one is staged |

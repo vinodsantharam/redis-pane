@@ -621,3 +621,15 @@ cargo run -p redis-pane -- --url redis://127.0.0.1:6379
 ## Found while building
 
 _(Executor: append anything noticed but deliberately not fixed, with `file:line`.)_
+
+**Phase 1.** The `CLIENT TRACKING` experiment came back the opposite of what the plan's Context
+section was prepared for: an `EXPIRE`-only and a `PERSIST`-only change on an armed, re-armed key
+both produced an ordinary `invalidate` push (see ADR-0019's Context and Consequences). This is
+good news, not a defect, but it does mean the "another client's TTL change" line in this plan's
+manual test plan should be read as an ordinary liveness check, not a demonstration of a known gap —
+the countdown is expected to catch up promptly, not stay wrong until `r`. Nothing was fixed because
+nothing was broken; flagging it here only so phase 5 does not go looking for a gap that measurement
+closed. Also not fixed, because out of scope for phase 1: `docs/PLAN.md` row 10 previously read
+"TTL editing: set / persist / extend" with no mention of shorten in the Task column despite the
+plan's own D3 table listing shorten throughout — the amended wording (this phase) folds shorten in
+explicitly rather than leaving the asymmetry for a future reader to puzzle over.

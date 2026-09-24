@@ -3566,3 +3566,77 @@ fn golden_palette_shows_a_rebound_key() {
     assert!(frame.contains("⌃X"), "{frame}");
     assert!(!frame.contains(" q "), "the stale default must be gone");
 }
+
+/// Bug reported live: arrowing `↓` past the first page (`PALETTE_MAX_VISIBLE`
+/// rows) moved `selected` correctly — it clamps at the last action, never
+/// wraps — but the overlay only ever drew `matches[0..PALETTE_MAX_VISIBLE)`,
+/// so once `selected` pointed past that fixed window nothing on screen was
+/// marked selected any more. The state was fine; the highlight, and with it
+/// any visible sign of where the cursor was, had simply scrolled off a
+/// window that never followed it — indistinguishable from the Palette having
+/// hung. `↑` back up was equally silent, for the same reason.
+///
+/// Drives real `Msg::Key` presses through `update()`, not a hand-built
+/// `PaletteState`, so this exercises the same path a keypress actually
+/// takes.
+#[test]
+fn scrolling_past_the_first_page_keeps_the_selection_on_screen() {
+    use redis_pane_core::keymap::ALL_ACTIONS;
+
+    let opened = with_palette("");
+    assert!(
+        ALL_ACTIONS.len() > PALETTE_MAX_VISIBLE_FOR_TEST,
+        "this test needs more actions than one page to mean anything"
+    );
+
+    let mut state = opened;
+    for _ in 0..(PALETTE_MAX_VISIBLE_FOR_TEST + 5) {
+        state = update(state, Msg::Key(KeyPress::plain(KeyCode::Down))).0;
+    }
+    let selected = state.palette.as_ref().unwrap().selected;
+    assert_eq!(
+        selected,
+        PALETTE_MAX_VISIBLE_FOR_TEST + 5,
+        "the selection itself was never the bug — it already clamped/moved correctly"
+    );
+
+    let expected_action = ALL_ACTIONS[selected];
+    let frame = draw(&state, 130, 26);
+    assert!(
+        frame.contains(expected_action.label()),
+        "the selected action ({:?}) must still be drawn once selection has \
+         scrolled past the first page — frame:\n{frame}",
+        expected_action
+    );
+
+    // Scroll all the way back to the top and confirm the first action is
+    // visible again — proves the window actually follows `selected` in both
+    // directions, not just downward.
+    for _ in 0..(PALETTE_MAX_VISIBLE_FOR_TEST + 10) {
+        state = update(state, Msg::Key(KeyPress::plain(KeyCode::Up))).0;
+    }
+    assert_eq!(state.palette.as_ref().unwrap().selected, 0);
+    let frame = draw(&state, 130, 26);
+    assert!(frame.contains(ALL_ACTIONS[0].label()), "{frame}");
+
+    assert_golden(
+        "palette_scrolled_past_first_page_130",
+        &draw(
+            &{
+                let mut s = with_palette("");
+                for _ in 0..(PALETTE_MAX_VISIBLE_FOR_TEST + 5) {
+                    s = update(s, Msg::Key(KeyPress::plain(KeyCode::Down))).0;
+                }
+                s
+            },
+            130,
+            26,
+        ),
+    );
+}
+
+/// Mirrors `PALETTE_MAX_VISIBLE` in `render/mod.rs`, which is private to that
+/// module — kept as a plain literal here rather than exposed just for a test
+/// to import, the same call `render/mod.rs`'s own doc comments already make
+/// about not growing the module's public surface for test-only access.
+const PALETTE_MAX_VISIBLE_FOR_TEST: usize = 10;

@@ -105,7 +105,58 @@ pub enum Action {
     EditorUndo,
     /// Redo the last undone edit inside the inline editor.
     EditorRedo,
+    /// Open the command palette — the fuzzy list over every `Action` in this
+    /// enum, reading this same keymap so it and the hint bar can never
+    /// disagree on the effective binding (CONTEXT.md, DESIGN §3, PLAN M3
+    /// task 1). Global, like `Help`: not scoped to either pane.
+    OpenPalette,
 }
+
+/// Every `Action` that exists, in a stable order.
+///
+/// `Action` is `#[non_exhaustive]` to keep another crate from constructing or
+/// exhaustively matching it, but this crate still has to be able to list
+/// every variant it defines — the Palette has nothing else to search over.
+/// There is no `derive`-able way to enumerate an enum's variants without a
+/// dependency this crate has no other reason to take on (ADR-0011's boundary
+/// rule is about `crossterm`/`tokio`/`fred`, but a proc-macro crate would
+/// still be more surface than the ~30 actions here justify), so this list is
+/// maintained by hand, the same way `every_action_has_a_default_binding`
+/// already was before this array existed — see
+/// `tests::every_action_has_a_short_label_and_description` for the test that
+/// keeps `label`/`description` honest against it.
+pub const ALL_ACTIONS: &[Action] = &[
+    Action::Quit,
+    Action::Refetch,
+    Action::ToggleReadOnly,
+    Action::Help,
+    Action::Cancel,
+    Action::MoveUp,
+    Action::MoveDown,
+    Action::PageUp,
+    Action::PageDown,
+    Action::Top,
+    Action::Bottom,
+    Action::Filter,
+    Action::Sort,
+    Action::ToggleTree,
+    Action::CollapseGroup,
+    Action::Open,
+    Action::EnterValueCursor,
+    Action::Copy,
+    Action::CopyCommand,
+    Action::CyclePane,
+    Action::WidenKeysPane,
+    Action::NarrowKeysPane,
+    Action::Delete,
+    Action::ConfirmMutation,
+    Action::Edit,
+    Action::Add,
+    Action::EditorStage,
+    Action::EditorUndo,
+    Action::EditorRedo,
+    Action::OpenPalette,
+];
 
 impl Action {
     /// Whether the pane this action operates on is currently drawn.
@@ -163,8 +214,10 @@ impl Action {
             // Everything else is the app's, not a pane's: quitting, help, Esc,
             // `Tab` (which is what *changes* which pane is on screen), `r`
             // (already pane-scoped by R2.7 on its own terms), `Enter`
-            // (no-ops itself with nothing open to enter), copying, and the
-            // read-only toggle.
+            // (no-ops itself with nothing open to enter), copying, the
+            // read-only toggle, and the Palette — it has nothing to say about
+            // either pane until an entry is picked, at which point the picked
+            // `Action`'s own gate applies (see `update::palette`).
             _ => true,
         }
     }
@@ -206,6 +259,47 @@ impl Action {
             Action::EditorStage => "stage",
             Action::EditorUndo => "undo",
             Action::EditorRedo => "redo",
+            Action::OpenPalette => "palette",
+        }
+    }
+
+    /// The Palette row's second column (PLAN M3 task 1): what the action
+    /// does, in enough words to place it but few enough to fit one row at
+    /// the narrowest supported width (DESIGN §2, 80 cols) — a description
+    /// too long to fit there needs rewriting, not a wider Palette
+    /// (CLAUDE.md, "screen space is a budget, not a canvas").
+    pub fn description(&self) -> &'static str {
+        match self {
+            Action::Quit => "Exit redis-pane",
+            Action::Refetch => "Re-read the open key, or rescan the keyspace",
+            Action::ToggleReadOnly => "Lift or impose Read-only Mode",
+            Action::Help => "Show every keybinding",
+            Action::Cancel => "Back out of whatever is open",
+            Action::MoveUp => "Move up",
+            Action::MoveDown => "Move down",
+            Action::PageUp => "Move up one page",
+            Action::PageDown => "Move down one page",
+            Action::Top => "Jump to the top",
+            Action::Bottom => "Jump to the bottom",
+            Action::Filter => "Filter the key list",
+            Action::Sort => "Cycle the sort column",
+            Action::ToggleTree => "Fold or unfold the tree, or edit the open key's TTL",
+            Action::CollapseGroup => "Collapse the group under the cursor",
+            Action::Open => "Open the selected key, or expand a group",
+            Action::EnterValueCursor => "Start moving a cursor inside the open value",
+            Action::Copy => "Copy the key name or the open value",
+            Action::CopyCommand => "Copy a redis-cli command for the open key",
+            Action::CyclePane => "Move focus between the panes",
+            Action::WidenKeysPane => "Widen the keys pane",
+            Action::NarrowKeysPane => "Narrow the keys pane",
+            Action::Delete => "Stage a delete for confirmation",
+            Action::ConfirmMutation => "Confirm the staged mutation",
+            Action::Edit => "Edit the open value",
+            Action::Add => "Add a field or member to the open value",
+            Action::EditorStage => "Stage the inline editor's buffer",
+            Action::EditorUndo => "Undo the last edit in the inline editor",
+            Action::EditorRedo => "Redo the last undone edit",
+            Action::OpenPalette => "Open the command palette",
         }
     }
 
@@ -420,6 +514,10 @@ impl Default for Keymap {
                     key: KeyPress::ctrl(KeyCode::Char('y')),
                     action: Action::EditorRedo,
                 },
+                Binding {
+                    key: KeyPress::ctrl(KeyCode::Char('k')),
+                    action: Action::OpenPalette,
+                },
             ],
         }
     }
@@ -609,36 +707,40 @@ mod tests {
 
     #[test]
     fn every_action_has_a_default_binding() {
+        // `CyclePane`, `WidenKeysPane` and `NarrowKeysPane` were always
+        // exercised via a literal `KeyPress` in their own tests rather than
+        // by name here — walking `ALL_ACTIONS` instead of a second hand-typed
+        // list closes that gap along with covering `OpenPalette`.
         let k = Keymap::default();
-        for action in [
-            Action::Quit,
-            Action::Refetch,
-            Action::ToggleReadOnly,
-            Action::Help,
-            Action::Cancel,
-            Action::MoveUp,
-            Action::MoveDown,
-            Action::PageUp,
-            Action::PageDown,
-            Action::Top,
-            Action::Bottom,
-            Action::Filter,
-            Action::Sort,
-            Action::ToggleTree,
-            Action::CollapseGroup,
-            Action::Open,
-            Action::EnterValueCursor,
-            Action::Copy,
-            Action::CopyCommand,
-            Action::Delete,
-            Action::ConfirmMutation,
-            Action::Edit,
-            Action::Add,
-            Action::EditorStage,
-            Action::EditorUndo,
-            Action::EditorRedo,
-        ] {
-            assert!(k.key_for(action).is_some(), "{action:?} has no binding");
+        for action in ALL_ACTIONS {
+            assert!(k.key_for(*action).is_some(), "{action:?} has no binding");
+        }
+    }
+
+    #[test]
+    fn ctrl_k_opens_the_palette() {
+        let k = Keymap::default();
+        assert_eq!(
+            k.action_for(&KeyPress::ctrl(KeyCode::Char('k'))),
+            Some(Action::OpenPalette)
+        );
+    }
+
+    /// Every action in [`ALL_ACTIONS`] has a label and a description short
+    /// enough to fit one Palette row at the narrowest supported width
+    /// (DESIGN §2, 80 cols) — checked here rather than left to a golden
+    /// frame, since a too-long description is wrong regardless of how it
+    /// happens to wrap.
+    #[test]
+    fn every_action_has_a_short_label_and_description() {
+        for action in ALL_ACTIONS {
+            assert!(!action.label().is_empty(), "{action:?} has no label");
+            let description = action.description();
+            assert!(!description.is_empty(), "{action:?} has no description");
+            assert!(
+                description.chars().count() <= 60,
+                "{action:?}'s description is too long for one Palette row: {description:?}"
+            );
         }
     }
 }

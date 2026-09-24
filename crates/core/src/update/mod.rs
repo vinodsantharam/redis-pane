@@ -23,6 +23,7 @@ mod editor;
 mod keys;
 mod link;
 mod mouse;
+mod palette;
 mod scan;
 mod viewer;
 
@@ -37,6 +38,7 @@ use self::editor::*;
 use self::keys::*;
 use self::link::*;
 use self::mouse::*;
+use self::palette::*;
 use self::scan::*;
 use self::viewer::*;
 
@@ -243,11 +245,12 @@ pub(crate) enum Mode {
     Confirm,
     Editing,
     Filtering,
+    Palette,
     Normal,
 }
 
 /// The one place mode precedence is decided — confirm dialog, then editor,
-/// then filter, then Normal.
+/// then filter, then Palette, then Normal.
 pub(crate) fn mode(state: &State) -> Mode {
     // A staged mutation is a modal dialog: it is the only thing on screen
     // that can act on the keypress until it is confirmed or dismissed,
@@ -271,6 +274,24 @@ pub(crate) fn mode(state: &State) -> Mode {
     if state.filtering {
         return Mode::Filtering;
     }
+    // The Palette is ranked last, immediately above Normal, rather than
+    // above Confirm/Editing/Filtering the way DESIGN §3's "global" scope
+    // might suggest: `Ctrl-K` is a keymap `Action` like any other
+    // (`Action::OpenPalette`), so it only ever *opens* the Palette from
+    // Normal mode, exactly the way `Ctrl-R`/`?`/every other bound key does —
+    // Confirm and Filtering do not special-case themselves an exception for
+    // it (Confirm ignores every key outside its own y/Esc vocabulary, and
+    // Filtering never consults the keymap at all), and Editing already
+    // treats an unrecognized ctrl-chord as "not the reader asking to type
+    // its letter" rather than as a command to act on. What *is* ranked here
+    // is what happens once the Palette is already open (`state.palette`
+    // is `Some`): typed characters, `↑↓` and `Enter`/`Esc` must reach the
+    // Palette's own handler rather than fall through to whatever Normal mode
+    // would have done with them — the same "own the keystroke stream while
+    // active" shape Confirm/Editing/Filtering each already have.
+    if state.palette.is_some() {
+        return Mode::Palette;
+    }
     Mode::Normal
 }
 
@@ -288,6 +309,7 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
         }
         Mode::Editing => return editor_key(state, key),
         Mode::Filtering => return filter_key(state, key),
+        Mode::Palette => return palette_key(state, key),
         Mode::Normal => {}
     }
     let Some(action) = state.keymap.action_for(&key) else {
@@ -304,6 +326,18 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
     if !action.pane_is_on_screen(&state) {
         return (state, Vec::new());
     }
+    dispatch_action(state, action)
+}
+
+/// What a resolved `Action` actually does — the one dispatch step both a
+/// direct keypress (`key_press`, above) and the Palette's `Enter`
+/// (`update::palette::palette_key`) call, so the two can never diverge on the
+/// same `Action` (PLAN M3 row 1: "hint bar and Palette never disagree").
+/// `key_press` reaches this only after the mode gate and the
+/// `pane_is_on_screen` gate above have both passed; `palette_key` applies its
+/// own copy of the latter gate before calling here, since a Palette entry can
+/// name an action whose pane is not the one currently on screen.
+fn dispatch_action(mut state: State, action: Action) -> (State, Vec<Command>) {
     match action {
         Action::Quit => quit(state),
         Action::Help => {
@@ -425,6 +459,7 @@ fn key_press(mut state: State, key: KeyPress) -> (State, Vec<Command>) {
             }
             (state, Vec::new())
         }
+        Action::OpenPalette => open_palette(state),
     }
 }
 

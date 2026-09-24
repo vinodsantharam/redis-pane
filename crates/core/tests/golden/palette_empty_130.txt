@@ -1,0 +1,26 @@
+─ redis-pane ─ ● staging · cache-01:6379/0 · from profile staging ─────────────────────────────────────────────────────── ● live ─
+
+ KEY                               TYPE        SIZE   TTL │ → to open
+ ● user:8812:session               hash      2.1 KB   42m │
+ ● user:8812:profile               json       880 B     ∞ │
+ ● user:8812:cart        ┌─ palette ────────────────────────────────────────────────────────────────────┐
+ ● user:8813:session     │                                                                              │
+ ● cart:91af3c9d2e       │ >                                                                            │
+ ● feed:global:hot       │ quit                     q      Exit redis-pane                              │
+ ● lock:checkout:8812    │ refetch / rescan         r      Re-read the open key, or rescan the keyspace │
+ ● stream:orders         │ read-only                ⌃R     Lift or impose Read-only Mode                │
+                         │ help                     ?      Show every keybinding                        │
+                         │ back                     Esc    Back out of whatever is open                 │
+                         │ move                     ↑      Move up                                      │
+                         │ move                     ↓      Move down                                    │
+                         │ page                     PgUp   Move up one page                             │
+                         │ page                     PgDn   Move down one page                           │
+                         │ top                      Home   Jump to the top                              │
+                         │                                                                              │
+                         │ ↑↓ move · ⏎ open · Esc cancel                                                │
+                         └──────────────────────────────────────────────────────────────────────────────┘
+                                                          │
+                                                          │
+                                                          │
+ scanning 41,203 of ~180,000  Esc cancel
+ Esc back   r rescan   ⌃R read-only   ? help   q quit

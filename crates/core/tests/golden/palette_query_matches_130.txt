@@ -1,0 +1,26 @@
+─ redis-pane ─ ● staging · cache-01:6379/0 · from profile staging ─────────────────────────────────────────────────────── ● live ─
+
+ KEY                               TYPE        SIZE   TTL │ → to open
+ ● user:8812:session               hash      2.1 KB   42m │
+ ● user:8812:profile               json       880 B     ∞ │
+ ● user:8812:cart                  zset       412 B   12m │
+ ● user:8813:session     ┌─ palette ────────────────────────────────────────────────────────────────────┐
+ ● cart:91af3c9d2e       │                                                                              │
+ ● feed:global:hot       │ > read                                                                       │
+ ● lock:checkout:8812    │ read-only                ⌃R     Lift or impose Read-only Mode                │
+ ● stream:orders         │ copy redis-cli command   C      Copy a redis-cli command for the open key    │
+                         │ redo                     ⌃Y     Redo the last undone edit                    │
+                         │ refetch / rescan         r      Re-read the open key, or rescan the keyspace │
+                         │ collapse / parent        ←      Collapse the group under the cursor          │
+                         │ confirm                  y      Confirm the staged mutation                  │
+                         │ open / expand            →      Open the selected key, or expand a group     │
+                         │                                                                              │
+                         │ ↑↓ move · ⏎ open · Esc cancel                                                │
+                         └──────────────────────────────────────────────────────────────────────────────┘
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+                                                          │
+ scanning 41,203 of ~180,000  Esc cancel
+ Esc back   r rescan   ⌃R read-only   ? help   q quit

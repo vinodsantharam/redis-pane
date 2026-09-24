@@ -3478,3 +3478,91 @@ fn golden_ttl_hint_bar_is_constant_whatever_is_typed() {
         );
     }
 }
+
+// ── M3 task 1: the command palette (`Ctrl-K`) ───────────────────────────────
+
+use redis_pane_core::state::PaletteState;
+
+fn palette(query: &str) -> PaletteState {
+    let mut palette = PaletteState::new();
+    palette.query = query.to_string();
+    palette.refresh();
+    palette
+}
+
+fn with_palette(query: &str) -> State {
+    State {
+        palette: Some(palette(query)),
+        ..browsing()
+    }
+}
+
+/// A freshly opened Palette (`Ctrl-K`, nothing typed yet): every action
+/// listed, top row selected.
+#[test]
+fn golden_palette_empty_130_cols() {
+    assert_golden("palette_empty_130", &draw(&with_palette(""), 130, 26));
+}
+
+#[test]
+fn golden_palette_empty_80_cols() {
+    assert_golden("palette_empty_80", &draw(&with_palette(""), 80, 24));
+}
+
+/// Mid-query: typing narrows the list, the same fuzzy filter
+/// `state::palette::fuzzy_match` is unit-tested against directly.
+#[test]
+fn golden_palette_query_matches_130_cols() {
+    assert_golden(
+        "palette_query_matches_130",
+        &draw(&with_palette("read"), 130, 26),
+    );
+}
+
+#[test]
+fn golden_palette_query_matches_80_cols() {
+    assert_golden(
+        "palette_query_matches_80",
+        &draw(&with_palette("read"), 80, 24),
+    );
+}
+
+/// No action matches the query at all — the "type more" idiom, not an empty
+/// silent box.
+#[test]
+fn golden_palette_no_matches_130_cols() {
+    assert_golden(
+        "palette_no_matches_130",
+        &draw(&with_palette("zzzzqqqq"), 130, 26),
+    );
+}
+
+#[test]
+fn golden_palette_no_matches_80_cols() {
+    assert_golden(
+        "palette_no_matches_80",
+        &draw(&with_palette("zzzzqqqq"), 80, 24),
+    );
+}
+
+/// R7.5's proof, applied to the Palette (PLAN M3 row 1): every action's
+/// *effective* binding is what the row shows, not its default.
+#[test]
+fn golden_palette_shows_a_rebound_key() {
+    let mut keymap = Keymap::default();
+    keymap.bind(Action::Quit, KeyPress::ctrl(KeyCode::Char('x')));
+    let mut state = State {
+        keymap,
+        ..with_palette("quit")
+    };
+    // `with_palette` builds its `PaletteState` before the rebind above, so
+    // refresh once more against the state actually under test — matching
+    // how a real session would already have the rebind in force before
+    // `Ctrl-K` is ever pressed.
+    if let Some(p) = &mut state.palette {
+        p.refresh();
+    }
+    let frame = draw(&state, 130, 26);
+    assert!(frame.contains("⌃X"), "{frame}");
+    assert!(!frame.contains(" q "), "the stale default must be gone");
+}

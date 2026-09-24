@@ -17,8 +17,8 @@ use crate::clock::Clock;
 use crate::keymap::{Action, key_label};
 use crate::state::value::{Value, format_score};
 use crate::state::{
-    Attachment, EditBuffer, EditTarget, FieldPart, Link, Liveness, PendingMutation, PendingRead,
-    State, is_valid_zset_score,
+    Attachment, EditBuffer, EditTarget, FieldPart, Link, Liveness, PaletteState, PendingMutation,
+    PendingRead, State, is_valid_zset_score,
 };
 use crate::theme::{Theme, Token, env_token};
 use crate::update::{Mode, mode};
@@ -58,6 +58,13 @@ pub fn frame(state: &State, theme: &Theme, clock: &dyn Clock, area: Rect) -> Buf
     // `PendingMutation` this needs anyway.
     if let Some(pending) = &state.confirm {
         confirm_overlay(state, pending, theme, area, &mut buf);
+    }
+    // Drawn last, same reason as `confirm_overlay`: the Palette can only be
+    // open from Normal mode (`update::mode`), but Normal mode is reachable
+    // with the help overlay still toggled on, so this has to be able to sit
+    // on top of that too.
+    if let Some(palette) = &state.palette {
+        palette_overlay(state, palette, theme, area, &mut buf);
     }
     buf
 }
@@ -1271,6 +1278,127 @@ fn confirm_overlay(
         (y0 + 2 + visible_rows - 1) as u16,
         &hint_text,
         theme.style(hint_line.1),
+    );
+}
+
+/// How many match rows the Palette shows at once — a cap, not a scroll:
+/// past this, narrowing the query is the answer, the same "type more" idiom
+/// the keys pane's own filter already has.
+const PALETTE_MAX_VISIBLE: usize = 10;
+
+/// The command palette overlay (`Ctrl-K`, PLAN M3 task 1).
+///
+/// Matches [`confirm_overlay`]'s shape exactly — a centered, bordered box
+/// over both panes, drawn last so nothing else covers it — because CLAUDE.md
+/// is explicit that screen space is a budget, not a canvas: a new surface
+/// either displaces something or lives in an overlay, and every overlay this
+/// codebase already has looks like this one.
+fn palette_overlay(
+    state: &State,
+    palette: &PaletteState,
+    theme: &Theme,
+    area: Rect,
+    buf: &mut Buffer,
+) {
+    let query_line = format!("> {}", palette.query);
+    let match_lines: Vec<(String, bool)> = if palette.matches.is_empty() {
+        vec![("no matching action".to_string(), false)]
+    } else {
+        palette
+            .matches
+            .iter()
+            .enumerate()
+            .take(PALETTE_MAX_VISIBLE)
+            .map(|(i, action)| {
+                let key = state.keymap.hint(*action).unwrap_or_default();
+                let row = format!("{:<24} {:<6} {}", action.label(), key, action.description());
+                (row, i == palette.selected)
+            })
+            .collect()
+    };
+    let hint_line = "↑↓ move · ⏎ open · Esc cancel".to_string();
+
+    let max_w = (area.width as usize).saturating_sub(6).clamp(10, 100);
+    let inner_w = std::iter::once(query_line.chars().count())
+        .chain(match_lines.iter().map(|(l, _)| l.chars().count()))
+        .chain(std::iter::once(hint_line.chars().count()))
+        .map(|w| w.min(max_w))
+        .max()
+        .unwrap_or(10);
+    let w = (inner_w + 4).min(area.width as usize);
+    // Query line + match rows + hint line + 4 border/title rows.
+    let h = (match_lines.len() + 6).min(area.height as usize);
+    let x0 = (area.width as usize - w) / 2;
+    let y0 = (area.height as usize - h) / 2;
+
+    let border = theme.style(Token::BorderFocus);
+    for y in 0..h {
+        let row = (y0 + y) as u16;
+        let line = if y == 0 || y == h - 1 {
+            format!(
+                "{}{}{}",
+                if y == 0 { "┌" } else { "└" },
+                "─".repeat(w - 2),
+                if y == 0 { "┐" } else { "┘" }
+            )
+        } else {
+            format!("│{}│", " ".repeat(w - 2))
+        };
+        put(buf, x0 as u16, row, &line, border);
+    }
+    put(
+        buf,
+        x0 as u16 + 2,
+        y0 as u16,
+        " palette ",
+        theme.style(Token::Text),
+    );
+
+    let visible_rows = h.saturating_sub(3);
+    if visible_rows == 0 {
+        return;
+    }
+    let inner_w = w.saturating_sub(4);
+
+    let query_text = truncate_right(&query_line, inner_w);
+    put(
+        buf,
+        x0 as u16 + 2,
+        (y0 + 2) as u16,
+        &query_text,
+        theme.style(Token::Text),
+    );
+
+    // The query line and the hint line each claim one row; whatever is left
+    // goes to match rows, the same "the hint always gets the last visible
+    // row" discipline `confirm_overlay` uses for its own dialog.
+    let match_rows = visible_rows.saturating_sub(2);
+    for (i, (line, selected)) in match_lines.iter().take(match_rows).enumerate() {
+        let y = (y0 + 3 + i) as u16;
+        let text = truncate_right(line, inner_w);
+        if *selected {
+            // A full-row highlight, the same `Token::Selected` bar the keys
+            // pane uses for its own cursor row — one selection idiom across
+            // the app, not a second one invented for the Palette.
+            let padded = format!("{text:<inner_w$}");
+            put(buf, x0 as u16 + 2, y, &padded, theme.style(Token::Selected));
+        } else {
+            let token = if palette.matches.is_empty() {
+                Token::Muted
+            } else {
+                Token::Text
+            };
+            put(buf, x0 as u16 + 2, y, &text, theme.style(token));
+        }
+    }
+
+    let hint_text = truncate_right(&hint_line, inner_w);
+    put(
+        buf,
+        x0 as u16 + 2,
+        (y0 + 2 + visible_rows - 1) as u16,
+        &hint_text,
+        theme.style(Token::Muted),
     );
 }
 

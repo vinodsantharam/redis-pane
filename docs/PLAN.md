@@ -194,14 +194,17 @@ hunting for a keybinding, and the server's own operational signals — slow comm
 stream, pub/sub traffic, its own vitals — are visible without leaving the terminal or opening a
 second one.
 
-**Progress: not started.** M3 has had a one-line scope mention (see §6.1 below) but no task
-breakdown until this table. Per-feature detail in PRD.md/DESIGN.md ranges from a full glossary
-entry (Palette) to a keymap chord and nothing else (Slowlog) — see each `docs/plans/m3-*.md` for
-what exists today and what this milestone has to design close to from scratch.
+**Progress: in flight.** Task 1 (Palette) is done: `Ctrl-K` opens a fuzzy list over every
+`Action` in `crates/core/src/keymap/mod.rs`, reading the same `Keymap` the hint bar and help
+overlay already read rather than a second copy of it. The task's own risk — a Palette selection
+quietly doing something different from its bound key — is closed structurally: `key_press`'s old
+inline `match action { … }` is now `update::dispatch_action`, one function both the keymap path
+and the Palette's `Enter` call, so there is no second place for the two to drift apart. The rest
+of the table is unstarted.
 
 | # | Task | Proves |
 |---|---|---|
-| 1 | Palette (`Ctrl-K`): fuzzy list over every app action, reading the same keymap-as-data source the hint bar uses (CLAUDE.md's "Keybindings are data") | Every bound action is reachable via the Palette; hint bar and Palette never disagree on the effective binding |
+| 1 | Palette (`Ctrl-K`): fuzzy list over every app action, reading the same keymap-as-data source the hint bar uses (CLAUDE.md's "Keybindings are data") | Every bound action is reachable via the Palette; hint bar and Palette never disagree on the effective binding — **done** |
 | 2 | Dedicated-connection plumbing for push/poll feeds: a second `fred::Client` (or equivalent) the shell can hand to Monitor/Pub-Sub without starving the main read/write path | The main connection keeps answering ordinary reads/writes while a feed connection is open; closing the feed view tears down its connection cleanly |
 | 3 | Slowlog viewer (`g s`): `SLOWLOG GET`/`RESET`, sort, single-node (ADR-0008) | Entries render in a type-aware-consistent frame; `RESET` is a real mutation (confirm dialog, read-only refusal) |
 | 4 | Monitor (`g m`): live tail, filter box, pause/resume, bounded buffer with a visible cap, persistent cost-warning banner | Buffer never grows unbounded; pausing stops consuming the feed, not just hides it; the warning is impossible to miss |

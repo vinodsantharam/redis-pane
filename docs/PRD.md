@@ -203,9 +203,11 @@ config file; a **Connection** is a live session, which may be **ad-hoc** (no Pro
 ### 6.5 Command surface
 - **R5.1** Command palette (fuzzy, single keystroke) for every app action.
 - **R5.2** Embedded command console with history, completion, and inline documentation for the
-  command under the cursor.
-- **R5.3** Results of console commands render in the same type-aware viewers.
-- **R5.4** Command history persisted per profile, searchable.
+  command under the cursor. **Not scheduled for M3** — see §10's resolved open question.
+- **R5.3** Results of console commands render in the same type-aware viewers. **Not scheduled for
+  M3**, same as R5.2.
+- **R5.4** Command history persisted per profile, searchable. **Not scheduled for M3**, same as
+  R5.2.
 
 ### 6.6 Live views
 - **R6.1** `MONITOR` tail with filtering — clearly flagged as expensive.
@@ -260,7 +262,8 @@ config file; a **Connection** is a live session, which may be **ad-hoc** (no Pro
   liveness on the open key (R3.6–R3.11). *This is the milestone that already beats `redis-cli`
   for daily use.*
 - **M2 — Mutate.** Editing, TTL management, delete/rename/copy, read-only mode, safety rails.
-- **M3 — Power.** Command palette + console, monitor, pub/sub, server dashboard, slowlog.
+- **M3 — Power.** Command palette, monitor, pub/sub, server dashboard, slowlog. (Console cut from
+  M3 — see §10's resolved open question.)
 - **M4 — Scale & polish.** Cluster support, million-key performance work, themes, packaging
   and distribution. *Raw binary distribution (GitHub Release archives for macOS, Linux, and
   Windows, via `cargo-dist`) shipped ahead of M4 as a low-risk alpha-testing convenience — no
@@ -272,8 +275,12 @@ config file; a **Connection** is a live session, which may be **ad-hoc** (no Pro
   credential path makes this plausible — is it worth designing for in v1?
 - With one Connection per process, is there any in-app Profile surface left to build, or do
   `--profile`, a bare positional name, and shell completion cover it entirely?
-- Is the Console worth building in v1, given that the terminal it is running in already has
-  `redis-cli` one keystroke away?
+- ~~Is the Console worth building in v1, given that the terminal it is running in already has
+  `redis-cli` one keystroke away?~~ **Resolved for M3:** no. The Console is cut — for exactly the
+  reason the question names. R5.2–R5.4 stay in §6.5 as a real requirement, just not scheduled: an
+  embedded REPL earns its keep once the app is used somewhere `redis-cli` genuinely is not one
+  keystroke away, and that has not been true of any session this project has been built against.
+  The Palette (R5.1) ships in M3 on its own; see [PLAN.md §6](PLAN.md) for the M3 task table.
 
 **Resolved since v0.3** — the server floor (RESP3, Redis 6.0+; ADR-0007), Cluster vs. Sentinel
 (Sentinel in v1, Cluster deferred; ADR-0008), connection lifecycle and startup failure

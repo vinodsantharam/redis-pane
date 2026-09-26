@@ -100,8 +100,8 @@ are enforced at that chokepoint, not at each call site." Concretely:
 ## CLAUDE.md rules this binds
 
 - **Mutations flow through one path.** `RESET` is the point of this task's second half; see above.
-- **Screen space is a budget, not a canvas.** Slowlog is a `View`, reached by `g s` or the
-  Palette, never a third permanent pane.
+- **Screen space is a budget, not a canvas.** Slowlog is a `View`, reached by `g s`, never a
+  third permanent pane (Palette withdrawn, ADR-0020).
 - **The render loop never does I/O.** `Command::FetchSlowlog`/`Command::ResetSlowlog` (issued only
   once confirmed) are the only I/O triggers; `update()` never calls into `redis/` directly.
 - **Type-awareness is a first-class abstraction** doesn't apply literally (a Slowlog entry is not

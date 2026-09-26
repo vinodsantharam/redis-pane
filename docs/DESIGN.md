@@ -42,7 +42,7 @@ R7.3's mouse support lands); nothing else is permanent.
 │ ↑↓ move  → open  / filter  d d delete   │ e edit  y copy  t ttl            │
 └─────────────────────────────────────────┴──────────────────────────────────┘
                                                                               
- Esc back   ⌃K palette   : console   ? help     SCAN 23% ▓▓▓░░░░░  Esc cancel 
+ Esc back   ? help                             SCAN 23% ▓▓▓░░░░░  Esc cancel 
 ```
 
 **There is no sidebar.** An earlier draft gave one to Profiles, live Connections and databases.
@@ -96,10 +96,8 @@ terminal is small and the situation is urgent.
   what is actually selected rather than the last key `Enter` was pressed on.
 - **Global jumps** use a `g`-prefixed chord: `g k` keys, `g d` dashboard, `g m` monitor,
   `g p` pub/sub, `g s` slowlog. There is no `g c` — there is only ever one Connection.
-- **The command palette** (`Ctrl-K`, or `Cmd-K` where the terminal forwards it) is the escape
-  hatch for everything: actions, keys, profiles, commands, help topics — one fuzzy list.
-- **The console** (`:`) is for raw Redis commands. Palette and console are deliberately separate:
-  the palette drives the *app*, the console drives the *server*.
+- **The console** (`:`) is for raw Redis commands sent straight to the server. It is not
+  scheduled — R5.2–R5.4 stay a real requirement, just not built (PRD §10).
 - **`Esc` is always "back"**, and never destroys unsaved input without asking.
   It pops one thing at a time: the value cursor first if it is active, then
   the pane stack, then an unrelated background operation.
@@ -109,8 +107,6 @@ terminal is small and the situation is urgent.
 | Key | Action | Scope |
 |---|---|---|
 | `?` | Help overlay | global |
-| `Ctrl-K` | Command palette | global |
-| `:` | Redis console | global |
 | `Tab` | Move focus between the panes | global |
 | `g` + key | Jump to view | global |
 | `Ctrl-C` ×2 | Quit (single press = cancel current op) | global |
@@ -130,8 +126,24 @@ terminal is small and the situation is urgent.
 | `y` | Confirm a staged mutation (`Esc` dismisses) | global, only while one is staged |
 | `Ctrl-R` | Toggle read-only mode | global |
 
-Every one of these is also listed in the palette with its binding shown, so the keymap teaches
-itself. Bindings are user-overridable in config; the hint bar renders the *effective* binding.
+Bindings are user-overridable in config; the hint bar and the help overlay (`?`) both render the
+*effective* binding, so a remap is never a lie the hint bar tells.
+
+**Keymap growth rule.** The Palette was the one check against this keymap growing without limit
+(CLAUDE.md); withdrawing it (ADR-0020) replaces that check with a written rule instead of a
+searchable escape hatch: a bare top-level single key is spent only on a per-session action, one
+reached for in most sessions — not a rare or long-tail one, which has no business claiming a whole
+key of its own. A view (Dashboard, Monitor, Pub/Sub, Slowlog) never gets a bare key; it lives under
+the `g`-prefixed chord above. Everything else is scoped to whichever pane or view already has
+focus, so the same key can mean two things in two places without colliding — `r` is refetch in the
+value pane and rescan in the keys pane, `t` is tree in the keys pane and edit-ttl in the value pane
+— rather than needing a second binding. Revisit this rule, per ADR-0020, once focus-scoped keys and
+`g`-chords genuinely run out, or once an overloaded key like `t` starts confusing users.
+
+Derived from the default keymap in `crates/core/src/keymap/mod.rs` (not from the table above,
+which includes keys this document plans but this codebase has not built yet): the free single
+lowercase keys, unclaimed by any default binding, are `b f i m n o p u v w x z`. `g` is free too,
+but is reserved as the view-jump chord prefix above rather than as a lone binding.
 
 **Focus is one concept at every width.** Below 70 columns it decides which pane is *drawn*
 (§2's stack navigation); at or above it, both panes are drawn and focus decides only which one a
@@ -482,7 +494,8 @@ the reader's time.
 - Full monochrome fallback that remains navigable. The type name stays in the key list when
   color is gone, so a hash is still distinguishable from a sorted set.
 - Screen-reader-friendly mode: linearized rendering, no box-drawing, announced focus changes.
-- No timing-dependent interactions; every chord has a non-chord equivalent in the palette.
+- No timing-dependent interactions; every chord is listed in the help overlay (`?`) with its
+  binding, so none has to be recalled from memory.
 
 ## 9. Open design questions
 

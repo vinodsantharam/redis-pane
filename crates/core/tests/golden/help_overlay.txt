@@ -32,4 +32,3 @@ a       add
 ⌃S      stage
 ⌃Z      undo
 ⌃Y      redo
-⌃K      palette

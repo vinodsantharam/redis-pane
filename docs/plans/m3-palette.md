@@ -1,5 +1,9 @@
 # M3 task 1: the command palette (`Ctrl-K`)
 
+Status: **superseded.** This plan shipped (#43, 0.1.0-alpha.14), and the Palette it built was then
+withdrawn — see [`m3-palette-withdrawn.md`](m3-palette-withdrawn.md) and
+[ADR-0020](../adr/0020-no-command-palette.md).
+
 Status: **planning — not started.** No code, no ADR needed (the Palette is already named and
 scoped by CONTEXT.md and DESIGN.md — see below; this doc plans the build, not a new decision).
 

@@ -9,7 +9,6 @@ pub mod copy;
 pub mod editor;
 pub mod loaded;
 pub mod open;
-pub mod palette;
 pub mod scan;
 pub mod tree;
 pub mod ttl;
@@ -20,7 +19,6 @@ pub use copy::CopyWhat;
 pub use editor::{EditBuffer, EditTarget, FieldPart, is_valid_zset_score};
 pub use loaded::{KeyKind, LoadedSet};
 pub use open::{Attachment, EditPhase, OpenKey, PendingRead, ReadOutcome};
-pub use palette::PaletteState;
 pub use scan::ScanState;
 pub use tree::Tree;
 pub use ttl::{
@@ -758,9 +756,6 @@ pub struct State {
     /// Bindings in force. Hints read from here so they show the effective key.
     pub keymap: crate::keymap::Keymap,
     pub help_open: bool,
-    /// The command palette, while open (`Ctrl-K`, PLAN M3 task 1). `Option`,
-    /// matching `confirm`/`help_open`: "is the Palette open" is one field.
-    pub palette: Option<PaletteState>,
     /// Every key scanned so far, columnar and capped (ADR-0010).
     pub keys: LoadedSet,
     pub scan: ScanState,

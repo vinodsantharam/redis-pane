@@ -169,11 +169,11 @@ they are expensive to retrofit:
   width-identical).
 - **Terminal capability degrades gracefully.** Truecolor → 256 → monochrome; Nerd Font → ASCII;
   ≥140 cols → 80 cols → single-pane. Layout breakpoints are in DESIGN.md §2.
-- **Keybindings are data.** The keymap, the palette, and the on-screen hint bar all read from one
-  source, so hints always show the *effective* binding after user overrides.
+- **Keybindings are data.** The keymap, the help overlay and the on-screen hint bar all read from
+  one source, so hints always show the *effective* binding after user overrides.
 - **Screen space is a budget, not a canvas.** The layout is two panes (PRD R7.7, G7). A new
-  surface either displaces something or lives in the Palette or a dismissible overlay. "It's only
-  a few columns" is how the sidebar happened; it was removed for exactly that reason.
+  surface either displaces something or lives in a dismissible overlay. "It's only a few columns"
+  is how the sidebar happened; it was removed for exactly that reason.
 
 ## Decisions already made (see ADRs before revisiting)
 
@@ -216,8 +216,9 @@ they are expensive to retrofit:
   code that blurs them will blur them in the interface too.
 - Environment (`local` / `staging` / `prod` / `unknown`) is a safety feature, not decoration —
   any code path touching mutations must be aware of it (PRD R4.5, R4.6, R1.9).
-- Prefer adding to the command palette over adding a keybinding; every action must be reachable
-  from the palette (R5.1), and only frequent actions earn a key.
+- Follow the keymap growth rule (DESIGN §4, ADR-0020) before adding a keybinding: a bare
+  top-level key is for a per-session action only, a new view goes under a `g`-chord, and
+  everything else is scoped to the focused pane or view.
 - Errors surface as non-blocking notifications carrying the failing command (R7.4) — never
   `panic!` on a Redis error, and never swallow one silently. In practice this defect takes the
   shape of a bare `Err(_) => return` inside a task: the operation vanishes and nothing changes on

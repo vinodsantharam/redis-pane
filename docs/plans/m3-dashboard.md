@@ -101,8 +101,8 @@ neither — it must actually re-issue `INFO` on a timer while open.
   tokens, never literals."
 - Expanding a tile (a keypress or `Enter` on the focused tile) sets `expanded_tile` and renders
   that section's raw `INFO` key/value pairs as an overlay or an in-place expansion — DESIGN gives
-  no specifics here; propose an overlay (consistent with the Palette's and confirm dialog's
-  existing overlay pattern) since a tile expanding in place would reflow the whole grid under the
+  no specifics here; propose an overlay (consistent with the confirm dialog's existing overlay
+  pattern) since a tile expanding in place would reflow the whole grid under the
   reader's cursor, which is exactly the kind of layout shift M1's lazy-metadata design went out of
   its way to avoid for the keys pane ("Pending cells render without shifting layout").
 
@@ -130,9 +130,10 @@ DESIGN.md when built, since DESIGN §2 currently has no grid-layout section at a
 - **Terminal capability degrades gracefully.** The tile grid needs its own breakpoints; see Layout
   above.
 - **Screen space is a budget, not a canvas.** The Dashboard is a `View` (introduced in
-  `m3-slowlog.md`), reached by `g d` or the Palette, never a persistent status-bar-adjacent panel —
-  which is exactly what option 2 above proposes *instead of* this screen, worth remembering while
-  building option 1: the two are genuinely alternatives, not layers.
+  `m3-slowlog.md`), reached by `g d` (Palette withdrawn, ADR-0020), never a persistent
+  status-bar-adjacent panel — which is exactly what option 2 above proposes *instead of* this
+  screen, worth remembering while building option 1: the two are genuinely alternatives, not
+  layers.
 - **Every in-flight operation must be cancellable.** Less literally applicable here (a poll isn't
   "in flight" the way a scan is) but the interval must stop the instant the view closes, the same
   discipline as a cancelled scan or a closed feed connection.

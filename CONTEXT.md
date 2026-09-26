@@ -77,14 +77,17 @@ A key is identified by its exact bytes, which need not be valid UTF-8. The name 
 is for reading only: every read and write names the key by its bytes, never by what is displayed.
 _Avoid_: Current key, active key, focused key, previewed key
 
-**Palette**:
-The fuzzy launcher for actions belonging to *the application* — navigation, settings, view
-switching. Every action is reachable here.
+**Palette** _(withdrawn, see [ADR-0020](docs/adr/0020-no-command-palette.md))_:
+Shipped in 0.1.0-alpha.14 as the fuzzy launcher for actions belonging to *the application* —
+navigation, settings, view switching, every action reachable from one place. Removed: every
+action it listed already had a key of its own, so it was only ever a slower route to the same
+thing. Kept defined here so the term stays readable in commits and code written before the
+withdrawal.
 _Avoid_: Command palette (ambiguous against Console), launcher, menu
 
 **Console**:
-The input surface for raw commands sent to *the Redis server*. Deliberately separate from the
-Palette: the Palette drives the app, the Console drives the server.
+The input surface for raw commands sent to *the Redis server*. Not scheduled for M3
+(PRD §10).
 _Avoid_: REPL, terminal, prompt, command bar
 
 **Refetch**:

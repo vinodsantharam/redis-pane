@@ -23,9 +23,9 @@ exactly one thing it can be describing.
 
 Exactly one Connection per process, against exactly one database, fixed at launch.
 
-There is no connection switcher, no `SELECT`, no tabs, and no sidebar. The Palette does not
-offer a "switch to Profile" action. The database is part of the target, chosen the same way the
-host is.
+There is no connection switcher, no `SELECT`, no tabs, and no sidebar. Nothing offers a
+"switch to Profile" action (the Palette would have been the obvious place for one; it was
+withdrawn — ADR-0020). The database is part of the target, chosen the same way the host is.
 
 The sidebar is removed entirely; the layout is two panes.
 

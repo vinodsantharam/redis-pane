@@ -189,7 +189,7 @@ surveyed and rejected for exactly that reason, which is why `⌃S` was chosen in
 This amendment does not ask `Enter` to mean two things at once on one value; it changes which
 *targets* is multi-line at all. A Hash field's value, a Set member, and a Hash add form's value
 part are none of them read as a paragraph — they are short, structured pieces of a collection, the
-same way a Palette entry or a filter line is a single line the reader expects `Enter` to submit.
+same way a filter line is a single line the reader expects `Enter` to submit.
 A String is the one shape in this app a reader routinely wants to keep typing past a line break —
 a cached API response, a session blob, an arbitrary blob of prose — which is the same reasoning
 the "Single-line prompts only" alternative was rejected for, below. So the rule is not "guess which

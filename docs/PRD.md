@@ -201,7 +201,8 @@ config file; a **Connection** is a live session, which may be **ad-hoc** (no Pro
   bulk delete on prod = typed confirmation.
 
 ### 6.5 Command surface
-- **R5.1** Command palette (fuzzy, single keystroke) for every app action.
+- ~~**R5.1** Command palette (fuzzy, single keystroke) for every app action.~~ **Withdrawn** — see
+  [ADR-0020](adr/0020-no-command-palette.md).
 - **R5.2** Embedded command console with history, completion, and inline documentation for the
   command under the cursor. **Not scheduled for M3** — see §10's resolved open question.
 - **R5.3** Results of console commands render in the same type-aware viewers. **Not scheduled for
@@ -224,8 +225,8 @@ config file; a **Connection** is a live session, which may be **ad-hoc** (no Pro
 - **R7.5** Full-app help overlay and per-pane contextual key hints always visible.
 - **R7.6** Single self-contained binary, no runtime dependency.
 - **R7.7** The default layout is two panes — keyspace and current value. Anything else reaches
-  the screen through the Palette or a dismissible overlay, and nothing else holds columns
-  permanently. New surfaces must displace something or justify their width against G7.
+  the screen through a dismissible overlay, and nothing else holds columns permanently. New
+  surfaces must displace something or justify their width against G7.
 
 ## 7. Success metrics
 
@@ -262,8 +263,9 @@ config file; a **Connection** is a live session, which may be **ad-hoc** (no Pro
   liveness on the open key (R3.6–R3.11). *This is the milestone that already beats `redis-cli`
   for daily use.*
 - **M2 — Mutate.** Editing, TTL management, delete/rename/copy, read-only mode, safety rails.
-- **M3 — Power.** Command palette, monitor, pub/sub, server dashboard, slowlog. (Console cut from
-  M3 — see §10's resolved open question.)
+- **M3 — Power.** Monitor, pub/sub, server dashboard, slowlog. (Console cut from M3 — see §10's
+  resolved open question. The command palette shipped in alpha.14 and was withdrawn —
+  [ADR-0020](adr/0020-no-command-palette.md).)
 - **M4 — Scale & polish.** Cluster support, million-key performance work, themes, packaging
   and distribution. *Raw binary distribution (GitHub Release archives for macOS, Linux, and
   Windows, via `cargo-dist`) shipped ahead of M4 as a low-risk alpha-testing convenience — no
@@ -280,7 +282,8 @@ config file; a **Connection** is a live session, which may be **ad-hoc** (no Pro
   reason the question names. R5.2–R5.4 stay in §6.5 as a real requirement, just not scheduled: an
   embedded REPL earns its keep once the app is used somewhere `redis-cli` genuinely is not one
   keystroke away, and that has not been true of any session this project has been built against.
-  The Palette (R5.1) ships in M3 on its own; see [PLAN.md §6](PLAN.md) for the M3 task table.
+  The Palette (R5.1) shipped in alpha.14 and was withdrawn — see
+  [ADR-0020](adr/0020-no-command-palette.md) and [PLAN.md §6](PLAN.md) for the M3 task table.
 
 **Resolved since v0.3** — the server floor (RESP3, Redis 6.0+; ADR-0007), Cluster vs. Sentinel
 (Sentinel in v1, Cluster deferred; ADR-0008), connection lifecycle and startup failure

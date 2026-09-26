@@ -194,41 +194,46 @@ hunting for a keybinding, and the server's own operational signals — slow comm
 stream, pub/sub traffic, its own vitals — are visible without leaving the terminal or opening a
 second one.
 
-**Progress: in flight.** Task 1 (Palette) is done: `Ctrl-K` opens a fuzzy list over every
-`Action` in `crates/core/src/keymap/mod.rs`, reading the same `Keymap` the hint bar and help
-overlay already read rather than a second copy of it. The task's own risk — a Palette selection
-quietly doing something different from its bound key — is closed structurally: `key_press`'s old
-inline `match action { … }` is now `update::dispatch_action`, one function both the keymap path
-and the Palette's `Enter` call, so there is no second place for the two to drift apart. The rest
-of the table is unstarted.
+**Progress: in flight.** Task 1 (Palette) shipped in 0.1.0-alpha.14, then was withdrawn
+(ADR-0020): `Ctrl-K` opened a fuzzy list over every `Action` in `crates/core/src/keymap/mod.rs`,
+reading the same `Keymap` the hint bar and help overlay already read rather than a second copy of
+it. Hands-on testing found no use for it — every `Action` it listed already had a key, so it was
+only ever a slower route to the same thing — and it was removed completely. Discovery for the
+occasional on-call user moves to a contextual help overlay, a separate change
+(`docs/plans/m3-contextual-help.md`). One piece of the task's own structure survives the
+withdrawal: `key_press`'s old inline `match action { … }` stayed factored out as
+`update::dispatch_action`, since the keymap path is still its caller. The rest of the table is
+unstarted.
 
 | # | Task | Proves |
 |---|---|---|
-| 1 | Palette (`Ctrl-K`): fuzzy list over every app action, reading the same keymap-as-data source the hint bar uses (CLAUDE.md's "Keybindings are data") | Every bound action is reachable via the Palette; hint bar and Palette never disagree on the effective binding — **done** |
+| 1 | ~~Palette (`Ctrl-K`): fuzzy list over every app action, reading the same keymap-as-data source the hint bar uses (CLAUDE.md's "Keybindings are data")~~ | done in alpha.14, then withdrawn (ADR-0020) |
 | 2 | Dedicated-connection plumbing for push/poll feeds: a second `fred::Client` (or equivalent) the shell can hand to Monitor/Pub-Sub without starving the main read/write path | The main connection keeps answering ordinary reads/writes while a feed connection is open; closing the feed view tears down its connection cleanly |
 | 3 | Slowlog viewer (`g s`): `SLOWLOG GET`/`RESET`, sort, single-node (ADR-0008) | Entries render in a type-aware-consistent frame; `RESET` is a real mutation (confirm dialog, read-only refusal) |
 | 4 | Monitor (`g m`): live tail, filter box, pause/resume, bounded buffer with a visible cap, persistent cost-warning banner | Buffer never grows unbounded; pausing stops consuming the feed, not just hides it; the warning is impossible to miss |
 | 5 | Pub/Sub (`g p`): subscribe to channels and patterns, live tail | Distinct from Monitor's layout (not just "Monitor with a different source"); unsubscribing on view-close leaves no orphaned subscription |
 | 6 | Dashboard (`g d`): `INFO`-based tiles — memory used/peak/maxmemory bar, hit ratio, ops/sec sparkline, clients, replication role/lag, eviction/expiry counters, single-node (ADR-0008) | Alarming values are colored; every tile expands to its raw `INFO` section; refreshes on an interval, not static — **flag at the top of this task's plan doc**: the documented alternative (skip the Dashboard, add a memory figure to the status bar, rely on the Slowlog for triage) is still on the table and should be re-decided before work starts, not assumed away by this plan existing |
 
-**Console (R5.2–R5.4) is explicitly out of scope for M3.** Only the Palette (R5.1) ships — see
-[PRD.md §10](PRD.md) for the resolved open question and the rationale.
+**Console (R5.2–R5.4) is explicitly out of scope for M3.** The Palette (R5.1) shipped and was
+withdrawn (ADR-0020) — see [PRD.md §10](PRD.md) for the resolved open question and the rationale.
 
 ### 6.1 Individual plan docs
 
 Each row above has its own doc under `docs/plans/`, in the shape M2's per-task docs used —
 context, approach, files touched, tests — written before any of it is built:
-[`m3-palette.md`](plans/m3-palette.md), [`m3-feed-connection.md`](plans/m3-feed-connection.md)
-(task 2 — shared infrastructure Monitor and Pub-Sub both depend on, so it is its own doc rather
-than duplicated in each), [`m3-slowlog.md`](plans/m3-slowlog.md),
-[`m3-monitor.md`](plans/m3-monitor.md), [`m3-pubsub.md`](plans/m3-pubsub.md), and
-[`m3-dashboard.md`](plans/m3-dashboard.md) — the last opens with the descope alternative as a
-named decision point, not buried in prose.
+[`m3-palette.md`](plans/m3-palette.md) (superseded by
+[`m3-palette-withdrawn.md`](plans/m3-palette-withdrawn.md)),
+[`m3-feed-connection.md`](plans/m3-feed-connection.md) (task 2 — shared infrastructure Monitor
+and Pub-Sub both depend on, so it is its own doc rather than duplicated in each),
+[`m3-slowlog.md`](plans/m3-slowlog.md), [`m3-monitor.md`](plans/m3-monitor.md),
+[`m3-pubsub.md`](plans/m3-pubsub.md), and [`m3-dashboard.md`](plans/m3-dashboard.md) — the last
+opens with the descope alternative as a named decision point, not buried in prose.
 
 ## 7. Explicitly not in M0, M1 or M2
 
-Palette, Console, dashboard, monitor, pub/sub, slowlog (M3) — Console cut, see §6 above. Cluster,
-themes beyond the two defaults, packaging (M4). Keys-pane liveness, and the other open questions
+Palette, Console, dashboard, monitor, pub/sub, slowlog (M3) — Console cut, Palette shipped then
+withdrawn (ADR-0020), see §6 above. Cluster, themes beyond the two defaults, packaging (M4).
+Keys-pane liveness, and the other open questions
 in [DESIGN §9](DESIGN.md) — all decidable later without rework, which is why they are still open.
 
 ## 8. Risk order

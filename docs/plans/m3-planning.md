@@ -17,8 +17,9 @@ were open in the docs themselves; the user has now resolved both:
   be chosen instead at build time.**
 - **Console** (R5.2–R5.4): PRD.md's open questions challenge whether it's worth building
   given `redis-cli` is one keystroke away in the same terminal. **Decision: drop the
-  Console from M3. Palette (R5.1) ships; Console is cut, not deferred-unlabeled — the PRD's
-  open question gets resolved in the docs, not left dangling.**
+  Console from M3. Palette (R5.1) ships (it later shipped and was withdrawn — ADR-0020); Console
+  is cut, not deferred-unlabeled — the PRD's open question gets resolved in the docs, not left
+  dangling.**
 
 ## M3 summary
 
